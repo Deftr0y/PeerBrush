@@ -4,6 +4,13 @@ use crate::{effects, liquify};
 use serde_json::Value;
 const MAX: f64 = 65535.0;
 const PREMULT_MAX: f64 = MAX * MAX;
+fn allocation<T>(capacity: usize) -> Result<Vec<T>, String> {
+    let mut result = Vec::new();
+    result
+        .try_reserve_exact(capacity)
+        .map_err(|_| "Native16 effect buffer allocation failed")?;
+    Ok(result)
+}
 pub fn weighted_working_bytes(
     effect: &effects::Effect,
     width: u32,
@@ -216,9 +223,8 @@ fn apply_cpu_prepared(image: &mut Image16, kind: &str, settings: Value) -> Resul
         }
         "posterize" => {
             let levels = effects::posterize::levels(&settings)?;
-            let table: Vec<u16> = (0..=65535u16)
-                .map(|v| effects::posterize::sample(v, 65535, levels))
-                .collect();
+            let mut table = allocation(65536)?;
+            table.extend((0..=65535u16).map(|v| effects::posterize::sample(v, 65535, levels)));
             for pixel in image.words.chunks_exact_mut(4) {
                 for channel in &mut pixel[..3] {
                     *channel = table[*channel as usize];
@@ -257,9 +263,8 @@ fn apply_cpu_prepared(image: &mut Image16, kind: &str, settings: Value) -> Resul
         }
         _ => {}
     }
-    let table: Vec<u16> = (0..65536)
-        .map(|v| word(map(kind, &settings, v as f64 / MAX) * MAX))
-        .collect();
+    let mut table = allocation(65536)?;
+    table.extend((0..65536).map(|v| word(map(kind, &settings, v as f64 / MAX) * MAX)));
     let saturation = number(&settings, "saturation", 1.0);
     for p in image.words.chunks_exact_mut(4) {
         if p[3] == 0 {
@@ -305,12 +310,13 @@ fn apply_cpu_prepared(image: &mut Image16, kind: &str, settings: Value) -> Resul
 }
 // In-place sliding windows preserve originals in a radius-sized ring rather
 // than allocating a second full image or a canvas-length scratch line.
-fn boxes(pixels: &mut [u32], width: usize, height: usize, sigma: f32) {
+fn boxes(pixels: &mut [u32], width: usize, height: usize, sigma: f32) -> Result<(), String> {
     for radius in effects::gaussian_radii(sigma) {
         if radius == 0 {
             continue;
         }
-        let mut ring = vec![[0u32; 4]; radius + 1];
+        let mut ring = allocation(radius + 1)?;
+        ring.resize(radius + 1, [0u32; 4]);
         let count = (radius * 2 + 1) as u64;
         for vertical in [false, true] {
             let (lines, length, stride) = if vertical {
@@ -355,12 +361,13 @@ fn boxes(pixels: &mut [u32], width: usize, height: usize, sigma: f32) {
             }
         }
     }
+    Ok(())
 }
 fn blur(image: &mut Image16, sigma: f32) -> Result<(), String> {
     if sigma < 0.5 || image.width == 0 || image.height == 0 {
         return Ok(());
     }
-    let mut pixels: Vec<u32> = Vec::with_capacity(image.words.len());
+    let mut pixels = allocation(image.words.len())?;
     for p in image.words.chunks_exact(4) {
         pixels.extend([
             u32::from(p[0]) * u32::from(p[3]),
@@ -374,7 +381,7 @@ fn blur(image: &mut Image16, sigma: f32) -> Result<(), String> {
         image.width as usize,
         image.height as usize,
         sigma,
-    );
+    )?;
     for (p, v) in image.words.chunks_exact_mut(4).zip(pixels.chunks_exact(4)) {
         p[3] = ((u64::from(v[3]) + 32767) / 65535).min(65535) as u16;
         for c in 0..3 {
@@ -394,7 +401,7 @@ fn bloom(image: &mut Image16, settings: &Value) -> Result<(), String> {
     if threshold == 1.0 || strength == 0.0 {
         return Ok(());
     }
-    let mut glow = Vec::with_capacity(image.words.len());
+    let mut glow = allocation(image.words.len())?;
     let mut emitted = false;
     for p in image.words.chunks_exact(4) {
         let emission = ((luma([p[0] as f64 / MAX, p[1] as f64 / MAX, p[2] as f64 / MAX])
@@ -421,7 +428,7 @@ fn bloom(image: &mut Image16, settings: &Value) -> Result<(), String> {
         image.width as usize,
         image.height as usize,
         number(settings, "spread", 12.0) as f32,
-    );
+    )?;
     for (p, g) in image.words.chunks_exact_mut(4).zip(glow.chunks_exact(4)) {
         let base = p[3] as f64 / MAX;
         let alpha = base + (1.0 - base) * (g[3] as f64 / PREMULT_MAX * strength).clamp(0.0, 1.0);
@@ -552,7 +559,7 @@ mod tests {
                 if which == 0 {
                     legacy_boxes(std::hint::black_box(&mut baseline), edge, edge, 4.0);
                 } else {
-                    boxes(std::hint::black_box(&mut candidate), edge, edge, 4.0);
+                    boxes(std::hint::black_box(&mut candidate), edge, edge, 4.0).unwrap();
                 }
                 // Keep the complete mutated output observable inside the timer.
                 std::hint::black_box(if which == 0 {

@@ -36,6 +36,9 @@ impl Grid {
                 bounds = visible;
             }
         }
+        Self::from_bounds(bounds, value)
+    }
+    pub(super) fn from_bounds(bounds: (usize, usize, usize, usize), value: &Value) -> Self {
         let (width, height) = ((bounds.2 - bounds.0) as f64, (bounds.3 - bounds.1) as f64);
         let degrees = value["angle"].as_f64().unwrap_or(90.);
         let angle = degrees.to_radians();
