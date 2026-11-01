@@ -10,7 +10,8 @@ footprint. The sampler explicitly prepares that footprint before reading its
 memory-only pixel view. If its area or pin admission is too large, it divides
 the output region and retries the smaller footprints. Coordinate scratch is
 reused across subdivisions. Every map evaluation, including repeated scans,
-consumes the caller's work allowance. Cancellation or source failure returns
+consumes the caller's work allowance. Identity copies charge their complete
+physical tile, including padding. Cancellation or source failure returns
 no tile; partial output cannot become a completed source.
 
 Sampling preserves the existing native8 f32 and native16 f64 premultiplied
@@ -29,6 +30,12 @@ Warp preparation retains a separate bounded metadata reservation. Output,
 coordinate scratch, source pins and permanent source descriptors use the same
 resident pool. The source's disk pool is also checked. These are component
 admissions, not a total application RAM or performance claim.
+
+The provisional whole-plane writer streams these tiles into the caller's owned
+store, retaining its index admission through permanent descriptor conversion.
+It emits explicit known zero when every physical byte is zero. Its caller must
+retire any unused fragment, then seal nonzero output through the common session
+before requesting a prepared edit; a completed plane alone grants no authority.
 
 The final consumer must use the common captured edit, generation-bound source
 slots, sealed source-session output, retained-source action and guarded
