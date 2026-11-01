@@ -1,5 +1,6 @@
 //! Original raster samples and accumulated placement are editable source data.
 pub(crate) mod geometry;
+pub(crate) mod policy;
 pub(crate) mod projection;
 pub(crate) mod stage;
 use crate::{
