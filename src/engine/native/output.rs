@@ -255,6 +255,12 @@ pub(super) mod tests {
         }
     }
     pub(crate) fn draft(base: &NativeDocument) -> (OutputDraft, std::path::PathBuf) {
+        draft_with(base, &mut |_| {})
+    }
+    fn draft_with(
+        base: &NativeDocument,
+        edit: &mut dyn FnMut(&mut [u8]),
+    ) -> (OutputDraft, std::path::PathBuf) {
         let path = std::fs::canonicalize(std::env::temp_dir())
             .unwrap()
             .join(format!("peerbrush-output-draft-{}", crate::engine::id()));
@@ -278,6 +284,7 @@ pub(super) mod tests {
         {
             pair.copy_from_slice(&word.to_be_bytes());
         }
+        edit(&mut bytes);
         let reference = fragment.store().put(spec, &bytes, &mut || Ok(())).unwrap();
         drop(bytes);
         let surface = Surface::from_plane(
@@ -342,5 +349,135 @@ pub(super) mod tests {
         assert_eq!(base.disk_budget().used().unwrap(), 0);
         assert!(pool.used() < baseline);
         std::fs::remove_dir(path).unwrap();
+    }
+    #[test]
+    fn retained_noop_and_unshifted_expansion_keep_original_across_distinct_owned_stores() {
+        use crate::engine::scene::{PendingScene, Retained36};
+        let pool = ResidentBudget::new(16 * 1024 * 1024).unwrap();
+        let blank = super::super::tests::document(&pool);
+        let blank = NativeDocument {
+            core: blank
+                .core
+                .map_unique(|mut core, _| {
+                    core.disk = DiskBudget::new(8 * 1024 * 1024, 64).unwrap();
+                    Ok(core)
+                })
+                .unwrap(),
+        };
+        let (first, path) = draft(&blank);
+        let first = first
+            .seal(&blank, &Session, &|| Ok(()))
+            .unwrap_or_else(|e| panic!("{}", e.reason()));
+        let stored = first.surface().clone();
+        first.mark_published();
+        let metadata_owner = MetadataCharge::reserve(&pool, 64 * 1024, &|| Ok(())).unwrap();
+        let mut metadata = blank.core.metadata.clone();
+        metadata.layers[0].pixels.retained = Some(Box::new(Retained36 {
+            pixels: RasterRef36 {
+                id: 2,
+                width: 8,
+                height: 8,
+                depth: 16,
+                retained: None,
+            },
+            matrix: crate::retained::IDENTITY,
+            projective: None,
+            warps: vec![],
+        }));
+        let pending = PendingScene::new(
+            Admitted::from_parts(Arc::new(metadata), metadata_owner),
+            RasterRoster::new(vec![stored, Surface::zero(8, 8, 16).unwrap()]).unwrap(),
+            pool.clone(),
+            blank.disk_budget().clone(),
+        )
+        .unwrap();
+        let base = NativeDocument::from_pending(pending).unwrap();
+        let target = base.metadata().layer(0).unwrap().pixels().slot();
+        let original = base
+            .metadata()
+            .layer(0)
+            .unwrap()
+            .pixels()
+            .retained()
+            .unwrap()
+            .pixels()
+            .slot();
+        let original_key = base.source(original).unwrap().key();
+        for width in [8, 16, 4] {
+            let (mut next, next_path) = draft(&base);
+            let tile = next.surface.physical_tiles().next().unwrap();
+            let owner = tile.owner().clone();
+            let reference = tile.reference();
+            drop(tile);
+            next.surface = Surface::from_plane(
+                Plane::from_blocks(
+                    width,
+                    width,
+                    16,
+                    owner,
+                    BTreeMap::from([((0, 0), reference)]),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let output = next
+                .seal(&base, &Session, &|| Ok(()))
+                .unwrap_or_else(|e| panic!("{}", e.reason()));
+            assert_ne!(base.source(target).unwrap().key(), output.surface().key());
+            let patch = RasterPatch {
+                target,
+                output,
+                retained: RetainedUpdate::Keep,
+                layer_origin: None,
+            };
+            let prepared = base.capture_edit().unwrap().raster_patch(patch, &|| Ok(()));
+            if width >= 8 {
+                let prepared = prepared.unwrap_or_else(|e| panic!("{}", e.reason()));
+                let current = base.publish("human", &[], 1, false, prepared).unwrap();
+                let raster = current.metadata().layer(0).unwrap().pixels();
+                assert_eq!(raster.width(), width);
+                assert_eq!(
+                    current
+                        .source(raster.retained().unwrap().pixels().slot())
+                        .unwrap()
+                        .key(),
+                    original_key
+                );
+                drop(current);
+                std::fs::remove_dir_all(next_path).unwrap();
+            } else {
+                let refused = prepared.err().unwrap();
+                assert!(refused.reason().contains("source reconciliation"));
+                refused.abort(&Session, &|| Ok(())).unwrap();
+                std::fs::remove_dir(next_path).unwrap();
+            }
+        }
+        // Hidden native RGB in physical padding is part of exact equivalence.
+        let (changed, changed_path) =
+            draft_with(&base, &mut |bytes| bytes[(200 * 256 + 200) * 8] = 1);
+        let output = changed
+            .seal(&base, &Session, &|| Ok(()))
+            .unwrap_or_else(|e| panic!("{}", e.reason()));
+        let refused = base
+            .capture_edit()
+            .unwrap()
+            .raster_patch(
+                RasterPatch {
+                    target,
+                    output,
+                    retained: RetainedUpdate::Keep,
+                    layer_origin: None,
+                },
+                &|| Ok(()),
+            )
+            .err()
+            .unwrap();
+        assert!(refused.reason().contains("source reconciliation"));
+        refused.abort(&Session, &|| Ok(())).unwrap();
+        std::fs::remove_dir(changed_path).unwrap();
+        drop(base);
+        drop(blank);
+        std::fs::remove_dir_all(path).unwrap();
+        assert_eq!(pool.used(), 0);
     }
 }
