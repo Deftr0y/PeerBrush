@@ -20,7 +20,7 @@ mod staging;
 pub(crate) use staging::{SessionBytes, SessionTemporary};
 #[path = "source_runtime/recovery_marker.rs"]
 mod recovery_marker;
-pub(crate) use recovery_marker::NativeMarker;
+pub(crate) use recovery_marker::{NativeMarker, NativeMarkerIds};
 
 pub(crate) struct Limits {
     pub resident_bytes: usize,
@@ -630,6 +630,64 @@ impl SourceSession {
             }
         }
         let head = store.checkpoint_reference().map_err(|e| e.to_string())?;
+        if let Some(snapshot) = store
+            .checkpoint_snapshot(&mut || {
+                self.check()
+                    .map_err(|_| crate::large_document::Error::Changed)
+            })
+            .map_err(|e| e.to_string())?
+        {
+            if Some(snapshot.reference()) != head {
+                return Err("Source checkpoint changed during coverage admission".into());
+            }
+            let bytes = blocks
+                .len()
+                .checked_mul(std::mem::size_of::<([u8; 32], bool)>())
+                .and_then(|n| n.checked_mul(2))
+                .and_then(|n| n.checked_add(128))
+                .ok_or("Source reference coverage footprint overflow")?;
+            let _coverage = self
+                .resident()
+                .reserve_bytes(bytes, 64 * 1024 * 1024)
+                .map_err(|e| e.to_string())?;
+            let mut needed = Vec::new();
+            needed
+                .try_reserve_exact(blocks.len())
+                .map_err(|_| "Source coverage allocation refused")?;
+            if needed.capacity() > blocks.len().saturating_mul(2) {
+                return Err("Source coverage exceeds admitted capacity".into());
+            }
+            needed.extend(
+                blocks
+                    .iter()
+                    .map(|reference| (reference.fingerprint(), false)),
+            );
+            needed.sort_unstable_by_key(|(key, _)| *key);
+            needed.dedup_by_key(|(key, _)| *key);
+            snapshot
+                .visit_blocks(
+                    &mut || {
+                        self.check()
+                            .map_err(|_| crate::large_document::Error::Changed)
+                    },
+                    |reference| {
+                        if let Ok(at) =
+                            needed.binary_search_by_key(&reference.fingerprint(), |(key, _)| *key)
+                        {
+                            needed[at].1 = true;
+                        }
+                        Ok(())
+                    },
+                )
+                .map_err(|e| e.to_string())?;
+            if needed.iter().all(|(_, covered)| *covered) {
+                self.record_selected(store, snapshot.reference())?;
+                return Ok(snapshot);
+            }
+            if snapshot.has_unconfirmed_tail().map_err(|e| e.to_string())? {
+                return Err("Readonly source prefix does not cover every required reference; bytes retained".into());
+            }
+        }
         let source = head.map_or(store.identity(), |head| head.source());
         let revision = head
             .map_or(Some(1), |head| head.revision().checked_add(1))
@@ -640,6 +698,10 @@ impl SourceSession {
                     .map_err(|_| crate::large_document::Error::Cancelled)
             })
             .map_err(|e| e.to_string())?;
+        self.record_selected(store, snapshot.reference())?;
+        Ok(snapshot)
+    }
+    fn record_selected(&self, store: &Store, selected: CommitRef) -> Result<(), String> {
         self.check()?;
         let mut state = self
             .runtime
@@ -650,8 +712,17 @@ impl SourceSession {
             .as_mut()
             .and_then(|inventory| inventory.locations.get_mut(&store.identity()))
             .ok_or("Source is outside the owned inventory")?;
-        location.selected = Some(snapshot.reference());
-        Ok(snapshot)
+        if !location
+            .weak
+            .as_ref()
+            .and_then(WeakStore::upgrade)
+            .is_some_and(|owner| owner.same_owner(store))
+        {
+            return Err("Source checkpoint owner changed before registration".into());
+        }
+        location.selected = Some(selected);
+        drop(state);
+        self.check()
     }
     pub(crate) fn resolve_store(
         &self,
@@ -1157,6 +1228,71 @@ mod tests {
         assert_eq!(runtime.disk().used().unwrap(), 56);
     }
     #[test]
+    fn readonly_selected_source_reuses_only_a_complete_covering_original_prefix() {
+        let f = Fixture::new();
+        let (_shared, connection) = f.connection();
+        let context = PersistentRootContext::from_explicit_state(&connection).unwrap();
+        let runtime = SourceRuntime::new(context, limits()).unwrap();
+        let session = runtime.begin().unwrap();
+        let store = session.store_for_lineage([3; 16]).unwrap();
+        let spec = crate::large_document::TileSpec::new(1, 1, 8).unwrap();
+        let first = store.put(spec, &[1; 4], &mut || Ok(())).unwrap();
+        let second = store.put(spec, &[2; 4], &mut || Ok(())).unwrap();
+        let original = session
+            .seal_store(&store, &[first], b"original physical prefix")
+            .unwrap();
+        let selected = original.reference();
+        let identity = store.identity();
+        let path = runtime
+            .inventory
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .locations[&identity]
+            .path
+            .join("blocks.pbt");
+        drop(original);
+        drop(store);
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let charge = runtime.disk().retain_file(&path, &file).unwrap();
+        charge.grow(4).unwrap();
+        file.write_all(b"tail").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let recovered = session.resolve_store(identity, selected).unwrap();
+        assert!(recovered.has_unconfirmed_tail().unwrap());
+        let source = recovered.store();
+        let before = fs::metadata(&path).unwrap().len();
+        let reused = session
+            .seal_store(
+                &source,
+                &[first, first],
+                b"new document metadata is separate",
+            )
+            .unwrap();
+        assert_eq!(reused.reference(), selected);
+        assert_eq!(
+            &*reused.metadata(&mut || Ok(())).unwrap(),
+            b"original physical prefix"
+        );
+        assert_eq!(fs::metadata(&path).unwrap().len(), before);
+        assert!(session
+            .seal_store(&source, &[second], b"missing from selected table")
+            .is_err());
+        let foreign = session.store_for_lineage([4; 16]).unwrap();
+        let copied = foreign.put(spec, &[1; 4], &mut || Ok(())).unwrap();
+        assert!(session
+            .seal_store(&source, &[copied], b"foreign reference")
+            .is_err());
+        assert_eq!(fs::metadata(&path).unwrap().len(), before);
+    }
+    #[test]
     fn native_marker_publication_is_exclusive_held_and_startup_inventory_only() {
         let f = Fixture::new();
         let (_shared, connection) = f.connection();
@@ -1178,6 +1314,9 @@ mod tests {
                 &|| Ok(()),
             )
             .unwrap();
+        let ids = session.recovery_marker_ids().unwrap();
+        assert_eq!(ids.iter().collect::<Vec<_>>(), [snapshot]);
+        drop(ids);
         let mut marker = session.open_recovery_marker(snapshot).unwrap();
         assert_eq!(marker.snapshot(), snapshot);
         assert_eq!(marker.len(), bytes.len() as u64);
