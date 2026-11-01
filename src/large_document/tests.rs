@@ -93,6 +93,218 @@ fn owned_bytes(store: &Store) -> Vec<u8> {
 }
 
 #[test]
+fn unpublished_fragment_abort_verifies_all_records_then_releases_only_its_charge() {
+    for depth in [8, 16] {
+        let fixture = Fixture::new();
+        let resident = ResidentBudget::new(1024 * 1024).unwrap();
+        let disk = DiskBudget::new(1024 * 1024, 4).unwrap();
+        let fragment =
+            FreshFragment::create(&fixture.root(), resident.clone(), disk.clone(), limits())
+                .unwrap();
+        let spec = TileSpec::new(17, 9, depth).unwrap();
+        let first = fragment
+            .store()
+            .put(spec, &bytes(spec, 4), &mut okay)
+            .unwrap();
+        let snapshot = fragment
+            .store()
+            .commit([8; 16], 1, None, b"candidate", &[first], &mut okay)
+            .unwrap();
+        drop(snapshot);
+        fragment
+            .store()
+            .put(spec, &bytes(spec, 5), &mut okay)
+            .unwrap();
+        assert!(disk.used().unwrap() > 24);
+        fragment.abort(&mut okay).unwrap();
+        assert!(!fixture.root().join("blocks.pbt").exists());
+        assert!(fixture.root().is_dir());
+        assert_eq!(disk.used().unwrap(), 0);
+        assert_eq!(resident.used(), 0);
+    }
+}
+
+#[test]
+fn fragment_publication_or_a_retained_candidate_prevents_early_retirement() {
+    for published in [false, true] {
+        let fixture = Fixture::new();
+        let disk = DiskBudget::new(1024 * 1024, 4).unwrap();
+        let fragment = FreshFragment::create(
+            &fixture.root(),
+            ResidentBudget::new(1024 * 1024).unwrap(),
+            disk.clone(),
+            limits(),
+        )
+        .unwrap();
+        let candidate = fragment.store().clone();
+        if published {
+            let store = fragment.publish();
+            assert!(candidate.0.may_be_published.load(Ordering::Acquire));
+            drop(candidate);
+            assert!(matches!(
+                store.retire_unpublished(&mut okay),
+                Err(Error::Invalid(_))
+            ));
+        } else {
+            assert!(matches!(fragment.abort(&mut okay), Err(Error::Busy)));
+            drop(candidate);
+        }
+        assert_eq!(
+            fs::metadata(fixture.root().join("blocks.pbt"))
+                .unwrap()
+                .len(),
+            24
+        );
+        assert_eq!(disk.used().unwrap(), 24);
+    }
+}
+
+#[test]
+fn dropped_or_recovered_fragments_never_gain_unpublished_retirement_authority() {
+    let fixture = Fixture::new();
+    let resident = ResidentBudget::new(1024 * 1024).unwrap();
+    let disk = DiskBudget::new(1024 * 1024, 4).unwrap();
+    let fragment =
+        FreshFragment::create(&fixture.root(), resident.clone(), disk.clone(), limits()).unwrap();
+    let snapshot = fragment
+        .store()
+        .commit([7; 16], 0, None, b"staged", &[], &mut okay)
+        .unwrap();
+    let selected = snapshot.reference();
+    drop(snapshot);
+    let charged = disk.used().unwrap();
+    drop(fragment);
+    assert_eq!(disk.used().unwrap(), charged);
+    let restored = Store::recover_with_disk_budget(
+        &fixture.root(),
+        selected,
+        resident,
+        disk.clone(),
+        limits(),
+        &mut okay,
+    )
+    .unwrap();
+    let store = restored.store();
+    drop(restored);
+    assert!(matches!(
+        store.retire_unpublished(&mut okay),
+        Err(Error::Invalid(_))
+    ));
+    assert_eq!(disk.used().unwrap(), charged);
+    assert_eq!(
+        fs::metadata(fixture.root().join("blocks.pbt"))
+            .unwrap()
+            .len(),
+        charged
+    );
+}
+
+#[test]
+fn fragment_abort_keeps_canceled_corrupt_partial_and_foreign_bytes_charged() {
+    for fault in 0..4 {
+        let fixture = Fixture::new();
+        let disk = DiskBudget::new(1024 * 1024, 4).unwrap();
+        let fragment = FreshFragment::create(
+            &fixture.root(),
+            ResidentBudget::new(1024 * 1024).unwrap(),
+            disk.clone(),
+            limits(),
+        )
+        .unwrap();
+        let spec = TileSpec::new(4, 3, 16).unwrap();
+        fragment
+            .store()
+            .put(spec, &bytes(spec, 9), &mut okay)
+            .unwrap();
+        let path = fixture.root().join("blocks.pbt");
+        let reserved = disk.used().unwrap();
+        match fault {
+            0 => {
+                assert!(matches!(
+                    fragment.abort(&mut || Err(Error::Cancelled)),
+                    Err(Error::Cancelled)
+                ));
+            }
+            1 => {
+                write_all_at(
+                    &fragment.store().0.file,
+                    FILE_HEADER + RECORD_HEADER + 8,
+                    &[42],
+                )
+                .unwrap();
+                fragment.store().state().unwrap().expected =
+                    stamp(&fragment.store().0.file).unwrap();
+                assert!(matches!(fragment.abort(&mut okay), Err(Error::Corrupt)));
+            }
+            2 => {
+                fragment.store().state().unwrap().poisoned = true;
+                assert!(matches!(fragment.abort(&mut okay), Err(Error::Interrupted)));
+            }
+            _ => {
+                fs::rename(&path, fixture.root().join("held.pbt")).unwrap();
+                fs::write(&path, b"foreign").unwrap();
+                assert!(matches!(fragment.abort(&mut okay), Err(Error::Changed)));
+                assert_eq!(fs::read(&path).unwrap(), b"foreign");
+                assert_eq!(
+                    fs::metadata(fixture.root().join("held.pbt")).unwrap().len(),
+                    reserved
+                );
+            }
+        }
+        assert!(path.exists());
+        assert_eq!(disk.used().unwrap(), reserved);
+    }
+}
+
+#[test]
+fn fragment_abort_rechecks_changes_after_its_final_callback() {
+    let mut calls = 0;
+    for late_change in [false, true] {
+        let fixture = Fixture::new();
+        let disk = DiskBudget::new(1024 * 1024, 4).unwrap();
+        let fragment = FreshFragment::create(
+            &fixture.root(),
+            ResidentBudget::new(1024 * 1024).unwrap(),
+            disk.clone(),
+            limits(),
+        )
+        .unwrap();
+        let spec = TileSpec::new(2, 2, 8).unwrap();
+        fragment
+            .store()
+            .put(spec, &bytes(spec, 1), &mut okay)
+            .unwrap();
+        let path = fixture.root().join("blocks.pbt");
+        let reserved = disk.used().unwrap();
+        let mut at = 0;
+        let result = fragment.abort(&mut || {
+            at += 1;
+            if late_change && at == calls {
+                fs::rename(&path, fixture.root().join("late-held.pbt"))?;
+                fs::write(&path, b"late foreign")?;
+            }
+            Ok(())
+        });
+        if late_change {
+            assert!(matches!(result, Err(Error::Changed)));
+            assert_eq!(fs::read(path).unwrap(), b"late foreign");
+            assert_eq!(
+                fs::metadata(fixture.root().join("late-held.pbt"))
+                    .unwrap()
+                    .len(),
+                reserved
+            );
+            assert_eq!(disk.used().unwrap(), reserved);
+        } else {
+            result.unwrap();
+            calls = at;
+            assert!(calls >= 3);
+            assert_eq!(disk.used().unwrap(), 0);
+        }
+    }
+}
+
+#[test]
 fn native_depth_blocks_deduplicate_share_capacity_and_recover_exact_checkpoint() {
     for depth in [8, 16] {
         let fixture = Fixture::new();
