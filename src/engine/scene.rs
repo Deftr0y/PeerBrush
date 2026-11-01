@@ -11,6 +11,8 @@ use std::sync::Arc;
 mod bounds;
 #[path = "scene/capture.rs"]
 mod capture;
+#[path = "scene/icc.rs"]
+pub(crate) mod icc;
 pub use capture::{CapturedScene, LegacyTileCache};
 pub(crate) use capture::{StageRuntime, StageSession, StagedScene};
 
@@ -395,6 +397,7 @@ pub struct Document36 {
     pub height: u32,
     pub revision: u64,
     pub bit_depth: u16,
+    #[serde(with = "icc")]
     pub icc_profile: Option<Arc<Vec<u8>>>,
     pub srgb_tagged: bool,
     pub psd_global_mask: Option<crate::psd::GlobalMaskSettings>,
