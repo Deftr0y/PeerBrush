@@ -60,6 +60,8 @@ pub(crate) struct MetadataCharge {
     budget: ResidentBudget,
     bytes: usize,
     _reservations: Vec<Reservation>,
+    // Flat unique reservation owners. No payload graph is retained here.
+    _retained: Vec<Arc<MetadataCharge>>,
 }
 impl MetadataCharge {
     pub(crate) fn reserve(
@@ -89,6 +91,61 @@ impl MetadataCharge {
             budget: budget.clone(),
             bytes,
             _reservations: reservations,
+            _retained: Vec::new(),
+        }))
+    }
+    /// Retain existing charges across captured-field moves without reserving or
+    /// cloning their payloads. The input/base admission must already cover this
+    /// bounded owner-vector/sort scratch (at most 1,048,576 Arc entries). Flatten
+    /// and deduplicate leaves so shared/nested owners cannot inflate byte credit.
+    pub(crate) fn combine(
+        owners: &[Arc<Self>],
+        check: &dyn Fn() -> Result<(), String>,
+    ) -> Result<Arc<Self>, String> {
+        check()?;
+        let budget = owners
+            .first()
+            .ok_or("Source36 metadata ownership list is empty")?
+            .budget
+            .clone();
+        let count = owners.iter().try_fold(0usize, |n, owner| {
+            if !owner.uses_budget(&budget) {
+                return Err("Source36 metadata owners use different resident pools");
+            }
+            n.checked_add(owner._retained.len().max(1))
+                .filter(|n| *n <= 1_048_576)
+                .ok_or("Source36 metadata ownership index exceeds admission")
+        })?;
+        let mut retained = Vec::new();
+        retained
+            .try_reserve_exact(count)
+            .map_err(|_| "Source36 retained owner allocation refused")?;
+        for owner in owners {
+            check()?;
+            if owner._retained.is_empty() {
+                retained.push(owner.clone());
+            } else {
+                for leaf in &owner._retained {
+                    check()?;
+                    if !leaf._retained.is_empty() || !leaf.uses_budget(&budget) {
+                        return Err("Source36 metadata retained-owner inventory differs".into());
+                    }
+                    retained.push(leaf.clone());
+                }
+            }
+        }
+        retained.sort_unstable_by_key(|owner| Arc::as_ptr(owner) as usize);
+        retained.dedup_by(|a, b| Arc::ptr_eq(a, b));
+        let bytes = retained.iter().try_fold(0usize, |n, owner| {
+            n.checked_add(owner.bytes)
+                .ok_or("Source36 retained metadata byte sum overflow")
+        })?;
+        check()?;
+        Ok(Arc::new(Self {
+            budget,
+            bytes,
+            _reservations: Vec::new(),
+            _retained: retained,
         }))
     }
     pub(crate) fn bytes(&self) -> usize {
@@ -252,6 +309,57 @@ mod tests {
         };
         assert!(MetadataCharge::reserve(&pool, MAX_BYTES + 1, &canceled).is_err());
         assert_eq!(pool.used(), 0);
+    }
+    #[test]
+    fn combined_capture_owners_retain_shared_unique_leaf_charges_without_payload_or_budget_duplication(
+    ) {
+        let check = || Ok(());
+        let pool = ResidentBudget::new(2 * 1024 * 1024).unwrap();
+        let base = MetadataCharge::reserve(&pool, 1024 * 1024, &check).unwrap();
+        let coverage = MetadataCharge::reserve(&pool, 65536, &check).unwrap();
+        let expected = pool.used();
+        let nested = MetadataCharge::combine(&[base.clone(), coverage.clone()], &check).unwrap();
+        let combined = MetadataCharge::combine(
+            &[
+                nested.clone(),
+                coverage.clone(),
+                base.clone(),
+                nested.clone(),
+            ],
+            &check,
+        )
+        .unwrap();
+        assert_eq!(combined.bytes(), expected);
+        assert_eq!(pool.used(), expected);
+        drop(nested);
+        drop(base);
+        drop(coverage);
+        let metadata = Admitted::from_parts(Arc::new(vec!["captured contours"]), combined);
+        assert_eq!(pool.used(), expected);
+        let retained = metadata.clone();
+        drop(metadata);
+        assert_eq!(pool.used(), expected);
+        drop(retained);
+        assert_eq!(pool.used(), 0);
+    }
+    #[test]
+    fn retained_metadata_rejects_foreign_pool_and_cancellation_without_losing_original_charges() {
+        let check = || Ok(());
+        let pool = ResidentBudget::new(1024 * 1024).unwrap();
+        let other = ResidentBudget::new(1024 * 1024).unwrap();
+        let a = MetadataCharge::reserve(&pool, 65536, &check).unwrap();
+        let b = MetadataCharge::reserve(&other, 65536, &check).unwrap();
+        assert!(MetadataCharge::combine(&[a.clone(), b.clone()], &check).is_err());
+        assert_eq!(pool.used(), 65536);
+        assert_eq!(other.used(), 65536);
+        assert!(
+            MetadataCharge::combine(&[a.clone()], &|| Err("Cancelled capture".into())).is_err()
+        );
+        assert_eq!(pool.used(), 65536);
+        drop(a);
+        drop(b);
+        assert_eq!(pool.used(), 0);
+        assert_eq!(other.used(), 0);
     }
     #[test]
     fn typed_handoff_keeps_owners_and_refuses_foreign_pools_and_unadmitted_byte_sources() {
