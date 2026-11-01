@@ -50,6 +50,12 @@ directory retirement releases the directory/location slot. Busy, foreign or
 uncertain cleanup keeps conservative inventory; it never recursively deletes.
 The session permit remains held through cleanup. Its caller's cleanup check may
 ignore an obsolete gesture revision, while actual profile/session checks remain.
+An already-admitted session may finish proven provisional retirement after the
+closing gate stops new work. Its retirement-only check still validates the actual
+instance/profile/root and owned inventory, and retains both request and workspace
+file-operation permits until cleanup ends. Connection destruction therefore waits
+before releasing its instance lock. This exception cannot admit new allocation,
+tile writes, checkpoints or publication; those retain the normal closing check.
 
 `SourceSession::byte_temporary` is the admitted factory for codec operation
 spools. It chooses a fresh internal bytes namespace, reserves the directory slot,

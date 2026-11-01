@@ -373,13 +373,22 @@ pub(crate) struct SourceSession {
 }
 impl SourceSession {
     pub(crate) fn check(&self) -> Result<(), String> {
+        self.operation.check()?;
+        self.check_inventory()
+    }
+    /// Existing permits remain held. This admits only explicit proven cleanup,
+    /// never a new writer, publication, checkpoint or source allocation.
+    pub(crate) fn cleanup_check(&self) -> Result<(), String> {
+        self.operation.check_retirement()?;
+        self.check_inventory()
+    }
+    fn check_inventory(&self) -> Result<(), String> {
         if self.runtime.tainted.load(Ordering::Acquire) {
             return Err(
                 "Source inventory ownership changed; fresh admission required and bytes retained"
                     .into(),
             );
         }
-        self.operation.check()?;
         let state = self
             .runtime
             .inventory
@@ -420,7 +429,7 @@ impl SourceSession {
         fragment: FreshFragment,
         cleanup: &mut dyn FnMut() -> Result<(), String>,
     ) -> Result<(), String> {
-        self.check()?;
+        self.cleanup_check()?;
         cleanup()?;
         let identity = fragment.store().identity();
         let path = {
@@ -447,18 +456,18 @@ impl SourceSession {
         fragment
             .abort(&mut || {
                 cleanup().map_err(|_| crate::large_document::Error::Cancelled)?;
-                self.check()
+                self.cleanup_check()
                     .map_err(|_| crate::large_document::Error::Changed)
             })
             .map_err(|e| e.to_string())?;
         if let Err(error) = directory.retire_empty(&mut || {
             cleanup()?;
-            self.check()
+            self.cleanup_check()
         }) {
             self.runtime.tainted.store(true, Ordering::Release);
             return Err(error);
         }
-        self.check()?;
+        self.cleanup_check()?;
         let mut state = self
             .runtime
             .inventory
@@ -1128,6 +1137,98 @@ mod tests {
         drop(runtime);
         drop(context);
         drop(connection);
+    }
+    #[test]
+    fn admitted_provisional_retirement_finishes_during_connection_drop_before_instance_unlock() {
+        use std::{
+            sync::mpsc,
+            thread,
+            time::{Duration, Instant},
+        };
+        let f = Fixture::new();
+        let (shared, connection) = f.connection();
+        let state_dir = connection.state_dir.clone();
+        let context = PersistentRootContext::from_explicit_state(&connection).unwrap();
+        let runtime = SourceRuntime::new(context, limits()).unwrap();
+        let session = runtime.begin().unwrap();
+        let fragment = session.fresh_fragment().unwrap();
+        fragment
+            .store()
+            .put(
+                crate::large_document::TileSpec::new(1, 1, 8).unwrap(),
+                &[2; 4],
+                &mut || Ok(()),
+            )
+            .unwrap();
+        let mut partial = session
+            .byte_temporary(128, crate::large_document::ByteRole::SourceBulk)
+            .unwrap();
+        partial
+            .temporary()
+            .append(&[3; 16], &mut || Ok(()))
+            .unwrap();
+        let completed = session
+            .byte_temporary(0, crate::large_document::ByteRole::LayerData)
+            .unwrap()
+            .finish([4; 32], &mut || Ok(()))
+            .unwrap();
+        let (finished, done) = mpsc::channel();
+        let dropper = thread::spawn(move || {
+            drop(connection);
+            finished.send(()).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while session.check().is_ok() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(session.check().is_err());
+        assert!(runtime.begin().is_err());
+        assert!(session.fresh_fragment().is_err());
+        assert!(session
+            .byte_temporary(0, crate::large_document::ByteRole::LayerData)
+            .is_err());
+        let workspace = crate::workspace::attach(&shared);
+        let mut cleanup = || {
+            assert!(session.check().is_err());
+            session.cleanup_check()?;
+            assert!(
+                workspace
+                    .lock()
+                    .unwrap()
+                    .file_operations
+                    .load(Ordering::Acquire)
+                    > 0
+            );
+            assert!(matches!(done.try_recv(), Err(mpsc::TryRecvError::Empty)));
+            Ok(())
+        };
+        partial.abort(&mut cleanup).unwrap();
+        completed.retire(&mut cleanup).unwrap();
+        session.abort_fragment(fragment, &mut cleanup).unwrap();
+        assert_eq!(runtime.disk().used().unwrap(), 56);
+        assert_eq!(
+            runtime
+                .inventory
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .directories,
+            0
+        );
+        assert!(matches!(
+            done.recv_timeout(Duration::from_millis(20)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(session);
+        done.recv_timeout(Duration::from_secs(5)).unwrap();
+        dropper.join().unwrap();
+        let next = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(state_dir.join("instance.lock"))
+            .unwrap();
+        next.try_lock().unwrap();
     }
     #[test]
     fn session_byte_spools_register_before_append_and_reclaim_only_after_verified_retirement() {
