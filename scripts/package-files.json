@@ -569,6 +569,7 @@
     "src/ui/source.rs",
     "src/ui/source/buffer.rs",
     "src/ui/source/native.rs",
+    "src/ui/source/path_view.rs",
     "src/ui/source/text_state.rs",
     "src/ui/source/widgets.rs",
     "src/ui/style_settings.rs",

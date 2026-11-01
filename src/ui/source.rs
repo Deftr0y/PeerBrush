@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 mod buffer;
 #[path = "source/native.rs"]
 mod native;
+#[path = "source/path_view.rs"]
+pub(super) mod path_view;
 #[path = "source/text_state.rs"]
 mod text_state;
 #[path = "source/widgets.rs"]
