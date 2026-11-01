@@ -633,6 +633,7 @@ impl NativeLease {
     pub(crate) fn validate(&self, check: impl Fn() -> Result<(), String>) -> Result<(), String> {
         self.0.validate_checked(check)
     }
+    #[cfg(test)]
     pub(crate) fn preserve(
         &self,
         check: impl Fn() -> Result<(), String>,
