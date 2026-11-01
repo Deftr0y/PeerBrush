@@ -5,6 +5,7 @@ mod flood;
 pub mod import;
 pub mod masks;
 pub mod refine;
+mod rows;
 mod system;
 #[cfg(test)]
 mod visited;
