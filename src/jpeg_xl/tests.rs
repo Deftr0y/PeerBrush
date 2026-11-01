@@ -88,7 +88,7 @@ fn timeout_diagnostic_exposes_only_fixed_worker_categories() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn completed_native_workers_apply_child_limits_and_preserve_parent_policy() {
-    let _serial = PROCESS_FIXTURES.lock().unwrap();
+    let _serial = PROCESS_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
     let inherited = native_limits().unwrap();
     for depth in [8, 16] {
         // The exact known child verifies actual OS limits after successful native work.
@@ -266,7 +266,7 @@ fn healthy_child(depth: u16) {
 
 #[test]
 fn cancellation_after_joined_native_result_discards_output_and_releases_worker() {
-    let _serial = PROCESS_FIXTURES.lock().unwrap();
+    let _serial = PROCESS_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
     for depth in [8, 16] {
         let words = vec![12347_u16; 3 * 2 * 4];
         let bytes = vec![47_u8; 3 * 2 * 4];
@@ -311,7 +311,7 @@ fn cancellation_after_joined_native_result_discards_output_and_releases_worker()
 }
 #[test]
 fn stalled_unconsumed_large_input_cancels_or_times_out_and_kill_fallback_recovers() {
-    let _serial = PROCESS_FIXTURES.lock().unwrap();
+    let _serial = PROCESS_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
     use std::sync::atomic::AtomicUsize;
     for depth in [8, 16] {
         let doc = document(depth);
@@ -366,7 +366,7 @@ fn stalled_unconsumed_large_input_cancels_or_times_out_and_kill_fallback_recover
 
 #[test]
 fn known_reaped_child_never_reaches_primary_or_fallback_kill() {
-    let _serial = PROCESS_FIXTURES.lock().unwrap();
+    let _serial = PROCESS_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
     let mut command = runtime("", 8, DEADLINE, None).command.take().unwrap();
     command
         .stdin(Stdio::null())
@@ -401,7 +401,7 @@ fn known_reaped_child_never_reaches_primary_or_fallback_kill() {
 
 #[test]
 fn early_success_also_stops_an_unfinished_writer_before_joining() {
-    let _serial = PROCESS_FIXTURES.lock().unwrap();
+    let _serial = PROCESS_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
     // A deterministic writer hook models a surviving inherited pipe reader
     // without forking an orphan. Actual blocked-pipe I/O is covered above.
     let mut runtime = runtime("early_success", 8, Duration::from_secs(10), None);
@@ -459,7 +459,7 @@ fn strict_metadata_lengths_nonce_source_and_trailing_bytes_fail_before_output() 
 }
 #[test]
 fn abnormal_exit_abort_protocol_damage_and_timeout_preserve_parent_native_work() {
-    let _serial = PROCESS_FIXTURES.lock().unwrap();
+    let _serial = PROCESS_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
     for depth in [8, 16] {
         let doc = document(depth);
         let before = serde_json::to_value(&doc).unwrap();
@@ -503,7 +503,7 @@ fn abnormal_exit_abort_protocol_damage_and_timeout_preserve_parent_native_work()
 }
 #[test]
 fn cancellation_during_partial_native_depth_output_kills_reaps_and_discards_it() {
-    let _serial = PROCESS_FIXTURES.lock().unwrap();
+    let _serial = PROCESS_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
     for depth in [8, 16] {
         let doc = document(depth);
         let before = serde_json::to_value(&doc).unwrap();
