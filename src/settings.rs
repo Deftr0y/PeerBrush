@@ -104,10 +104,11 @@ impl SourceProfile {
         &self.locations
     }
     pub(crate) fn validate(&self) -> Result<(), String> {
+        let config = crate::large_document::root::Directory::open(&self.locations.config)?;
         let path = self.locations.config.join("settings.lock");
         let named_metadata =
             fs::symlink_metadata(&path).map_err(|_| "Source profile lock is unavailable")?;
-        let named = crate::file_safety::open_for_identity(&path)
+        let named = crate::file_safety::open_native_identity(&path)
             .map_err(|_| "Source profile lock is unavailable")?;
         let held = self
             .lock
@@ -127,7 +128,8 @@ impl SourceProfile {
             locations: self.locations.clone(),
             _lock: self.lock.clone(),
         }
-        .validate_manifest()
+        .validate_native_manifest()?;
+        config.check()
     }
 }
 /// A default-profile lease can only come from the session holding settings.lock.
@@ -341,7 +343,42 @@ impl Profile {
         }
         let bytes = crate::tool_settings::read_owned(&root.join("profile.json"))?
             .ok_or("Settings profile is incomplete; preserve it before retrying migration")?;
-        let manifest: Manifest = serde_json::from_slice(&bytes)
+        Self::validate_manifest_bytes(&bytes)
+    }
+    fn validate_native_manifest(&self) -> Result<(), String> {
+        let root = crate::large_document::root::Directory::open(&self.locations.profile())?;
+        let path = root.path().join("profile.json");
+        let file = crate::file_safety::open_native_read(&path)
+            .map_err(|_| "Source profile manifest is unavailable")?;
+        let identity = crate::file_safety::identity(&file)?;
+        let before = file
+            .metadata()
+            .map_err(|_| "Source profile manifest unavailable")?;
+        if before.len() > 128 * 1024 || crate::file_safety::link_count(&file)? != 1 {
+            return Err("Source profile manifest exceeds its owned bounds".into());
+        }
+        let mut bytes = Vec::new();
+        (&file)
+            .take(128 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| "Source profile manifest read failed")?;
+        let named = crate::file_safety::open_native_identity(&path)
+            .map_err(|_| "Source profile manifest changed")?;
+        let after = file
+            .metadata()
+            .map_err(|_| "Source profile manifest unavailable")?;
+        if bytes.len() as u64 != before.len()
+            || after.len() != before.len()
+            || after.modified().ok() != before.modified().ok()
+            || crate::file_safety::identity(&named)? != identity
+        {
+            return Err("Source profile manifest changed during admission".into());
+        }
+        Self::validate_manifest_bytes(&bytes)?;
+        root.check()
+    }
+    fn validate_manifest_bytes(bytes: &[u8]) -> Result<(), String> {
+        let manifest: Manifest = serde_json::from_slice(bytes)
             .map_err(|e| format!("Unreadable settings profile: {e}"))?;
         if manifest.version != 1
             || manifest.migrated_files.len() > FILES.len()

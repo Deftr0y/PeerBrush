@@ -31,6 +31,9 @@ impl Directory {
     pub(crate) fn identity(&self) -> (u64, u64) {
         self.identity
     }
+    pub(crate) fn held(&self) -> &fs::File {
+        &self.file
+    }
     pub(crate) fn check(&self) -> Result<(), String> {
         validate_ancestors(&self.path).map_err(|e| e.to_string())?;
         let named = open_directory(&self.path).map_err(|e| e.to_string())?;
@@ -221,7 +224,7 @@ impl PersistentRootContext {
         let path = self.connection.path().join("instance.lock");
         let metadata =
             fs::symlink_metadata(&path).map_err(|_| "Source instance name is unavailable")?;
-        let named = crate::file_safety::open_for_identity(&path)
+        let named = crate::file_safety::open_native_identity(&path)
             .map_err(|_| "Source instance name is unavailable")?;
         if !metadata.is_file()
             || metadata.file_type().is_symlink()

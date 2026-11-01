@@ -62,6 +62,110 @@ pub(crate) fn open_for_identity(path: &Path) -> std::io::Result<fs::File> {
     options.open(path)
 }
 
+/// Native backing identity observations must not block on a raced FIFO/device.
+/// This is deliberately separate from legacy file publication behavior.
+pub(crate) fn open_native_identity(path: &Path) -> std::io::Result<fs::File> {
+    #[cfg(unix)]
+    let file = open_native_read(path)?;
+    #[cfg(not(unix))]
+    let file = open_for_identity(path)?;
+    native_regular(&file)?;
+    Ok(file)
+}
+
+pub(crate) fn open_native_read(path: &Path) -> std::io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.share_mode(7).custom_flags(0x00200000);
+    }
+    let file = options.open(path)?;
+    native_regular(&file)?;
+    Ok(file)
+}
+fn native_regular(file: &fs::File) -> std::io::Result<()> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(std::io::Error::other(
+            "Native identity requires a regular non-alias file",
+        ));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x400 != 0 {
+            return Err(std::io::Error::other(
+                "Native identity refuses reparse files",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod native_identity_tests {
+    use super::*;
+    use std::{
+        ffi::CString,
+        os::unix::{
+            ffi::OsStrExt,
+            fs::{symlink, OpenOptionsExt},
+        },
+        sync::mpsc,
+        time::Duration,
+    };
+    #[test]
+    fn fifo_and_symlink_identity_or_read_observations_refuse_without_blocking() {
+        let base = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("peerbrush-native-identity-{}", crate::engine::id()));
+        fs::create_dir(&base).unwrap();
+        let directory = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(&base)
+            .unwrap();
+        let identity = identity(&directory).unwrap();
+        let fifo = base.join("fifo");
+        let name = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        fs::write(base.join("regular"), b"preserve").unwrap();
+        symlink(base.join("regular"), base.join("alias")).unwrap();
+        let cloned = base.clone();
+        let (sender, done) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            for name in ["fifo", "alias"] {
+                assert!(open_native_identity(&cloned.join(name)).is_err());
+                assert!(open_native_read(&cloned.join(name)).is_err());
+            }
+            sender.send(()).unwrap();
+        });
+        done.recv_timeout(Duration::from_secs(2))
+            .expect("Native FIFO identity observation blocked");
+        worker.join().unwrap();
+        assert_eq!(fs::read(base.join("regular")).unwrap(), b"preserve");
+        let named = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(&base)
+            .unwrap();
+        assert_eq!(super::identity(&named).unwrap(), identity);
+        for name in ["fifo", "alias", "regular"] {
+            fs::remove_file(base.join(name)).unwrap();
+        }
+        drop(named);
+        drop(directory);
+        fs::remove_dir(base).unwrap();
+    }
+}
+
 #[cfg(unix)]
 pub(crate) fn identity(file: &fs::File) -> Result<(u64, u64), String> {
     use std::os::unix::fs::MetadataExt;
