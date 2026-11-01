@@ -7,6 +7,7 @@ pub(crate) mod import36;
 mod indexed;
 pub(crate) mod manifest36;
 pub(crate) mod memory36;
+pub(crate) mod native_rows36;
 pub mod patterns;
 pub(crate) mod read36;
 mod row_stream;
