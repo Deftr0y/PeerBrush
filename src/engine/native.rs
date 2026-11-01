@@ -3,6 +3,8 @@
 mod admission;
 #[path = "native/batch.rs"]
 mod batch;
+#[path = "native/create.rs"]
+mod create;
 #[path = "native/descriptor.rs"]
 mod descriptor;
 #[path = "native/effect_patch.rs"]

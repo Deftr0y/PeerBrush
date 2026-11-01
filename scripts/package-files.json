@@ -267,6 +267,7 @@
     "src/engine/native.rs",
     "src/engine/native/admission.rs",
     "src/engine/native/batch.rs",
+    "src/engine/native/create.rs",
     "src/engine/native/descriptor.rs",
     "src/engine/native/effect_patch.rs",
     "src/engine/native/history.rs",
