@@ -283,8 +283,17 @@ mod tests {
             .unwrap()
     }
     fn cleanup(store: Store, path: std::path::PathBuf) {
+        let budget = store.resident_budget();
+        assert_store_metadata_only(&store);
         drop(store);
+        assert_eq!(budget.used(), 0);
         std::fs::remove_dir_all(path).unwrap();
+    }
+    fn assert_store_metadata_only(store: &Store) {
+        assert_eq!(
+            store.resident_budget().used(),
+            store.retained_index_bytes().unwrap()
+        );
     }
 
     #[test]
@@ -346,7 +355,7 @@ mod tests {
                 typed.redo("human").unwrap();
                 wire.redo("human").unwrap();
                 assert_eq!(typed.doc.layers[0].pixels, wire.doc.layers[0].pixels);
-                assert_eq!(store.resident_budget().used(), 0);
+                assert_store_metadata_only(&store);
                 cleanup(store, path);
             }
         }
@@ -390,7 +399,7 @@ mod tests {
                 .is_err());
             assert_eq!(serde_json::to_value(&e.doc).unwrap(), before);
             assert!(e.undo.is_empty());
-            assert_eq!(store.resident_budget().used(), 0);
+            assert_store_metadata_only(&store);
             cleanup(store, path);
         }
     }
@@ -441,7 +450,7 @@ mod tests {
             .is_err());
         assert_eq!(serde_json::to_value(&e.doc).unwrap(), before);
         assert!(e.undo.is_empty());
-        assert_eq!(store.resident_budget().used(), 0);
+        assert_store_metadata_only(&store);
         cleanup(store, path);
     }
 
@@ -479,7 +488,7 @@ mod tests {
             .is_err());
         assert_eq!(serde_json::to_value(&e.doc).unwrap(), before);
         assert!(e.undo.is_empty());
-        assert_eq!(store.resident_budget().used(), 0);
+        assert_store_metadata_only(&store);
         cleanup(store, path);
     }
 
@@ -510,7 +519,7 @@ mod tests {
                 )
                 .is_err());
             assert_eq!(serde_json::to_value(&e.doc).unwrap(), before);
-            assert_eq!(store.resident_budget().used(), 0);
+            assert_store_metadata_only(&store);
             cleanup(store, path);
         }
     }
