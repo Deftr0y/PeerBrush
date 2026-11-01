@@ -108,6 +108,8 @@ pub(crate) fn render(
                     })
                     .map_err(|e| refused.unwrap_or_else(|| e.to_string()))?;
                 blocks.insert((tx, ty), block);
+                #[cfg(test)]
+                tests::observe_completed_tile();
             }
         }
         guarded()?;
