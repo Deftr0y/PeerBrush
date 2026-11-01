@@ -1047,7 +1047,11 @@ fn dense_three_layer_native16_backing_crosses_four_gib_with_bounded_pins() {
     let mut admitted = limits();
     admitted.disk_bytes = 8 * 1024 * 1024 * 1024;
     admitted.max_blocks = 16384;
-    let store = Store::create(&fixture.root(), budget.clone(), admitted).unwrap();
+    let disk = DiskBudget::new(admitted.disk_bytes, 4).unwrap();
+    let store =
+        Store::create_with_disk_budget(&fixture.root(), budget.clone(), disk.clone(), admitted)
+            .unwrap();
+    assert!(store.uses_disk_budget(&disk));
     let spec = TileSpec::new(256, 256, 16).unwrap();
     let tile_count = 3 * 63 * 63;
     let mut source = vec![0; spec.bytes()];
@@ -1091,6 +1095,7 @@ fn dense_three_layer_native16_backing_crosses_four_gib_with_bounded_pins() {
     let selected = snapshot.reference();
     let physical = store.0.file.metadata().unwrap().len();
     assert!(physical > 6_000_000_000);
+    assert_eq!(disk.used().unwrap(), physical);
     let mut context = Context::new(&SHA256);
     let mut buffer = [0; CHUNK];
     let mut offset = 0;
@@ -1108,14 +1113,17 @@ fn dense_three_layer_native16_backing_crosses_four_gib_with_bounded_pins() {
         .collect::<String>();
     drop(snapshot);
     drop(store);
-    let recovered = Store::recover(
+    assert_eq!(disk.used().unwrap(), physical);
+    let recovered = Store::recover_with_disk_budget(
         &fixture.root(),
         selected,
         budget.clone(),
+        disk.clone(),
         admitted,
         &mut okay,
     )
     .unwrap();
+    assert_eq!(disk.used().unwrap(), physical);
     let mut count = 0;
     recovered
         .visit_blocks(&mut okay, |reference| {
@@ -1138,5 +1146,7 @@ fn dense_three_layer_native16_backing_crosses_four_gib_with_bounded_pins() {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    println!("dense backing component: {tile_count} full native16 tiles, {physical} encoded file bytes (all payload bytes written, allocated disk clusters not measured), canonical BE readback, resident pin payload <= {} bytes, elapsed_ms={}, file_sha256={file_sha256}, checkpoint_sha256={checkpoint_sha256}; no total RAM/editor/PSB/history qualification",spec.bytes(),started.elapsed().as_millis());
+    drop(recovered);
+    assert_eq!(disk.used().unwrap(), physical);
+    println!("dense backing component: {tile_count} full native16 tiles, {physical} encoded file bytes (all payload bytes written, allocated disk clusters not measured), canonical BE readback, resident pin payload <= {} bytes, persistent_reserved_bytes={}, retained after owner drop, elapsed_ms={}, file_sha256={file_sha256}, checkpoint_sha256={checkpoint_sha256}; no total RAM/editor/PSB/history qualification",spec.bytes(),disk.used().unwrap(),started.elapsed().as_millis());
 }
