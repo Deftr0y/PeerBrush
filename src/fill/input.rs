@@ -173,6 +173,106 @@ fn validate(
     }
     Ok(())
 }
+fn foreground_color(parameters: &serde_json::Value) -> Result<[u8; 4], String> {
+    let values = parameters["color"]
+        .as_array()
+        .filter(|v| v.len() == 4 && v.iter().all(|v| v.as_u64().is_some_and(|n| n <= 255)))
+        .ok_or("Fill color must contain four byte values")?;
+    Ok(std::array::from_fn(|i| values[i].as_u64().unwrap() as u8))
+}
+
+/// New folder child pixels. The existing group slot is only a captured scope
+/// target; its source plane is never used as the child's baseline or replaced.
+pub(crate) fn stage_child_fill<'d, 's>(
+    input: &RasterInput<'d>,
+    guard: &crate::edit_bounds::input::WriteGuard<'_>,
+    session: &'s SourceSession,
+    check: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<BuiltTiles<'d, 's>, String> {
+    guard.validate(input, None, &["paint.fill"])?;
+    validate(input, session, check)?;
+    if input.is_mask() || input.layer_metadata().kind() != "group" {
+        return Err("Native foreground-fill insertion requires its captured folder".into());
+    }
+    let metadata = input.document().metadata();
+    let selection = input.selection()?;
+    let canvas = [0, 0, metadata.width() as i32, metadata.height() as i32];
+    let parameters = guard.parameters();
+    let mut area = clip(
+        parameters
+            .get("rect")
+            .and_then(crate::engine::rect)
+            .or(selection.bounds())
+            .unwrap_or(canvas),
+        canvas,
+    );
+    if let Some(bounds) = selection.bounds() {
+        area = clip(area, bounds);
+    }
+    if empty(area) {
+        return Ok(BuiltTiles::Unchanged);
+    }
+    let color = foreground_color(parameters)?;
+    let plan = PreparedFill::new(
+        metadata.width(),
+        metadata.height(),
+        metadata.depth(),
+        area,
+        [0, 0],
+        color,
+        selection.polygon(),
+        input.pool(),
+    )?;
+    let mut checked = || {
+        guard.check_active()?;
+        session.check()?;
+        check()?;
+        guard.check_active()
+    };
+    let mut seed = crate::edit_bounds::output::FrameSeed::empty_canvas(
+        input.document(),
+        session,
+        &mut checked,
+    )?;
+    let result = (|| {
+        for key in plan.tiles() {
+            checked()?;
+            let length = (TILE * TILE) as usize * if metadata.depth() == 16 { 8 } else { 4 };
+            let before = ScratchBytes::new(input.pool(), length, length)
+                .map_err(|e| e.to_string())?
+                .freeze();
+            let mut after = plan.render_tile(key, &before, &mut checked)?;
+            if selection.has_coverage() {
+                let region = [
+                    (key.0 * TILE) as i32,
+                    (key.1 * TILE) as i32,
+                    ((key.0 + 1) * TILE).min(metadata.width()) as i32,
+                    ((key.1 + 1) * TILE).min(metadata.height()) as i32,
+                ];
+                let coverage = selection.prepare(region, &mut checked)?;
+                after = crate::edit_bounds::input::restrict_child_tile(
+                    input,
+                    key,
+                    &before,
+                    &after,
+                    &coverage,
+                    &mut checked,
+                )?;
+            }
+            guard.check_child_tile(input, key, &before, &after, &mut checked)?;
+            seed.replace_tile(key, after, &mut checked)?;
+        }
+        checked()
+    })();
+    if let Err(mut reason) = result {
+        if let Err(cleanup) = seed.abort() {
+            reason.push_str("; native child-fill cleanup retained inventory: ");
+            reason.push_str(&cleanup);
+        }
+        return Err(reason);
+    }
+    seed.finish(&mut checked).map(BuiltTiles::Draft)
+}
 
 /// Does not expand bounds. Coverage is consumed once by this clear kernel.
 #[cfg(test)]
@@ -300,11 +400,7 @@ pub(crate) fn stage_fill_guarded<'d, 's>(
 ) -> Result<FillStage<'d, 's>, String> {
     guard.validate(input, frame, &["paint.fill"])?;
     let parameters = guard.parameters();
-    let values = parameters["color"]
-        .as_array()
-        .filter(|v| v.len() == 4 && v.iter().all(|v| v.as_u64().is_some_and(|n| n <= 255)))
-        .ok_or("Fill color must contain four byte values")?;
-    let color = std::array::from_fn(|i| values[i].as_u64().unwrap() as u8);
+    let color = foreground_color(parameters)?;
     let requested = parameters.get("rect").and_then(crate::engine::rect);
     let mut checked = || {
         guard.check_active()?;

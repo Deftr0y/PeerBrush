@@ -35,6 +35,44 @@ pub(crate) struct FrameSeed<'d, 's> {
     _charge: Reservation,
 }
 impl<'d, 's> FrameSeed<'d, 's> {
+    /// A genuinely new plane has an explicit zero canvas, not a fabricated
+    /// existing RasterSlot. Only the engine's typed insertion can adopt it.
+    pub(crate) fn empty_canvas(
+        base: &'d NativeDocument,
+        session: &'s SourceSession,
+        check: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<Self, String> {
+        session.check()?;
+        check()?;
+        if base.metadata().read_only()
+            || !base.budget().same_pool(&session.resident())
+            || !base.disk_budget().same_pool(&session.disk())
+        {
+            return Err("New native canvas requires its editable captured source session".into());
+        }
+        let metadata = base.metadata();
+        let surface = Surface::zero(metadata.width(), metadata.height(), metadata.depth())
+            .map_err(|e| e.to_string())?;
+        let count =
+            metadata.width().div_ceil(TILE) as usize * metadata.height().div_ceil(TILE) as usize;
+        let bytes = count
+            .checked_mul(512)
+            .and_then(|n| n.checked_add(4096))
+            .ok_or("New native canvas index admission overflow")?;
+        let charge = base
+            .budget()
+            .reserve_bytes(bytes, bytes)
+            .map_err(|e| e.to_string())?;
+        check()?;
+        Ok(Self {
+            base,
+            session,
+            surface,
+            fragments: Vec::new(),
+            poisoned: false,
+            _charge: charge,
+        })
+    }
     pub(crate) fn shape(&self) -> [u32; 2] {
         [self.surface.width(), self.surface.height()]
     }

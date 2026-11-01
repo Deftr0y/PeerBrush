@@ -186,6 +186,36 @@ impl<'c> WriteGuard<'c> {
         }
         self.check_active()
     }
+    pub(crate) fn check_child_tile(
+        &self,
+        input: &RasterInput<'_>,
+        key: (u32, u32),
+        before: &PinnedBytes,
+        after: &PinnedBytes,
+        check: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.validate(input, None, &["paint.fill"])?;
+        if input.is_mask() || input.layer_metadata().kind() != "group" {
+            return Err("Native child fill requires its captured folder target".into());
+        }
+        let metadata = input.document().metadata();
+        if let Some(bounds) = changed_geometry(
+            input.pool(),
+            metadata.depth(),
+            [metadata.width(), metadata.height()],
+            [0, 0],
+            key,
+            before,
+            after,
+            check,
+        )? {
+            // The existing folder slot is only the authorization target. Its
+            // unused plane is never replaced; the engine inserts a new child.
+            self.command
+                .check_write(input.document(), input.binding.slot, bounds)?;
+        }
+        self.check_active()
+    }
 }
 impl InputBinding {
     pub(crate) fn generation(self) -> DocumentKey {
@@ -747,12 +777,34 @@ pub(crate) fn changed_bounds(
     } else {
         (input.shape(), input.origin())
     };
-    let bpp = if input.depth() == 16 { 8 } else { 4 };
+    changed_geometry(
+        input.pool(),
+        input.depth(),
+        shape,
+        origin,
+        key,
+        before,
+        after,
+        check,
+    )
+}
+fn changed_geometry(
+    pool: &ResidentBudget,
+    depth: u16,
+    shape: [u32; 2],
+    origin: [i32; 2],
+    key: (u32, u32),
+    before: &PinnedBytes,
+    after: &PinnedBytes,
+    check: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<Option<[i32; 4]>, String> {
+    check()?;
+    let bpp = if depth == 16 { 8 } else { 4 };
     let length = (TILE * TILE) as usize * bpp;
     if key.0 >= shape[0].div_ceil(TILE)
         || key.1 >= shape[1].div_ceil(TILE)
-        || !before.uses_budget(input.pool())
-        || !after.uses_budget(input.pool())
+        || !before.uses_budget(pool)
+        || !after.uses_budget(pool)
         || before.len() != length
         || after.len() != length
     {
@@ -1121,11 +1173,58 @@ fn restrict_geometry(
     selection: &PreparedSelection<'_>,
     check: &mut dyn FnMut() -> Result<(), String>,
 ) -> Result<PinnedBytes, String> {
+    restrict_document_geometry(
+        input.document(),
+        input.depth(),
+        shape,
+        origin,
+        key,
+        before,
+        after,
+        selection,
+        check,
+    )
+}
+pub(crate) fn restrict_child_tile(
+    input: &RasterInput<'_>,
+    key: (u32, u32),
+    before: &PinnedBytes,
+    after: &PinnedBytes,
+    selection: &PreparedSelection<'_>,
+    check: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<PinnedBytes, String> {
+    if input.is_mask() || input.layer_metadata().kind() != "group" {
+        return Err("Native child coverage requires its folder target".into());
+    }
+    let metadata = input.document().metadata();
+    restrict_document_geometry(
+        input.document(),
+        metadata.depth(),
+        [metadata.width(), metadata.height()],
+        [0, 0],
+        key,
+        before,
+        after,
+        selection,
+        check,
+    )
+}
+fn restrict_document_geometry(
+    document: &NativeDocument,
+    depth: u16,
+    shape: [u32; 2],
+    origin: [i32; 2],
+    key: (u32, u32),
+    before: &PinnedBytes,
+    after: &PinnedBytes,
+    selection: &PreparedSelection<'_>,
+    check: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<PinnedBytes, String> {
     check()?;
-    let bpp = if input.depth() == 16 { 8 } else { 4 };
+    let bpp = if depth == 16 { 8 } else { 4 };
     let length = (TILE * TILE) as usize * bpp;
-    if !before.uses_budget(input.pool())
-        || !after.uses_budget(input.pool())
+    if !before.uses_budget(document.budget())
+        || !after.uses_budget(document.budget())
         || before.len() != length
         || after.len() != length
         || key.0 >= shape[0].div_ceil(TILE)
@@ -1133,13 +1232,14 @@ fn restrict_geometry(
     {
         return Err("Soft-selection tile input differs from its admitted native frame".into());
     }
-    if selection._document.key() != input.binding.generation {
+    if selection._document.key() != document.key() {
         return Err("Soft selection belongs to another native generation".into());
     }
     if selection.coverage.is_none() {
         return Ok(after.clone());
     }
-    let mut output = ScratchBytes::new(input.pool(), length, length).map_err(|e| e.to_string())?;
+    let mut output =
+        ScratchBytes::new(document.budget(), length, length).map_err(|e| e.to_string())?;
     output.copy_from_slice(after);
     for y in key.1 * TILE..((key.1 + 1) * TILE).min(shape[1]) {
         check()?;
@@ -1151,7 +1251,7 @@ fn restrict_geometry(
             let at = ((y % TILE) * TILE + x % TILE) as usize * bpp;
             let read = |bytes: &[u8]| -> [u16; 4] {
                 std::array::from_fn(|c| {
-                    if input.depth() == 16 {
+                    if depth == 16 {
                         u16::from_be_bytes([bytes[at + c * 2], bytes[at + c * 2 + 1]])
                     } else {
                         u16::from(bytes[at + c]) * 257
@@ -1177,7 +1277,7 @@ fn restrict_geometry(
                 };
             }
             for c in 0..4 {
-                if input.depth() == 16 {
+                if depth == 16 {
                     output[at + c * 2..at + c * 2 + 2].copy_from_slice(&result[c].to_be_bytes());
                 } else {
                     output[at + c] = project16(result[c]);

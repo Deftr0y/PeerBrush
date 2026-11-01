@@ -1862,3 +1862,102 @@ fn command_guards_refuse_foreign_descriptors_unbound_frames_outside_writes_and_c
         .is_err());
     assert_eq!(runtime.disk().used().unwrap(), before);
 }
+
+#[test]
+fn folder_fill_prepares_a_new_zero_baseline_canvas_without_replacing_the_folder_plane() {
+    use crate::engine::native::CommandDescriptor;
+    let f = Fixture::new();
+    let (runtime, _connection) = f.runtime();
+    let session = runtime.begin().unwrap();
+    for depth in [8, 16] {
+        for alpha in [0, 193] {
+            for empty in [false, true] {
+                let mut source = Document::new_depth(12, 10, depth).unwrap();
+                source.layers[0].kind = "group".into();
+                source.layers[0].pixels = Raster::new_depth(2, 2, 8);
+                source.layers[0].x = 3;
+                source.layers[0].y = -2;
+                let mut existing = crate::engine::Layer::new("Existing", "paint", 12, 10);
+                existing.parent = Some(source.layers[0].id.clone());
+                existing.pixels = Raster::new_depth(12, 10, depth);
+                existing.pixels.set16(4, 3, [12347, 23521, 43217, 49153]);
+                source.layers.push(existing);
+                source.selection = Some([1, 1, 10, 8]);
+                let mut coverage = Raster::new_depth(12, 10, 16);
+                for y in 0..10 {
+                    for x in 0..12 {
+                        coverage.set16(x, y, [if x < 6 { 32769 } else { 49153 }, 0, 0, 0]);
+                    }
+                }
+                source.selection_coverage = Some(crate::selection::Coverage {
+                    mask: coverage,
+                    bounds: source.selection.unwrap(),
+                    origin: [0, 0],
+                    contours: vec![],
+                });
+                let parameters = serde_json::json!({"op":"paint.fill","layer":source.layers[0].id,
+            "rect":if empty {[20,20,22,22]}else{[2,2,8,7]},"color":[37,83,127,alpha]});
+                let mut legacy = crate::engine::Engine::new();
+                legacy.doc = source.clone();
+                legacy
+                    .edit("human", &[parameters.clone()], None, None, "Fill")
+                    .unwrap();
+                let document = native(&source, &session);
+                let descriptor =
+                    CommandDescriptor::from_normalized(&document, 0, &[parameters], &|| Ok(()))
+                        .unwrap();
+                let captured = document
+                    .capture_descriptor(descriptor.clone(), "human", &[], 1, false, true)
+                    .unwrap();
+                let command = descriptor.commands().next().unwrap();
+                let input = RasterInput::from_parameters(captured.document(), command.parameters())
+                    .unwrap();
+                let parent_key = input.binding().source();
+                let guard = WriteGuard::new(&captured, command, &input, None).unwrap();
+                let before = runtime.disk().used().unwrap();
+                let output =
+                    crate::fill::input::stage_child_fill(&input, &guard, &session, &mut || Ok(()))
+                        .unwrap();
+                if empty {
+                    assert!(matches!(output, BuiltTiles::Unchanged));
+                    assert_eq!(legacy.doc.layers.len(), 2);
+                } else {
+                    assert_eq!(legacy.doc.layers.len(), 3);
+                    let BuiltTiles::Draft(draft) = output else {
+                        panic!("A nonempty folder fill must insert a real child")
+                    };
+                    let output = draft.seal(&|| Ok(())).ok().unwrap();
+                    assert_eq!(
+                        [
+                            output.surface().width(),
+                            output.surface().height(),
+                            u32::from(output.surface().depth())
+                        ],
+                        [12, 10, u32::from(depth)]
+                    );
+                    let region = output
+                        .surface()
+                        .prepare_region(Region::new([0, 0, 12, 10]).unwrap(), &mut || Ok(()))
+                        .unwrap();
+                    for y in 0..10 {
+                        for x in 0..12 {
+                            assert_eq!(
+                                region.pixel16(x, y).unwrap(),
+                                legacy.doc.layers[1].pixels.get16(x, y),
+                                "depth{depth} alpha{alpha} at{x},{y}"
+                            );
+                        }
+                    }
+                    drop(region);
+                    output.abort(&session, &|| Ok(())).unwrap();
+                }
+                assert_eq!(runtime.disk().used().unwrap(), before);
+                assert_eq!(input.binding().source(), parent_key);
+                assert_eq!(input.shape(), [2, 2]);
+                assert_eq!(input.depth(), 8);
+                assert_eq!(document.metadata().layers().count(), 2);
+                assert_eq!(document.metadata().revision(), 0);
+            }
+        }
+    }
+}
