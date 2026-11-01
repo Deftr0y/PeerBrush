@@ -4,10 +4,10 @@
 mod native;
 mod pipe;
 mod process_limits;
+mod stream_chunks;
 mod stream_native;
 pub(crate) mod stream_parent;
 pub(crate) mod stream_protocol;
-mod stream_chunks;
 pub use native::{Decoded, Info, Options, Pixels, PixelsRef, ENCODED_LIMIT};
 use serde::{Deserialize, Serialize};
 use std::{
