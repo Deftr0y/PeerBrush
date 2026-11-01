@@ -156,27 +156,10 @@ impl Original {
                 self.pixels.height as i32,
             ])
         };
-        if !self.warps.is_empty() {
+        if !self.warps.is_empty() || self.projective.is_some() {
             self.validate(self.pixels.depth)?;
-            return self.prepared()?.bounds(p.map(|v| v as f64));
         }
-        if self.projective.is_some() {
-            self.validate(self.pixels.depth)?;
-            return self.placement()?.bounds(p.map(|v| v as f64));
-        }
-        let [a, b, c, d, tx, ty] = self.matrix;
-        let ps = [[p[0], p[1]], [p[2], p[1]], [p[2], p[3]], [p[0], p[3]]].map(|[x, y]| {
-            [
-                exact(a * x as f64 + c * y as f64 + tx),
-                exact(b * x as f64 + d * y as f64 + ty),
-            ]
-        });
-        Ok([
-            ps.iter().map(|p| p[0]).fold(f64::INFINITY, f64::min),
-            ps.iter().map(|p| p[1]).fold(f64::INFINITY, f64::min),
-            ps.iter().map(|p| p[0]).fold(f64::NEG_INFINITY, f64::max),
-            ps.iter().map(|p| p[1]).fold(f64::NEG_INFINITY, f64::max),
-        ])
+        geometry::bounds(p, self.matrix, self.projective, &self.warps)
     }
 }
 pub fn layer(layer: &mut Layer, c: &Value) -> Result<(), String> {
