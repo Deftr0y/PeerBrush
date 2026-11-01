@@ -7,6 +7,7 @@ mod chunks;
 mod wire;
 use crate::large_document::{Reservation, ResidentBudget};
 pub(super) use chunks::{SegmentReader, SegmentWriter, Segments};
+use serde::ser::SerializeMap;
 use serde::{Serialize, Serializer};
 use serde_json::Value;
 use std::io::Write;
@@ -144,6 +145,7 @@ impl ReplyAdmission {
         Ok(OwnedReply {
             value,
             admission: self,
+            ordered: false,
         })
     }
 }
@@ -152,16 +154,38 @@ impl ReplyAdmission {
 pub(crate) struct OwnedReply {
     value: Value,
     admission: ReplyAdmission,
+    ordered: bool,
 }
 impl OwnedReply {
     pub(super) fn plain(value: Value) -> Self {
         Self {
             value,
             admission: ReplyAdmission::new(false),
+            ordered: false,
         }
     }
     pub(crate) fn value(&self) -> &Value {
         &self.value
+    }
+    pub(super) fn admitted(&self) -> bool {
+        self.admission.pool.is_some()
+    }
+    pub(super) fn ordered_rpc(mut self) -> Result<Self, String> {
+        if self.value.get("id").is_none() || self.value["jsonrpc"] != "2.0" {
+            return Err("Private MCP stream requires a JSON-RPC reply".into());
+        }
+        self.ordered = true;
+        Ok(self)
+    }
+    pub(super) fn rpc(self, id: &Value) -> Result<Self, String> {
+        let mut reply = self;
+        if let Some(pool) = reply.admission.pool.clone() {
+            reply.admission.admit_projection(&pool, id)?;
+        }
+        let mut header = serde_json::Map::new();
+        header.insert("jsonrpc".into(), Value::String("2.0".into()));
+        header.insert("id".into(), id.clone());
+        reply.envelope("result", header)
     }
     pub(super) fn into_plain(self) -> Result<Value, String> {
         if self.admission.pool.is_some() || !self.admission.slots.is_empty() {
@@ -274,6 +298,45 @@ impl Serialize for OwnedReply {
             if wire::at(&self.value, &slot.path[..slot.length]) != Some(&Value::Null) {
                 return Err(serde::ser::Error::custom("Sealed response slot changed"));
             }
+        }
+        if self.ordered {
+            let object = self
+                .value
+                .as_object()
+                .ok_or_else(|| serde::ser::Error::custom("Private MCP reply is not an object"))?;
+            let mut map = serializer.serialize_map(Some(object.len()))?;
+            for key in ["id", "jsonrpc"] {
+                let value = object
+                    .get(key)
+                    .ok_or_else(|| serde::ser::Error::custom("Private MCP reply header changed"))?;
+                let mut path = [Part::End; DEPTH];
+                path[0] = Part::Key(key);
+                map.serialize_entry(
+                    key,
+                    &wire::Node {
+                        value,
+                        slots: &self.admission.slots,
+                        path,
+                        length: 1,
+                    },
+                )?;
+            }
+            for (key, value) in object {
+                if key != "id" && key != "jsonrpc" {
+                    let mut path = [Part::End; DEPTH];
+                    path[0] = Part::Key(key);
+                    map.serialize_entry(
+                        key,
+                        &wire::Node {
+                            value,
+                            slots: &self.admission.slots,
+                            path,
+                            length: 1,
+                        },
+                    )?;
+                }
+            }
+            return map.end();
         }
         wire::Node {
             value: &self.value,

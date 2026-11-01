@@ -1,6 +1,9 @@
 mod fonts;
 mod instance;
 mod reply;
+mod stream;
+#[cfg(test)]
+mod stream_http_tests;
 use crate::{
     engine::{self, view, Engine, Scope},
     psd, raster,
@@ -1298,7 +1301,11 @@ pub fn capabilities() -> Value {
     result
 }
 
-fn observation(shared: &Shared, p: &Value) -> Result<Value, String> {
+fn observation(
+    shared: &Shared,
+    p: &Value,
+    admission: &mut reply::ReplyAdmission,
+) -> Result<Value, String> {
     let (state, doc) = {
         let mut e = shared.lock().unwrap();
         crate::workspace::validate_target(&e, p)?;
@@ -1331,6 +1338,25 @@ fn observation(shared: &Shared, p: &Value) -> Result<Value, String> {
     Ok(result)
 }
 pub fn dispatch(shared: &Shared, method: &str, p: &Value) -> Result<Value, String> {
+    let mut admission = reply::ReplyAdmission::new(false);
+    let value = dispatch_reply(shared, method, p, &mut admission)?;
+    admission.finish(value)?.into_plain()
+}
+pub(crate) fn dispatch_owned(
+    shared: &Shared,
+    method: &str,
+    p: &Value,
+) -> Result<reply::OwnedReply, String> {
+    let mut admission = reply::ReplyAdmission::new(true);
+    let value = dispatch_reply(shared, method, p, &mut admission)?;
+    admission.finish(value)
+}
+fn dispatch_reply(
+    shared: &Shared,
+    method: &str,
+    p: &Value,
+    admission: &mut reply::ReplyAdmission,
+) -> Result<Value, String> {
     let persistent = match method {
         "brushes" => matches!(p["action"].as_str(), Some("save" | "delete")),
         "tool_settings" => p["action"] == "set",
@@ -1376,7 +1402,7 @@ pub fn dispatch(shared: &Shared, method: &str, p: &Value) -> Result<Value, Strin
                     &crate::loading::Control::default(),
                     None,
                 )?;
-                let mut result = observation(&restored, &json!({}))?;
+                let mut result = observation(&restored, &json!({}), admission)?;
                 result["project_id"] = json!(restored.lock().unwrap().project_id);
                 result["recovery_retained"] = json!(true);
                 Ok(result)
@@ -1412,10 +1438,10 @@ pub fn dispatch(shared: &Shared, method: &str, p: &Value) -> Result<Value, Strin
             | "client_state"
             | "capture_ui"
     ) {
-        return dispatch_project(shared, method, p);
+        return dispatch_project(shared, method, p, admission);
     }
     let target = crate::workspace::route(shared, method, p)?;
-    let mut result = dispatch_project(&target, method, p)?;
+    let mut result = dispatch_project(&target, method, p, admission)?;
     if result.is_object() {
         result["project_id"] = json!(target.lock().unwrap().project_id);
     }
@@ -1645,7 +1671,12 @@ fn filter_library(shared: &Shared, p: &Value) -> Result<Value, String> {
         _ => Err("Unknown filter library action".into()),
     }
 }
-fn dispatch_project(shared: &Shared, method: &str, p: &Value) -> Result<Value, String> {
+fn dispatch_project(
+    shared: &Shared,
+    method: &str,
+    p: &Value,
+    admission: &mut reply::ReplyAdmission,
+) -> Result<Value, String> {
     let actor = p.get("actor").and_then(Value::as_str).unwrap_or("agent");
     match method {
         "capabilities" => Ok(capabilities()),
@@ -1673,7 +1704,7 @@ fn dispatch_project(shared: &Shared, method: &str, p: &Value) -> Result<Value, S
             let queued = crate::activation::enqueue(shared, paths)?;
             Ok(json!({"queued":queued}))
         }
-        "observe" => observation(shared, p),
+        "observe" => observation(shared, p, admission),
         "code" => crate::code::dispatch(shared, actor, p),
         "filters" => filter_library(shared, p),
         "tool_settings" => {
@@ -1846,7 +1877,7 @@ fn dispatch_project(shared: &Shared, method: &str, p: &Value) -> Result<Value, S
                 )?;
                 let mut result = result;
                 if p["feedback"] != "request" {
-                    result["images"] = observation(shared, p)?["images"].clone();
+                    result["images"] = observation(shared, p, admission)?["images"].take();
                 }
                 return Ok(result);
             }
@@ -1957,7 +1988,7 @@ fn dispatch_project(shared: &Shared, method: &str, p: &Value) -> Result<Value, S
             if p.get("label").is_none() {
                 edit["label"] = json!("Place image");
             }
-            let mut result = dispatch_project(shared, "edit", &edit)?;
+            let mut result = dispatch_project(shared, "edit", &edit, admission)?;
             let layer = if p["new_layer"] == false {
                 p.get("layer").cloned().unwrap_or(Value::Null)
             } else {
@@ -1970,11 +2001,12 @@ fn dispatch_project(shared: &Shared, method: &str, p: &Value) -> Result<Value, S
         "segment" => {
             let mut result = crate::segmentation::run(shared, actor, p)?;
             if p["feedback"] != "request" {
-                let view = observation(
+                let mut view = observation(
                     shared,
                     &json!({"selection_view":"mask","rect":p.get("rect"),"max_edge":p.get("max_edge").and_then(Value::as_u64).unwrap_or(768)}),
+                    admission,
                 )?;
-                result["images"] = view["images"].clone();
+                result["images"] = view["images"].take();
             }
             Ok(result)
         }
@@ -2013,11 +2045,12 @@ fn dispatch_project(shared: &Shared, method: &str, p: &Value) -> Result<Value, S
                 .unwrap_or("batch".into());
             let mut out = result;
             if feedback != "request" {
-                let view = observation(
+                let mut view = observation(
                     shared,
                     &json!({"max_edge":p.get("max_edge").and_then(Value::as_u64).unwrap_or(768),"rect":p.get("feedback_rect")}),
+                    admission,
                 )?;
-                out["images"] = view["images"].clone();
+                out["images"] = view["images"].take();
             }
             Ok(out)
         }
@@ -2128,8 +2161,9 @@ fn dispatch_project(shared: &Shared, method: &str, p: &Value) -> Result<Value, S
                 result["images"] = observation(
                     shared,
                     &json!({"max_edge":p.get("max_edge").and_then(Value::as_u64).unwrap_or(768)}),
+                    admission,
                 )?["images"]
-                    .clone();
+                    .take();
             }
             Ok(result)
         }
@@ -2344,6 +2378,13 @@ fn initialization(params: &Value) -> Value {
 }
 
 pub fn mcp(shared: &Shared, request: &Value) -> Value {
+    mcp_reply(shared, request, false).and_then(reply::OwnedReply::into_plain)
+        .unwrap_or_else(|error| json!({"jsonrpc":"2.0","id":request.get("id").unwrap_or(&Value::Null),"error":{"code":-32000,"message":error}}))
+}
+fn mcp_owned(shared: &Shared, request: &Value) -> reply::OwnedReply {
+    mcp_reply(shared, request, true).unwrap_or_else(|error| reply::OwnedReply::plain(json!({"jsonrpc":"2.0","id":request.get("id").unwrap_or(&Value::Null),"error":{"code":-32000,"message":error}})))
+}
+fn mcp_reply(shared: &Shared, request: &Value, owned: bool) -> Result<reply::OwnedReply, String> {
     let request_id = request.get("id").cloned().unwrap_or(Value::Null);
     let p = request.get("params").cloned().unwrap_or(json!({}));
     let client_id = request
@@ -2357,14 +2398,14 @@ pub fn mcp(shared: &Shared, request: &Value) -> Value {
             }
         }
     }
-    let result: Result<Value, String> = match request
+    let result: Result<reply::OwnedReply, String> = match request
         .get("method")
         .and_then(Value::as_str)
         .unwrap_or("")
     {
-        "initialize" => Ok(initialization(&p)),
-        "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({"tools":tools()})),
+        "initialize" => Ok(reply::OwnedReply::plain(initialization(&p))),
+        "ping" => Ok(reply::OwnedReply::plain(json!({}))),
+        "tools/list" => Ok(reply::OwnedReply::plain(json!({"tools":tools()}))),
         "tools/call" => {
             let name = p.get("name").and_then(Value::as_str).unwrap_or("");
             let method = name.strip_prefix("peerbrush_").unwrap_or(name);
@@ -2390,7 +2431,9 @@ pub fn mcp(shared: &Shared, request: &Value) -> Value {
             ]
             .contains(&method)
             {
-                return json!({"jsonrpc":"2.0","id":request_id,"result":{"content":[{"type":"text","text":"Unknown PeerBrush tool"}],"isError":true}});
+                return Ok(reply::OwnedReply::plain(
+                    json!({"jsonrpc":"2.0","id":request_id,"result":{"content":[{"type":"text","text":"Unknown PeerBrush tool"}],"isError":true}}),
+                ));
             }
             {
                 if let Ok(mut e) = shared.try_lock() {
@@ -2409,46 +2452,29 @@ pub fn mcp(shared: &Shared, request: &Value) -> Value {
                     }
                 }
             }
-            match dispatch(shared, method, p.get("arguments").unwrap_or(&json!({}))) {
-                Ok(mut result) => {
-                    let images = result
-                        .get("images")
-                        .and_then(Value::as_array)
-                        .cloned()
-                        .unwrap_or_default();
-                    if let Some(o) = result.as_object_mut() {
-                        o.remove("images");
-                    }
-                    if !images.is_empty() {
-                        result["views"] = json!(images
-                            .iter()
-                            .map(|i| {
-                                let mut meta = i.clone();
-                                meta.as_object_mut().unwrap().remove("data");
-                                meta
-                            })
-                            .collect::<Vec<_>>());
-                    }
-                    let mut content =
-                        vec![json!({"type":"text","text":serde_json::to_string(&result).unwrap()})];
-                    for img in images {
-                        content.push(
-                            json!({"type":"image","mimeType":"image/png","data":img["data"]}),
-                        );
-                    }
-                    Ok(json!({"content":content,"isError":false}))
-                }
-                Err(e) => Ok(json!({"content":[{"type":"text","text":e}],"isError":true})),
+            let mut admission = reply::ReplyAdmission::new(owned);
+            match dispatch_reply(
+                shared,
+                method,
+                p.get("arguments").unwrap_or(&json!({})),
+                &mut admission,
+            ) {
+                Ok(result) => admission.finish(result)?.tool_result(),
+                Err(error) => Ok(reply::OwnedReply::plain(
+                    json!({"content":[{"type":"text","text":error}],"isError":true}),
+                )),
             }
         }
-        method if method.starts_with("notifications/") => return Value::Null,
+        method if method.starts_with("notifications/") => {
+            return Ok(reply::OwnedReply::plain(Value::Null))
+        }
         _ => Err("Method not found".into()),
     };
     match result {
-        Ok(result) => json!({"jsonrpc":"2.0","id":request_id,"result":result}),
-        Err(error) => {
-            json!({"jsonrpc":"2.0","id":request_id,"error":{"code":-32601,"message":error}})
-        }
+        Ok(result) => result.rpc(&request_id),
+        Err(error) => Ok(reply::OwnedReply::plain(
+            json!({"jsonrpc":"2.0","id":request_id,"error":{"code":-32601,"message":error}}),
+        )),
     }
 }
 /// Both per-request metadata and initialization-based Streamable HTTP clients.
@@ -2507,6 +2533,48 @@ fn respond_http(
     let _ = request.respond(response);
 }
 
+fn owned_response(body: reply::OwnedReply) -> Result<tiny_http::ResponseBox, String> {
+    let headers = vec![
+        tiny_http::Header::from_bytes("Cache-Control", "no-store").unwrap(),
+        tiny_http::Header::from_bytes("Content-Type", "application/json").unwrap(),
+    ];
+    let response = if body.admitted() {
+        let bytes = body.serialized(&mut || Ok(()))?;
+        let length = bytes.len();
+        tiny_http::Response::new(
+            tiny_http::StatusCode(200),
+            headers,
+            bytes.reader(),
+            Some(length),
+            None,
+        )
+        .boxed()
+    } else {
+        let bytes = serde_json::to_vec(&body).map_err(|_| "Response serialization failed")?;
+        tiny_http::Response::from_data(bytes)
+            .with_header(headers[0].clone())
+            .with_header(headers[1].clone())
+            .boxed()
+    };
+    // The private adapter validates an exact Content-Length before forwarding.
+    // tiny_http otherwise switches a known large body to chunks at 32 KiB.
+    Ok(response.with_chunked_threshold(512 * 1024 * 1024 + 1))
+}
+fn respond_owned(request: tiny_http::Request, body: reply::OwnedReply) {
+    match owned_response(body) {
+        Ok(response) => {
+            let _ = request.respond(response);
+        }
+        Err(_) => fail_http(
+            request,
+            503,
+            None,
+            -32000,
+            "Response resource admission failed; observe again",
+        ),
+    }
+}
+
 fn fail_http(
     request: tiny_http::Request,
     status: u16,
@@ -2534,7 +2602,7 @@ fn http_work(
     request: tiny_http::Request,
     shared: &Shared,
     requests: &Arc<instance::Requests>,
-    work: impl FnOnce(&Shared) -> Value + Send + 'static,
+    work: impl FnOnce(&Shared) -> reply::OwnedReply + Send + 'static,
 ) {
     let Some(operation) = requests.begin() else {
         fail_http(request, 503, None, -32000, "PeerBrush workspace is closing");
@@ -2568,7 +2636,7 @@ fn http_work(
         }
         let _permit = Permit;
         let result = work(&shared);
-        respond_http(request, 200, Some(result), None);
+        respond_owned(request, result);
     });
 }
 
@@ -2667,22 +2735,24 @@ fn handle_modern_http(
     touch_http_presence(shared, "http-stateless");
     http_work(request, shared, requests, move |shared| {
         let mut result = if method == "server/discover" {
-            json!({"jsonrpc":"2.0","id":q["id"],"result":{
+            reply::OwnedReply::plain(json!({"jsonrpc":"2.0","id":q["id"],"result":{
                 "supportedVersions":MCP_HTTP_VERSIONS,"capabilities":{"tools":{}},
                 "instructions":initialization(&json!({}))["instructions"],"ttlMs":300000,"cacheScope":"private"
-            }})
+            }}))
         } else {
-            mcp(shared, &q)
+            mcp_owned(shared, &q)
         };
-        if result.get("result").is_some() {
-            result["result"]["resultType"] = json!("complete");
-            result["result"]["_meta"]["io.modelcontextprotocol/serverInfo"] =
-                json!({"name":"PeerBrush","version":env!("CARGO_PKG_VERSION")});
-            if method == "tools/list" {
-                result["result"]["ttlMs"] = json!(300000);
-                result["result"]["cacheScope"] = json!("private");
+        result.update(|result| {
+            if result.get("result").is_some() {
+                result["result"]["resultType"] = json!("complete");
+                result["result"]["_meta"]["io.modelcontextprotocol/serverInfo"] =
+                    json!({"name":"PeerBrush","version":env!("CARGO_PKG_VERSION")});
+                if method == "tools/list" {
+                    result["result"]["ttlMs"] = json!(300000);
+                    result["result"]["cacheScope"] = json!("private");
+                }
             }
-        }
+        });
         touch_http_presence(shared, "http-stateless");
         result
     });
@@ -2910,26 +2980,50 @@ fn handle_http(
     if !is_mcp {
         // The private authenticated bridge lets stdio keep its offline handshake and reconnect.
         http_work(request, shared, requests, move |shared| {
-            let result = if q["method"] == "mcp" {
-                if q["params"]["request"].is_object() {
-                    if q["params"]["request"].get("id").is_none() {
-                        Ok(Value::Null)
+            let stream = q["method"] == "mcp_stream";
+            let bridge = stream || q["method"] == "mcp";
+            let result = if bridge {
+                let request = &q["params"]["request"];
+                if !request.is_object() {
+                    Err("MCP bridge requires a request object".into())
+                } else if request.get("id").is_none() {
+                    if stream {
+                        Err("MCP stream requires a request ID".into())
                     } else {
-                        Ok(mcp(shared, &q["params"]["request"]))
+                        Ok(reply::OwnedReply::plain(Value::Null))
                     }
                 } else {
-                    Err("MCP bridge requires a request object".into())
+                    Ok(mcp_owned(shared, request))
                 }
             } else {
-                dispatch(
+                dispatch_owned(
                     shared,
                     q.get("method").and_then(Value::as_str).unwrap_or(""),
                     q.get("params").unwrap_or(&json!({})),
                 )
             };
+            if stream {
+                return match result.and_then(reply::OwnedReply::ordered_rpc) {
+                    Ok(value) => value,
+                    Err(_) => reply::OwnedReply::plain(rpc_error(
+                        None,
+                        -32600,
+                        "Invalid private MCP stream request",
+                    )),
+                };
+            }
             match result {
-                Ok(value) => json!({"ok":true,"result":value}),
-                Err(error) => json!({"ok":false,"error":error}),
+                Ok(value) => value
+                    .envelope(
+                        "result",
+                        serde_json::from_value(json!({"ok":true})).unwrap(),
+                    )
+                    .unwrap_or_else(|_| {
+                        reply::OwnedReply::plain(
+                            json!({"ok":false,"error":"Response envelope admission failed"}),
+                        )
+                    }),
+                Err(error) => reply::OwnedReply::plain(json!({"ok":false,"error":error})),
             }
         });
         return;
@@ -3124,7 +3218,7 @@ fn handle_http(
     } else {
         q["_client"] = json!(client);
         http_work(request, shared, requests, move |shared| {
-            let result = mcp(shared, &q);
+            let result = mcp_owned(shared, &q);
             touch_http_presence(shared, &client);
             result
         });
@@ -3393,7 +3487,7 @@ fn connection_request(
     timeout: std::time::Duration,
 ) -> Result<ureq::Response, ConnectionProbe> {
     use ConnectionCategory::*;
-    if !matches!(endpoint, "rpc" | "mcp") {
+    if !matches!(endpoint, "rpc" | "mcp" | "mcp_stream") {
         return Err(ConnectionProbe::new(ConnectionInvalid));
     }
     let io_failure = |error: std::io::Error| {
@@ -3429,10 +3523,11 @@ fn connection_request(
                 && token.bytes().all(|byte| byte.is_ascii_graphic())
         })
         .ok_or_else(|| ConnectionProbe::new(ConnectionInvalid))?;
-    let bridge = endpoint == "mcp";
+    let bridge = matches!(endpoint, "mcp" | "mcp_stream");
+    let bridge_method = endpoint;
     let endpoint = if bridge { "rpc" } else { endpoint };
     let payload = if bridge {
-        json!({"method":"mcp","params":{"request":payload}})
+        json!({"method":bridge_method,"params":{"request":payload}})
     } else {
         payload.clone()
     };
@@ -3444,6 +3539,7 @@ fn connection_request(
     let response = agent
         .post(&format!("{url}/{endpoint}"))
         .set("Authorization", &format!("Bearer {token}"))
+        .set("Accept-Encoding", "identity")
         .timeout(timeout)
         .send_json(payload)
         .map_err(|error| match error {
@@ -3462,6 +3558,35 @@ fn connection_request(
         return Err(ConnectionProbe::new(ResponseRejected));
     }
     Ok(response)
+}
+
+fn stdio_stream(
+    state_dir: &Path,
+    request: &Value,
+    output: &mut impl Write,
+) -> Result<(), stream::Failure> {
+    let response = connection_request(
+        state_dir,
+        "mcp_stream",
+        request,
+        std::time::Duration::from_secs(300),
+    )
+    .map_err(|_| stream::Failure { started: false })?;
+    let names = response.headers_names();
+    let headers = names.iter().flat_map(|name| {
+        response
+            .all(name)
+            .into_iter()
+            .map(move |value| (name.as_str(), value))
+    });
+    let length = stream::framing(response.status(), headers)?;
+    stream::forward(
+        response.into_reader(),
+        output,
+        length,
+        &request["id"],
+        &mut || Ok(()),
+    )
 }
 
 pub(crate) fn probe_connection(state_dir: &Path) -> ConnectionProbe {
@@ -3542,8 +3667,20 @@ pub fn stdio(state_dir: &Path) -> Result<(), String> {
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout().lock();
     let result = (|| -> Result<(), String> {
-        for line in stdin.lock().lines() {
-            let line = line.map_err(|e| e.to_string())?;
+        let mut input = stdin.lock();
+        loop {
+            let mut line = String::new();
+            let read = input
+                .by_ref()
+                .take((HTTP_BODY_LIMIT + 1) as u64)
+                .read_line(&mut line)
+                .map_err(|_| "Invalid MCP input encoding")?;
+            if read == 0 {
+                break;
+            }
+            if line.len() > HTTP_BODY_LIMIT {
+                return Err("MCP request exceeds its input bound".into());
+            }
             if line.trim().is_empty() {
                 continue;
             }
@@ -3579,7 +3716,11 @@ pub fn stdio(state_dir: &Path) -> Result<(), String> {
                 if initialized.load(Ordering::Relaxed) {
                     announce_presence(state_dir, &client_id, true);
                 }
-                client(state_dir, "mcp", &q).unwrap_or_else(|error| stdio_unavailable(&q, &error))
+                match stdio_stream(state_dir, &q, &mut stdout) {
+                    Ok(()) => continue,
+                    Err(failure) if failure.started => return Err(failure.message().into()),
+                    Err(failure) => stdio_unavailable(&q, failure.message()),
+                }
             };
             writeln!(stdout, "{}", response).map_err(|e| e.to_string())?;
             stdout.flush().map_err(|e| e.to_string())?;

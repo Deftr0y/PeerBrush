@@ -484,6 +484,8 @@
     "src/server/reply/chunks.rs",
     "src/server/reply/tests.rs",
     "src/server/reply/wire.rs",
+    "src/server/stream.rs",
+    "src/server/stream_http_tests.rs",
     "src/settings.rs",
     "src/settings_tests.rs",
     "src/setup_main.rs",
