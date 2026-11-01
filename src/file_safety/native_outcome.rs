@@ -6,6 +6,20 @@ mod sealed {
     pub trait RootOutcome {}
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExternalCreationRole {
+    Temporary,
+    Backup,
+}
+/// A live zero-byte exclusive owner. A planned name or copied metadata fact
+/// cannot implement this sealed authority, even when its digest happens to fit.
+pub(crate) trait ExternalCreationProof: sealed::RootOutcome {
+    fn validate(&self, intent: [u8; 32], target: [u8; 32], growth: u64) -> Result<(), String>;
+    fn fact(&self) -> NativeExternalFile;
+    fn role(&self) -> ExternalCreationRole;
+    fn name(&self) -> &OsStr;
+    fn parent_identity(&self) -> (u64, u64);
+}
 /// Implemented by the native destination writer's held publication/abort
 /// receipts, after all named identities and retired owners are reobserved.
 /// Validation may perform I/O and therefore precedes the ledger mutex.
@@ -69,4 +83,34 @@ impl ExternalOutcomeProof for AccountingOutcome {
     fn retired(&self) -> &[(u64, u64)] {
         &self.retired
     }
+}
+
+#[cfg(test)]
+pub(crate) struct AccountingCreation {
+    intent: [u8;32], target: [u8;32], growth:u64,
+    fact:NativeExternalFile, role:ExternalCreationRole, name:OsString,
+    parent:(u64,u64), accepted:bool,
+}
+#[cfg(test)]
+impl AccountingCreation {
+    /// Journal admission fixture only; absent from production, no file authority.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(intent:[u8;32],target:[u8;32],growth:u64,fact:NativeExternalFile,
+        role:ExternalCreationRole,name:OsString,parent:(u64,u64))->Self {
+        Self {intent,target,growth,fact,role,name,parent,accepted:true}
+    }
+    pub(crate) fn refuse(mut self)->Self {self.accepted=false;self}
+}
+#[cfg(test)]
+impl sealed::RootOutcome for AccountingCreation {}
+#[cfg(test)]
+impl ExternalCreationProof for AccountingCreation {
+    fn validate(&self,i:[u8;32],t:[u8;32],g:u64)->Result<(),String> {
+        if self.accepted && self.fact.bytes()==0 && (i,t,g)==(self.intent,self.target,self.growth) {Ok(())}
+        else {Err("Accounting creation fixture refused".into())}
+    }
+    fn fact(&self)->NativeExternalFile {self.fact}
+    fn role(&self)->ExternalCreationRole {self.role}
+    fn name(&self)->&OsStr {&self.name}
+    fn parent_identity(&self)->(u64,u64) {self.parent}
 }
