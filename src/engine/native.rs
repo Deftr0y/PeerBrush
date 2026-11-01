@@ -124,6 +124,36 @@ impl NativeDocument {
     pub fn disk_budget(&self) -> &DiskBudget {
         &self.core.disk
     }
+    /// Metadata-only producer copies retain a fresh shared-pool charge. These
+    /// helpers grant no source staging or editor publication authority.
+    pub(crate) fn copy_value_metadata(
+        &self,
+        value: &serde_json::Value,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<Admitted<serde_json::Value>> {
+        copy_admitted(value, self.budget(), true, check)
+    }
+    pub(crate) fn copy_contour_metadata(
+        &self,
+        contours: &[Vec<[f32; 2]>],
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<Admitted<Vec<Vec<[f32; 2]>>>> {
+        if contours.len() > 500_000 {
+            return Err("Native contour array count exceeds its bound".into());
+        }
+        let mut vertices = 0usize;
+        for contour in contours {
+            check()?;
+            vertices = vertices
+                .checked_add(contour.len())
+                .filter(|count| *count <= 500_000)
+                .ok_or("Native contour vertex count exceeds its bound")?;
+            if contour.iter().flatten().any(|v| !v.is_finite()) {
+                return Err("Native contour coordinates must be finite".into());
+            }
+        }
+        copy_admitted(&contours, self.budget(), true, check)
+    }
     pub(super) fn roster(&self) -> &RasterRoster {
         &self.core.roster.roster
     }
@@ -913,6 +943,46 @@ fn copy_admitted<T: Serialize, U: serde::de::DeserializeOwned + Serialize>(
 mod tests {
     use super::*;
     use crate::engine::{scene::RasterCollector, Document};
+    #[test]
+    fn producer_metadata_copies_preserve_unknown_fields_and_own_their_fresh_charge() {
+        let pool = ResidentBudget::new(8 * 1024 * 1024).unwrap();
+        let document = document(&pool);
+        let value =
+            serde_json::json!({"future":{"enabled":true,"exact":[-0.0,1.23456789]},"strokes":[]});
+        let copied = document.copy_value_metadata(&value, &|| Ok(())).unwrap();
+        assert_eq!(*copied, value);
+        let copied = copied
+            .map_unique(|mut value, _| {
+                value["future"]["enabled"] = serde_json::json!(false);
+                Ok(value)
+            })
+            .unwrap();
+        assert_eq!(value["future"]["enabled"], true);
+        let contours = vec![vec![[1., 2.], [3., 4.]], vec![]];
+        let copied_contours = document
+            .copy_contour_metadata(&contours, &|| Ok(()))
+            .unwrap();
+        let copied_contours = copied_contours
+            .map_unique(|mut values, _| {
+                values[0][0][0] += 4.;
+                Ok(values)
+            })
+            .unwrap();
+        assert_eq!(copied_contours[0][0], [5., 2.]);
+        assert_eq!(contours[0][0], [1., 2.]);
+        assert!(document
+            .copy_contour_metadata(&[vec![[f32::NAN, 0.]]], &|| Ok(()))
+            .is_err());
+        assert!(document
+            .copy_value_metadata(&value, &|| Err("cancelled".into()))
+            .is_err());
+        drop(document);
+        assert!(pool.used() > 0);
+        assert_eq!(copied["future"]["exact"], value["future"]["exact"]);
+        drop(copied);
+        drop(copied_contours);
+        assert_eq!(pool.used(), 0);
+    }
     struct Collector {
         rasters: Vec<Surface>,
     }
