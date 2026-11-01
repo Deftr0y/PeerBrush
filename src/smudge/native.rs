@@ -91,6 +91,10 @@ impl PreparedTile {
 /// reads to the captured scene and all completed prior dabs. They must not commit
 /// engine history or publish a document. An error drops the entire working owner.
 pub(crate) trait WorkingSource {
+    /// Captured immutable metadata; these getters perform no I/O.
+    fn frame(&self) -> [u32; 2];
+    fn depth(&self) -> u16;
+    fn uses_budget(&self, pool: &ResidentBudget) -> bool;
     fn prepare_strip(
         &mut self,
         step: usize,
@@ -171,6 +175,12 @@ impl<'a> PreparedSmudge<'a> {
         check: &mut dyn FnMut() -> Result<(), String>,
     ) -> Result<W, String> {
         check()?;
+        if working.frame() != self.geometry.frame()
+            || working.depth() != self.depth
+            || !working.uses_budget(&self.pool)
+        {
+            return Err("Native smudge working frame, depth or pool differs".into());
+        }
         if self.settings.opacity == 0. || self.settings.flow == 0. || self.settings.wetness == 0. {
             return Ok(working);
         }
@@ -447,6 +457,7 @@ mod tests {
     // A resident immutable fixture is only an oracle/input adapter, never a live
     // large-document authority. Every provisional byte is charged until drop.
     struct Candidate {
+        frame: [u32; 2],
         original: Raster,
         pending: BTreeMap<(u32, u32), PinnedBytes>,
         pool: ResidentBudget,
@@ -460,6 +471,7 @@ mod tests {
     impl Candidate {
         fn new(original: Raster, pool: &ResidentBudget) -> Self {
             Self {
+                frame: [original.width, original.height],
                 original,
                 pending: BTreeMap::new(),
                 pool: pool.clone(),
@@ -490,6 +502,15 @@ mod tests {
         }
     }
     impl WorkingSource for Candidate {
+        fn frame(&self) -> [u32; 2] {
+            self.frame
+        }
+        fn depth(&self) -> u16 {
+            self.original.depth
+        }
+        fn uses_budget(&self, pool: &ResidentBudget) -> bool {
+            self.pool.same_pool(pool)
+        }
         fn prepare_strip(
             &mut self,
             step: usize,
@@ -683,10 +704,13 @@ mod tests {
             &mut || Ok(()),
         )
         .unwrap();
-        for mode in 0..3 {
+        for mode in 0..4 {
             let mut candidate = Candidate::new(input(16), &pool);
             candidate.wrong_step = mode == 0;
             candidate.fail_stage = mode == 1;
+            if mode == 3 {
+                candidate.frame = [1, 1];
+            }
             let dropped = candidate.dropped.clone();
             let stages = candidate.stages.clone();
             let before = pool.used();
@@ -727,7 +751,8 @@ mod tests {
             &mut || Ok(()),
         )
         .unwrap();
-        let candidate = Candidate::new(input(16), &pool);
+        let mut candidate = Candidate::new(input(16), &pool);
+        candidate.frame = [16000, 16000];
         let finished = plan.run(candidate, &mut || Ok(())).unwrap();
         assert!(finished.strips > 1);
         assert!(finished.maximum_strip <= STRIP_PIXELS);

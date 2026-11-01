@@ -1,4 +1,6 @@
 //! Raster edits use document coordinates, independently of transformed content bounds.
+#[path = "edit_bounds/native.rs"]
+pub(crate) mod native;
 use crate::{engine::Document, raster::check_size};
 use serde_json::Value;
 
