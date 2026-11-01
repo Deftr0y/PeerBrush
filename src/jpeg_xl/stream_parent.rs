@@ -9,7 +9,7 @@ use crate::{
         segments::{SegmentEvent, SegmentLimits},
         ScratchBytes,
     },
-    production_export::native_rows::StagedNativeRows,
+    production_export::staged_rows::StagedNativeRows,
     workspace::source_runtime::{SessionJxlOutput, SessionSegmentLog},
 };
 use ring::digest::{Context, SHA256};
@@ -713,7 +713,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         for depth in [8, 16] {
-            crate::production_export::native_rows::tests::with_staged(depth, |input| {
+            crate::production_export::staged_rows::tests::with_staged(depth, |input| {
                 let session = input.session();
                 let raw = input.raw_bytes();
                 let profile = input.profile().to_vec();
@@ -769,7 +769,7 @@ mod tests {
                         for (at, value) in bytes.iter().enumerate() {
                             assert_eq!(
                                 *value,
-                                crate::production_export::native_rows::tests::expected_byte(
+                                crate::production_export::staged_rows::tests::expected_byte(
                                     at, depth
                                 )
                             );
@@ -781,11 +781,11 @@ mod tests {
                             assert_eq!(
                                 value.to_be_bytes(),
                                 [
-                                    crate::production_export::native_rows::tests::expected_byte(
+                                    crate::production_export::staged_rows::tests::expected_byte(
                                         at * 2,
                                         depth
                                     ),
-                                    crate::production_export::native_rows::tests::expected_byte(
+                                    crate::production_export::staged_rows::tests::expected_byte(
                                         at * 2 + 1,
                                         depth
                                     )
@@ -805,7 +805,7 @@ mod tests {
         let _serial = super::super::tests::PROCESS_FIXTURES
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        crate::production_export::native_rows::tests::with_staged(16, |input| {
+        crate::production_export::staged_rows::tests::with_staged(16, |input| {
             let session = input.session();
             let raw = input.raw_bytes();
             let limits = Limits {
