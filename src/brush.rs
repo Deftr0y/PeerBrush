@@ -1,4 +1,6 @@
 //! Shared, bounded brush rasterization. Opacity caps a stroke; flow accumulates per dab.
+#[path = "brush/native.rs"]
+pub(crate) mod native;
 use crate::raster::{blend, Pixel, Raster, TILE};
 use serde_json::Value;
 use std::{
@@ -735,10 +737,12 @@ fn accumulate(
         }
         let tip = base_tip.with_radius(dab.radius);
         let b = dab_bounds(dab);
-        let left = b[0].max(clip[0]);
-        let top = b[1].max(clip[1]);
-        let right = b[2].min(clip[2]);
-        let bottom = b[3].min(clip[3]);
+        let [left, top, right, bottom] = [
+            b[0].max(clip[0]),
+            b[1].max(clip[1]),
+            b[2].min(clip[2]),
+            b[3].min(clip[3]),
+        ];
         if left >= right || top >= bottom {
             continue;
         }
@@ -748,34 +752,70 @@ fn accumulate(
                 let tile = coverage
                     .entry((tx, ty))
                     .or_insert_with(|| vec![0; (TILE * TILE) as usize]);
-                let tile_x = (tx * TILE) as i32;
-                let tile_y = (ty * TILE) as i32;
-                let x0 = left.max(tile_x);
-                let x1 = right.min(tile_x + TILE as i32);
-                let y0 = top.max(tile_y);
-                let y1 = bottom.min(tile_y + TILE as i32);
-                for y in y0..y1 {
-                    let row = ((y - tile_y) as u32 * TILE) as usize;
-                    for x in x0..x1 {
-                        if polygon.is_some_and(|selection| {
-                            !crate::selection::contains(selection, x as f32 + 0.5, y as f32 + 0.5)
-                        }) {
-                            continue;
-                        }
-                        let alpha = tip.at(dab.document_point, x, y) * settings.flow;
-                        if alpha <= 0.0 {
-                            continue;
-                        }
-                        let alpha_byte = &mut tile[row + (x - tile_x) as usize];
-                        let old = *alpha_byte as f32 / 255.0;
-                        *alpha_byte =
-                            ((old + alpha * (dab.opacity - old).max(0.0)) * 255.0).round() as u8;
-                    }
-                }
+                visit_tile_dab(
+                    dab,
+                    tip,
+                    clip,
+                    [(tx * TILE) as i32, (ty * TILE) as i32],
+                    polygon,
+                    |at, amount| {
+                        tile[at] = accumulated8(tile[at], amount, settings.flow, dab.opacity);
+                    },
+                );
             }
         }
     }
     touched
+}
+
+/// A single admitted tile's memory-only coverage kernel, shared by the resident
+/// gesture and explicit backed-tile workers. Each invocation visits at most 256² pixels.
+fn visit_tile_dab(
+    dab: Dab,
+    tip: Tip,
+    clip: [i32; 4],
+    origin: [i32; 2],
+    polygon: Option<&[[f32; 2]]>,
+    mut visit: impl FnMut(usize, f32),
+) {
+    let b = dab_bounds(dab);
+    let [left, top, right, bottom] = [
+        b[0].max(clip[0]).max(origin[0]),
+        b[1].max(clip[1]).max(origin[1]),
+        b[2].min(clip[2]).min(origin[0] + TILE as i32),
+        b[3].min(clip[3]).min(origin[1] + TILE as i32),
+    ];
+    for y in top..bottom {
+        let row = ((y - origin[1]) as u32 * TILE) as usize;
+        for x in left..right {
+            if polygon
+                .is_some_and(|p| !crate::selection::contains(p, x as f32 + 0.5, y as f32 + 0.5))
+            {
+                continue;
+            }
+            visit(
+                row + (x - origin[0]) as usize,
+                tip.at(dab.document_point, x, y),
+            );
+        }
+    }
+}
+
+fn accumulated8(value: u8, amount: f32, flow: f32, opacity: f32) -> u8 {
+    let alpha = amount * flow;
+    if alpha <= 0.0 {
+        return value;
+    }
+    let old = value as f32 / 255.0;
+    ((old + alpha * (opacity - old).max(0.0)) * 255.0).round() as u8
+}
+fn accumulated16(value: u16, amount: f32, flow: f32, opacity: f32) -> u16 {
+    let alpha = amount as f64 * flow as f64;
+    if alpha <= 0.0 {
+        return value;
+    }
+    let old = value as f64 / 65535.0;
+    ((old + alpha * (opacity as f64 - old).max(0.0)) * 65535.0).round() as u16
 }
 
 fn apply_coverage16(
@@ -790,24 +830,38 @@ fn apply_coverage16(
         if coverage == 0 {
             continue;
         }
-        let alpha = coverage as f64 / 65535.0 * opacity as f64;
-        let old = [pixel[0], pixel[1], pixel[2], pixel[3]];
-        let mut src = color;
-        src[3] = (color[3] as f64 * alpha).round() as u16;
-        let result = if erase {
-            [
-                old[0],
-                old[1],
-                old[2],
-                (old[3] as f64 * (1.0 - src[3] as f64 / 65535.0)).round() as u16,
-            ]
-        } else {
-            crate::raster::blend16(old, src, 1.0, "normal")
-        };
+        let result = coverage_pixel16(
+            [pixel[0], pixel[1], pixel[2], pixel[3]],
+            coverage,
+            opacity,
+            color,
+            erase,
+        );
         nonzero |= result != [0; 4];
         pixel.copy_from_slice(&result);
     }
     nonzero
+}
+fn coverage_pixel16(
+    old: [u16; 4],
+    coverage: u16,
+    opacity: f32,
+    color: [u16; 4],
+    erase: bool,
+) -> [u16; 4] {
+    let alpha = coverage as f64 / 65535.0 * opacity as f64;
+    let mut src = color;
+    src[3] = (color[3] as f64 * alpha).round() as u16;
+    if erase {
+        [
+            old[0],
+            old[1],
+            old[2],
+            (old[3] as f64 * (1.0 - src[3] as f64 / 65535.0)).round() as u16,
+        ]
+    } else {
+        crate::raster::blend16(old, src, 1.0, "normal")
+    }
 }
 
 fn accumulate16(
@@ -825,10 +879,12 @@ fn accumulate16(
         }
         let tip = base_tip.with_radius(dab.radius);
         let b = dab_bounds(dab);
-        let left = b[0].max(clip[0]);
-        let top = b[1].max(clip[1]);
-        let right = b[2].min(clip[2]);
-        let bottom = b[3].min(clip[3]);
+        let [left, top, right, bottom] = [
+            b[0].max(clip[0]),
+            b[1].max(clip[1]),
+            b[2].min(clip[2]),
+            b[3].min(clip[3]),
+        ];
         if left >= right || top >= bottom {
             continue;
         }
@@ -838,26 +894,16 @@ fn accumulate16(
                 let tile = coverage
                     .entry((tx, ty))
                     .or_insert_with(|| vec![0; (TILE * TILE) as usize]);
-                let tile_x = (tx * TILE) as i32;
-                let tile_y = (ty * TILE) as i32;
-                for y in top.max(tile_y)..bottom.min(tile_y + TILE as i32) {
-                    let row = ((y - tile_y) as u32 * TILE) as usize;
-                    for x in left.max(tile_x)..right.min(tile_x + TILE as i32) {
-                        if polygon.is_some_and(|p| {
-                            !crate::selection::contains(p, x as f32 + 0.5, y as f32 + 0.5)
-                        }) {
-                            continue;
-                        }
-                        let alpha = tip.at(dab.document_point, x, y) as f64 * settings.flow as f64;
-                        if alpha <= 0.0 {
-                            continue;
-                        }
-                        let byte = &mut tile[row + (x - tile_x) as usize];
-                        let old = *byte as f64 / 65535.0;
-                        *byte = ((old + alpha * (dab.opacity as f64 - old).max(0.0)) * 65535.0)
-                            .round() as u16;
-                    }
-                }
+                visit_tile_dab(
+                    dab,
+                    tip,
+                    clip,
+                    [(tx * TILE) as i32, (ty * TILE) as i32],
+                    polygon,
+                    |at, amount| {
+                        tile[at] = accumulated16(tile[at], amount, settings.flow, dab.opacity);
+                    },
+                );
             }
         }
     }
