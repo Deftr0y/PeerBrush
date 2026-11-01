@@ -185,8 +185,7 @@ mod tests {
     use crate::{
         engine::{Document, Engine, History, Scope},
         large_document::{Limits, Store},
-        raster::backed::Plane,
-        Raster,
+        raster::{backed::Plane, Raster},
     };
     struct Fixture {
         store: Option<Store>,
