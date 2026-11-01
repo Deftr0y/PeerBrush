@@ -820,6 +820,10 @@ impl Review {
 
 impl PeerBrush {
     pub(super) fn request_close(&mut self, intent: Intent) {
+        if self.edit_worker.pending() {
+            self.message = "Wait for the edit result before closing the project".into();
+            return;
+        }
         #[cfg(target_os = "macos")]
         if intent == Intent::Exit && self.native_update_quit() {
             return;
