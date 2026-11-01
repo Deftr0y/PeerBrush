@@ -2791,3 +2791,151 @@ fn guarded_brush_transaction_replans_working_sources_and_publishes_one_history_e
         }
     }
 }
+
+#[test]
+fn guarded_unchanged_heal_preserves_physical_sources_and_records_command_history() {
+    use crate::{
+        brush::input::StrokePoints,
+        engine::native::{
+            CommandDescriptor, Direction, HistoryRequest, NativeHistory, Publication,
+        },
+    };
+    let f = Fixture::new();
+    let (runtime, _connection) = f.runtime();
+    let session = runtime.begin().unwrap();
+    for depth in [8, 16] {
+        let mut source = Document::new_depth(9, 7, depth).unwrap();
+        for y in 0..7 {
+            for x in 0..9 {
+                source.layers[0]
+                    .pixels
+                    .set16(x, y, [23521, 36791, 51237, 65535]);
+            }
+        }
+        let command = serde_json::json!({"op":"heal","layer":source.layers[0].id,
+            "points":[[4.,3.]],"source":[4.,3.],"radius":1.,"heal_radius":2});
+        let mut legacy = crate::engine::Engine::new();
+        legacy.doc = source.clone();
+        legacy
+            .edit("human", &[command.clone()], None, None, "Unchanged heal")
+            .unwrap();
+        assert_eq!(legacy.undo.len(), 1);
+        assert_eq!(legacy.doc.revision, 1);
+        let mut document = native(&source, &session);
+        let original_slot = document.metadata().layer(0).unwrap().pixels().slot();
+        let source_key = document.source(original_slot).unwrap().key();
+        let disk_before = session.disk().used().unwrap();
+        let descriptor =
+            CommandDescriptor::from_normalized(&document, 0, &[command], &|| Ok(())).unwrap();
+        let captured = document
+            .capture_descriptor(descriptor, "human", &[], 1, false, true)
+            .unwrap();
+        let token = {
+            let command = captured.descriptor().unwrap().commands().next().unwrap();
+            let input =
+                RasterInput::from_parameters(captured.document(), command.parameters()).unwrap();
+            let points = StrokePoints::from_command(command, input.pool(), &mut || Ok(())).unwrap();
+            let frame = input
+                .stroke_frame(command, &points, &mut || Ok(()))
+                .unwrap();
+            assert!(frame.is_none());
+            let stroke = points.local(&input, None, &mut || Ok(())).unwrap();
+            let guard = WriteGuard::new(&captured, command, &input, None).unwrap();
+            let built = crate::retouch::input::stage_guarded(
+                &input,
+                &input,
+                &stroke,
+                None,
+                &guard,
+                &session,
+                &mut || Ok(()),
+            )
+            .unwrap();
+            assert!(matches!(built, BuiltTiles::Unchanged));
+            // The actual full command is validated above, and its native output
+            // is byte-identical. No frame/kind/source metadata transition exists.
+            command.token()
+        };
+        let delta = captured.unchanged(token, &|| Ok(())).unwrap();
+        let mut history = NativeHistory::new(&runtime.resident(), 20).unwrap();
+        let commit = history
+            .snapshot()
+            .prepare_commit(
+                &document,
+                delta,
+                HistoryRequest {
+                    actor: "human",
+                    label: "Unchanged heal",
+                    task: None,
+                    gesture: None,
+                },
+                &|| Ok(()),
+            )
+            .unwrap();
+        let retired = history
+            .commit(
+                &mut document,
+                Publication {
+                    actor: "human",
+                    leases: &[],
+                    now: 1,
+                    closed: false,
+                    write_available: true,
+                },
+                commit,
+            )
+            .unwrap();
+        retired.retire(&session, &|| Ok(())).unwrap();
+        assert_eq!(history.undo_len(), 1);
+        assert_eq!(document.metadata().revision(), 1);
+        assert_eq!(session.disk().used().unwrap(), disk_before);
+        assert_eq!(
+            document
+                .source(document.metadata().layer(0).unwrap().pixels().slot())
+                .unwrap()
+                .key(),
+            source_key
+        );
+        for direction in [None, Some(Direction::Undo), Some(Direction::Redo)] {
+            if let Some(direction) = direction {
+                let movement = history
+                    .snapshot()
+                    .prepare_move(&document, direction, "human", &|| Ok(()))
+                    .unwrap();
+                drop(
+                    history
+                        .move_cursor(
+                            &mut document,
+                            Publication {
+                                actor: "human",
+                                leases: &[],
+                                now: 1,
+                                closed: false,
+                                write_available: true,
+                            },
+                            movement,
+                        )
+                        .unwrap(),
+                );
+            }
+            let pixels = document
+                .source(document.metadata().layer(0).unwrap().pixels().slot())
+                .unwrap()
+                .prepare_region(Region::new([0, 0, 9, 7]).unwrap(), &mut || Ok(()))
+                .unwrap();
+            for y in 0..7 {
+                for x in 0..9 {
+                    assert_eq!(
+                        pixels.pixel16(x, y).unwrap(),
+                        source.layers[0].pixels.get16(x, y)
+                    );
+                    assert_eq!(
+                        pixels.pixel16(x, y).unwrap(),
+                        legacy.doc.layers[0].pixels.get16(x, y)
+                    );
+                }
+            }
+            assert_eq!(session.disk().used().unwrap(), disk_before);
+        }
+    }
+}
