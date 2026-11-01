@@ -34,6 +34,13 @@ impl RasterRoster {
     pub fn len(&self) -> usize {
         self.entries.len()
     }
+    pub(crate) fn descriptor_bytes(&self) -> Result<usize> {
+        self.entries
+            .capacity()
+            .checked_mul(std::mem::size_of::<Surface>())
+            .and_then(|bytes| bytes.checked_add(128))
+            .ok_or_else(|| "Native roster footprint overflow".into())
+    }
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
