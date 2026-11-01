@@ -4,6 +4,7 @@
 // license that can be found in the LICENSE file.
 
 #include "lib/jxl/enc_heuristics.h"
+#include "lib/jxl/enc_sharper_rows.h"
 
 #include <jxl/cms_interface.h>
 #include <jxl/memory_manager.h>
@@ -277,129 +278,26 @@ void CreateMask(const ImageF& image, ImageF& mask) {
 // resulting pixels within certain bounds of a small region in the original
 // image.
 Status DownsampleImage2_Sharper(const ImageF& input, ImageF* output) {
-  const int64_t kernelx = 12;
-  const int64_t kernely = 12;
-  JxlMemoryManager* memory_manager = input.memory_manager();
-
-  static const float kernel[144] = {
-      -0.000314256996835, -0.000314256996835, -0.000897597057705,
-      -0.000562751488849, -0.000176807273646, 0.001864627368902,
-      0.001864627368902,  -0.000176807273646, -0.000562751488849,
-      -0.000897597057705, -0.000314256996835, -0.000314256996835,
-      -0.000314256996835, -0.001527942804748, -0.000121760530512,
-      0.000191123989093,  0.010193185932466,  0.058637519197110,
-      0.058637519197110,  0.010193185932466,  0.000191123989093,
-      -0.000121760530512, -0.001527942804748, -0.000314256996835,
-      -0.000897597057705, -0.000121760530512, 0.000946363683751,
-      0.007113577630288,  0.000437956841058,  -0.000372823835211,
-      -0.000372823835211, 0.000437956841058,  0.007113577630288,
-      0.000946363683751,  -0.000121760530512, -0.000897597057705,
-      -0.000562751488849, 0.000191123989093,  0.007113577630288,
-      0.044592622228814,  0.000222278879007,  -0.162864473015945,
-      -0.162864473015945, 0.000222278879007,  0.044592622228814,
-      0.007113577630288,  0.000191123989093,  -0.000562751488849,
-      -0.000176807273646, 0.010193185932466,  0.000437956841058,
-      0.000222278879007,  -0.000913092543974, -0.017071696107902,
-      -0.017071696107902, -0.000913092543974, 0.000222278879007,
-      0.000437956841058,  0.010193185932466,  -0.000176807273646,
-      0.001864627368902,  0.058637519197110,  -0.000372823835211,
-      -0.162864473015945, -0.017071696107902, 0.414660099370354,
-      0.414660099370354,  -0.017071696107902, -0.162864473015945,
-      -0.000372823835211, 0.058637519197110,  0.001864627368902,
-      0.001864627368902,  0.058637519197110,  -0.000372823835211,
-      -0.162864473015945, -0.017071696107902, 0.414660099370354,
-      0.414660099370354,  -0.017071696107902, -0.162864473015945,
-      -0.000372823835211, 0.058637519197110,  0.001864627368902,
-      -0.000176807273646, 0.010193185932466,  0.000437956841058,
-      0.000222278879007,  -0.000913092543974, -0.017071696107902,
-      -0.017071696107902, -0.000913092543974, 0.000222278879007,
-      0.000437956841058,  0.010193185932466,  -0.000176807273646,
-      -0.000562751488849, 0.000191123989093,  0.007113577630288,
-      0.044592622228814,  0.000222278879007,  -0.162864473015945,
-      -0.162864473015945, 0.000222278879007,  0.044592622228814,
-      0.007113577630288,  0.000191123989093,  -0.000562751488849,
-      -0.000897597057705, -0.000121760530512, 0.000946363683751,
-      0.007113577630288,  0.000437956841058,  -0.000372823835211,
-      -0.000372823835211, 0.000437956841058,  0.007113577630288,
-      0.000946363683751,  -0.000121760530512, -0.000897597057705,
-      -0.000314256996835, -0.001527942804748, -0.000121760530512,
-      0.000191123989093,  0.010193185932466,  0.058637519197110,
-      0.058637519197110,  0.010193185932466,  0.000191123989093,
-      -0.000121760530512, -0.001527942804748, -0.000314256996835,
-      -0.000314256996835, -0.000314256996835, -0.000897597057705,
-      -0.000562751488849, -0.000176807273646, 0.001864627368902,
-      0.001864627368902,  -0.000176807273646, -0.000562751488849,
-      -0.000897597057705, -0.000314256996835, -0.000314256996835};
-
-  int64_t xsize = input.xsize();
-  int64_t ysize = input.ysize();
-
-  JXL_ASSIGN_OR_RETURN(ImageF box_downsample,
-                       ImageF::Create(memory_manager, xsize, ysize));
-  JXL_RETURN_IF_ERROR(CopyImageTo(input, &box_downsample));
-  JXL_ASSIGN_OR_RETURN(box_downsample, DownsampleImage(box_downsample, 2));
-
-  JXL_ASSIGN_OR_RETURN(ImageF mask,
-                       ImageF::Create(memory_manager, box_downsample.xsize(),
-                                      box_downsample.ysize()));
-  CreateMask(box_downsample, mask);
-
-  for (size_t y = 0; y < output->ysize(); y++) {
-    float* row_out = output->Row(y);
-    const float* row_in[kernely];
-    const float* row_mask = mask.Row(y);
-    // get the rows in the support
-    for (size_t ky = 0; ky < kernely; ky++) {
-      int64_t iy = y * 2 + ky - (kernely - 1) / 2;
-      if (iy < 0) iy = 0;
-      if (iy >= ysize) iy = ysize - 1;
-      row_in[ky] = input.Row(iy);
-    }
-
-    for (size_t x = 0; x < output->xsize(); x++) {
-      // get min and max values of the original image in the support
-      float min = std::numeric_limits<float>::max();
-      float max = std::numeric_limits<float>::min();
-      // kernelx - R and kernely - R are the radius of a rectangular region in
-      // which the values of a pixel are bounded to reduce ringing.
-      static constexpr int64_t R = 5;
-      for (int64_t ky = R; ky + R < kernely; ky++) {
-        for (int64_t kx = R; kx + R < kernelx; kx++) {
-          int64_t ix = x * 2 + kx - (kernelx - 1) / 2;
-          if (ix < 0) ix = 0;
-          if (ix >= xsize) ix = xsize - 1;
-          min = std::min<float>(min, row_in[ky][ix]);
-          max = std::max<float>(max, row_in[ky][ix]);
-        }
-      }
-
-      float sum = 0;
-      for (int64_t ky = 0; ky < kernely; ky++) {
-        for (int64_t kx = 0; kx < kernelx; kx++) {
-          int64_t ix = x * 2 + kx - (kernelx - 1) / 2;
-          if (ix < 0) ix = 0;
-          if (ix >= xsize) ix = xsize - 1;
-          sum += row_in[ky][ix] * kernel[ky * kernelx + kx];
-        }
-      }
-
-      row_out[x] = sum;
-
-      // Clamp the pixel within the value  of a small area to prevent ringning.
-      // The mask determines how much to clamp, clamp more to reduce more
-      // ringing in smooth areas, clamp less in noisy areas to get more
-      // sharpness. Higher mask_multiplier gives less clamping, so less
-      // ringing reduction.
-      const constexpr float mask_multiplier = 1;
-      float a = row_mask[x] * mask_multiplier;
-      float clip_min = min - a;
-      float clip_max = max + a;
-      if (row_out[x] < clip_min) {
-        row_out[x] = clip_min;
-      } else if (row_out[x] > clip_max) {
-        row_out[x] = clip_max;
-      }
-    }
+  JXL_ENSURE(output->xsize() == DivCeil(input.xsize(), 2));
+  JXL_ENSURE(output->ysize() == DivCeil(input.ysize(), 2));
+  JXL_ASSIGN_OR_RETURN(
+      ImageF workspace,
+      ImageF::Create(input.memory_manager(),
+                     std::min(sharper_rows::kStride, input.xsize()),
+                     sharper_rows::kRows + 1));
+  for (size_t x = 0; x < output->xsize(); x += sharper_rows::kMaxWidth) {
+    JXL_ENSURE(sharper_rows::Region(
+        input.xsize(), input.ysize(), x, 0,
+        std::min(sharper_rows::kMaxWidth, output->xsize() - x), output->ysize(),
+        workspace.Row(0), workspace.PixelsPerRow() * workspace.ysize(),
+        [&](size_t y, size_t first, size_t count, float* target) {
+          std::copy(input.Row(y) + first, input.Row(y) + first + count, target);
+          return true;
+        },
+        [&](size_t y, size_t first, size_t count, const float* source) {
+          std::copy(source, source + count, output->Row(y) + first);
+          return true;
+        }));
   }
   return true;
 }

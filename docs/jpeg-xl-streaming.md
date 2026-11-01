@@ -87,8 +87,9 @@ native buffer is released; eight-ID/128MiB aggregate bounds remain. Fixed 64 KiB
 input and 64 KiB output callback buffers count inside the 128 MiB callback envelope.
 Larger unsupported requests refuse. Small thin-image assembly is a bounded
 compatibility path and does not qualify genuine group streaming or dense 16000.
-Pinned lossy-alpha restrictions remain a separate mandatory design/qualification
-gate; no algorithm/quality/alpha default has been changed to avoid that gate.
+VarDCT RGB with distance-zero alpha can stream at ordinary distances. Remaining
+option restrictions need separate qualification; no algorithm/quality/alpha
+default has been changed to avoid them.
 
 All child messages, including zero-payload controls, share the derived hard event
 ceiling `4*max_records + 4*ceil(raw_bytes/65536) + 64`, at most 1048576 events.
@@ -133,3 +134,23 @@ these owners outside the retained-state mutex, even during profile closing with
 no future codec request. Future codec work remains disabled after uncertain stop
 until restart. No filesystem retirement is inferred merely from worker exit.
 The new operation is not activated by these producer/transport components.
+
+The pinned `ModularPartIsLossless` test applies to the modular channels, not the
+VarDCT RGB distance. With the existing alpha distance 0 setting, a tiny 33×2050
+native 8/16-bit fixture at RGB distance 1/effort 3 reached the second DC-group halo,
+kept exact alpha/hidden RGB behavior, and matched separately isolated unchanged
+one-shot encoder/decoder pixels and decoded ICC byte-for-byte. This qualifies
+those small fixtures/options only. XYB output may return a canonical sRGB profile
+rather than the original ICC byte encoding; comparison must follow the unchanged
+decoder's actual output-profile contract, without relabeling its samples.
+
+Distances 10–15 still enable the pinned automatic 2× resampling and adjusted RGB
+distance. The streaming selector currently refuses this resampling. Its sharper
+filter now uses an exact regional fallible row kernel with 13 bounded workspace
+rows, including image-edge clamps and the original scalar accumulation order;
+the ordinary sharper path calls that kernel. This removes its full-plane copy,
+box and mask intermediates without changing filters or encoder options. Tiny
+bitwise old-reference tests cover odd edges, interior ROI boundaries, negative
+and signed-zero samples, wide/tall one-dimensional offsets and explicit failures.
+The full native high-distance group-coordinate and iterative-filter integration
+remains open; this refactor does not qualify high-distance 16000 exports.
