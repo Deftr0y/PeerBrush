@@ -530,7 +530,11 @@ mod tests {
         doc.selection = Some([0, 0, 16, 12]);
         doc.selection_polygon = Some(vec![[0., 0.], [16., 0.], [0., 12.]]);
         let mut collector = Collector(Vec::new());
+        let owner =
+            crate::psd::memory36::MetadataCharge::reserve(&pool, 1024 * 1024, &|| Ok(())).unwrap();
         let metadata = Document36::capture(&doc, &mut collector).unwrap();
+        let metadata =
+            crate::psd::memory36::Admitted::from_parts(std::sync::Arc::new(metadata), owner);
         let identity = SceneIdentity {
             project_id: crate::engine::id(),
             document_id: doc.id.clone(),

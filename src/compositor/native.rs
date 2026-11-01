@@ -524,7 +524,12 @@ mod tests {
             store,
             sources: vec![],
         };
+        let owner =
+            crate::psd::memory36::MetadataCharge::reserve(&budget, 8 * 1024 * 1024, &|| Ok(()))
+                .unwrap();
         let metadata = Document36::capture(doc, &mut capture).unwrap();
+        let metadata =
+            crate::psd::memory36::Admitted::from_parts(std::sync::Arc::new(metadata), owner);
         let pending = PendingScene::new(
             metadata,
             RasterRoster::new(capture.sources).unwrap(),

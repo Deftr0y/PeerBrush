@@ -1,5 +1,17 @@
 # PeerBrush v0.3 — development
 
+November 1 native-source foundations (unreleased): explicit captured scenes,
+fallible prepared regions, native tile edit kernels and complete bounded Source36
+container verification are being integrated. Source36 has its own strict metadata,
+bulk-tile and standard-byte bindings; legacy source formats remain independent.
+Unpublished staging fragments can retire only after their complete known prefix,
+identity and ownership are verified. Published or uncertain fragments retain their
+bytes and quota. Native composition keeps the existing precision of clipping,
+pass-through folders, fractional masks and disabled-mask serialization. These
+components do not raise the live 8192-edge/32MP limits. Complete large-document
+editing, history, recovery, standard save/reopen and native workspace acceptance
+remain required before unrestricted 16000-square readiness can be claimed.
+
 October 31 distribution scope (unreleased): Windows uses Microsoft Store
 installation and Store-managed updates. Standalone Windows signing, App Installer
 and the dormant direct-update lifecycle are separate historical work, not release
