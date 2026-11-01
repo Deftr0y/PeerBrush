@@ -3,7 +3,7 @@ use super::{
     bulk36::{self, BulkLimits, BulkPlan, Descriptor, Digest, RasterSpec},
     canonical36::{Canonical, Limits},
 };
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 use std::io::Read;
 
@@ -100,11 +100,11 @@ pub(crate) struct Raster {
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Core {
+pub(crate) struct Core<T = Value> {
     pub format: u32,
     pub source_id: String,
     pub revision: u64,
-    pub metadata: Value,
+    pub metadata: T,
     pub rasters: Vec<Raster>,
     pub tiles: u32,
     pub references: u32,
@@ -174,8 +174,8 @@ fn source_id(text: &str) -> bool {
 
 /// A staged core binds metadata bytes/declared raster roster only. The engine
 /// must independently validate its exhaustive typed DTO and source semantics.
-pub(crate) struct StagedCore {
-    wire: Core,
+pub(crate) struct StagedCore<T = Value> {
+    wire: Core<T>,
     sha256: Digest,
     rasters: Vec<RasterSpec>,
     tile_root: Digest,
@@ -232,10 +232,12 @@ impl StagedCore {
             reference_root,
         })
     }
+}
+impl<T> StagedCore<T> {
     pub(crate) fn sha256(&self) -> Digest {
         self.sha256
     }
-    pub(crate) fn metadata(&self) -> &Value {
+    pub(crate) fn metadata(&self) -> &T {
         &self.wire.metadata
     }
     pub(crate) fn source_id(&self) -> &str {
@@ -246,8 +248,8 @@ impl StagedCore {
     }
 }
 
-pub(crate) struct Manifest {
-    core: StagedCore,
+pub(crate) struct Manifest<T = Value> {
+    core: StagedCore<T>,
     chunks: Vec<Descriptor>,
     standard_layer_bytes: u64,
     standard_composite_bytes: u64,
@@ -285,7 +287,22 @@ impl Manifest {
         bulk: BulkLimits,
         check: &dyn Fn() -> Result<(), String>,
     ) -> Result<Self, String> {
-        let (_, value) = Canonical::parse(bytes, metadata, check)?.into_parts();
+        Self::from_canonical(
+            Canonical::parse(bytes, metadata, check)?,
+            metadata,
+            bulk,
+            check,
+        )
+    }
+    /// Consume an already admitted canonical tree rather than copying or parsing
+    /// the raw manifest again. The caller must retain its metadata charge owner.
+    pub(crate) fn from_canonical(
+        canonical: Canonical,
+        metadata: Limits,
+        bulk: BulkLimits,
+        check: &dyn Fn() -> Result<(), String>,
+    ) -> Result<Self, String> {
+        let (_, value) = canonical.into_parts();
         let wire: Wire = serde_json::from_value(value).map_err(|e| e.to_string())?;
         if wire.format != 36 {
             return Err("Unknown Source36 manifest version".into());
@@ -320,15 +337,77 @@ impl Manifest {
             check,
         )
     }
+    /// Moving the typed metadata also moves the caller's Admitted owner. Exact
+    /// canonical roundtrip forbids ignored, defaulted or narrowed source fields.
+    /// The closure must validate the full DTO/roster and document identity; this
+    /// generic conversion grants no source, semantic or publication authority.
+    pub(crate) fn into_typed<T: DeserializeOwned + Serialize>(
+        self,
+        limits: Limits,
+        check: &dyn Fn() -> Result<(), String>,
+        validate: impl FnOnce(&T, &[RasterSpec], &str, u64) -> Result<(), String>,
+    ) -> Result<Manifest<T>, String> {
+        check()?;
+        let Core {
+            format,
+            source_id,
+            revision,
+            metadata,
+            rasters,
+            tiles,
+            references,
+            tile_root,
+            reference_root,
+        } = self.core.wire;
+        let (original, original_tree) =
+            Canonical::from_serializable(&metadata, limits, check)?.into_parts();
+        drop(original_tree);
+        let typed: T = serde_json::from_value(metadata).map_err(|e| e.to_string())?;
+        let converted = Canonical::from_serializable(&typed, limits, check)?;
+        if original != converted.bytes() {
+            return Err(
+                "Source36 typed metadata does not preserve its exact canonical fields".into(),
+            );
+        }
+        drop(converted);
+        drop(original);
+        validate(&typed, &self.core.rasters, &source_id, revision)?;
+        check()?;
+        Ok(Manifest {
+            core: StagedCore {
+                wire: Core {
+                    format,
+                    source_id,
+                    revision,
+                    metadata: typed,
+                    rasters,
+                    tiles,
+                    references,
+                    tile_root,
+                    reference_root,
+                },
+                sha256: self.core.sha256,
+                rasters: self.core.rasters,
+                tile_root: self.core.tile_root,
+                reference_root: self.core.reference_root,
+            },
+            chunks: self.chunks,
+            standard_layer_bytes: self.standard_layer_bytes,
+            standard_composite_bytes: self.standard_composite_bytes,
+            standard_sha256: self.standard_sha256,
+        })
+    }
+}
+impl<T: Serialize> Manifest<T> {
     pub(crate) fn canonical(
         &self,
         limits: Limits,
         check: &dyn Fn() -> Result<(), String>,
     ) -> Result<Canonical, String> {
         #[derive(Serialize)]
-        struct Emitted<'a> {
+        struct Emitted<'a, T> {
             format: u32,
-            core: &'a Core,
+            core: &'a Core<T>,
             core_sha256: String,
             standard: Standard,
             chunks: Vec<Chunk>,
@@ -361,7 +440,9 @@ impl Manifest {
             check,
         )
     }
-    pub(crate) fn core(&self) -> &StagedCore {
+}
+impl<T> Manifest<T> {
+    pub(crate) fn core(&self) -> &StagedCore<T> {
         &self.core
     }
     pub(crate) fn plan(&self) -> BulkPlan<'_> {
@@ -412,7 +493,7 @@ pub(crate) struct CompletedStandard {
     sha256: Digest,
 }
 impl CompletedStandard {
-    pub(crate) fn check(&self, manifest: &Manifest) -> Result<(), String> {
+    pub(crate) fn check<T>(&self, manifest: &Manifest<T>) -> Result<(), String> {
         if self.core != manifest.core.sha256
             || self.layer_bytes != manifest.standard_layer_bytes
             || self.composite_bytes != manifest.standard_composite_bytes
@@ -635,5 +716,103 @@ mod tests {
             &check
         )
         .is_err());
+    }
+
+    #[test]
+    fn consuming_typed_transition_preserves_exact_fields_identity_and_standard_proofs() {
+        #[derive(Serialize, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Metadata {
+            id: String,
+            revision: u64,
+            native: bool,
+        }
+        let check = || Ok(());
+        let original = fixture();
+        let token = original
+            .verify_standard(
+                &mut b"original-native-layer".as_slice(),
+                21,
+                &mut b"original-current-composite".as_slice(),
+                26,
+                &check,
+            )
+            .unwrap();
+        let canonical = original.canonical(metadata_limits(), &check).unwrap();
+        let parsed =
+            Manifest::from_canonical(canonical, metadata_limits(), bulk_limits(), &check).unwrap();
+        let typed = parsed
+            .into_typed::<Metadata>(
+                metadata_limits(),
+                &check,
+                |metadata, roster, id, revision| {
+                    if metadata.id != id || metadata.revision != revision || !roster.is_empty() {
+                        return Err("Typed document identity or raster roster differs".into());
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert!(typed.core().metadata().native);
+        token.check(&typed).unwrap();
+        assert_eq!(
+            typed.canonical(metadata_limits(), &check).unwrap().bytes(),
+            original
+                .canonical(metadata_limits(), &check)
+                .unwrap()
+                .bytes()
+        );
+        assert!(fixture()
+            .into_typed::<Metadata>(metadata_limits(), &check, |_, _, _, _| {
+                Err("Final typed source refusal".into())
+            })
+            .is_err());
+    }
+
+    #[test]
+    fn typed_transition_refuses_ignored_fields_defaults_and_narrowed_numbers() {
+        #[derive(Serialize, Deserialize)]
+        struct MissingField {
+            id: String,
+            revision: u64,
+        }
+        #[derive(Serialize, Deserialize)]
+        struct AddedField {
+            id: String,
+            revision: u64,
+            native: bool,
+            #[serde(default)]
+            extra: bool,
+        }
+        #[derive(Serialize, Deserialize)]
+        struct NarrowedNumber {
+            id: String,
+            revision: f32,
+            native: bool,
+        }
+        let check = || Ok(());
+        assert!(fixture()
+            .into_typed::<MissingField>(metadata_limits(), &check, |_, _, _, _| Ok(()))
+            .is_err());
+        assert!(fixture()
+            .into_typed::<AddedField>(metadata_limits(), &check, |_, _, _, _| Ok(()))
+            .is_err());
+        let mut wire = core();
+        wire.metadata["revision"] = json!(16777217);
+        let core = StagedCore::new(wire, metadata_limits(), bulk_limits(), &check).unwrap();
+        let original = fixture();
+        let changed = Manifest::bind(
+            core,
+            21,
+            26,
+            original.standard_sha256,
+            vec![],
+            bulk_limits(),
+            &check,
+        )
+        .unwrap();
+        assert!(changed
+            .into_typed::<NarrowedNumber>(metadata_limits(), &check, |_, _, _, _| Ok(()))
+            .is_err());
     }
 }
