@@ -71,6 +71,15 @@ computed from adjacent scalar rows. The existing 500,000-edge limit remains;
 directed contours retain holes and separate diagonally touching regions. Final
 source/revision/lease admission remains the engine's responsibility.
 
+The candidate worker connects explicit source-row preparation, flood completion,
+span ordering, soft-edge rows, prior-selection combination and the owned tile
+writer. It releases traversal buffers before scalar filtering and releases span
+buffers before final contour construction. No restriction remains an empty
+combination baseline, matching the existing add/subtract/intersect behavior.
+The worker checks source/cancellation through every stage and returns only a
+candidate coverage source. It grants no larger live-document admission, history
+commit or permission to bypass source locks and reservations.
+
 Component checks compare complete masks with an independent pixel BFS, including
 holes, tile edges, several seed colors, Quick radius, generation rollover and
 failure after provisional output. The opt-in 256MP traversal uses computed
