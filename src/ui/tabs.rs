@@ -233,8 +233,8 @@ impl PeerBrush {
                 self.project_labels.insert(
                     id.clone(),
                     Label {
-                        name: e.doc.name.clone(),
-                        dirty: e.doc.revision != e.saved_revision,
+                        name: crate::engine::view::current(&e).name().to_owned(),
+                        dirty: crate::engine::view::current(&e).revision() != e.saved_revision,
                         ai: !e.leases.is_empty()
                             || e.ai_change.as_ref().is_some_and(|change| {
                                 crate::engine::now().saturating_sub(change.at) < 3
@@ -311,28 +311,31 @@ impl PeerBrush {
                                         )
                                     {
                                         if let Some(drag) = &self.layer_drag {
-                                            if let Ok(e) = shared.try_lock() {
-                                                let target = self
+                                            let target = shared.try_lock().ok().map(|engine| {
+                                                let view = crate::engine::view::current(&engine);
+                                                let selected = self
                                                     .project_views
                                                     .get(id)
-                                                    .map(|v| v.selected.clone())
-                                                    .filter(|target| {
-                                                        e.doc.layers.iter().any(|l| l.id == *target)
-                                                    })
-                                                    .unwrap_or_else(|| {
-                                                        e.doc
-                                                            .layers
-                                                            .first()
-                                                            .map(|l| l.id.clone())
-                                                            .unwrap_or_default()
-                                                    });
+                                                    .map(|v| v.selected.as_str())
+                                                    .and_then(|id| view.find_layer(id))
+                                                    .or_else(|| view.layer(0))
+                                                    .map(|layer| layer.id().to_owned())
+                                                    .unwrap_or_default();
+                                                (selected, view.id().to_owned(), view.revision())
+                                            });
+                                            if let Some((target, document, revision)) = target {
                                                 hovered = Some(TabTransfer {
                                                     source: self.project_id.clone(),
                                                     destination: id.clone(),
-                                                    source_document: self.doc_snapshot.id.clone(),
-                                                    destination_document: e.doc.id.clone(),
+                                                    source_document:
+                                                        crate::engine::view::DocumentView::from(
+                                                            &self.doc_snapshot,
+                                                        )
+                                                        .id()
+                                                        .to_owned(),
+                                                    destination_document: document,
                                                     source_revision: drag.revision,
-                                                    destination_revision: e.doc.revision,
+                                                    destination_revision: revision,
                                                     layers: drag.ids.clone(),
                                                     target,
                                                     move_layers: ctx.input(|i| i.modifiers.shift),
