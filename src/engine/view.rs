@@ -48,6 +48,11 @@ impl<'a> From<&'a DocumentSnapshot> for DocumentView<'a> {
         doc.view()
     }
 }
+impl<'a> From<&DocumentView<'a>> for DocumentView<'a> {
+    fn from(view: &DocumentView<'a>) -> Self {
+        *view
+    }
+}
 impl<'a> From<&'a Layer> for LayerView<'a> {
     fn from(layer: &'a Layer) -> Self {
         Self::Resident(layer)

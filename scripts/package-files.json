@@ -275,6 +275,7 @@
     "src/effects/posterize.rs",
     "src/effects/styles.rs",
     "src/engine.rs",
+    "src/engine/authority.rs",
     "src/engine/backed.rs",
     "src/engine/native.rs",
     "src/engine/native/admission.rs",

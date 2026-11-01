@@ -463,16 +463,19 @@ fn actual_workspace_embedded_source_snapshot_and_inspector_components() {
             );
             assert!(e.undo.is_empty() && e.redo.is_empty() && e.leases.is_empty());
             if embedded {
+                let DocumentSnapshot::Resident(snapshot) = &app.doc_snapshot else {
+                    panic!("This diagnostic explicitly measures resident compatibility")
+                };
                 assert!(Arc::ptr_eq(
                     &e.doc.layers[0].effects[0].settings,
                     &before.layers[0].effects[0].settings
                 ));
                 assert!(Arc::ptr_eq(
-                    &app.doc_snapshot.layers[0].effects[0].settings,
+                    &snapshot.layers[0].effects[0].settings,
                     &e.doc.layers[0].effects[0].settings
                 ));
                 assert!(Arc::ptr_eq(
-                    app.doc_snapshot.layers[0].source.as_ref().unwrap(),
+                    snapshot.layers[0].source.as_ref().unwrap(),
                     e.doc.layers[0].source.as_ref().unwrap()
                 ));
                 assert!(Arc::ptr_eq(
