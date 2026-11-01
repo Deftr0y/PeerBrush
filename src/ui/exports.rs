@@ -43,17 +43,19 @@ impl Drop for Editor {
     }
 }
 impl Editor {
-    fn source(&self, doc: &Document) -> Value {
+    fn source<'a>(&self, doc: impl Into<DocumentView<'a>>) -> Value {
+        let doc = doc.into();
         let targets = if self.selected_only {
             self.targets.clone()
         } else {
             vec![]
         };
-        json!({"action":"preview","project_id":self.project,"document_id":doc.id,"expected_revision":doc.revision,"settings":self.settings,"targets":targets,"max_edge":512})
+        json!({"action":"preview","project_id":self.project,"document_id":doc.id(),"expected_revision":doc.revision(),"settings":self.settings,"targets":targets,"max_edge":512})
     }
-    fn sync_preview(&mut self, doc: &Document) -> Value {
+    fn sync_preview<'a>(&mut self, doc: impl Into<DocumentView<'a>>) -> Value {
+        let doc = doc.into();
         let source = self.source(doc);
-        let desired = json!({"request":source,"document_name":doc.name}).to_string();
+        let desired = json!({"request":source,"document_name":doc.name()}).to_string();
         if desired != self.desired {
             self.desired = desired;
             self.changed_at = Instant::now();
@@ -68,7 +70,8 @@ impl Editor {
     }
 }
 impl PeerBrush {
-    pub(super) fn open_exports(&mut self, doc: &Document) {
+    pub(super) fn open_exports<'a>(&mut self, doc: impl Into<DocumentView<'a>>) {
+        let doc = doc.into();
         if self.export_editor.is_some() {
             return;
         }
@@ -76,7 +79,7 @@ impl PeerBrush {
         let (folder_tx, folder_rx) = mpsc::channel();
         self.export_editor = Some(Editor {
             project: self.project_id.clone(),
-            document: doc.id.clone(),
+            document: doc.id().to_owned(),
             settings: Settings::default(),
             selected_only: false,
             targets: self.selected_layer_ids(doc),
@@ -107,12 +110,17 @@ impl PeerBrush {
     pub(super) fn exports_capture_ready(&self) -> bool {
         self.export_editor.as_ref().is_none_or(|editor| {
             editor.project != self.project_id
-                || editor.document != self.doc_snapshot.id
+                || editor.document != DocumentView::from(&self.doc_snapshot).id()
                 || (editor.pending.is_none()
                     && (editor.preview.is_some() || editor.error.is_some()))
         })
     }
-    pub(super) fn exports_window(&mut self, ctx: &egui::Context, doc: &Document) {
+    pub(super) fn exports_window<'a>(
+        &mut self,
+        ctx: &egui::Context,
+        doc: impl Into<DocumentView<'a>>,
+    ) {
+        let doc = doc.into();
         let Some(mut editor) = self.export_editor.take() else {
             return;
         };
@@ -184,14 +192,14 @@ impl PeerBrush {
             .as_deref()
             .and_then(|id| export::jobs::state(&library, id).ok());
         let running = run.as_ref().is_some_and(|state| state.status == "running");
-        let valid = editor.document == doc.id;
+        let valid = editor.document == doc.id();
         let mut open = true;
         let mut save = false;
         let mut delete = false;
         let mut start = false;
         let mut cancel = false;
         egui::Window::new("Production export").id(egui::Id::new("production export")).open(&mut open).collapsible(false).default_width(800.).show(ctx,|ui| {
-            ui.label(RichText::new(&doc.name).strong());
+            ui.label(RichText::new(doc.name()).strong());
             ui.horizontal(|ui| {
                 ui.label("Format");
                 ui.selectable_value(&mut editor.settings.format,Format::Png,"PNG");
@@ -199,14 +207,14 @@ impl PeerBrush {
                 ui.selectable_value(&mut editor.settings.format,Format::Webp,"WebP · lossless 8-bit");
             });
             ui.label(format!("{} · {}",match editor.settings.format {
-                Format::Png=>format!("Native {}-bit output",doc.bit_depth),
-                Format::Jxl=>format!("Native {}-bit JPEG XL output",doc.bit_depth),
-                Format::Webp=>format!("8-bit output · {}-bit project unchanged",doc.bit_depth),
+                Format::Png=>format!("Native {}-bit output",doc.depth()),
+                Format::Jxl=>format!("Native {}-bit JPEG XL output",doc.depth()),
+                Format::Webp=>format!("8-bit output · {}-bit project unchanged",doc.depth()),
             },if editor.settings.format == Format::Jxl {
-                if doc.icc_profile.is_none() && !doc.srgb_tagged { "Untagged RGB encoded as sRGB" }
+                if doc.profile().is_none() && !doc.srgb_tagged() { "Untagged RGB encoded as sRGB" }
                 else if editor.settings.jxl.lossless { "ICC retained" }
                 else { "Decoded output may convert to sRGB" }
-            } else if doc.icc_profile.is_some()||doc.srgb_tagged { "ICC retained" } else { "untagged working RGB" }));
+            } else if doc.profile().is_some()||doc.srgb_tagged() { "ICC retained" } else { "untagged working RGB" }));
             if editor.settings.format == Format::Jxl {
                 ui.horizontal_wrapped(|ui| {
                     ui.checkbox(&mut editor.settings.jxl.lossless, "Lossless");
@@ -228,7 +236,7 @@ impl PeerBrush {
             }
             if !valid {
                 ui.label(RichText::new("The document source changed. Settings are retained; choose the current document before exporting.").color(ACCENT));
-                if ui.button("Use current document").clicked(){editor.document=doc.id.clone();editor.targets=self.selected_layer_ids(doc);editor.selected_only=false;}
+                if ui.button("Use current document").clicked(){editor.document=doc.id().to_owned();editor.targets=self.selected_layer_ids(doc);editor.selected_only=false;}
             }
             ui.horizontal(|ui| {
                 egui::ComboBox::from_id_salt("export preset").selected_text(editor.preset.as_ref().and_then(|id|snapshot.presets.iter().find(|p|&p.id==id)).map(|p|p.name.as_str()).unwrap_or("Unsaved settings")).show_ui(ui,|ui|{
@@ -245,12 +253,12 @@ impl PeerBrush {
                 let ui=&mut columns[0];
                 ui.horizontal(|ui|{
                     ui.selectable_value(&mut editor.selected_only,false,"Document composite");
-                    if ui.add_enabled(!doc.read_only,egui::Button::new("Selected layers/folders").selected(editor.selected_only)).clicked(){editor.selected_only=true;editor.targets=self.selected_layer_ids(doc);}
+                    if ui.add_enabled(!doc.read_only(),egui::Button::new("Selected layers/folders").selected(editor.selected_only)).clicked(){editor.selected_only=true;editor.targets=self.selected_layer_ids(doc);}
                 });
                 if editor.selected_only {
                     if ui.button("Use current layer selection").clicked(){editor.targets=self.selected_layer_ids(doc);}
-                    let roots=crate::tree::roots(doc,&editor.targets.iter().cloned().collect());
-                    for id in roots {if let Some(layer)=doc.layers.iter().find(|l|l.id==id){ui.label(&layer.name);}}
+                    let roots=crate::tree::roots_view(doc,&editor.targets.iter().cloned().collect());
+                    for id in roots {if let Some(layer)=doc.find_layer(&id){ui.label(layer.name());}}
                     ui.label(RichText::new("Isolated on transparency. Ancestor folders and document filters are excluded; a clipped layer needs its containing folder.").small().color(MUTED));
                 } else {ui.label(RichText::new("Current composite, including document filters.").small().color(MUTED));}
                 ui.label("Filename · {document} / {layer} / {variant}");ui.text_edit_singleline(&mut editor.settings.template);
@@ -294,7 +302,7 @@ impl PeerBrush {
                     ui.label(format!("Document bounds: {}, {} → {}, {}",output.document_rect[0],output.document_rect[1],output.document_rect[2],output.document_rect[3]));
                 }
                 if let Some(state)=&run {
-                    if state.document_id!=doc.id {ui.label(RichText::new("Batch from an earlier document source").small().color(MUTED));}
+                    if state.document_id!=doc.id() {ui.label(RichText::new("Batch from an earlier document source").small().color(MUTED));}
                     let color=if state.actor=="human" {ACCENT} else {AI_BLUE};ui.label(RichText::new(&state.stage).color(color));
                     if let Some(error)=&state.error {ui.label(RichText::new(error).color(ACCENT));}
                     egui::ScrollArea::vertical().id_salt("export receipts").max_height(160.).show(ui,|ui|{for receipt in &state.outputs {ui.label(format!("{} · {}",receipt.output.filename,receipt.status));if let Some(message)=&receipt.message {ui.label(RichText::new(message).small().color(MUTED));}}});
@@ -785,6 +793,50 @@ mod tests {
                 drop(shared);
                 std::fs::remove_dir_all(root).unwrap();
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+    #[test]
+    fn native_export_settings_bind_only_shared_document_metadata_and_keep_preview_requests_exact() {
+        for depth in [8, 16] {
+            let ctx = egui::Context::default();
+            let mut document = Document::new_depth(9, 7, depth).unwrap();
+            document.name = "Native export".into();
+            let mut engine = crate::engine::Engine::new();
+            engine.doc = document.clone();
+            let mut app = PeerBrush::init(
+                &ctx,
+                Arc::new(std::sync::Mutex::new(engine)),
+                Connection {
+                    port: 0,
+                    token: String::new(),
+                    state_dir: Default::default(),
+                    instance_lock: None,
+                    availability: Default::default(),
+                },
+            );
+            let pool = crate::large_document::ResidentBudget::new(8 * 1024 * 1024).unwrap();
+            let owner = crate::engine::view::DocumentSnapshot::from(
+                crate::tree::presentation_tests::native(&document, &pool),
+            );
+            let admitted = pool.used();
+            app.open_exports(owner.view());
+            let editor = app.export_editor.as_mut().unwrap();
+            let request = editor.source(owner.view());
+            assert_eq!(request, editor.source(&document));
+            assert_eq!(request["document_id"], document.id);
+            assert_eq!(request["expected_revision"], 0);
+            assert_eq!(request["max_edge"], 512);
+            assert_eq!(editor.sync_preview(owner.view()), request);
+            let desired = editor.desired.clone();
+            assert_eq!(editor.sync_preview(&document), request);
+            assert_eq!(editor.desired, desired);
+            assert!(editor.pending.is_none());
+            assert_eq!(pool.used(), admitted);
         }
     }
 }

@@ -17,19 +17,21 @@ const TOOLS: &[(&str, &str, Icon)] = &[
     ("object", "Object region", Icon::ObjectSelection),
 ];
 impl PeerBrush {
-    pub(super) fn selection_gesture_stale(&self, doc: &Document) -> bool {
+    pub(super) fn selection_gesture_stale<'a>(&self, doc: impl Into<DocumentView<'a>>) -> bool {
+        let doc = doc.into();
         self.selection_gesture_source
             .as_ref()
             .is_some_and(|source| {
-                source.document != doc.id
-                    || source.revision != doc.revision
+                source.document != doc.id()
+                    || source.revision != doc.revision()
                     || source.layer != self.selected
             })
     }
-    pub(super) fn selection_source(&self, doc: &Document) -> GestureSource {
+    pub(super) fn selection_source<'a>(&self, doc: impl Into<DocumentView<'a>>) -> GestureSource {
+        let doc = doc.into();
         GestureSource {
-            document: doc.id.clone(),
-            revision: doc.revision,
+            document: doc.id().to_owned(),
+            revision: doc.revision(),
             layer: self.selected.clone(),
         }
     }
@@ -43,20 +45,22 @@ impl PeerBrush {
         self.drag_start = None;
         self.drag_revision = None;
     }
-    pub(super) fn deselect_area(&mut self, doc: &Document, tool: bool) {
+    pub(super) fn deselect_area<'a>(&mut self, doc: impl Into<DocumentView<'a>>, tool: bool) {
+        let doc = doc.into();
         self.finish_parameter(true);
         self.cancel_geometry();
         self.cancel_source();
         self.cancel_filters();
         self.cancel_refinement();
         self.select_tool(if tool { Tool::None } else { self.tool });
-        if doc.selection.is_some() {
-            self.edit(vec![json!({"op":"selection.clear","document_id":doc.id,"source_revision":doc.revision})], "Deselect");
+        if doc.selection().is_some() {
+            self.edit(vec![json!({"op":"selection.clear","document_id":doc.id(),"source_revision":doc.revision()})], "Deselect");
         }
     }
-    fn wand_update_command(&self, doc: &Document) -> Value {
-        json!({"op":"selection.wand_update", "document_id":doc.id,
-            "source_revision":doc.revision, "tolerance":self.selection_tolerance,
+    fn wand_update_command<'a>(&self, doc: impl Into<DocumentView<'a>>) -> Value {
+        let doc = doc.into();
+        json!({"op":"selection.wand_update", "document_id":doc.id(),
+            "source_revision":doc.revision(), "tolerance":self.selection_tolerance,
             "feather":self.selection_feather, "contiguous":self.selection_contiguous,
             "sample_merged":self.selection_merged,"color_similarity":self.selection_color_similarity})
     }

@@ -437,7 +437,12 @@ impl PeerBrush {
             }
         }
     }
-    pub(super) fn configured_shortcuts(&mut self, input: &egui::InputState, doc: &Document) {
+    pub(super) fn configured_shortcuts<'a>(
+        &mut self,
+        input: &egui::InputState,
+        doc: impl Into<DocumentView<'a>>,
+    ) {
+        let doc = doc.into();
         if self.shortcuts.open || self.shortcuts.temporary.is_some() {
             return;
         }
