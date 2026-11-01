@@ -1013,7 +1013,7 @@ fn session_clone_and_heal_match_resident_source_offsets_and_soft_selection() {
     let (runtime, _connection) = f.runtime();
     let session = runtime.begin().unwrap();
     for depth in [8, 16] {
-        for heal in [false, true] {
+        for (heal, textured) in [(false, false), (true, false), (false, true), (true, true)] {
             let mode = if heal { "heal" } else { "clone" };
             let mut source = Document::new_depth(9, 7, depth).unwrap();
             let mut sample = crate::engine::Layer::new("Sample", "paint", 9, 7);
@@ -1031,9 +1031,33 @@ fn session_clone_and_heal_match_resident_source_offsets_and_soft_selection() {
                         x,
                         y,
                         [
-                            23521 + x as u16 * 173,
-                            43217 + y as u16 * 131,
-                            12347 + (x * y) as u16 * 113,
+                            if textured {
+                                if x % 2 == 0 {
+                                    60001
+                                } else {
+                                    7001
+                                }
+                            } else {
+                                23521 + x as u16 * 173
+                            },
+                            if textured {
+                                if y % 3 == 0 {
+                                    9001
+                                } else {
+                                    57001
+                                }
+                            } else {
+                                43217 + y as u16 * 131
+                            },
+                            if textured {
+                                if (x + y) % 3 == 0 {
+                                    53003
+                                } else {
+                                    11003
+                                }
+                            } else {
+                                12347 + (x * y) as u16 * 113
+                            },
                             if (x + y) % 4 == 0 { 0 } else { 45679 },
                         ],
                     );
@@ -1076,13 +1100,14 @@ fn session_clone_and_heal_match_resident_source_offsets_and_soft_selection() {
                 );
             }
             assert_eq!(legacy.undo.len(), 1);
+            assert_eq!(legacy.doc.revision, 1);
             let document = native(&source, &session);
             let input = RasterInput::layer(&document, &source.layers[0].id).unwrap();
             let sampling = RasterInput::layer(&document, &source_id).unwrap();
             let stroke =
                 LocalStroke::new(&input, &points, pressures.as_deref(), &mut || Ok(())).unwrap();
             let before = runtime.disk().used().unwrap();
-            let BuiltTiles::Draft(draft) = crate::retouch::input::stage_raster(
+            let built = crate::retouch::input::stage_raster(
                 &input,
                 &sampling,
                 &stroke,
@@ -1096,10 +1121,36 @@ fn session_clone_and_heal_match_resident_source_offsets_and_soft_selection() {
             .unwrap_or_else(|_| {
                 input_failure("retouch", "stage", depth, mode, "refused", 1);
                 panic!("Native retouch staging refused")
-            }) else {
-                input_failure("retouch", "stage", depth, mode, "refused", 0);
-                panic!("No retouch output")
+            });
+            let draft = match built {
+                BuiltTiles::Draft(draft) => draft,
+                BuiltTiles::Unchanged => {
+                    // A smooth 8-bit heal can round back to every original byte.
+                    // Legacy records the command, even when its pixels do not change.
+                    assert!(depth == 8 && heal && !textured);
+                    for y in 0..7 {
+                        for x in 0..9 {
+                            if source.layers[0].pixels.get16(x, y)
+                                != legacy.doc.layers[0].pixels.get16(x, y)
+                            {
+                                input_failure("retouch", "pixels", depth, mode, "pixel_count", 1);
+                            }
+                            assert_eq!(
+                                source.layers[0].pixels.get16(x, y),
+                                legacy.doc.layers[0].pixels.get16(x, y)
+                            );
+                        }
+                    }
+                    assert_eq!(runtime.disk().used().unwrap(), before);
+                    continue;
+                }
             };
+            if textured {
+                assert!(
+                    (0..7).any(|y| (0..9).any(|x| source.layers[0].pixels.get16(x, y)
+                        != legacy.doc.layers[0].pixels.get16(x, y)))
+                );
+            }
             let output = draft.seal(&|| Ok(())).unwrap_or_else(|_| {
                 input_failure("retouch", "seal", depth, mode, "refused", 1);
                 panic!("Native retouch sealing refused")
