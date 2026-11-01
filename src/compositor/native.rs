@@ -474,7 +474,7 @@ impl<'a> RawLayers<'a> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{
         engine::{
@@ -509,7 +509,7 @@ mod tests {
     pub(super) fn capture(doc: &Document) -> (SceneSnapshot, std::path::PathBuf) {
         capture_kind(doc, false)
     }
-    fn capture_kind(doc: &Document, native: bool) -> (SceneSnapshot, std::path::PathBuf) {
+    pub(crate) fn capture_kind(doc: &Document, native: bool) -> (SceneSnapshot, std::path::PathBuf) {
         let budget = ResidentBudget::new(32 * 1024 * 1024).unwrap();
         let disk = DiskBudget::new(128 * 1024 * 1024, 16).unwrap();
         let path = std::fs::canonicalize(std::env::temp_dir())
@@ -563,7 +563,7 @@ mod tests {
         .unwrap();
         (scene, path)
     }
-    pub(super) fn cleanup(path: &std::path::Path) {
+    pub(crate) fn cleanup(path: &std::path::Path) {
         let owned = std::fs::canonicalize(path).unwrap();
         assert_eq!(
             owned.parent().unwrap(),
@@ -576,7 +576,7 @@ mod tests {
             .starts_with("pb-native-compose-"));
         std::fs::remove_dir_all(owned).unwrap();
     }
-    pub(super) fn doc(depth: u16, pass: bool, blend: &str) -> Document {
+    pub(crate) fn doc(depth: u16, pass: bool, blend: &str) -> Document {
         let mut doc = Document::new_depth(9, 7, depth).unwrap();
         let mut folder = Layer::new("Folder", "group", 9, 7);
         folder.pixels = Raster::new_depth(9, 7, depth);

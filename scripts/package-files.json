@@ -342,6 +342,7 @@
     "src/production_export/library.rs",
     "src/production_export/native_grid.rs",
     "src/production_export/native_png.rs",
+    "src/production_export/native_rows.rs",
     "src/production_export/native_webp.rs",
     "src/production_export/native_webp/vp8l.rs",
     "src/production_export/png.rs",
