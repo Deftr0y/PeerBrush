@@ -19,6 +19,69 @@ use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
 };
+#[test]
+fn write_guard_records_only_verified_logical_changes_including_native_low_bits() {
+    for depth in [8, 16] {
+        let pool = ResidentBudget::new(16 * 1024 * 1024).unwrap();
+        let disk = crate::large_document::DiskBudget::new(1024 * 1024, 4).unwrap();
+        let document =
+            crate::engine::native::NativeDocument::new_blank(4, 2, depth, &pool, &disk, &|| Ok(()))
+                .unwrap();
+        let layer = document.metadata().layer(0).unwrap().id().to_owned();
+        let descriptor = crate::engine::native::CommandDescriptor::from_normalized(
+            &document,
+            0,
+            &[serde_json::json!({"op":"paint","layer":layer,"points":[[1.5,1.0]],"radius":1})],
+            &|| Ok(()),
+        )
+        .unwrap();
+        let capture = document
+            .capture_descriptor(descriptor, "human", &[], 0, false, true)
+            .unwrap();
+        let command = capture.descriptor().unwrap().commands().next().unwrap();
+        let input = RasterInput::from_parameters(&document, command.parameters()).unwrap();
+        let guard = WriteGuard::new(&capture, command, &input, None).unwrap();
+        let bpp = if depth == 16 { 8 } else { 4 };
+        let length = (crate::raster::TILE * crate::raster::TILE) as usize * bpp;
+        let before = ScratchBytes::new(&pool, length, length).unwrap().freeze();
+        guard
+            .check_tile(&input, None, (0, 0), &before, &before, &mut || Ok(()))
+            .unwrap();
+        assert_eq!(guard.write_bounds(), None);
+        let mut first = ScratchBytes::new(&pool, length, length).unwrap();
+        first[if depth == 16 { 1 } else { 0 }] = 1;
+        let first = first.freeze();
+        guard
+            .check_tile(&input, None, (0, 0), &before, &first, &mut || Ok(()))
+            .unwrap();
+        assert_eq!(guard.write_bounds(), Some([0, 0, 1, 1]));
+        let mut second = ScratchBytes::new(&pool, length, length).unwrap();
+        second[(crate::raster::TILE as usize + 1) * bpp + if depth == 16 { 1 } else { 0 }] = 1;
+        let second = second.freeze();
+        guard
+            .check_tile(&input, None, (0, 0), &before, &second, &mut || Ok(()))
+            .unwrap();
+        assert_eq!(guard.write_bounds(), Some([0, 0, 2, 2]));
+        let mut padding = ScratchBytes::new(&pool, length, length).unwrap();
+        padding[4 * bpp] = 1;
+        let padding = padding.freeze();
+        assert!(guard
+            .check_tile(&input, None, (0, 0), &before, &padding, &mut || Ok(()))
+            .is_err());
+        assert_eq!(guard.write_bounds(), Some([0, 0, 2, 2]));
+        capture.cancellation().cancel();
+        assert!(guard
+            .check_tile(&input, None, (0, 0), &before, &first, &mut || Ok(()))
+            .is_err());
+        assert_eq!(guard.write_bounds(), Some([0, 0, 2, 2]));
+        drop((padding, second, first, before));
+        drop(guard);
+        drop(input);
+        drop(capture);
+        drop(document);
+        assert_eq!(pool.used(), 0);
+    }
+}
 struct Fixture {
     root: PathBuf,
     held: Option<Directory>,

@@ -111,6 +111,51 @@ impl NativeCapture {
     }
 }
 impl DocumentAuthority {
+    pub(crate) fn capture_scene(
+        &self,
+        preview: Option<&Document>,
+        project_id: String,
+        leases: Vec<Lease>,
+        file_version: Option<crate::file_safety::Version>,
+        file_ownership: Option<Arc<crate::file_ownership::Ownership>>,
+    ) -> Result<super::scene::CapturedScene> {
+        match self {
+            Self::Resident(state) => {
+                let document = preview.unwrap_or(&state.document);
+                if document.id != state.document.id || document.revision != state.document.revision
+                {
+                    return Err("Preview does not belong to the captured project revision".into());
+                }
+                Ok(super::scene::CapturedScene::from_parts(
+                    document.clone(),
+                    project_id,
+                    leases,
+                    file_version,
+                    file_ownership,
+                ))
+            }
+            Self::Native(state) => {
+                if preview.is_some() {
+                    return Err(
+                        "Native previews require their captured prepared-output envelope".into(),
+                    );
+                }
+                let metadata = state.document.metadata();
+                let scene = super::scene::SceneSnapshot::from_native(
+                    super::scene::SceneIdentity {
+                        project_id,
+                        document_id: metadata.id().to_owned(),
+                        revision: metadata.revision(),
+                    },
+                    state.document.clone(),
+                    leases,
+                    file_version,
+                    file_ownership,
+                )?;
+                super::scene::CapturedScene::from_native(scene)
+            }
+        }
+    }
     pub(crate) fn from_resident(document: Document) -> Self {
         Self::Resident(ResidentAuthority {
             document,

@@ -28,6 +28,7 @@ pub(crate) struct WriteGuard<'c> {
     binding: InputBinding,
     shape: [u32; 2],
     origin: [i32; 2],
+    writes: std::cell::Cell<Option<[i32; 4]>>,
 }
 impl<'c> WriteGuard<'c> {
     pub(crate) fn new(
@@ -127,7 +128,22 @@ impl<'c> WriteGuard<'c> {
             binding: input.binding,
             shape,
             origin,
+            writes: std::cell::Cell::new(None),
         })
+    }
+    pub(crate) fn write_bounds(&self) -> Option<[i32; 4]> {
+        self.writes.get()
+    }
+    fn record_write(&self, bounds: [i32; 4]) {
+        self.writes.set(Some(match self.writes.get() {
+            None => bounds,
+            Some(old) => [
+                old[0].min(bounds[0]),
+                old[1].min(bounds[1]),
+                old[2].max(bounds[2]),
+                old[3].max(bounds[3]),
+            ],
+        }));
     }
     pub(crate) fn parameters(&self) -> &'c serde_json::Value {
         self.command.parameters()
@@ -186,6 +202,8 @@ impl<'c> WriteGuard<'c> {
         if let Some(bounds) = changed_bounds(input, frame, key, before, after, check)? {
             self.command
                 .check_write(input.document(), input.binding.slot, bounds)?;
+            self.check_active()?;
+            self.record_write(bounds);
         }
         self.check_active()
     }
@@ -216,6 +234,8 @@ impl<'c> WriteGuard<'c> {
             // unused plane is never replaced; the engine inserts a new child.
             self.command
                 .check_write(input.document(), input.binding.slot, bounds)?;
+            self.check_active()?;
+            self.record_write(bounds);
         }
         self.check_active()
     }
