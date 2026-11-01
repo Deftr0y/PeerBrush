@@ -376,12 +376,17 @@ mod tests {
         assert_eq!(source.contours(), &original.contours);
         let metadata = source.metadata_bytes();
         let descriptors = source.mask().physical_tiles().count() * 512 + 128;
-        assert_eq!(pool.used(), metadata + descriptors);
+        assert_eq!(pool.payload_used(), metadata + descriptors);
         let prepared = source
             .prepare_region(Region::new([0, 0, 8, 4]).unwrap(), &pool, &mut || Ok(()))
             .unwrap();
         assert_eq!(prepared.key(), source.key());
-        assert_eq!(pool.used(), 256 * 256 * 4 + metadata + descriptors);
+        let region_index = prepared.pixels.as_ref().unwrap().index_bytes();
+        assert_eq!(
+            pool.payload_used(),
+            256 * 256 * 4 + metadata + descriptors + region_index
+        );
+        let all_owners = pool.used();
         for y in 0..4 {
             for x in 0..8 {
                 assert_eq!(prepared.value(x, y).unwrap(), original.value(x, y));
@@ -394,7 +399,11 @@ mod tests {
         assert!(prepared.copy_row(1, &mut row[..2]).is_err());
         drop(source);
         drop(store);
-        assert_eq!(pool.used(), 256 * 256 * 4 + metadata + descriptors);
+        assert_eq!(
+            pool.payload_used(),
+            256 * 256 * 4 + metadata + descriptors + region_index
+        );
+        assert_eq!(pool.used(), all_owners);
         assert_eq!(prepared.value(3, 1).unwrap(), 31. / 255.);
         drop(prepared);
         assert_eq!(pool.used(), 0);
@@ -410,29 +419,46 @@ mod tests {
                 CoverageSource::stage_legacy(&legacy(), store.clone(), &mut || Ok(())).unwrap();
             let metadata = source.metadata_bytes();
             let descriptors = source.mask().physical_tiles().count() * 512 + 128;
+            let region = Region::new([3, 1, 7, 3]).unwrap();
+            // Warm only the weak Store index. Every native payload and ROI
+            // allocation must still be released after the cancelled pin.
+            let region_index = if cancel {
+                let view = source
+                    .prepare_region(region, &pool, &mut || Ok(()))
+                    .unwrap();
+                view.pixels.as_ref().unwrap().index_bytes()
+            } else {
+                0
+            };
             let baseline = metadata + descriptors;
+            assert_eq!(pool.payload_used(), baseline);
+            let all_owners = pool.used();
+            let cancelled_payload = std::cell::Cell::new(false);
             assert!(source
                 .prepare_region(
-                    Region::new([3, 1, 7, 3]).unwrap(),
+                    region,
                     &ResidentBudget::new(pool.limit()).unwrap(),
                     &mut || Ok(())
                 )
                 .is_err());
-            let result =
-                source.prepare_region(Region::new([3, 1, 7, 3]).unwrap(), &pool, &mut || {
-                    if cancel && pool.used() > baseline {
-                        Err(Error::Cancelled)
-                    } else {
-                        Ok(())
-                    }
-                });
+            let result = source.prepare_region(region, &pool, &mut || {
+                if cancel && pool.payload_used() > baseline + region_index {
+                    cancelled_payload.set(true);
+                    Err(Error::Cancelled)
+                } else {
+                    Ok(())
+                }
+            });
             assert!(matches!(
                 (cancel, result),
                 (false, Err(Error::Budget)) | (true, Err(Error::Cancelled))
             ));
-            assert_eq!(pool.used(), baseline);
+            assert_eq!(cancelled_payload.get(), cancel);
+            assert_eq!(pool.payload_used(), baseline);
+            assert_eq!(pool.used(), all_owners);
             drop(source);
             drop(store);
+            assert_eq!(pool.used(), 0);
             std::fs::remove_dir_all(path).unwrap();
         }
     }
