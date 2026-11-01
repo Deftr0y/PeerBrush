@@ -86,6 +86,26 @@ class Diagnostics(unittest.TestCase):
         self.assertEqual(output.count('Native codec diagnostic::'), 1)
         self.assertIn('category=protocol', output)
 
+    def test_native_broker_events_are_finite_exact_failure_scoped_and_private(self):
+        name = 'jpeg_xl::stream_parent::tests::actual_profile_staging_owned_mode1_worker_replay_and_isolated_decode_keep_native_samples'
+        header = f'test {name} ... FAILED\n---- {name} stdout ----\n'
+        phases = ['queue', 'source', 'launch', 'start', 'ready', 'rectangle', 'release', 'segment', 'done', 'exit', 'canonical']
+        records = [f'JXL_BROKER_STATUS phase={phase} depth={depth} category={category}'
+                   for depth in [8, 16] for phase in phases for category in ['begin', 'ok']]
+        output = self.summarize(header + '\n'.join(records) + '\n' + PRIVATE)
+        self.assertEqual(output.count('Native broker diagnostic::'), 44)
+        for record in records:
+            self.assertIn('Native broker diagnostic::' + record.removeprefix('JXL_BROKER_STATUS '), output)
+        valid = records[0]
+        for bad in [PRIVATE + valid, valid + ' ' + PRIVATE,
+                    valid.replace('phase=queue', 'phase=' + PRIVATE),
+                    valid.replace('depth=8', 'depth=32'), valid.replace('depth=8', 'depth=08'),
+                    valid.replace('category=begin', 'category=timeout')]:
+            self.assertNotIn('Native broker diagnostic::', self.summarize(header + bad + '\n' + PRIVATE))
+        self.assertNotIn('Native broker diagnostic::', self.summarize(header + (valid + '\n') * 45))
+        self.assertNotIn('Native broker diagnostic::', self.summarize('test other::case ... FAILED\n---- other::case stdout ----\n' + valid))
+        self.assertNotIn('Native broker diagnostic::', self.summarize('test result: ok. 1 passed; 0 failed; 0 ignored;\n' + valid, status=0))
+
     def test_section_location_never_exports_non_source_traversal_or_unselected_test(self):
         name = 'ui::bounded'
         for path in ['private/input.rs', 'src/../private.rs', 'src/private.rs:0:1', 'src/' + PRIVATE]:
