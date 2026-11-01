@@ -15,11 +15,12 @@ impl Editor {
     }
 }
 impl PeerBrush {
-    pub(super) fn segment_subject(&mut self, doc: &Document, region: bool) {
+    pub(super) fn segment_subject<'a>(&mut self, doc: impl Into<DocumentView<'a>>, region: bool) {
+        let doc = doc.into();
         self.cancel_refinement();
         self.animation.cancel();
         let shared = self.shared.clone();
-        let params = json!({"actor":"human","document_id":doc.id,"expected_revision":doc.revision,"rect":if region {doc.selection}else{None},"mode":self.selection_mode,"feedback":"request"});
+        let params = json!({"actor":"human","document_id":doc.id(),"expected_revision":doc.revision(),"rect":if region {doc.selection()}else{None},"mode":self.selection_mode,"feedback":"request"});
         self.job(move || {
             server::dispatch(&shared, "segment", &params)?;
             Ok("Subject selected · refine the edge from Select".into())
@@ -31,7 +32,12 @@ impl PeerBrush {
             .retain(|c| c["op"] != "selection.refine" && c["op"] != "mask.refine");
         self.last_preview = None;
     }
-    pub(super) fn open_refinement(&mut self, doc: &Document, target: Option<String>) {
+    pub(super) fn open_refinement<'a>(
+        &mut self,
+        doc: impl Into<DocumentView<'a>>,
+        target: Option<String>,
+    ) {
+        let doc = doc.into();
         self.cancel_filters();
         self.points.clear();
         self.drag_start = None;
@@ -40,8 +46,8 @@ impl PeerBrush {
         self.animation.cancel();
         self.isolate = false;
         self.refinement = Some(Editor {
-            document: doc.id.clone(),
-            revision: doc.revision,
+            document: doc.id().to_owned(),
+            revision: doc.revision(),
             target,
             preview: "cutout".into(),
             gesture: crate::engine::id(),
@@ -50,11 +56,16 @@ impl PeerBrush {
             layer: self.selected.clone(),
         });
     }
-    pub(super) fn refinement_window(&mut self, ctx: &egui::Context, doc: &Document) {
+    pub(super) fn refinement_window<'a>(
+        &mut self,
+        ctx: &egui::Context,
+        doc: impl Into<DocumentView<'a>>,
+    ) {
+        let doc = doc.into();
         let Some(mut editor) = self.refinement.take() else {
             return;
         };
-        if editor.document != doc.id || editor.revision != doc.revision {
+        if editor.document != doc.id() || editor.revision != doc.revision() {
             self.cancel_refinement();
             return;
         }
