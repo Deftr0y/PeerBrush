@@ -133,7 +133,7 @@ impl CompletedPlanar {
     pub fn role(&self) -> PlanarRole {
         match self.inner.spec.kind {
             linear::Kind::Native(role) => role,
-            linear::Kind::Scalar => unreachable!("Native wrapper contains a scalar field"),
+            _ => unreachable!("Native wrapper contains a non-native field"),
         }
     }
     pub fn binding(&self) -> Digest {

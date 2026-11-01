@@ -19,47 +19,54 @@ const SEAL: usize = 144;
 type Digest = [u8; 32];
 type Check<'a> = &'a mut dyn FnMut() -> Result<()>;
 
+use super::bytes::ByteRole;
 use super::planar::PlanarRole;
 #[derive(Clone, Copy)]
 pub(super) enum Kind {
     Native(PlanarRole),
     Scalar,
+    Bytes(ByteRole, u64),
 }
 impl Kind {
     fn magic(self) -> &'static [u8; 8] {
         match self {
             Self::Native(_) => b"PBPLAN01",
             Self::Scalar => b"PBF64L01",
+            Self::Bytes(..) => b"PBBYTE01",
         }
     }
     fn filename(self) -> &'static str {
         match self {
             Self::Native(_) => "planes.pbp",
             Self::Scalar => "field.pbf",
+            Self::Bytes(..) => "bytes.pbb",
         }
     }
     fn role(self) -> u8 {
         match self {
             Self::Native(role) => role as u8,
             Self::Scalar => 1,
+            Self::Bytes(role, _) => role as u8,
         }
     }
     fn content_start(self, header: &[u8; 64]) -> Context {
         match self {
             Self::Native(_) => hash_start(b"PBPLANAR-CONTENT1", header),
-            Self::Scalar => Context::new(&SHA256),
+            Self::Scalar | Self::Bytes(..) => Context::new(&SHA256),
         }
     }
     fn index_domain(self) -> &'static [u8] {
         match self {
             Self::Native(_) => b"PBPLANAR-INDEX1",
             Self::Scalar => b"PBSCALAR-INDEX1",
+            Self::Bytes(..) => b"PBBYTES-INDEX1",
         }
     }
     fn seal_domain(self) -> &'static [u8] {
         match self {
             Self::Native(_) => b"PBPLANAR-SEAL1",
             Self::Scalar => b"PBSCALAR-SEAL1",
+            Self::Bytes(..) => b"PBBYTES-SEAL1",
         }
     }
 }
@@ -76,7 +83,10 @@ impl Spec {
         self.width as usize * (self.depth as usize / 8)
     }
     pub fn payload_bytes(self) -> u64 {
-        self.row_bytes() as u64 * self.height as u64 * self.channels as u64
+        match self.kind {
+            Kind::Bytes(_, bytes) => bytes,
+            _ => self.row_bytes() as u64 * self.height as u64 * self.channels as u64,
+        }
     }
     pub fn chunks(self) -> usize {
         self.payload_bytes().div_ceil(CHUNK as u64) as usize
@@ -244,6 +254,9 @@ impl Scratch {
         if self.poisoned {
             return Err(Error::Interrupted);
         }
+        if self.spec.row_bytes() == 0 {
+            return Err(Error::Invalid("Byte spools do not accept image rows"));
+        }
         let count = bytes.len() / self.spec.row_bytes();
         if channel >= self.spec.channels
             || first_y >= self.spec.height
@@ -257,10 +270,34 @@ impl Scratch {
                 "Planar rows must be complete, sequential, and bounded",
             ));
         }
+        self.append_payload(bytes, check)?;
+        self.rows += count as u64;
+        Ok(())
+    }
+
+    pub fn append_bytes(&mut self, bytes: &[u8], check: Check<'_>) -> Result<()> {
+        if !matches!(self.spec.kind, Kind::Bytes(..)) {
+            return Err(Error::Invalid("Image planes require ordered rows"));
+        }
+        self.append_payload(bytes, check)
+    }
+
+    fn append_payload(&mut self, bytes: &[u8], check: Check<'_>) -> Result<()> {
+        if self.poisoned {
+            return Err(Error::Interrupted);
+        }
+        if bytes.len() > 64 * 1024 * 1024
+            || self
+                .written
+                .checked_add(bytes.len() as u64)
+                .is_none_or(|end| end > self.spec.payload_bytes())
+        {
+            return Err(Error::Budget);
+        }
         check()?;
         self.owned.check()?;
         let result = (|| {
-            let mut at = HEADER + self.rows * self.spec.row_bytes() as u64;
+            let mut at = HEADER + self.written;
             let mut input = bytes;
             while !input.is_empty() {
                 check()?;
@@ -297,8 +334,6 @@ impl Scratch {
         })();
         if result.is_err() {
             self.poisoned = true;
-        } else {
-            self.rows += count as u64;
         }
         result
     }
@@ -310,6 +345,7 @@ impl Scratch {
             return Err(Error::Interrupted);
         }
         if self.rows != self.spec.channels as u64 * self.spec.height as u64
+            || self.written != self.spec.payload_bytes()
             || self.chunk_count != self.spec.chunks()
             || binding == [0; 32]
         {
@@ -518,6 +554,51 @@ impl Complete {
         self.owned.check()
     }
 
+    pub fn read_range_into(
+        &self,
+        start: u64,
+        output: &mut ScratchBytes,
+        check: Check<'_>,
+    ) -> Result<()> {
+        if output.len() > 64 * 1024 * 1024 || !output.uses_budget(&self.budget) {
+            return Err(Error::Budget);
+        }
+        let mut buffer = ScratchBytes::new(&self.budget, CHUNK, CHUNK)?;
+        self.read_bytes(start, output, &mut buffer, check)
+    }
+
+    pub fn read_bytes(
+        &self,
+        start: u64,
+        output: &mut [u8],
+        buffer: &mut ScratchBytes,
+        check: Check<'_>,
+    ) -> Result<()> {
+        if !matches!(self.spec.kind, Kind::Bytes(..))
+            || output.len() > 64 * 1024 * 1024
+            || start
+                .checked_add(output.len() as u64)
+                .is_none_or(|end| end > self.spec.payload_bytes())
+        {
+            return Err(Error::Invalid("Byte range exceeds its sealed payload"));
+        }
+        if buffer.len() != CHUNK || !buffer.uses_budget(&self.budget) {
+            return Err(Error::Budget);
+        }
+        check()?;
+        self.owned.check()?;
+        self.copy_range(
+            start,
+            start + output.len() as u64,
+            output,
+            buffer,
+            &mut None,
+            check,
+        )?;
+        check()?;
+        self.owned.check()
+    }
+
     fn copy_range(
         &self,
         start: u64,
@@ -592,10 +673,10 @@ fn hash_start(domain: &[u8], header: &[u8; 64]) -> Context {
     hash
 }
 fn chunk_start(header: &[u8; 64], number: usize) -> Context {
-    let domain: &[u8] = if &header[..8] == b"PBF64L01" {
-        b"PBSCALAR-CHUNK1"
-    } else {
-        b"PBPLANAR-CHUNK1"
+    let domain: &[u8] = match &header[..8] {
+        b"PBF64L01" => b"PBSCALAR-CHUNK1",
+        b"PBBYTE01" => b"PBBYTES-CHUNK1",
+        _ => b"PBPLANAR-CHUNK1",
     };
     let mut hash = hash_start(domain, header);
     hash.update(&(number as u64).to_be_bytes());
