@@ -355,6 +355,11 @@ impl HistorySnapshot {
             if delta.base != current.key() {
                 return Err("Prepared native edit is stale".into());
             }
+            delta
+                .admission
+                .as_ref()
+                .ok_or("Native editor capture admission is missing")?
+                .check(current, request.actor, &delta.intent)?;
             let coalesce = request.gesture.is_some()
                 && self.undo.as_ref().is_some_and(|record| {
                     record.info.actor == request.actor
@@ -509,6 +514,7 @@ impl HistorySnapshot {
                 cancellation: Cancellation::default(),
                 intent,
                 outputs: vec![],
+                admission: None,
             },
         })
     }
@@ -535,9 +541,24 @@ mod tests {
             gesture: None,
         }
     }
+    fn captured(doc: &NativeDocument) -> CapturedEdit {
+        doc.capture_intent(
+            doc.key(),
+            doc.metadata().revision(),
+            "worker",
+            &[Scope {
+                target: None,
+                rect: None,
+            }],
+            &[],
+            1,
+            false,
+            true,
+        )
+        .unwrap()
+    }
     fn visibility(doc: &NativeDocument, visible: bool) -> PreparedDelta {
-        doc.capture_edit()
-            .unwrap()
+        captured(doc)
             .visibility(doc.metadata().layer(0).unwrap().id(), visible, &|| Ok(()))
             .unwrap()
     }
@@ -720,9 +741,7 @@ mod tests {
             .seal(&current, &Session, &|| Ok(()))
             .unwrap_or_else(|e| panic!("{}", e.reason()));
         let target = current.metadata().layer(0).unwrap().pixels().slot();
-        let delta = current
-            .capture_edit()
-            .unwrap()
+        let delta = captured(&current)
             .raster_patch(
                 RasterPatch {
                     target,
@@ -748,9 +767,7 @@ mod tests {
         let output = built
             .seal(&current, &Session, &|| Ok(()))
             .unwrap_or_else(|e| panic!("{}", e.reason()));
-        let delta = current
-            .capture_edit()
-            .unwrap()
+        let delta = captured(&current)
             .raster_patch(
                 RasterPatch {
                     target,

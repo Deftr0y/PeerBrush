@@ -1,4 +1,6 @@
 //! Immutable native document owners. No live Engine field is switched here.
+#[path = "native/admission.rs"]
+mod admission;
 #[path = "native/batch.rs"]
 mod batch;
 #[path = "native/effect_patch.rs"]
@@ -163,6 +165,7 @@ impl NativeDocument {
         Ok(CapturedEdit {
             base: self.clone(),
             cancellation: Cancellation::default(),
+            admission: None,
         })
     }
     /// No callbacks, file access or history duplication occurs here.
@@ -194,6 +197,11 @@ impl NativeDocument {
         }
         if let Err(reason) = prepared.intent.check(self, actor, leases, now) {
             return Err(RefusedDelta { reason, prepared });
+        }
+        if let Some(admission) = &prepared.admission {
+            if let Err(reason) = admission.check(self, actor, &prepared.intent) {
+                return Err(RefusedDelta { reason, prepared });
+            }
         }
         self.finish(prepared)
     }
@@ -526,6 +534,7 @@ impl Cancellation {
 pub struct CapturedEdit {
     base: NativeDocument,
     cancellation: Cancellation,
+    admission: Option<Arc<admission::EditAdmission>>,
 }
 pub struct PreparedDelta {
     base: DocumentKey,
@@ -533,6 +542,7 @@ pub struct PreparedDelta {
     cancellation: Cancellation,
     intent: Intent,
     outputs: Vec<StagedOutput>,
+    admission: Option<Arc<admission::EditAdmission>>,
 }
 #[must_use]
 pub struct RefusedDelta {
@@ -637,6 +647,7 @@ impl CapturedEdit {
             cancellation: self.cancellation,
             intent,
             outputs: vec![],
+            admission: self.admission.clone(),
         })
     }
     /// Bounded first structural operation. Hierarchical/clip policy stays with
@@ -699,6 +710,7 @@ impl CapturedEdit {
             cancellation: self.cancellation,
             intent,
             outputs: vec![],
+            admission: self.admission.clone(),
         })
     }
 }
