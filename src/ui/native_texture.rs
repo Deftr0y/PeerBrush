@@ -36,6 +36,7 @@ impl tiles::Rows for FrameRows<'_> {
 pub(crate) struct Prepared {
     tiles: tiles::Tiles,
     tag: Tag,
+    status: crate::color_profile::prepared::DisplayStatus,
 }
 impl Prepared {
     /// Run off UI. Frame remains charged throughout conversion; no source IO,
@@ -76,20 +77,32 @@ impl Prepared {
             check,
         )?;
         let tag = frame.tag();
+        let status = frame.display_status();
         drop(frame);
-        Ok(Self { tiles, tag })
+        Ok(Self { tiles, tag, status })
     }
     pub(crate) fn tag(&self) -> &Tag {
         &self.tag
+    }
+    pub(crate) fn profile_warning(&self) -> Option<&'static str> {
+        self.status.warning()
     }
 }
 pub(crate) struct Canvas {
     textures: tiles::Textures,
     tag: Tag,
+    status: crate::color_profile::prepared::DisplayStatus,
 }
 impl Canvas {
+    #[cfg(test)]
+    pub(crate) fn texture_ids(&self) -> impl Iterator<Item = egui::TextureId> + '_ {
+        self.textures.ids()
+    }
     pub(crate) fn key(&self) -> &crate::render::native_preview::Key {
         self.tag.key()
+    }
+    pub(crate) fn profile_warning(&self) -> Option<&'static str> {
+        self.status.warning()
     }
     pub(crate) fn paint_with(
         &self,
@@ -132,6 +145,7 @@ impl Presenter {
         self.current = Some(Canvas {
             textures,
             tag: prepared.tag,
+            status: prepared.status,
         });
         Ok(())
     }
