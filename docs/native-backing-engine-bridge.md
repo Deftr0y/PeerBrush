@@ -35,3 +35,22 @@ infallible Vec/Arc operations; the precursor does not replace their allocator. T
 live document, and ordinary document/raster serde never performs backing I/O.
 Full ownership admission, fallible render/edit consumers, durable recovery and
 profile-backup integration must precede live eviction or larger document caps.
+
+The derived scene bridge captures the current document or gesture preview through
+`Engine::capture_scene`. It clones native owners without source I/O. After all
+engine/root/registry locks are released, staging uses the admitted persistent
+source runtime, reuses unchanged COW tiles only after a weak owner upgrades and
+matches the exact Arc, and seals the referenced blocks in every physical store.
+The returned operation retains the runtime session and selected checkpoints
+through its last source read. A cached scene must not indefinitely retain an
+active session. A wholly absent plane needs no source runtime session or files.
+
+Scene identity includes typed metadata and every resolved physical source key;
+uncommitted preview pixels cannot alias the committed revision's render cache.
+Retained originals and historical Liquify clips occupy explicit source roster
+locations. Protected Photoshop structure and raw pattern inspection owners stay
+runtime-only. Capture or staging does not promote those views to editable data.
+Resolved tile fragments share immutable Store owners, retain full edge padding,
+and keep descriptor admission through the final history/clipboard/task owner.
+These derived sources coexist with resident authority until all live consumers,
+publication, recovery and cleanup paths are migrated and qualified.
