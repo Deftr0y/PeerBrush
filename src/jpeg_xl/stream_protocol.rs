@@ -11,6 +11,7 @@ pub(crate) const MAX_RECT_BYTES: u64 = 2048 * 2048 * 8;
 pub(crate) const MAX_HELD_BYTES: u32 = 128 * 1024 * 1024;
 pub(crate) const MAX_HELD_BUFFERS: u16 = 8;
 pub(crate) const MAX_RECORDS: u32 = 131072;
+pub(crate) const MAX_CHILD_EVENTS: u32 = 1048576;
 pub(crate) const MAX_OUTPUT_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 pub(crate) const MAX_ELAPSED_MS: u32 = 20 * 60 * 1000;
 const MAGIC: &[u8; 8] = b"PBJXLS01";
@@ -148,6 +149,24 @@ fn u32le(bytes: &[u8]) -> u32 {
 }
 fn u64le(bytes: &[u8]) -> u64 {
     u64::from_le_bytes(bytes.try_into().unwrap())
+}
+/// Admit control transcript/index ownership from this bound as well as DATA
+/// bytes. A deadline alone does not bound hostile zero-payload message growth.
+pub(crate) fn child_event_limit(configuration: &Configuration) -> Result<u32> {
+    configuration.validate()?;
+    let events = u64::from(configuration.max_records)
+        .checked_mul(4)
+        .and_then(|n| {
+            configuration
+                .raw_bytes
+                .div_ceil(BUFFER_BYTES as u64)
+                .checked_mul(4)
+                .and_then(|raw| n.checked_add(raw))
+        })
+        .and_then(|n| n.checked_add(64))
+        .filter(|n| *n <= u64::from(MAX_CHILD_EVENTS))
+        .ok_or(ERROR)?;
+    u32::try_from(events).map_err(|_| ERROR.into())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -579,6 +598,7 @@ pub(crate) struct State {
     finalized: u64,
     records: u32,
     log_bytes: u64,
+    child_events: u32,
     failed: bool,
     success: bool,
 }
@@ -599,6 +619,7 @@ impl State {
             finalized: 0,
             records: 0,
             log_bytes: 0,
+            child_events: 0,
             failed: false,
             success: false,
         })
@@ -720,6 +741,14 @@ impl State {
             return Err(ERROR.into());
         }
         let next = self.next[index].checked_add(1).ok_or(ERROR)?;
+        if direction == Direction::Child {
+            let limit = child_event_limit(&self.configuration)?;
+            self.child_events = self
+                .child_events
+                .checked_add(1)
+                .filter(|n| *n <= limit)
+                .ok_or(ERROR)?;
+        }
         let message = frame.message;
         message.bounded()?;
         if matches!(message, Message::Cancel { .. })
@@ -1406,5 +1435,34 @@ mod tests {
             let _ = Frame::read(&mut cursor, &|| Ok(()));
             assert!(cursor.position() <= HEADER_BYTES as u64);
         }
+    }
+    #[test]
+    fn zero_payload_child_events_have_a_hard_admitted_total_not_only_a_deadline() {
+        let (mut a, mut b) = handshake();
+        let limit = child_event_limit(&a.configuration).unwrap();
+        // Ready already consumed one child event. No data or body allocation is
+        // needed for this bounded control-spam regression.
+        for _ in 1..limit {
+            deliver(
+                &mut a,
+                &mut b,
+                Direction::Child,
+                Message::Seek { position: 0 },
+                &[],
+            );
+            ack(&mut a, &mut b);
+        }
+        let extra = frame(&a, Direction::Child, Message::Seek { position: 0 });
+        assert!(a.preflight(Direction::Child, &extra).is_err());
+        assert!(a.preflight(Direction::Child, &extra).is_err());
+        let mut config = configuration();
+        config.info = Info {
+            width: 16000,
+            height: 16000,
+            bit_depth: 16,
+        };
+        config.raw_bytes = 2_048_000_000;
+        config.max_records = MAX_RECORDS;
+        assert!(child_event_limit(&config).unwrap() <= MAX_CHILD_EVENTS);
     }
 }

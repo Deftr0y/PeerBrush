@@ -80,7 +80,7 @@ pub fn signature(bytes: &[u8]) -> bool {
         JxlSignature::Codestream | JxlSignature::Container
     )
 }
-fn version() -> Result<(), String> {
+pub(super) fn version() -> Result<(), String> {
     if unsafe { JxlDecoderVersion() == 12000 && JxlEncoderVersion() == 12000 } {
         Ok(())
     } else {
@@ -104,7 +104,7 @@ fn sample_count(info: Info) -> Result<usize, String> {
     }
     Ok(count)
 }
-fn format(depth: u16) -> JxlPixelFormat {
+pub(super) fn format(depth: u16) -> JxlPixelFormat {
     JxlPixelFormat {
         num_channels: 4,
         data_type: if depth == 8 {
@@ -123,7 +123,7 @@ fn dec(status: JxlDecoderStatus) -> Result<(), String> {
         Err(ERROR.into())
     }
 }
-fn enc(status: JxlEncoderStatus) -> Result<(), String> {
+pub(super) fn enc(status: JxlEncoderStatus) -> Result<(), String> {
     if status == JxlEncoderStatus::Success {
         Ok(())
     } else {
@@ -347,13 +347,13 @@ impl Drop for Decoder {
         }
     }
 }
-struct Encoder {
+pub(super) struct Encoder {
     raw: *mut JxlEncoder,
     _budget: Box<Budget>,
     cms: Box<Cms>,
 }
 impl Encoder {
-    fn new() -> Result<Self, String> {
+    pub(super) fn new() -> Result<Self, String> {
         let mut budget = Budget::new(CALLBACK_LIMIT);
         let raw = unsafe { JxlEncoderCreate(&budget.manager()) };
         if raw.is_null() {
@@ -378,6 +378,9 @@ impl Encoder {
             JxlEncoderSetCms(raw, encoder.cms.interface());
         }
         Ok(encoder)
+    }
+    pub(super) fn raw(&self) -> *mut JxlEncoder {
+        self.raw
     }
 }
 impl Drop for Encoder {

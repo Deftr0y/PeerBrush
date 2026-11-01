@@ -41,7 +41,10 @@ seal overhead. The new operation carries an explicit absolute deadline of at mos
 including launch, callbacks, pipes and final exit. A production policy selecting
 that deadline still requires resource/performance qualification; there is no
 automatic extension. Existing resident/decode operations retain their 120-second
-deadline. Traffic does not reset either deadline.
+deadline. The separate streaming entry selects a validated CPU ceiling of at
+most 1200 seconds before any legacy guard runs, preserving inherited lower hard
+limits and all memory/parent-death/no-core protections. Traffic does not reset
+either deadline.
 Cancellation must stop parent pumps and terminate/reap the isolated child using
 the existing process protections; a surviving or uncertain child blocks reuse.
 
@@ -70,3 +73,25 @@ unbounded outstanding callback allocation or in-process file-data codec route
 is allowed. Source/revision/lease checks, native pixel/profile fidelity, real
 installed acceptance, interruption tests and actual dense 16000 qualification are
 separate gates. Small protocol tests do not establish those results.
+
+After Done, the parent closes the child input before checking child-output EOF
+and successful exit. A failed or partial exchange is never resumed or retried on
+the same pipes. A fresh attempt requires a new nonce and fresh admitted owners.
+
+Pinned enc_frame.cc extends 2048-group patches by eight border pixels on each
+side, requesting native callback edges up to 2064 despite public 2048 wording.
+The adapter uses RGB3 plus separate alpha1 native channels. Each complete owner
+is at most 32 MiB and is filled directly from authenticated 2048-bounded RGBA wire
+windows, with no 2064 RGBA intermediate. Every subwindow ID remains held until its
+native buffer is released; eight-ID/128MiB aggregate bounds remain. Fixed 64 KiB
+input and 64 KiB output callback buffers count inside the 128 MiB callback envelope.
+Larger unsupported requests refuse. Small thin-image assembly is a bounded
+compatibility path and does not qualify genuine group streaming or dense 16000.
+Pinned lossy-alpha restrictions remain a separate mandatory design/qualification
+gate; no algorithm/quality/alpha default has been changed to avoid that gate.
+
+All child messages, including zero-payload controls, share the derived hard event
+ceiling `4*max_records + 4*ceil(raw_bytes/65536) + 64`, at most 1048576 events.
+Storage must admit its control transcript and interval metadata from this bound
+in addition to DATA bytes/record overhead. The absolute deadline alone does not
+bound hostile control-record growth.

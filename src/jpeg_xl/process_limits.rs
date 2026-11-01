@@ -92,6 +92,12 @@ pub(super) fn check(child: &Child) -> Result<(), Failure> {
 mod tests {
     use super::*;
     #[test]
+    fn streaming_cpu_policy_rejects_before_any_process_setting() {
+        assert!(streaming_worker(0).is_err());
+        assert!(streaming_worker(1201).is_err());
+        assert!(streaming_worker(u32::MAX).is_err());
+    }
+    #[test]
     fn measured_resource_excess_is_never_ignored_after_exit() {
         assert!(Failure::Exceeded.rejects(false));
         assert!(Failure::Exceeded.rejects(true));
@@ -100,6 +106,17 @@ mod tests {
     }
 }
 pub(super) fn worker() -> Result<(), String> {
+    worker_limits(120)
+}
+/// Selected only by the separately validated streaming-encode operation.
+/// This never raises an inherited hard limit or changes legacy/decode policy.
+pub(super) fn streaming_worker(cpu_ceiling: u32) -> Result<(), String> {
+    if !(1..=1200).contains(&cpu_ceiling) {
+        return Err(ERROR.into());
+    }
+    worker_limits(cpu_ceiling)
+}
+fn worker_limits(cpu_ceiling: u32) -> Result<(), String> {
     #[cfg(windows)]
     unsafe {
         use windows::Win32::System::{Diagnostics::Debug::*, ErrorReporting::*};
@@ -128,7 +145,7 @@ pub(super) fn worker() -> Result<(), String> {
             }};
         }
         limit!(libc::RLIMIT_CORE, 0);
-        limit!(libc::RLIMIT_CPU, 120);
+        limit!(libc::RLIMIT_CPU, cpu_ceiling);
         #[cfg(target_os = "linux")]
         {
             limit!(libc::RLIMIT_AS, MEMORY);
@@ -147,5 +164,7 @@ pub(super) fn worker() -> Result<(), String> {
     }
     #[cfg(not(any(unix, windows)))]
     return Err(ERROR.into());
+    #[cfg(not(unix))]
+    let _ = cpu_ceiling;
     Ok(())
 }
