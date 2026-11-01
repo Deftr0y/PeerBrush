@@ -10,6 +10,7 @@ type Result<T> = std::result::Result<T, String>;
 pub(crate) struct NativeSeed {
     document: native::NativeDocument,
     project_id: String,
+    ai_serial: u64,
     path: Option<std::path::PathBuf>,
     file_version: Option<crate::file_safety::Version>,
     ownership: Option<Arc<crate::file_ownership::Ownership>>,
@@ -19,10 +20,13 @@ impl NativeSeed {
     pub(crate) fn document(&self) -> &native::NativeDocument {
         &self.document
     }
+    pub(super) fn runtime_serial(&self) -> u64 {
+        self.ai_serial
+    }
     pub(crate) fn project_id(&self) -> &str {
         &self.project_id
     }
-    fn capture(engine: &Engine, document: &native::NativeDocument) -> Result<Self> {
+    pub(super) fn capture(engine: &Engine, document: &native::NativeDocument) -> Result<Self> {
         let bytes = engine
             .project_id
             .len()
@@ -50,6 +54,7 @@ impl NativeSeed {
         Ok(Self {
             document: document.clone(),
             project_id,
+            ai_serial: engine.ai_serial,
             path,
             file_version: engine.file_version,
             ownership: engine.file_ownership.clone(),
@@ -88,6 +93,18 @@ impl Engine {
     // authority and never derives native state from the live resident document.
     fn native_authority(&self) -> Option<&DocumentAuthority> {
         None
+    }
+    pub(crate) fn history_task_complete(&self, owner: &str, task: &str) -> bool {
+        if let Some(authority) = self
+            .native_authority()
+            .filter(|state| state.native().is_ok())
+        {
+            return authority.task_complete(owner, task);
+        }
+        !self
+            .truncated_tasks
+            .iter()
+            .any(|(a, t)| a == owner && t == task)
     }
     pub(crate) fn native_document(&self) -> Option<&native::NativeDocument> {
         self.native_authority()
@@ -333,6 +350,15 @@ impl DocumentAuthority {
         match self {
             Self::Resident(state) => state.document.clone().into(),
             Self::Native(state) => state.document.clone().into(),
+        }
+    }
+    pub(crate) fn task_complete(&self, owner: &str, task: &str) -> bool {
+        match self {
+            Self::Resident(state) => !state
+                .truncated_tasks
+                .iter()
+                .any(|(a, t)| a == owner && t == task),
+            Self::Native(state) => state.history.task_complete(owner, task),
         }
     }
     pub(crate) fn history_lengths(&self) -> [usize; 2] {
