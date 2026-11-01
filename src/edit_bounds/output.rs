@@ -165,6 +165,72 @@ impl<'d, 's> TileOutput<'d, 's> {
         }
         result
     }
+    pub(crate) fn has_replacement(&self, key: (u32, u32)) -> bool {
+        self.replacements.contains_key(&key)
+    }
+    /// Explicit worker preparation of the complete provisional result. These
+    /// reads include every successfully staged prior dab, without adoption.
+    pub(crate) fn prepare_working_tile(
+        &self,
+        key: (u32, u32),
+        check: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<PinnedBytes, String> {
+        let surface = self.candidate(check)?;
+        let tile = surface
+            .prepare_tile(key, &mut || {
+                self.session.check().map_err(|_| Error::Changed)?;
+                check().map_err(|_| Error::Cancelled)
+            })
+            .map_err(|e| e.to_string())?;
+        let bytes = tile
+            .copy_to_scratch(self.base.budget())
+            .map_err(|e| e.to_string())?;
+        check()?;
+        Ok(bytes.freeze())
+    }
+    pub(crate) fn prepare_working_strip(
+        &self,
+        area: [i32; 4],
+        check: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<PinnedBytes, String> {
+        let width = i64::from(area[2]) - i64::from(area[0]);
+        let height = i64::from(area[3]) - i64::from(area[1]);
+        if width <= 0
+            || height <= 0
+            || area[0] < 0
+            || area[1] < 0
+            || area[2] > self.binding.shape()[0] as i32
+            || area[3] > self.binding.shape()[1] as i32
+            || width * height > crate::raster::backed::MAX_REGION_PIXELS as i64
+        {
+            return Err("Native working strip is outside its bounded captured frame".into());
+        }
+        let bpp = if self.binding.depth() == 16 { 8 } else { 4 };
+        let stride = width as usize * bpp;
+        let mut bytes = ScratchBytes::new(
+            self.base.budget(),
+            stride * height as usize,
+            stride * height as usize,
+        )
+        .map_err(|e| e.to_string())?;
+        let surface = self.candidate(check)?;
+        let view = surface
+            .prepare_region(
+                crate::raster::backed::Region::new(area).map_err(|e| e.to_string())?,
+                &mut || {
+                    self.session.check().map_err(|_| Error::Changed)?;
+                    check().map_err(|_| Error::Cancelled)
+                },
+            )
+            .map_err(|e| e.to_string())?;
+        for (index, row) in bytes.chunks_exact_mut(stride).enumerate() {
+            check()?;
+            view.copy_row(area[1] + index as i32, row)
+                .map_err(|e| e.to_string())?;
+        }
+        check()?;
+        Ok(bytes.freeze())
+    }
     fn replace_inner(
         &mut self,
         before: &InputTile,
