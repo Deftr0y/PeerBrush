@@ -24,8 +24,10 @@ their actual shared undo state. The admission accounts for the pinned100-state
 undo limit, redo/flux overlap, deque/vector capacity and bounded event/temporary
 copies. A closed nonce cannot prepare another widget. Close clears the shared
 undoers before removing precisely those Context entries and refunding their
-admission. A teardown interrupted before acknowledgement retains accounting
-debt instead of treating uncertain destruction as a refund.
+admission. A bounded retirement worker retains the actual Context, seeded state
+clones and split charge through interrupted teardown. Drop closes the nonce and
+wakes that owner; it does not block on Context locks or abandon the ticket. The
+worker exits after clearing the actual histories and acknowledging cleanup.
 
 This is not combined application RAM qualification. Galley, nested LayoutJob and
 Row owners, font caches, and retained platform output or clipboard copies need
