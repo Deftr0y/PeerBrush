@@ -385,6 +385,23 @@ impl<'inventory, 'lease, 'session> NativeNewDestination<'inventory, 'lease, 'ses
         self.inventory.validate(check)?;
         self.active(check)
     }
+    /// Prepare the target's physical identity lock outside the Engine fence.
+    /// A private temporary path never escapes as generic filesystem authority.
+    pub(crate) fn prepare_ownership(
+        &self,
+        ownership: &crate::file_ownership::Ownership,
+        check: &dyn Fn() -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.ready_to_arm(check)?;
+        let temporary = self
+            .plan
+            .target()
+            .parent()
+            .ok_or("Native temporary parent missing")?
+            .join(self.plan.temporary_name());
+        ownership.prepare(&temporary)?;
+        self.ready_to_arm(check)
+    }
     pub(crate) fn publish(
         self,
         committed: &CommittedPublication<'_>,
