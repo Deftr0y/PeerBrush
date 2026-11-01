@@ -68,6 +68,17 @@ source/history/recovery garbage collection remains closed.
 
 ## New destinations
 
+Before even a versions directory or save lock is created, the source session
+admits the destination against the actual private source namespace, current held
+parent ancestry, managed staging names and known backing FileIds. The native lease
+consumes this proof and retains its operation and directory handles through the
+save receipt. It never recanonicalizes a raw caller path as new write authority.
+POSIX directory/lock/quota creation uses the admitted directory descriptors;
+Windows retains deny-delete ancestor and versions-directory name pins. Namespace
+checks repeat immediately before mutation. These are live observations and
+relative-object operations, not a POSIX atomic ancestry/rename comparison claim.
+The operation owner must not escape into long-lived document file ownership.
+
 A completed Source36 candidate already owns the exact scene and all qualified
 standard/source bytes. The destination writer requires that candidate, its exact
 source session, a held destination lease and frozen previous-version inventory.

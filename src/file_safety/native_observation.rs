@@ -68,7 +68,7 @@ impl NativeInventory<'_> {
             .parent()
             .ok_or("Missing external destination parent")?;
         regular_directory(path)?;
-        let parent = open_directory(path)?;
+        let parent = self.lease.native_parent_handle()?;
         let parent_identity = identity(&parent)?;
         let source = self
             .lease
@@ -96,6 +96,12 @@ impl NativeInventory<'_> {
     }
 }
 impl NativeExternalSnapshot<'_> {
+    pub(crate) fn check_session(
+        &self,
+        session: &crate::workspace::source_runtime::SourceSession,
+    ) -> Result<(), String> {
+        self.inventory.lease.check_source_session(session)
+    }
     pub(crate) fn uses_budget(&self, budget: &ResidentBudget) -> bool {
         self.inventory.budget.same_pool(budget) && self._charge.uses_budget(budget)
     }

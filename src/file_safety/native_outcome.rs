@@ -148,6 +148,7 @@ impl<'inventory, 'lease, 'session> NativeNewDestination<'inventory, 'lease, 'ses
         check()?;
         candidate.check_session(session)?;
         let observed = inventory.observe_external(check)?;
+        observed.check_session(session)?;
         let plan = intent.plan(&observed, check)?;
         plan.check_session(session)?;
         if plan.expected_version().is_some()
@@ -173,7 +174,7 @@ impl<'inventory, 'lease, 'session> NativeNewDestination<'inventory, 'lease, 'ses
             .target()
             .parent()
             .ok_or("Native destination has no parent")?;
-        let parent = super::owned_rename::open_directory(parent_path)?;
+        let parent = inventory.writer_lease().native_parent_handle()?;
         directory(&parent, parent_path, plan.parent_identity())?;
         #[cfg(windows)]
         let pins = super::owned_rename::pin_directories(parent_path, plan.parent_identity())?;
@@ -182,6 +183,9 @@ impl<'inventory, 'lease, 'session> NativeNewDestination<'inventory, 'lease, 'ses
         inventory.validate(check)?;
         absent(plan.target())?;
         absent(&parent_path.join(plan.temporary_name()))?;
+        inventory
+            .writer_lease()
+            .check_before_native_mutation(check)?;
         let temporary = create_temporary(&parent, parent_path, plan.temporary_name())?;
         super::native_regular(&temporary).map_err(|_| "Native temporary is not a regular owner")?;
         #[cfg(windows)]

@@ -39,7 +39,8 @@ impl NativeLease {
         budget: &ResidentBudget,
         check: &dyn Fn() -> Result<(), String>,
     ) -> Result<NativeInventory<'_>, String> {
-        check()?;
+        self.check_before_native_mutation(check)?;
+        self.check_native_budget(budget)?;
         let charge = budget
             .reserve_bytes(INVENTORY_BYTES, INVENTORY_BYTES)
             .map_err(|e| e.to_string())?;
@@ -49,37 +50,30 @@ impl NativeLease {
             .ok_or("Missing native destination parent")?
             .join(".peerbrush-versions");
         regular_directory(&directory)?;
-        let held_directory = open_directory(&directory)?;
+        let held_directory = self.native_versions_handle()?;
         let directory_identity = identity(&held_directory)?;
         let quota_path = directory.join("quota.lock");
         if fs::symlink_metadata(&quota_path).is_ok() && !regular(&quota_path) {
             return Err("Native previous-save quota is not a regular file".into());
         }
-        let mut quota_options = fs::OpenOptions::new();
-        quota_options
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false);
-        #[cfg(unix)]
+        let quota_file = self.open_native_quota(&held_directory, check)?;
+        native_regular(&quota_file).map_err(|_| "Native quota is not a regular owner")?;
+        super::native_access::supported(&quota_file)?;
+        if quota_file
+            .metadata()
+            .map_err(|_| "Native quota metadata unavailable")?
+            .len()
+            != 0
+            || link_count(&quota_file)? != 1
         {
-            use std::os::unix::fs::OpenOptionsExt;
-            quota_options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+            return Err("Native previous-save quota ownership changed".into());
         }
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::OpenOptionsExt;
-            quota_options.custom_flags(0x00200000);
-        }
-        let quota_file = quota_options.open(&quota_path).map_err(|e| e.to_string())?;
+        self.check_before_native_mutation(check)?;
         quota_file.try_lock().map_err(|_| {
             "Previous-save inventory is busy; retry without changing the destination"
         })?;
         let quota = LockedFile(quota_file);
         let quota_identity = identity(&quota.0)?;
-        if quota.0.metadata().map_err(|e| e.to_string())?.len() != 0 || link_count(&quota.0)? != 1 {
-            return Err("Native previous-save quota ownership changed".into());
-        }
         let mut inventory = NativeInventory {
             lease: self,
             directory,
