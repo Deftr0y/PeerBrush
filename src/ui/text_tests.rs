@@ -22,6 +22,18 @@ fn draw(
     )
 }
 
+fn wait_edit(app: &mut PeerBrush) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while app.edit_worker.pending() {
+        app.poll_edit_job();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "source edit did not return a terminal result"
+        );
+        std::thread::yield_now();
+    }
+}
+
 fn button(
     at: Pos2,
     button: egui::PointerButton,
@@ -356,6 +368,7 @@ fn text_toolbar_canvas_draft_controls_render_native_pixels_then_apply_once() {
         assert_eq!(state(&app), before);
         let output = draw(&mut app, &ctx, vec![], Default::default());
         click(&mut app, &ctx, label(&output, "Apply"));
+        wait_edit(&mut app);
         assert!(app.source_editor.is_none());
         let mut e = app.shared.lock().unwrap();
         assert_eq!(e.undo.len(), 2);
@@ -619,6 +632,7 @@ fn explicit_shaped_layout_control_previews_native_pixels_caches_unchanged_valida
         let draft = app.source_editor.as_ref().unwrap().source.clone();
         let output = draw(&mut app, &ctx, vec![], Default::default());
         click(&mut app, &ctx, label(&output, "Apply"));
+        wait_edit(&mut app);
         assert!(app.source_editor.is_none());
         {
             let mut engine = app.shared.lock().unwrap();
@@ -743,6 +757,7 @@ fn text_affine_blank_field_hits_visibility_locks_and_reserved_apply_preserve_the
         );
         let output = draw(&mut app, &ctx, vec![], Default::default());
         click(&mut app, &ctx, label(&output, "Apply"));
+        wait_edit(&mut app);
         assert_eq!(app.source_editor.as_ref().unwrap().command(), draft);
         assert_eq!(state(&app), before);
         assert_eq!(
@@ -760,6 +775,7 @@ fn text_affine_blank_field_hits_visibility_locks_and_reserved_apply_preserve_the
             .retain(|lease| lease.id != task);
         let output = draw(&mut app, &ctx, vec![], Default::default());
         click(&mut app, &ctx, label(&output, "Apply"));
+        wait_edit(&mut app);
         assert!(app.source_editor.is_none());
         assert_eq!(
             app.shared.lock().unwrap().doc.export_png().unwrap(),
@@ -848,6 +864,84 @@ fn overlapping_text_field_hit_follows_visible_group_order_instead_of_flat_storag
             Some(top.as_str())
         );
         assert_eq!(state(&app), before);
+        file.unchanged();
+    }
+}
+
+#[test]
+fn pending_source_apply_preserves_its_draft_until_real_terminal_completion() {
+    for depth in [8, 16] {
+        let (mut app, ctx, file) = fixture(depth);
+        let doc = app.shared.lock().unwrap().doc.clone();
+        app.open_source(&doc, "text");
+        let token = app.source_editor.as_ref().unwrap().token();
+        let draft = app.source_editor.as_ref().unwrap().command();
+        let project = app.project_id.clone();
+        let shared = app.shared.clone();
+        let guard = shared.lock().unwrap();
+        let revision = guard.doc.revision;
+        let history = guard.undo.len();
+        let render = |app: &mut PeerBrush, events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, SIZE)),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.source_window(ctx, &doc),
+            )
+        };
+        let output = render(&mut app, vec![]);
+        let at = label(&output, "Apply");
+        for pressed in [true, false] {
+            render(
+                &mut app,
+                vec![
+                    egui::Event::PointerMoved(at),
+                    button(
+                        at,
+                        egui::PointerButton::Primary,
+                        pressed,
+                        Default::default(),
+                    ),
+                ],
+            );
+        }
+        assert!(app.edit_worker.pending());
+        assert_eq!(guard.doc.revision, revision);
+        assert_eq!(guard.undo.len(), history);
+        app.cancel_source();
+        assert_eq!(app.source_editor.as_ref().unwrap().token(), token);
+        app.open_source(&doc, "ellipse");
+        assert_eq!(app.source_editor.as_ref().unwrap().command(), draft);
+        app.switch_project("another-project");
+        assert_eq!(app.project_id, project);
+        app.request_close(lifecycle::Intent::Exit);
+        assert!(app.lifecycle.is_none());
+        assert!(!app.exit_approved);
+        app.source_edit_finished_nonce(token.nonce().wrapping_add(1), Ok(()));
+        assert_eq!(app.source_editor.as_ref().unwrap().token(), token);
+        drop(guard);
+        wait_edit(&mut app);
+        assert!(app.source_editor.is_none(), "{}", app.message);
+        let mut engine = shared.lock().unwrap();
+        assert_eq!(engine.doc.revision, revision + 1);
+        assert_eq!(engine.undo.len(), history + 1);
+        let id = app.selected.clone();
+        assert!(engine
+            .doc
+            .layers
+            .iter()
+            .any(|layer| layer.id == id && layer.source.is_some()));
+        engine.undo("human").unwrap();
+        assert!(engine.doc.layers.iter().all(|layer| layer.id != id));
+        engine.redo("human").unwrap();
+        assert!(engine
+            .doc
+            .layers
+            .iter()
+            .any(|layer| layer.id == id && layer.source.is_some()));
+        drop(engine);
         file.unchanged();
     }
 }

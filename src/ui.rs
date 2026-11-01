@@ -431,6 +431,8 @@ pub struct PeerBrush {
     free_transform_frame: bool,
     free_transform_cancelled_pointer: bool,
     source_editor: Option<source::Editor>,
+    native_source_preview: Option<crate::psd::memory36::Admitted<Value>>,
+    edit_worker: edit_job::Worker,
     pen: pen::State,
     straight: brush::Straight,
     filter_editor: Option<filters::Editor>,
@@ -808,6 +810,8 @@ impl PeerBrush {
             free_transform_frame: false,
             free_transform_cancelled_pointer: false,
             source_editor: None,
+            native_source_preview: None,
+            edit_worker: Default::default(),
             pen: pen::State::default(),
             straight: brush::Straight::default(),
             filter_editor: None,
@@ -1007,6 +1011,102 @@ impl PeerBrush {
                 self.message = e;
                 false
             }
+        }
+    }
+    fn submit_source_edit(
+        &mut self,
+        command: source::EditCommand,
+        token: source::EditToken,
+        ctx: &egui::Context,
+    ) -> Result<(), String> {
+        let editor = self
+            .source_editor
+            .as_ref()
+            .filter(|editor| editor.token() == token)
+            .ok_or("Source draft changed before applying")?;
+        let request = edit_job::Request {
+            project: self.project_id.clone(),
+            document: editor.document.clone(),
+            revision: editor.revision,
+            label: "Edit text/vector source".into(),
+            selection_edit: false,
+            origin: edit_job::Origin::Source(token.nonce()),
+        };
+        let commands = match command {
+            source::EditCommand::Resident(command) => edit_job::Commands::resident(vec![command]),
+            source::EditCommand::Native(command) => edit_job::Commands::Native(command),
+        };
+        let shared = self.shared.clone();
+        let ctx = ctx.clone();
+        self.edit_worker.submit(
+            request,
+            commands,
+            move |request, commands| {
+                server::edit_shared(
+                    &shared,
+                    "human",
+                    commands,
+                    Some(request.revision),
+                    None,
+                    &request.label,
+                    None,
+                    Some(&request.document),
+                )
+            },
+            move || ctx.request_repaint(),
+        )?;
+        self.lifecycle_frame = true;
+        self.message = "Applying source changes…".into();
+        Ok(())
+    }
+    fn poll_edit_job(&mut self) {
+        if !self.edit_worker.pending() {
+            return;
+        }
+        let document = match self.shared.try_lock() {
+            Ok(engine) => crate::engine::view::current(&engine).id().to_owned(),
+            Err(_) => return,
+        };
+        let Some(completed) = self.edit_worker.poll() else {
+            return;
+        };
+        let request = &completed.request;
+        if let edit_job::Origin::Source(nonce) = request.origin {
+            self.source_edit_finished_nonce(
+                nonce,
+                completed.result.as_ref().map(|_| ()).map_err(Clone::clone),
+            );
+        }
+        let current = request.project == self.project_id && document == request.document;
+        if current {
+            match &completed.result {
+                Ok(value) => {
+                    if let Some(id) = value["created"]
+                        .as_array()
+                        .and_then(|ids| ids.first())
+                        .and_then(Value::as_str)
+                    {
+                        self.selected = id.into();
+                        self.selection_layers = [id.to_owned()].into_iter().collect();
+                        self.selection_anchor = id.into();
+                        self.mask = false;
+                        self.mask_step = None;
+                    }
+                    self.message = request.label.clone();
+                    self.native_source_preview = None;
+                    self.last_preview = None;
+                }
+                Err(error) => {
+                    self.selection_commit_failed |= request.selection_edit;
+                    self.message = error.clone();
+                }
+            }
+        } else if let Some(view) = self.project_views.get_mut(&request.project) {
+            view.message = completed
+                .result
+                .as_ref()
+                .map(|_| request.label.clone())
+                .unwrap_or_else(Clone::clone);
         }
     }
     fn select_tool(&mut self, tool: Tool) {
@@ -2804,7 +2904,13 @@ impl PeerBrush {
         }
         self.thumbs.get(&key).map(|(_, texture)| texture.clone())
     }
-    fn layer_menu(&mut self, ui: &mut egui::Ui, doc: &Document, l: &crate::engine::Layer) {
+    fn layer_menu<'a>(
+        &mut self,
+        ui: &mut egui::Ui,
+        doc: impl Into<DocumentView<'a>>,
+        l: impl Into<LayerView<'a>>,
+    ) {
+        let doc = doc.into();
         if self.layer_menu_contents(ui, doc, l) {
             self.open_source(doc, "edit");
         }
@@ -3627,8 +3733,13 @@ impl PeerBrush {
         if let Some(editor) = &self.geometry {
             self.transient.push(editor.command());
         }
+        self.native_source_preview = None;
         if let Some(editor) = &self.source_editor {
-            self.transient.push(editor.command());
+            if editor.is_native() {
+                self.native_source_preview = editor.owned_command();
+            } else {
+                self.transient.push(editor.command());
+            }
         }
         if let Some(editor) = &self.filter_editor {
             self.transient.extend(editor.preview_commands(doc));
@@ -4313,6 +4424,10 @@ impl PeerBrush {
 }
 impl PeerBrush {
     fn switch_project(&mut self, id: &str) {
+        if self.edit_worker.pending() && id != self.project_id {
+            self.message = "Wait for the edit result before switching projects".into();
+            return;
+        }
         if id == self.project_id {
             return;
         }
@@ -5159,6 +5274,11 @@ impl PeerBrush {
         }
     }
     fn draw(&mut self, ctx: &egui::Context) {
+        self.poll_edit_job();
+        if self.edit_worker.pending() && ctx.input(|input| input.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.message = "Wait for the edit result before closing PeerBrush".into();
+        }
         if self.update_exit_committed() {
             return;
         }
@@ -5183,7 +5303,8 @@ impl PeerBrush {
         self.selection_commit_failed = false;
         let drawn_generation = self.canvas_generation;
         self.sync_tool_profile(ctx);
-        self.lifecycle_frame = self.save_loss_review.is_some() || self.show_new;
+        self.lifecycle_frame =
+            self.save_loss_review.is_some() || self.show_new || self.edit_worker.pending();
         if !self.lifecycle_frame && self.free_transform.is_none() {
             self.temporary_pen_tool(ctx);
         }
@@ -6307,6 +6428,7 @@ impl eframe::App for PeerBrush {
         self.animation.clear();
         self.native_preview.clear();
         self.native_canvas.clear();
+        self.native_source_preview = None;
         crate::production_export::jobs::cancel_all(&self.shared.lock().unwrap().export_library);
         if self.update_exit_committed() {
             return;
