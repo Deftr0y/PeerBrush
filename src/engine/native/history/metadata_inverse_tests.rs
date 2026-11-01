@@ -422,7 +422,7 @@ fn removed_layer_imports_retained_mask_and_typed_clips_in_exact_order() {
             weight: 1.,
             value: 1.,
             pixels: r(3),
-            settings: serde_json::json!({}),
+            settings: serde_json::json!({}).into(),
         }],
     });
     b.layers[0].effects = vec![Effect36 {
@@ -430,14 +430,14 @@ fn removed_layer_imports_retained_mask_and_typed_clips_in_exact_order() {
         kind: "liquify".into(),
         enabled: true,
         weight: 1.,
-        settings: Arc::new(serde_json::json!({"strokes":[{}]})),
+        settings: serde_json::json!({"strokes":[{}]}).into(),
         clips: vec![EffectClip36 {
             stroke: 0,
             coverage: Coverage36 {
                 mask: r(4),
                 bounds: [0, 0, 4, 2],
                 origin: [0, 0],
-                contours: vec![],
+                contours: vec![].into(),
             },
         }],
     }];
@@ -445,13 +445,13 @@ fn removed_layer_imports_retained_mask_and_typed_clips_in_exact_order() {
         mask: r(5),
         bounds: [0, 0, 4, 2],
         origin: [0, 0],
-        contours: vec![],
+        contours: vec![].into(),
     });
     b.visit_rasters(|_| Ok(())).unwrap();
-    let mut a = b.clone();
+    let mut a = crate::engine::scene::wire_copy(&b);
     a.layers.clear();
     a.selection_previous = None;
-    let c = a.clone();
+    let c = crate::engine::scene::wire_copy(&a);
     let result = run(&mut sources, &b, &a, &c);
     assert!(result.report.conflicts.is_empty());
     assert_eq!(result.candidate.visit_rasters(|_| Ok(())).unwrap(), 5);
@@ -480,15 +480,15 @@ fn later_selection_and_dependencies_refuse_instead_of_clobbering() {
     b.selection = None;
     a.selection = None;
     c.selection = None;
-    let mut created = a.layers[0].clone();
+    let mut created = crate::engine::scene::wire_copy(&a.layers[0]);
     created.id = "task-folder".into();
     created.kind = "group".into();
     created.pixels.id = 2;
-    a.layers.push(created.clone());
+    a.layers.push(crate::engine::scene::wire_copy(&created));
     c.layers.push(created);
     sources.originals[1].push(sources.originals[1][0].clone());
     sources.originals[2].push(sources.originals[2][0].clone());
-    let mut child = c.layers[0].clone();
+    let mut child = crate::engine::scene::wire_copy(&c.layers[0]);
     child.id = "human-child".into();
     child.parent = Some("task-folder".into());
     child.pixels.id = 3;
@@ -558,15 +558,19 @@ fn settings_with_ref_shaped_values_are_metadata_and_later_independent_settings_s
         kind: "levels".into(),
         enabled: true,
         weight: 1.,
-        settings: Arc::new(settings),
+        settings: settings.into(),
         clips: vec![],
     };
-    b.filters.push(effect.clone());
-    a.filters.push(effect.clone());
+    b.filters.push(crate::engine::scene::wire_copy(&effect));
+    a.filters.push(crate::engine::scene::wire_copy(&effect));
     c.filters.push(effect);
-    Arc::make_mut(&mut a.filters[0].settings)["gamma"] = serde_json::json!(1.7);
-    Arc::make_mut(&mut c.filters[0].settings)["gamma"] = serde_json::json!(1.7);
-    Arc::make_mut(&mut c.filters[0].settings)["white"] = serde_json::json!(0.82);
+    let mut changed = crate::engine::scene::wire_copy(a.filters[0].settings.value());
+    changed["gamma"] = serde_json::json!(1.7);
+    a.filters[0].settings = changed.into();
+    let mut changed = crate::engine::scene::wire_copy(c.filters[0].settings.value());
+    changed["gamma"] = serde_json::json!(1.7);
+    changed["white"] = serde_json::json!(0.82);
+    c.filters[0].settings = changed.into();
     let result = run(&mut sources, &b, &a, &c);
     assert!(result.report.conflicts.is_empty());
     assert_eq!(sources.output.len(), 1);
@@ -598,17 +602,17 @@ fn changed_project_frame_with_later_work_and_locked_filter_changes_fail_closed()
     assert_eq!(result.candidate.name, "later human");
     drop(result);
     sources.output.clear();
-    let mut a = b.clone();
-    let mut c = b.clone();
+    let mut a = crate::engine::scene::wire_copy(&b);
+    let mut c = crate::engine::scene::wire_copy(&b);
     let effect = Effect36 {
         id: "filter".into(),
         kind: "gamma".into(),
         enabled: true,
         weight: 1.,
-        settings: Arc::new(serde_json::json!({})),
+        settings: serde_json::json!({}).into(),
         clips: vec![],
     };
-    a.filters.push(effect.clone());
+    a.filters.push(crate::engine::scene::wire_copy(&effect));
     c.filters.push(effect);
     c.layers[0].locked = true;
     let result = run(&mut sources, &b, &a, &c);

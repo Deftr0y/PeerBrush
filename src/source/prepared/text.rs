@@ -38,7 +38,7 @@ impl TextPlan {
             align,
             color,
             ..
-        } = &source.content
+        } = source.definition()
         else {
             return Err("Text preparation requires text metadata".into());
         };
@@ -73,7 +73,7 @@ impl TextPlan {
                 super::super::shaping::layout_parts(
                     source.width,
                     text,
-                    match &source.content {
+                    match source.definition() {
                         Content36::Text { font, .. } => font,
                         _ => unreachable!(),
                     },

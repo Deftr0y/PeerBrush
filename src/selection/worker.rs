@@ -316,7 +316,7 @@ mod tests {
         let before = coverage.key();
         collector.0.push(coverage.clone());
         metadata.selection = Some([0, 0, 2, 2]);
-        metadata.selection_polygon = Some(vec![[0., 0.], [2., 0.], [0., 2.]]);
+        metadata.selection_polygon = Some(vec![[0., 0.], [2., 0.], [0., 2.]].into());
         metadata.selection_coverage = Some(Coverage36 {
             mask: RasterRef36 {
                 id: collector.0.len() as u32,
@@ -327,7 +327,7 @@ mod tests {
             },
             bounds: [0, 0, 2, 2],
             origin: [0, 0],
-            contours: Vec::new(),
+            contours: Vec::new().into(),
         });
         let identity = SceneIdentity {
             project_id: "selection-fixture".into(),

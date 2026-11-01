@@ -791,17 +791,10 @@ pub(super) fn restamp(
     let roster = source.core.roster.clone();
     let resident = source.budget().clone();
     let disk = source.disk_budget().clone();
-    let core = metadata.map_unique(|mut metadata, _| {
+    let core = metadata.rehome_unique(|mut metadata, _| {
         check()?;
         metadata.revision = revision;
-        Ok(Core {
-            metadata,
-            roster,
-            resident,
-            disk,
-            key: key(),
-            render_key: OnceLock::new(),
-        })
+        Core::prepare(metadata, roster, resident, disk, check)
     })?;
     Ok(NativeDocument { core })
 }
