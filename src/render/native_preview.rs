@@ -856,12 +856,20 @@ mod tests {
         ));
         let (scene, path) = profile_scene(&doc);
         let prepared = prepare(&scene, None, 48, None, false);
+        let pool = scene.budget().clone();
         let baseline = scene.budget().used();
         let remaining = scene.budget().limit() - baseline - 127 * 1024 * 1024;
-        let owner = scene
-            .budget()
-            .reserve_bytes(remaining, 64 * 1024 * 1024)
-            .unwrap();
+        let owner: Vec<_> = (0..remaining.div_ceil(64 * 1024 * 1024))
+            .map(|index| {
+                scene
+                    .budget()
+                    .reserve_bytes(
+                        (remaining - index * 64 * 1024 * 1024).min(64 * 1024 * 1024),
+                        64 * 1024 * 1024,
+                    )
+                    .unwrap()
+            })
+            .collect();
         assert!(prepared.render(&scene, &mut || Ok(())).is_err());
         assert_eq!(scene.budget().used(), baseline + remaining);
         drop(owner);
@@ -881,5 +889,6 @@ mod tests {
         drop(prepared);
         drop(scene);
         crate::compositor::native::tests::cleanup(&path);
+        assert_eq!(pool.used(), 0);
     }
 }
