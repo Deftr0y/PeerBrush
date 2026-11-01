@@ -18,6 +18,7 @@ use crate::{
 };
 use ring::digest::{Context, SHA256};
 use std::{
+    cell::Cell,
     io::{Read, Write},
     path::Path,
     sync::Arc,
@@ -441,6 +442,7 @@ pub(crate) fn prepare<'a>(
                 provenance: super::scene_save36::provenance(scene),
                 core_sha256: core_sha,
                 _standard_fidelity: fidelity,
+                failed: Cell::new(false),
             })
         }
         Err(error) => {
@@ -595,6 +597,7 @@ pub(crate) struct CompletedSave36<'a> {
     provenance: Digest,
     core_sha256: Digest,
     _standard_fidelity: ComparedStandard,
+    failed: Cell<bool>,
 }
 impl CompletedSave36<'_> {
     pub(crate) fn scene(&self) -> &SceneSnapshot {
@@ -619,6 +622,16 @@ impl CompletedSave36<'_> {
     /// Source file identity/lease and engine revision are the caller's guard;
     /// each supplied error is preserved through the owned I/O callback.
     pub(crate) fn recheck(&self, check: &dyn Fn() -> Result<(), String>) -> Result<(), String> {
+        if self.failed.replace(true) {
+            return Err("Source36 completed save is failed".into());
+        }
+        let result = self.recheck_inner(check);
+        if result.is_ok() {
+            self.failed.set(false);
+        }
+        result
+    }
+    fn recheck_inner(&self, check: &dyn Fn() -> Result<(), String>) -> Result<(), String> {
         check()?;
         if super::scene_save36::provenance(self.scene) != self.provenance
             || self.candidate.role() != ByteRole::PhotoshopContainer
@@ -678,3 +691,7 @@ impl CompletedSave36<'_> {
         first.map_or(Ok(()), Err)
     }
 }
+
+#[cfg(test)]
+#[path = "save36_tests.rs"]
+mod tests;
