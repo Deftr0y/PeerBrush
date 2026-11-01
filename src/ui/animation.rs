@@ -403,14 +403,15 @@ impl PeerBrush {
     pub(super) fn ai_layer(&self, id: &str, time: f64) -> bool {
         self.ai_reserved(id) || self.animation.layer(id, time)
     }
-    pub(super) fn ai_canvas(
+    pub(super) fn ai_canvas<'a>(
         &self,
         ui: &egui::Ui,
         painter: &egui::Painter,
-        doc: &Document,
+        doc: impl Into<DocumentView<'a>>,
         rect: Rect,
         scale: f32,
     ) {
+        let doc = doc.into();
         let time = ui.input(|i| i.time);
         let mut scopes = self.animation.scopes(time);
         scopes.extend(
@@ -432,13 +433,14 @@ impl PeerBrush {
                 scope
                     .target
                     .as_ref()
-                    .and_then(|id| doc.layers.iter().find(|l| &l.id == id))
+                    .and_then(|id| doc.find_layer(id))
                     .map(|l| {
+                        let [x, y] = l.origin();
                         [
-                            l.x,
-                            l.y,
-                            l.x + l.pixels.width as i32,
-                            l.y + l.pixels.height as i32,
+                            x,
+                            y,
+                            x + l.pixels().width as i32,
+                            y + l.pixels().height as i32,
                         ]
                     })
             });

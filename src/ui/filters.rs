@@ -330,9 +330,10 @@ impl Editor {
     pub fn command(&self) -> Value {
         json!({"op":if self.target.is_some(){"filter.update"}else{"filter.add"},"filter":self.target,"kind":self.kind,"settings":self.settings,"weight":self.weight,"document_id":self.document,"source_revision":self.revision})
     }
-    pub fn preview_commands(&self, doc: &Document) -> Vec<Value> {
+    pub fn preview_commands<'a>(&self, doc: impl Into<DocumentView<'a>>) -> Vec<Value> {
+        let doc = doc.into();
         if self.unfiltered {
-            doc.filters.iter().map(|f|json!({"op":"filter.update","filter":f.id,"enabled":false,"document_id":self.document,"source_revision":self.revision})).collect()
+            (0..doc.filter_count()).filter_map(|index| doc.filter(index)).map(|f|json!({"op":"filter.update","filter":f.id(),"enabled":false,"document_id":self.document,"source_revision":self.revision})).collect()
         } else if self.original {
             vec![]
         } else {
