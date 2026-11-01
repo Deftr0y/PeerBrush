@@ -95,4 +95,38 @@ mod tests {
         };
         assert!(validate(17, 19, 8, 8, crate::retained::IDENTITY, None, &[stage]).is_ok());
     }
+
+    #[test]
+    fn small_metadata_admission_matches_actual_resident_original_validation() {
+        for depth in [8, 16] {
+            let pixels = crate::raster::Raster::new_depth(17, 19, depth);
+            let valid = Stage {
+                before: Map::IDENTITY.matrix(),
+                grid: crate::warp::Grid::identity([-1., -1., 18., 20.]).unwrap(),
+            };
+            let mut folded = valid.clone();
+            folded.grid.points[4] = [40., 10.];
+            for (matrix, projective, warps) in [
+                (crate::retained::IDENTITY, None, Vec::new()),
+                ([1., 0.2, 0.1, 0.8, 3.25, -7.5], None, Vec::new()),
+                ([1., 0., 0., 0., 0., 0.], None, Vec::new()),
+                (
+                    crate::retained::IDENTITY,
+                    Some([1., 0., 0., 0., 1., 0., 1., 0., -8.]),
+                    Vec::new(),
+                ),
+                (crate::retained::IDENTITY, None, vec![valid]),
+                (crate::retained::IDENTITY, None, vec![folded]),
+            ] {
+                let mut old = crate::retained::Original::from(&pixels);
+                old.matrix = matrix;
+                old.projective = projective;
+                old.warps = serde_json::from_value(serde_json::to_value(&warps).unwrap()).unwrap();
+                assert_eq!(
+                    validate(17, 19, depth, depth, matrix, projective, &warps).is_ok(),
+                    old.validate(depth).is_ok()
+                );
+            }
+        }
+    }
 }
