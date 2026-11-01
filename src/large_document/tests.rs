@@ -797,6 +797,109 @@ fn corrupt_checkpoint_selection_never_changes_retained_bytes() {
 }
 
 #[test]
+fn held_owner_selects_old_checkpoint_without_advancing_head_or_bypassing_guards() {
+    let fixture = Fixture::new();
+    let budget = ResidentBudget::new(1024).unwrap();
+    let store = fixture.store(&budget);
+    assert_ne!(store.identity(), [0; 16]);
+    let block = store
+        .put(TileSpec::new(1, 1, 16).unwrap(), &[3; 8], &mut okay)
+        .unwrap();
+    let old = store
+        .commit([9; 16], 0, None, b"old", &[block], &mut okay)
+        .unwrap()
+        .reference();
+    let current = store
+        .commit([9; 16], 1, Some(old), b"current", &[block], &mut okay)
+        .unwrap()
+        .reference();
+    let selected = store.snapshot(old, &mut okay).unwrap();
+    assert_eq!(&*selected.metadata(&mut okay).unwrap(), b"old");
+    assert_eq!(store.state().unwrap().head, Some(current));
+    assert_eq!(
+        selected.store().pin(block, &mut okay).unwrap().bytes(),
+        [3; 8]
+    );
+    for field in 0..6 {
+        let mut forged = old;
+        match field {
+            0 => forged.store[0] ^= 1,
+            1 => forged.digest[0] ^= 1,
+            2 => forged.offset += 1,
+            3 => forged.end += 1,
+            4 => forged.source[0] ^= 1,
+            _ => forged.revision += 1,
+        }
+        assert!(store.snapshot(forged, &mut okay).is_err());
+    }
+    assert!(matches!(
+        store.snapshot(old, &mut || Err(Error::Cancelled)),
+        Err(Error::Cancelled)
+    ));
+    let writer = store.0.access.write().unwrap();
+    assert!(matches!(store.snapshot(old, &mut okay), Err(Error::Busy)));
+    drop(writer);
+    assert_eq!(store.state().unwrap().head, Some(current));
+    assert_eq!(budget.used(), 0);
+}
+
+#[test]
+fn embedded_manifest_bytes_are_not_a_selected_record_boundary() {
+    let fixture = Fixture::new();
+    let store = fixture.store(&ResidentBudget::new(1024).unwrap());
+    let mut payload = [0; 256];
+    let mut prefix = [0; MANIFEST_HEADER];
+    prefix[..16].copy_from_slice(&[7; 16]);
+    let digest = digest_parts(b"CMIT", [&prefix[..]], &mut okay).unwrap();
+    payload[..4].copy_from_slice(b"CMIT");
+    payload[4..12].copy_from_slice(&(MANIFEST_HEADER as u64).to_be_bytes());
+    payload[12..44].copy_from_slice(&digest);
+    payload[44..108].copy_from_slice(&prefix);
+    payload[108..116].copy_from_slice(SEAL);
+    let block = store
+        .put(TileSpec::new(8, 8, 8).unwrap(), &payload, &mut okay)
+        .unwrap();
+    store
+        .commit([7; 16], 1, None, b"real", &[block], &mut okay)
+        .unwrap();
+    let offset = block.offset + RECORD_HEADER + 8;
+    let forged = CommitRef {
+        store: store.identity(),
+        digest,
+        offset,
+        end: offset + 116,
+        source: [7; 16],
+        revision: 0,
+    };
+    assert!(matches!(
+        store.snapshot(forged, &mut okay),
+        Err(Error::Corrupt)
+    ));
+}
+
+#[test]
+fn held_checkpoint_selection_rechecks_late_source_changes() {
+    let fixture = Fixture::new();
+    let store = fixture.store(&ResidentBudget::new(1024).unwrap());
+    let selected = store
+        .commit([9; 16], 0, None, b"retained", &[], &mut okay)
+        .unwrap()
+        .reference();
+    let before = store.0.file.metadata().unwrap().len();
+    let mut changed = false;
+    let result = store.snapshot(selected, &mut || {
+        if !changed {
+            write_all_at(&store.0.file, before, b"foreign tail")?;
+            changed = true;
+        }
+        Ok(())
+    });
+    assert!(matches!(result, Err(Error::Changed)));
+    assert_eq!(store.state().unwrap().head, Some(selected));
+    assert_eq!(store.0.file.metadata().unwrap().len(), before + 12);
+}
+
+#[test]
 #[ignore = "Opt-in actual dense backing component; needs 8 GiB private disk, not full 16000 editor acceptance"]
 fn dense_three_layer_native16_backing_crosses_four_gib_with_bounded_pins() {
     let started = std::time::Instant::now();
