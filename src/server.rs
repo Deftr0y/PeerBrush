@@ -255,7 +255,8 @@ fn open_request(
                         "Image opened — save as PSD or PSB".into()
                     }
                 })
-                .unwrap_or_else(|e| e.clone());
+                .unwrap_or_else(|e| e.clone())
+                .into();
             e.loading = None;
         }
     }
@@ -552,7 +553,8 @@ impl SaveOperation {
             e.status = result
                 .as_ref()
                 .map(|_| "Photoshop document saved".into())
-                .unwrap_or_else(|error| error.clone());
+                .unwrap_or_else(|error| error.clone())
+                .into();
         }
         self.completed = true;
         self.control.finish(result);
@@ -3114,23 +3116,23 @@ pub fn start_with_preferences(
     crate::disk_cache::configure(cache);
     let library = crate::brush_library::Library::load(preferences.join("brushes.json"));
     if let Some(error) = &library.error {
-        shared.lock().unwrap().status = error.clone();
+        shared.lock().unwrap().status = error.clone().into();
     }
     *shared.lock().unwrap().brush_library.lock().unwrap() = library;
     let tools = crate::tool_settings::Store::load(preferences.join("tool-settings.json"));
     if let Some(error) = &tools.error {
-        shared.lock().unwrap().status = error.clone();
+        shared.lock().unwrap().status = error.clone().into();
     }
     *shared.lock().unwrap().tool_settings.lock().unwrap() = tools;
     let library = crate::filter_library::Library::load(preferences.join("filters.json"));
     if let Some(error) = &library.error {
-        shared.lock().unwrap().status = error.clone();
+        shared.lock().unwrap().status = error.clone().into();
     }
     *shared.lock().unwrap().filter_library.lock().unwrap() = library;
     let library =
         crate::production_export::library::Library::load(preferences.join("export-presets.json"));
     if let Some(error) = &library.error {
-        shared.lock().unwrap().status = error.clone();
+        shared.lock().unwrap().status = error.clone().into();
     }
     *shared.lock().unwrap().export_library.lock().unwrap() = library;
     let workspace = crate::workspace::attach(&shared);
