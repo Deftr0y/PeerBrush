@@ -896,3 +896,254 @@ fn ordered_session_smudge_matches_native_resident_with_one_final_soft_selection(
         assert_eq!(document.key(), input.binding().generation());
     }
 }
+
+#[test]
+fn prepared_bilinear_native_source_preserves_origin_edges_and_explicit_query_errors() {
+    let f = Fixture::new();
+    let (runtime, _connection) = f.runtime();
+    let session = runtime.begin().unwrap();
+    for depth in [8, 16] {
+        let mut source = source(depth);
+        for y in 0..7 {
+            for x in 0..9 {
+                source.layers[0].pixels.set16(
+                    x,
+                    y,
+                    [
+                        12347 + x as u16 * 911,
+                        23521 + y as u16 * 617,
+                        43217,
+                        if (x + y) % 4 == 0 { 0 } else { 49153 },
+                    ],
+                );
+            }
+        }
+        let document = native(&source, &session);
+        let input = RasterInput::layer(&document, &source.layers[0].id).unwrap();
+        let pixels = input
+            .prepare_samples([-4., 1., 6.5, 9.], &mut || Ok(()))
+            .unwrap();
+        for y in [1., 1.25, 2., 3.75, 8., 9.] {
+            for x in [-4., -3.75, -3., -0.5, 5., 6.5] {
+                assert_eq!(
+                    pixels.sample16(x, y).unwrap(),
+                    source.layers[0].pixels.sample16(x + 3., y - 2.)
+                );
+            }
+        }
+        assert!(pixels.sample16(6.75, 9.).is_err());
+        let before = runtime.resident().used();
+        let exterior = input
+            .prepare_samples([300_000., 300_000., 300_383., 300_383.], &mut || Ok(()))
+            .unwrap();
+        assert_eq!(runtime.resident().used(), before);
+        assert_eq!(exterior.sample16(300_127.5, 300_271.25).unwrap(), [0; 4]);
+        assert!(exterior.sample16(300_384., 300_000.).is_err());
+    }
+}
+
+#[test]
+fn session_clone_and_heal_match_resident_source_offsets_and_soft_selection() {
+    let f = Fixture::new();
+    let (runtime, _connection) = f.runtime();
+    let session = runtime.begin().unwrap();
+    for depth in [8, 16] {
+        for heal in [false, true] {
+            let mut source = Document::new_depth(9, 7, depth).unwrap();
+            let mut sample = crate::engine::Layer::new("Sample", "paint", 9, 7);
+            sample.pixels = Raster::new_depth(9, 7, depth);
+            sample.x = -2;
+            sample.y = 1;
+            for y in 0..7 {
+                for x in 0..9 {
+                    source.layers[0].pixels.set16(
+                        x,
+                        y,
+                        [12347 + x as u16 * 911, 23521 + y as u16 * 617, 43217, 49153],
+                    );
+                    sample.pixels.set16(
+                        x,
+                        y,
+                        [
+                            23521 + x as u16 * 173,
+                            43217 + y as u16 * 131,
+                            12347 + (x * y) as u16 * 113,
+                            if (x + y) % 4 == 0 { 0 } else { 45679 },
+                        ],
+                    );
+                }
+            }
+            let source_id = sample.id.clone();
+            source.layers.push(sample);
+            source.selection = Some([0, 0, 9, 7]);
+            let mut coverage = Raster::new_depth(9, 7, 16);
+            for y in 0..7 {
+                for x in 0..9 {
+                    coverage.set16(x, y, [if x < 4 { 32769 } else { 49153 }, 0, 0, 0]);
+                }
+            }
+            source.selection_coverage = Some(crate::selection::Coverage {
+                mask: coverage,
+                bounds: source.selection.unwrap(),
+                origin: [0, 0],
+                contours: vec![],
+            });
+            let command = serde_json::json!({"op":if heal {"heal"}else{"clone"},"layer":source.layers[0].id,
+            "source_layer":source_id,"source":[3.5,1.25],
+            "points":[[2.25,2.5,0.7],[5.25,3.25,0.9],[7.,5.,0.6]],
+            "radius":1.8,"spacing":0.8,"hardness":0.4,"flow":0.6,"opacity":0.7,"heal_radius":2});
+            let (points, pressures) = crate::brush::points_from_command(&command).unwrap();
+            let settings = crate::brush::Settings::from_command(&command).unwrap();
+            let mut legacy = crate::engine::Engine::new();
+            legacy.doc = source.clone();
+            legacy
+                .edit("human", &[command], None, None, "Retouch")
+                .unwrap();
+            assert_eq!(legacy.undo.len(), 1);
+            let document = native(&source, &session);
+            let input = RasterInput::layer(&document, &source.layers[0].id).unwrap();
+            let sampling = RasterInput::layer(&document, &source_id).unwrap();
+            let stroke =
+                LocalStroke::new(&input, &points, pressures.as_deref(), &mut || Ok(())).unwrap();
+            let before = runtime.disk().used().unwrap();
+            let BuiltTiles::Draft(draft) = crate::retouch::input::stage_raster(
+                &input,
+                &sampling,
+                &stroke,
+                settings,
+                [3.5 - points[0][0], 1.25 - points[0][1]],
+                heal.then_some(2),
+                None,
+                &session,
+                &mut || Ok(()),
+            )
+            .unwrap() else {
+                panic!("No retouch output")
+            };
+            let output = draft.seal(&|| Ok(())).ok().unwrap();
+            let region = output
+                .surface()
+                .prepare_region(Region::new([0, 0, 9, 7]).unwrap(), &mut || Ok(()))
+                .unwrap();
+            for y in 0..7 {
+                for x in 0..9 {
+                    assert_eq!(
+                        region.pixel16(x, y).unwrap(),
+                        legacy.doc.layers[0].pixels.get16(x, y),
+                        "depth{depth} heal{heal} at{x},{y}"
+                    );
+                }
+            }
+            drop(region);
+            output.abort(&session, &|| Ok(())).unwrap();
+            assert_eq!(runtime.disk().used().unwrap(), before);
+        }
+    }
+}
+
+#[test]
+fn framed_healing_uses_original_document_source_and_translated_destination_halo() {
+    let f = Fixture::new();
+    let (runtime, _connection) = f.runtime();
+    let session = runtime.begin().unwrap();
+    for depth in [8, 16] {
+        let mut source = Document::new_depth(12, 10, depth).unwrap();
+        source.layers[0].x = 4;
+        source.layers[0].y = 3;
+        source.layers[0].pixels = Raster::new_depth(5, 4, depth);
+        for y in 0..4 {
+            for x in 0..5 {
+                source.layers[0].pixels.set16(
+                    x,
+                    y,
+                    [12347 + x as u16 * 911, 23521 + y as u16 * 617, 43217, 49153],
+                );
+            }
+        }
+        let mut sample = crate::engine::Layer::new("Sample", "paint", 12, 10);
+        sample.pixels = Raster::new_depth(12, 10, depth);
+        for y in 0..10 {
+            for x in 0..12 {
+                sample.pixels.set16(
+                    x,
+                    y,
+                    [
+                        23521 + x as u16 * 173,
+                        43217 + y as u16 * 131,
+                        12347 + (x * y) as u16 * 113,
+                        45679,
+                    ],
+                );
+            }
+        }
+        let source_id = sample.id.clone();
+        source.layers.push(sample);
+        let command = serde_json::json!({"op":"heal","layer":source.layers[0].id,"source_layer":source_id,
+            "source":[7.5,2.25],"points":[[1.25,1.5,0.7],[6.25,4.25,0.9]],
+            "radius":1.8,"spacing":0.8,"hardness":0.4,"flow":0.6,"opacity":0.7,"heal_radius":2});
+        let (points, pressures) = crate::brush::points_from_command(&command).unwrap();
+        let settings = crate::brush::Settings::from_command(&command).unwrap();
+        let mut legacy = crate::engine::Engine::new();
+        legacy.doc = source.clone();
+        legacy
+            .edit("human", &[command], None, None, "Heal")
+            .unwrap();
+        let document = native(&source, &session);
+        let input = RasterInput::layer(&document, &source.layers[0].id).unwrap();
+        let sampling = RasterInput::layer(&document, &source_id).unwrap();
+        let frame = input.project_frame([0, 0, 9, 7]).unwrap().unwrap();
+        let stroke = LocalStroke::for_frame(
+            &input,
+            &frame,
+            &points,
+            pressures.as_deref(),
+            &mut || Ok(()),
+        )
+        .unwrap();
+        let BuiltTiles::Draft(draft) = crate::retouch::input::stage_raster(
+            &input,
+            &sampling,
+            &stroke,
+            settings,
+            [7.5 - points[0][0], 2.25 - points[0][1]],
+            Some(2),
+            Some(&frame),
+            &session,
+            &mut || Ok(()),
+        )
+        .unwrap() else {
+            panic!("No framed retouch output")
+        };
+        let output = draft.seal(&|| Ok(())).ok().unwrap();
+        let shape = frame.geometry().new_shape();
+        assert_eq!(
+            shape,
+            [
+                legacy.doc.layers[0].pixels.width,
+                legacy.doc.layers[0].pixels.height
+            ]
+        );
+        assert_eq!(
+            frame.geometry().new_origin(),
+            [legacy.doc.layers[0].x, legacy.doc.layers[0].y]
+        );
+        let region = output
+            .surface()
+            .prepare_region(
+                Region::new([0, 0, shape[0] as i32, shape[1] as i32]).unwrap(),
+                &mut || Ok(()),
+            )
+            .unwrap();
+        for y in 0..shape[1] as i32 {
+            for x in 0..shape[0] as i32 {
+                assert_eq!(
+                    region.pixel16(x, y).unwrap(),
+                    legacy.doc.layers[0].pixels.get16(x, y),
+                    "depth{depth} at{x},{y}"
+                );
+            }
+        }
+        drop(region);
+        output.abort(&session, &|| Ok(())).unwrap();
+    }
+}

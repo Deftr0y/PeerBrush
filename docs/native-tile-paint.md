@@ -149,3 +149,12 @@ preserves the owner on error for registered fragment retirement. Soft coverage
 is applied once against the captured original after the full stroke. Reframed
 strokes are refused by their binding until a complete working-frame adapter is
 provided; this is an integration gate, not permission to clip requested work.
+
+The clone/heal adapter prepares a generation-matched paint source or raw paint
+mask step, including exact floating bilinear support and the complete healing
+destination halo. Bilinear support can span 385 samples because it includes the
+last adjacent sample; bounded physical strips feed its charged linear owner.
+Exterior zeros follow from source geometry, while undeclared queries fail.
+Reframed targets remap the destination baseline and halo without changing source
+document coordinates. Merged artwork and composed-mask inputs still require the
+shared prepared compositor and are not replaced with raw layer samples.
