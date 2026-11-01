@@ -61,3 +61,20 @@ fields use charged byte storage, including their padded rows and columns.
 The output preserves complete physical tile padding and stays provisional until
 the common captured-scene transaction adopts it. Merged artwork/mask sampling
 must use the shared prepared compositor; this kernel adds no full-frame fallback.
+
+`smudge::native::PreparedSmudge` retains the ordered pigment reservoir. A worker
+prepares explicitly stamped native strips of at most 128 KiPixels and completes
+each dab's average before staging any of that dab's tiles. Native8 uses the
+original f32 reservoir and native16 the original f64 reservoir, including the
+legacy f32 write-strength product. A transparent loading color can still move
+existing pigment. The working owner must make all completed prior dabs visible
+to the next preparation. Strip/tile preparation may perform worker I/O; sampling
+already-prepared bytes never does. Input and output buffers share the captured
+resident pool, and tile results preserve physical padding.
+
+The run owns its provisional candidate. A preparation, cancellation or staging
+failure drops that owner and returns no completed candidate. Successful output
+still grants no document authority: the common scene/revision/lease transaction
+must adopt it with one history entry. The small resident differential fixture is
+an operator oracle; the max-radius strip test is a footprint check, not dense16K
+document admission or native desktop/performance qualification.
