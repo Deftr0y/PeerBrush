@@ -549,6 +549,50 @@ impl CapturePixels for Surface {
 }
 
 impl Document36 {
+    /// Mutation traversal for a provisional native header. A rebuilt roster and
+    /// the strict immutable traversal must validate the result before adoption.
+    pub(crate) fn remap_rasters(
+        &mut self,
+        mut visit: impl FnMut(&mut RasterRef36) -> Result<()>,
+    ) -> Result<()> {
+        fn walk(
+            reference: &mut RasterRef36,
+            visit: &mut impl FnMut(&mut RasterRef36) -> Result<()>,
+        ) -> Result<()> {
+            visit(reference)?;
+            if let Some(original) = &mut reference.retained {
+                visit(&mut original.pixels)?;
+            }
+            Ok(())
+        }
+        for layer in &mut self.layers {
+            walk(&mut layer.pixels, &mut visit)?;
+            if let Some(mask) = &mut layer.mask {
+                for step in &mut mask.steps {
+                    walk(&mut step.pixels, &mut visit)?;
+                }
+            }
+            for effect in &mut layer.effects {
+                effect.checked_clips()?;
+                for clip in &mut effect.clips {
+                    walk(&mut clip.coverage.mask, &mut visit)?;
+                }
+            }
+        }
+        for effect in &mut self.filters {
+            effect.checked_clips()?;
+            for clip in &mut effect.clips {
+                walk(&mut clip.coverage.mask, &mut visit)?;
+            }
+        }
+        for coverage in [&mut self.selection_coverage, &mut self.selection_previous]
+            .into_iter()
+            .flatten()
+        {
+            walk(&mut coverage.mask, &mut visit)?;
+        }
+        Ok(())
+    }
     /// Source36 DTO construction is metadata-only. The caller first captures an
     /// immutable document, then runs this outside engine/root/registry locks.
     pub fn capture(doc: &Document, collector: &mut impl RasterCollector) -> Result<Self> {
