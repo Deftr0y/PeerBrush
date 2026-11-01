@@ -49,11 +49,16 @@ impl resvg::rows::RowBudget for Budget {
 fn main() {
     // Synthetic primitive oracle only. This fixture budget is not the app's
     // shared allocation ledger and provides no app-wide RAM qualification.
+    let baseline = std::env::args().any(|argument| argument == "--baseline");
     let mut out = io::BufWriter::new(io::stdout().lock());
     let budget = Budget {
         live: Arc::new(AtomicUsize::new(0)),
     };
     for case in corpus::cases() {
+        if baseline && case.name == "reused-identical-clip-sites" {
+            continue;
+        }
+
         let tree =
             resvg::usvg::Tree::from_str(&case.svg, &resvg::usvg::Options::default()).unwrap();
         let [sx, ky, kx, sy, tx, ty] = case.matrix;
@@ -97,6 +102,46 @@ fn main() {
                 assert_eq!(budget.live.load(Ordering::SeqCst), 0);
                 at += count;
             }
+        }
+        if !baseline {
+            let mut plan = resvg::rows::RowPlan::new(
+                &tree,
+                transform,
+                case.frame,
+                resvg::rows::PlanLimits {
+                    retained_bytes: 64 * 1024 * 1024,
+                    maximum_invocations: 16384,
+                    work: 1_000_000_000,
+                },
+                &budget,
+            )
+            .unwrap();
+            let mut selected = 0;
+            while !plan.is_complete() {
+                let start = plan.next_y();
+                let count = 7.min(case.frame[1] - start);
+                let image = plan
+                    .next(count)
+                    .unwrap_or_else(|error| panic!("{} plan row{start}: {error}", case.name));
+                while selected < case.rows.len() && case.rows[selected] < start + count {
+                    let row = case.rows[selected];
+                    assert!(row >= start);
+                    let begin = (row - start) as usize * case.frame[0] as usize * 4;
+                    out.write_all(&image.data()[begin..begin + case.frame[0] as usize * 4])
+                        .unwrap();
+                    selected += 1;
+                }
+                drop(image);
+                assert_eq!(budget.live.load(Ordering::SeqCst), 64 * 1024 * 1024);
+            }
+            assert_eq!(selected, case.rows.len());
+            eprintln!(
+                "whole operation scan work: {} {}",
+                case.name,
+                plan.work_used()
+            );
+            drop(plan);
+            assert_eq!(budget.live.load(Ordering::SeqCst), 0);
         }
         eprintln!(
             "bounded row: {} {:?} {:?}",

@@ -5,6 +5,12 @@
 // found in the LICENSE file.
 
 use crate::*;
+#[cfg(feature = "std")]
+use alloc::string::String;
+#[cfg(feature = "std")]
+type PreparedDraw<'a> = (&'a crate::ScanCache, crate::InvocationKey);
+#[cfg(not(feature = "std"))]
+type PreparedDraw<'a> = core::marker::PhantomData<&'a ()>;
 
 use tiny_skia_path::{PathStroker, Scalar, SCALAR_MAX};
 
@@ -195,6 +201,16 @@ impl PixmapMut<'_> {
         transform: Transform,
         mask: Option<&Mask>,
     ) {
+        self.fill_rect_inner(rect, paint, transform, mask, None);
+    }
+    fn fill_rect_inner(
+        &mut self,
+        rect: Rect,
+        paint: &Paint,
+        transform: Transform,
+        mask: Option<&Mask>,
+        prepared: Option<PreparedDraw<'_>>,
+    ) {
         // TODO: we probably can use tiler for rect too
         if transform.is_identity() && !DrawTiler::required(self.width(), self.height()) {
             // TODO: ignore rects outside the pixmap
@@ -215,7 +231,7 @@ impl PixmapMut<'_> {
             }
         } else {
             let path = PathBuilder::from_rect(rect);
-            self.fill_path(&path, paint, FillRule::Winding, transform, mask);
+            self.fill_path_inner(&path, paint, FillRule::Winding, transform, mask, prepared);
         }
     }
 
@@ -227,6 +243,37 @@ impl PixmapMut<'_> {
         fill_rule: FillRule,
         transform: Transform,
         mask: Option<&Mask>,
+    ) {
+        self.fill_path_inner(path, paint, fill_rule, transform, mask, None);
+    }
+    /// Operation-owned ascending-band scan continuation. Legacy fill remains uncached.
+    #[cfg(feature = "std")]
+    pub fn fill_path_prepared(
+        &mut self,
+        path: &Path,
+        paint: &Paint,
+        rule: FillRule,
+        transform: Transform,
+        mask: Option<&Mask>,
+        cache: &crate::ScanCache,
+        key: crate::InvocationKey,
+    ) -> Result<(), String> {
+        cache.status()?;
+        self.fill_path_inner(path, paint, rule, transform, mask, Some((cache, key)));
+        cache.status()?;
+        if self.row_storage_failed() {
+            return Err("SVG prepared fill escaped stored rows".into());
+        }
+        Ok(())
+    }
+    fn fill_path_inner(
+        &mut self,
+        path: &Path,
+        paint: &Paint,
+        fill_rule: FillRule,
+        transform: Transform,
+        mask: Option<&Mask>,
+        prepared: Option<PreparedDraw<'_>>,
     ) {
         if transform.is_identity() {
             // This is sort of similar to SkDraw::drawPath
@@ -240,6 +287,7 @@ impl PixmapMut<'_> {
 
             if is_too_big_for_math(path) {
                 log::warn!("path coordinates are too big");
+                refuse_prepared(prepared, "SVG prepared path kernel refused its input");
                 return;
             }
 
@@ -255,6 +303,7 @@ impl PixmapMut<'_> {
                         Some(v) => v,
                         None => {
                             log::warn!("path transformation failed");
+                            refuse_prepared(prepared, "SVG prepared path kernel refused its input");
                             return;
                         }
                     };
@@ -266,6 +315,7 @@ impl PixmapMut<'_> {
                         None => continue, // technically unreachable
                     };
 
+                    let band = [subpix.rows.start, subpix.rows.end()];
                     let submask = mask.and_then(|mask| mask.submask(tile.to_int_rect()));
                     let mut blitter = match RasterPipelineBlitter::new(&paint, submask, &mut subpix)
                     {
@@ -276,11 +326,15 @@ impl PixmapMut<'_> {
                     // We're ignoring "errors" here, because `fill_path` will return `None`
                     // when rendering a tile that doesn't have a path on it.
                     // Which is not an error in this case.
-                    if paint.anti_alias {
-                        scan::path_aa::fill_path(&path, fill_rule, &clip_rect, &mut blitter);
-                    } else {
-                        scan::path::fill_path(&path, fill_rule, &clip_rect, &mut blitter);
-                    }
+                    fill_scan(
+                        &path,
+                        paint.anti_alias,
+                        fill_rule,
+                        &clip_rect,
+                        tile_prepared(prepared, &tile),
+                        band,
+                        &mut blitter,
+                    );
 
                     let ts = Transform::from_translate(tile.x() as f32, tile.y() as f32);
                     path = match path.transform(ts) {
@@ -293,22 +347,28 @@ impl PixmapMut<'_> {
                 let clip_rect = self.size().to_screen_int_rect(0, 0);
                 let submask = mask.map(|mask| mask.as_submask());
                 let mut subpix = self.as_subpixmap();
+                let band = [subpix.rows.start, subpix.rows.end()];
                 let mut blitter = match RasterPipelineBlitter::new(paint, submask, &mut subpix) {
                     Some(v) => v,
                     None => return, // nothing to do, all good
                 };
 
-                if paint.anti_alias {
-                    scan::path_aa::fill_path(path, fill_rule, &clip_rect, &mut blitter);
-                } else {
-                    scan::path::fill_path(path, fill_rule, &clip_rect, &mut blitter);
-                }
+                fill_scan(
+                    path,
+                    paint.anti_alias,
+                    fill_rule,
+                    &clip_rect,
+                    prepared,
+                    band,
+                    &mut blitter,
+                );
             }
         } else {
             let path = match path.clone().transform(transform) {
                 Some(v) => v,
                 None => {
                     log::warn!("path transformation failed");
+                    refuse_prepared(prepared, "SVG prepared path kernel refused its input");
                     return;
                 }
             };
@@ -316,7 +376,14 @@ impl PixmapMut<'_> {
             let mut paint = paint.clone();
             paint.shader.transform(transform);
 
-            self.fill_path(&path, &paint, fill_rule, Transform::identity(), mask)
+            self.fill_path_inner(
+                &path,
+                &paint,
+                fill_rule,
+                Transform::identity(),
+                mask,
+                prepared,
+            )
         }
     }
 
@@ -341,8 +408,40 @@ impl PixmapMut<'_> {
         transform: Transform,
         mask: Option<&Mask>,
     ) {
+        self.stroke_path_inner(path, paint, stroke, transform, mask, None);
+    }
+    /// Operation-owned continuation for the original native stroke kernel.
+    #[cfg(feature = "std")]
+    pub fn stroke_path_prepared(
+        &mut self,
+        path: &Path,
+        paint: &Paint,
+        stroke: &Stroke,
+        transform: Transform,
+        mask: Option<&Mask>,
+        cache: &crate::ScanCache,
+        key: crate::InvocationKey,
+    ) -> Result<(), String> {
+        cache.status()?;
+        self.stroke_path_inner(path, paint, stroke, transform, mask, Some((cache, key)));
+        cache.status()?;
+        if self.row_storage_failed() {
+            return Err("SVG prepared stroke escaped stored rows".into());
+        }
+        Ok(())
+    }
+    fn stroke_path_inner(
+        &mut self,
+        path: &Path,
+        paint: &Paint,
+        stroke: &Stroke,
+        transform: Transform,
+        mask: Option<&Mask>,
+        prepared: Option<PreparedDraw<'_>>,
+    ) {
         if stroke.width < 0.0 {
             log::warn!("negative stroke width isn't allowed");
+            refuse_prepared(prepared, "SVG prepared path kernel refused its input");
             return;
         }
 
@@ -354,6 +453,7 @@ impl PixmapMut<'_> {
                 Some(v) => v,
                 None => {
                     log::warn!("path dashing failed");
+                    refuse_prepared(prepared, "SVG prepared path kernel refused its input");
                     return;
                 }
             };
@@ -363,6 +463,12 @@ impl PixmapMut<'_> {
         };
 
         if let Some(coverage) = treat_as_hairline(paint, stroke, transform) {
+            #[cfg(feature = "std")]
+            if let Some((cache, _)) = prepared {
+                cache.refuse("SVG retained hairline continuation is not yet qualified");
+                return;
+            }
+
             let mut paint = paint.clone();
             if coverage == 1.0 {
                 // No changes to the `paint`.
@@ -385,6 +491,7 @@ impl PixmapMut<'_> {
                         Some(v) => v,
                         None => {
                             log::warn!("path transformation failed");
+                            refuse_prepared(prepared, "SVG prepared path kernel refused its input");
                             return;
                         }
                     };
@@ -396,6 +503,7 @@ impl PixmapMut<'_> {
                         Some(v) => v,
                         None => {
                             log::warn!("path transformation failed");
+                            refuse_prepared(prepared, "SVG prepared path kernel refused its input");
                             return;
                         }
                     };
@@ -430,6 +538,7 @@ impl PixmapMut<'_> {
                         Some(v) => v,
                         None => {
                             log::warn!("path transformation failed");
+                            refuse_prepared(prepared, "SVG prepared path kernel refused its input");
                             return;
                         }
                     };
@@ -444,11 +553,12 @@ impl PixmapMut<'_> {
                 Some(v) => v,
                 None => {
                     log::warn!("path stroking failed");
+                    refuse_prepared(prepared, "SVG prepared path kernel refused its input");
                     return;
                 }
             };
 
-            self.fill_path(&path, paint, FillRule::Winding, transform, mask);
+            self.fill_path_inner(&path, paint, FillRule::Winding, transform, mask, prepared);
         }
     }
 
@@ -484,6 +594,38 @@ impl PixmapMut<'_> {
         transform: Transform,
         mask: Option<&Mask>,
     ) {
+        self.draw_pixmap_inner(x, y, pixmap, paint, transform, mask, None);
+    }
+    #[cfg(feature = "std")]
+    pub fn draw_pixmap_prepared(
+        &mut self,
+        x: i32,
+        y: i32,
+        pixmap: PixmapRef,
+        paint: &PixmapPaint,
+        transform: Transform,
+        mask: Option<&Mask>,
+        cache: &crate::ScanCache,
+        key: crate::InvocationKey,
+    ) -> Result<(), String> {
+        cache.status()?;
+        self.draw_pixmap_inner(x, y, pixmap, paint, transform, mask, Some((cache, key)));
+        cache.status()?;
+        if self.row_storage_failed() {
+            return Err("SVG prepared pixmap escaped stored rows".into());
+        }
+        Ok(())
+    }
+    fn draw_pixmap_inner(
+        &mut self,
+        x: i32,
+        y: i32,
+        pixmap: PixmapRef,
+        paint: &PixmapPaint,
+        transform: Transform,
+        mask: Option<&Mask>,
+        prepared: Option<PreparedDraw<'_>>,
+    ) {
         let rect = pixmap.size().to_int_rect(x, y).to_rect();
 
         // TODO: SkSpriteBlitter
@@ -507,7 +649,7 @@ impl PixmapMut<'_> {
             colorspace: ColorSpace::default(),
         };
 
-        self.fill_rect(rect, &paint, transform, mask);
+        self.fill_rect_inner(rect, &paint, transform, mask, prepared);
     }
 
     /// Applies a masks.
@@ -737,5 +879,63 @@ mod tests {
             ScreenIntRect::from_xywh(MAX_DIM, MAX_DIM, 10000 - MAX_DIM, 10000 - MAX_DIM)
         );
         assert_eq!(iter.next(), None);
+    }
+}
+
+fn tile_prepared<'a>(
+    prepared: Option<PreparedDraw<'a>>,
+    tile: &ScreenIntRect,
+) -> Option<PreparedDraw<'a>> {
+    #[cfg(feature = "std")]
+    if let Some((cache, key)) = prepared {
+        let key = key
+            .child(250, (u64::from(tile.x()) << 32) | u64::from(tile.y()))
+            .and_then(|key| {
+                key.child(
+                    251,
+                    (u64::from(tile.width()) << 32) | u64::from(tile.height()),
+                )
+            });
+        if let Some(key) = key {
+            return Some((cache, key));
+        }
+        cache.refuse("SVG prepared invocation depth exceeded");
+    }
+    None
+}
+fn fill_scan(
+    path: &Path,
+    aa: bool,
+    rule: FillRule,
+    clip: &ScreenIntRect,
+    prepared: Option<PreparedDraw<'_>>,
+    band: [u32; 2],
+    blitter: &mut dyn crate::blitter::Blitter,
+) {
+    #[cfg(feature = "std")]
+    if let Some((cache, key)) = prepared {
+        // Empty physical tiles still perform the original path/shader transform
+        // and restoration. They simply have no row state to consume.
+        if band[0] == band[1] {
+            return;
+        }
+        if aa {
+            scan::path_aa::fill_path_prepared(path, rule, clip, cache, key, band, blitter);
+        } else {
+            scan::path::fill_path_prepared(path, rule, clip, cache, key, band, blitter);
+        }
+        return;
+    }
+    if aa {
+        scan::path_aa::fill_path(path, rule, clip, blitter);
+    } else {
+        scan::path::fill_path(path, rule, clip, blitter);
+    }
+}
+
+fn refuse_prepared(prepared: Option<PreparedDraw<'_>>, message: &str) {
+    #[cfg(feature = "std")]
+    if let Some((cache, _)) = prepared {
+        cache.refuse(message);
     }
 }
