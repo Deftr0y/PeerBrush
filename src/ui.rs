@@ -12,6 +12,7 @@ mod compatibility;
 mod contour_points;
 mod dialogs;
 mod effect_color;
+mod edit_job;
 mod effects;
 mod exports;
 mod file_drop;
