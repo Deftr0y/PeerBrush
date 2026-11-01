@@ -196,6 +196,11 @@ jobs:
                       matched += ['JXL_WORKER_' + code for code in sorted(set(re.findall(r'^JXL_TIMEOUT_ERROR_(FAILED|PROTOCOL|RESOURCE|OTHER)$', body, re.M)))]
                       if matched:
                           print('::error title=Regression failure category::' + name[:128] + ': ' + ', '.join(matched))
+                      if name == 'jpeg_xl::stream_parent::tests::actual_profile_staging_owned_mode1_worker_replay_and_isolated_decode_keep_native_samples':
+                          records = re.findall(r'^JXL_STREAM_STATUS phase=(staging|encode|recheck|copy|decode|pixels|retire|cleanup) depth=(8|16) category=(begin|ok|quota|timeout|retained|worker|protocol|other)$', body, re.M)
+                          if 0 < len(records) <= 64:
+                              phase, depth, category = records[-1]
+                              print(f'::error title=Native codec diagnostic::phase={phase} depth={depth} category={category}')
                       if name in {'protocol_presets_preview_and_repeated_batches_keep_native_files_profiles_and_source', 'batch_existing_file_policies_report_written_skipped_failed_and_unattempted_outputs'}:
                           records = re.findall(r'^PB_EXPORT_WAIT elapsed_ms=(0|[1-9][0-9]{0,5}) status=(running) phase=(planning|rendering|complete|stopped|unknown) outputs=(0|[1-9][0-9]{0,2}) written=(0|[1-9][0-9]{0,2}) skipped=(0|[1-9][0-9]{0,2}) failed=(0|[1-9][0-9]{0,2}) not_written=(0|[1-9][0-9]{0,2})$', body, re.M)
                           if len(records) == 1:

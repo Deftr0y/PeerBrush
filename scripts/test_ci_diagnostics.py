@@ -62,6 +62,30 @@ class Diagnostics(unittest.TestCase):
                 self.assertEqual(output.count('title=Regression failure location::'), 1)
                 self.assertNotIn('private', output)
 
+    def test_native_codec_phase_is_finite_failure_scoped_and_private(self):
+        name = 'jpeg_xl::stream_parent::tests::actual_profile_staging_owned_mode1_worker_replay_and_isolated_decode_keep_native_samples'
+        header = f'test {name} ... FAILED\n---- {name} stdout ----\n'
+        phases = ['staging', 'encode', 'recheck', 'copy', 'decode', 'pixels', 'retire', 'cleanup']
+        categories = ['begin', 'ok', 'quota', 'timeout', 'retained', 'worker', 'protocol', 'other']
+        for depth in [8, 16]:
+            for phase, category in zip(phases, categories):
+                record = f'JXL_STREAM_STATUS phase={phase} depth={depth} category={category}'
+                output = self.summarize(header + record + '\n' + PRIVATE)
+                self.assertIn(f'Native codec diagnostic::phase={phase} depth={depth} category={category}', output)
+        valid = 'JXL_STREAM_STATUS phase=encode depth=16 category=worker'
+        for bad in [PRIVATE + valid, valid + ' ' + PRIVATE,
+                    valid.replace('phase=encode', 'phase=' + PRIVATE),
+                    valid.replace('depth=16', 'depth=32'), valid.replace('depth=16', 'depth=016'),
+                    valid.replace('category=worker', 'category=' + PRIVATE),
+                    valid.replace('category=worker', 'category=unknown')]:
+            self.assertNotIn('Native codec diagnostic::', self.summarize(header + bad + '\n' + PRIVATE))
+        self.assertNotIn('Native codec diagnostic::', self.summarize('test other::case ... FAILED\n---- other::case stdout ----\n' + valid))
+        self.assertNotIn('Native codec diagnostic::', self.summarize('test result: ok. 1 passed; 0 failed; 0 ignored;\n' + valid, status=0))
+        self.assertNotIn('Native codec diagnostic::', self.summarize(header + (valid + '\n') * 65))
+        output = self.summarize(header + valid + '\n' + valid.replace('category=worker', 'category=protocol'))
+        self.assertEqual(output.count('Native codec diagnostic::'), 1)
+        self.assertIn('category=protocol', output)
+
     def test_section_location_never_exports_non_source_traversal_or_unselected_test(self):
         name = 'ui::bounded'
         for path in ['private/input.rs', 'src/../private.rs', 'src/private.rs:0:1', 'src/' + PRIVATE]:
