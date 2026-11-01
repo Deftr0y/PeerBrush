@@ -73,6 +73,9 @@ impl NativeInventory<'_> {
     }
 }
 impl NativeExternalSnapshot<'_> {
+    pub(crate) fn uses_budget(&self, budget: &ResidentBudget) -> bool {
+        self.inventory.budget.same_pool(budget) && self._charge.uses_budget(budget)
+    }
     pub(crate) fn target(&self) -> &Path {
         self.inventory.lease.path()
     }
@@ -193,6 +196,8 @@ mod tests {
         let mut inventory = lease.freeze_inventory(&pool, &|| Ok(())).unwrap();
         {
             let snapshot = inventory.observe_external(&|| Ok(())).unwrap();
+            assert!(snapshot.uses_budget(&pool.clone()));
+            assert!(!snapshot.uses_budget(&ResidentBudget::new(16 * 1024 * 1024).unwrap()));
             snapshot.revalidate(&|| Ok(())).unwrap();
             assert_eq!(snapshot.target(), path);
             assert_eq!(
