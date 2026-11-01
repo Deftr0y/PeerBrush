@@ -19,6 +19,10 @@ impl Failure {
 
 #[cfg(windows)]
 pub(super) struct Parent(windows::Win32::Foundation::HANDLE);
+// An exclusively owned kernel job handle can be transferred between threads.
+// No borrowed handle escapes; Drop closes it exactly once after the owner moves.
+#[cfg(windows)]
+unsafe impl Send for Parent {}
 #[cfg(not(windows))]
 pub(super) struct Parent;
 

@@ -101,7 +101,7 @@ than checked `8*raw_bytes +32 MiB`. Every authenticated rectangle response count
 against this declared budget; NeedRectangle preflight refuses excess before the
 parent reads/stages that window. This bounds repeated source work as well as
 resident/output metadata. Legitimate effort/halo demand must be qualified before
-choosing a production policy. Earlier unpublished V1 peers fail the new magic.
+choosing a production policy. Earlier unpublished V1/V2 peers fail the new magic.
 
 V3 also binds an explicit `max_source_read_bytes`, at most checked
 `64*raw_bytes +256 MiB`. The parent accounts successful original sealed readback
@@ -110,3 +110,26 @@ fresh whole-hash pass before IO. The byte factory's frozen original chunk index
 supplies the integrity proof; no second mutable index/cache is substituted.
 Returned ROI bytes and physical authenticated readwork are separate counters.
 This initial bounded policy still needs legitimate effort/halo qualification.
+
+The closed parent input is a `StagedNativeRows` owner minted from an exact captured
+scene/output and the session's straight-native byte factory. Its original frozen
+chunk hashes authenticate each full covered chunk before ROI bytes reach the
+worker. Raw/source/profile/output/encoder options, build and nonce are bound
+separately; arbitrary byte spools are not accepted as native row authority.
+Parent callback buffers stay within32MiB, with the child's96MiB callback envelope
+admitted simultaneously. Native allocator/profile reservations are additional.
+
+The broker records every child event in the registered append-only segment log,
+requires terminal EOF and known successful owned-child exit, then rechecks the
+raw source before and after canonical forward replay. The resulting owner keeps
+both source and log/canonical namespaces through explicit retirement. It proves
+encoding transport and source ownership; final decoder/fidelity checks and
+destination publication remain separate mandatory gates.
+
+If stopping the worker is uncertain, its actual owned child, kernel-limit owner,
+source/profile operation and resource tickets remain parked. An internal reaper
+starts before launch and polls only that owned child; after known exit it drops
+these owners outside the retained-state mutex, even during profile closing with
+no future codec request. Future codec work remains disabled after uncertain stop
+until restart. No filesystem retirement is inferred merely from worker exit.
+The new operation is not activated by these producer/transport components.
