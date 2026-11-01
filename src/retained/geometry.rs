@@ -20,6 +20,42 @@ pub(crate) fn placement(matrix: [f64; 6], projective: Option<[f64; 9]>) -> Resul
         .map_or(Ok(affine), |p| affine.compose(p))
 }
 
+/// Map logical source support using the unchanged resident placement arithmetic.
+/// Source bounds, layout and prepared metadata admission belong to the caller.
+pub(crate) fn bounds(
+    source: [i32; 4],
+    matrix: [f64; 6],
+    projective: Option<[f64; 9]>,
+    warps: &[Stage],
+) -> Result<[f64; 4], String> {
+    if !warps.is_empty() {
+        return Placement::new(warps, placement(matrix, projective)?)?
+            .bounds(source.map(f64::from));
+    }
+    if projective.is_some() {
+        return placement(matrix, projective)?.bounds(source.map(f64::from));
+    }
+    let [a, b, c, d, tx, ty] = matrix;
+    let ps = [
+        [source[0], source[1]],
+        [source[2], source[1]],
+        [source[2], source[3]],
+        [source[0], source[3]],
+    ]
+    .map(|[x, y]| {
+        [
+            exact(a * x as f64 + c * y as f64 + tx),
+            exact(b * x as f64 + d * y as f64 + ty),
+        ]
+    });
+    Ok([
+        ps.iter().map(|p| p[0]).fold(f64::INFINITY, f64::min),
+        ps.iter().map(|p| p[1]).fold(f64::INFINITY, f64::min),
+        ps.iter().map(|p| p[0]).fold(f64::NEG_INFINITY, f64::max),
+        ps.iter().map(|p| p[1]).fold(f64::NEG_INFINITY, f64::max),
+    ])
+}
+
 /// Source layout/owner/metadata admission remains the caller's responsibility.
 /// This checks no Raster, backing file or live document-size policy.
 pub(crate) fn validate(
@@ -59,6 +95,23 @@ pub(crate) fn validate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounds_keep_raw_placement_coefficients_and_full_logical_support() {
+        let raw = [1. + 1e-9, 0., 0., 1., 0., 0.];
+        let b = bounds([0, 0, 16000, 5], raw, None, &[]).unwrap();
+        assert_eq!([b[0], b[1], b[3]], [0., 0., 5.]);
+        assert!(b[2] > 16000.00001);
+        assert_eq!(
+            bounds([0, 0, 6, 7], [1., 0., 0., 1., 2., 3.], None, &[]).unwrap(),
+            [2., 3., 8., 10.]
+        );
+        let projective = Some([1., 0., 2., 0., 1., 3., 0., 0., 1.]);
+        assert_eq!(
+            bounds([0, 0, 6, 7], crate::retained::IDENTITY, projective, &[]).unwrap(),
+            [2., 3., 8., 10.]
+        );
+    }
 
     #[test]
     fn geometry_keeps_depth_determinant_horizon_and_warp_support_checks_without_live_caps() {
