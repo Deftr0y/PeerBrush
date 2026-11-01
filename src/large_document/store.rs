@@ -81,6 +81,15 @@ pub struct BlockRef {
 }
 
 impl BlockRef {
+    /// Complete immutable reference identity for derived keys, never pin authority.
+    pub fn fingerprint(self) -> Digest {
+        let mut context = Context::new(&SHA256);
+        context.update(b"PBTILE-REF1");
+        context.update(&self.store);
+        context.update(&self.encode());
+        context.finish().as_ref().try_into().unwrap()
+    }
+
     pub fn digest(self) -> Digest {
         self.digest
     }
