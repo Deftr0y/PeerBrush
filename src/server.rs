@@ -1,7 +1,7 @@
 mod fonts;
 mod instance;
 use crate::{
-    engine::{self, Engine, Scope},
+    engine::{self, view, Engine, Scope},
     psd, raster,
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -288,10 +288,18 @@ fn open_progress_inner(
         if e.loading.as_ref().is_some_and(|c| !c.same(control)) {
             return Err("A document is already opening".into());
         }
-        let before = control
-            .source()
-            .unwrap_or_else(|| (e.doc.id.clone(), e.doc.revision));
-        if before != (e.doc.id.clone(), e.doc.revision) {
+        let before = control.source().unwrap_or_else(|| {
+            (
+                view::current(&e).id().to_owned(),
+                view::current(&e).revision(),
+            )
+        });
+        if before
+            != (
+                view::current(&e).id().to_owned(),
+                view::current(&e).revision(),
+            )
+        {
             return Err("Canvas changed before opening; current work preserved".into());
         }
         e.loading = Some(control.clone());
@@ -305,7 +313,11 @@ fn open_progress_inner(
         let doc = prepared.document(options, control)?;
         let mut e = shared.lock().unwrap();
         prepared.validate(control)?;
-        if (e.doc.id.clone(), e.doc.revision) != before {
+        if (
+            view::current(&e).id().to_owned(),
+            view::current(&e).revision(),
+        ) != before
+        {
             return Err("Canvas changed while opening; current work preserved".into());
         }
         e.replace(doc, None)?;
@@ -349,7 +361,11 @@ fn open_progress_inner(
     if crate::file_safety::version_with_check(path, || control.check())? != version {
         return Err("Photoshop file changed during decoding; current work preserved".into());
     }
-    if (e.doc.id.clone(), e.doc.revision) != before {
+    if (
+        view::current(&e).id().to_owned(),
+        view::current(&e).revision(),
+    ) != before
+    {
         return Err("Canvas changed while opening. Save the current work and try again.".into());
     }
     #[cfg(test)]
@@ -384,7 +400,7 @@ fn compatible_copy_guarded(
 ) -> Result<(), String> {
     let source = {
         let mut e = shared.lock().unwrap();
-        if document.is_some_and(|id| id != e.doc.id) {
+        if document.is_some_and(|id| id != view::current(&e).id()) {
             return Err("Project source changed before preparing a compatible copy".into());
         }
         e.expire();
@@ -395,10 +411,10 @@ fn compatible_copy_guarded(
                 rect: None,
             }],
         )?;
-        if !e.doc.read_only {
+        if !view::current(&e).read_only() {
             return Err("This document is already editable".into());
         }
-        if expected.is_some_and(|rev| rev != e.doc.revision) {
+        if expected.is_some_and(|rev| rev != view::current(&e).revision()) {
             return Err("Document changed; observe again before converting".into());
         }
         e.doc.clone()
@@ -442,7 +458,7 @@ fn compatible_copy_guarded(
     doc.layers[0].name = format!("Flattened {}-bit artwork", source.bit_depth);
     doc.revision = 1;
     let mut e = shared.lock().unwrap();
-    if e.doc.id != source.id || e.doc.revision != source.revision {
+    if view::current(&e).id() != source.id || view::current(&e).revision() != source.revision {
         return Err("Document changed while preparing the copy".into());
     }
     e.expire();
@@ -527,14 +543,17 @@ impl SaveOperation {
         crate::workspace::validate_target(&e, request)?;
         if request["expected_revision"]
             .as_u64()
-            .is_some_and(|revision| revision != e.doc.revision)
+            .is_some_and(|revision| revision != view::current(&e).revision())
         {
             return Err("Project revision changed before saving".into());
         }
         if e.saving.as_ref().is_some_and(|c| !c.status().finished) {
             return Err("A working save is already active for this project".into());
         }
-        control.begin(e.doc.id.clone(), e.doc.revision)?;
+        control.begin(
+            view::current(&e).id().to_owned(),
+            view::current(&e).revision(),
+        )?;
         e.saving = Some(control.clone());
         if e.loading.is_none() {
             e.status = "Saving Photoshop document".into();
@@ -790,12 +809,14 @@ fn save_prepared_inner(
         let e = shared.lock().unwrap();
         crate::workspace::validate_target(&e, request)?;
         let source = control.status();
-        if e.doc.id != source.document_id || e.doc.revision != source.revision {
+        if view::current(&e).id() != source.document_id
+            || view::current(&e).revision() != source.revision
+        {
             return Err("Project source changed before saving; current work preserved".into());
         }
         if request["expected_revision"]
             .as_u64()
-            .is_some_and(|r| r != e.doc.revision)
+            .is_some_and(|r| r != view::current(&e).revision())
         {
             return Err("Project revision changed before saving".into());
         }
@@ -837,8 +858,8 @@ fn save_prepared_inner(
         control.check()?;
         let e = shared.lock().unwrap();
         e.ensure_open()?;
-        if e.doc.id != doc.id
-            || e.doc.revision != doc.revision
+        if view::current(&e).id() != doc.id
+            || view::current(&e).revision() != doc.revision
             || e.path != source_path
             || e.file_version != source_version
             || e.saved_revision != saved_revision
@@ -892,8 +913,8 @@ fn save_prepared_inner(
     before_commit();
     let mut e = shared.lock().unwrap();
     e.ensure_open()?;
-    if e.doc.id != doc.id
-        || e.doc.revision != doc.revision
+    if view::current(&e).id() != doc.id
+        || view::current(&e).revision() != doc.revision
         || e.path != source_path
         || e.file_version != source_version
         || e.saved_revision != saved_revision
@@ -929,7 +950,7 @@ fn save_prepared_inner(
         return Err("Published save changed before verification; current work remains open and the previous version is retained".into());
     }
     ownership.published(version.identity);
-    if e.doc.id == doc.id {
+    if view::current(&e).id() == doc.id {
         e.path = Some(path.into());
         e.file_version = Some(version);
         e.doc.name = path
@@ -1054,7 +1075,7 @@ pub(crate) fn export_derived_to_guarded(
         }
         if request["expected_revision"]
             .as_u64()
-            .is_some_and(|r| r != e.doc.revision)
+            .is_some_and(|r| r != view::current(&e).revision())
         {
             return Err("Project changed before exporting".into());
         }
@@ -1145,7 +1166,7 @@ pub(crate) fn export_derived_to_guarded(
     let backup = lease.preserve()?;
     let e = shared.lock().unwrap();
     e.ensure_open()?;
-    if e.doc.id != doc.id || e.doc.revision != doc.revision {
+    if view::current(&e).id() != doc.id || view::current(&e).revision() != doc.revision {
         return Err("Project source changed before exporting".into());
     }
     lease.validate()?;
@@ -1575,8 +1596,8 @@ fn filter_library(shared: &Shared, p: &Value) -> Result<Value, String> {
             let doc = {
                 let mut e = shared.lock().unwrap();
                 crate::workspace::validate_target(&e, p)?;
-                if p["document_id"].as_str() != Some(e.doc.id.as_str())
-                    || p["expected_revision"].as_u64() != Some(e.doc.revision)
+                if p["document_id"].as_str() != Some(view::current(&e).id())
+                    || p["expected_revision"].as_u64() != Some(view::current(&e).revision())
                 {
                     return Err(
                         "Filter preview needs the current document_id and expected_revision".into(),
@@ -1610,7 +1631,10 @@ fn filter_library(shared: &Shared, p: &Value) -> Result<Value, String> {
             })?;
             let (w, h, rgba, rect) = preview.preview(None, edge, None, false)?;
             let e = shared.lock().unwrap();
-            if e.closed || e.doc.id != doc.id || e.doc.revision != doc.revision {
+            if e.closed
+                || view::current(&e).id() != doc.id
+                || view::current(&e).revision() != doc.revision
+            {
                 return Err("Project changed during filter preview; observe again".into());
             }
             Ok(
@@ -2003,7 +2027,7 @@ fn dispatch_project(shared: &Shared, method: &str, p: &Value) -> Result<Value, S
             if crate::workspace::mutating(method, p)
                 && p["expected_revision"]
                     .as_u64()
-                    .is_some_and(|r| r != e.doc.revision)
+                    .is_some_and(|r| r != view::current(&e).revision())
             {
                 return Err("Project revision changed; observe again".into());
             }
@@ -2083,7 +2107,7 @@ fn dispatch_project(shared: &Shared, method: &str, p: &Value) -> Result<Value, S
                 }
                 if p.get("expected_revision")
                     .and_then(Value::as_u64)
-                    .is_some_and(|r| r != e.doc.revision)
+                    .is_some_and(|r| r != view::current(&e).revision())
                 {
                     return Err("Document changed before undo/redo. Observe again.".into());
                 }
@@ -2097,7 +2121,7 @@ fn dispatch_project(shared: &Shared, method: &str, p: &Value) -> Result<Value, S
                 "list" => {}
                 _ => return Err("Unknown history action".into()),
             }
-            let mut result = json!({"revision":e.doc.revision,"undo":e.undo.iter().map(|h|json!({"actor":h.actor,"label":h.label,"task":h.task,"revision":h.after.revision,"reverted_batches":h.reverted})).collect::<Vec<_>>(),"redo_count":e.redo.len(),"tasks":e.task_history()});
+            let mut result = json!({"revision":view::current(&e).revision(),"undo":e.history_entries().map(|h|json!({"actor":h.actor(),"label":h.label(),"task":h.task(),"revision":h.revision(),"reverted_batches":h.reverted_batches()})).collect::<Vec<_>>(),"redo_count":e.history_lengths()[1],"tasks":e.task_history()});
             drop(e);
             if action != "list" && p["feedback"] != "request" {
                 result["images"] = observation(
@@ -2119,16 +2143,19 @@ fn dispatch_project(shared: &Shared, method: &str, p: &Value) -> Result<Value, S
                 crate::workspace::validate_target(&e, p)?;
                 if p["expected_revision"]
                     .as_u64()
-                    .is_some_and(|r| r != e.doc.revision)
+                    .is_some_and(|r| r != view::current(&e).revision())
                 {
                     return Err("Document revision changed; observe again before opening".into());
                 }
-                if e.doc.revision != e.saved_revision
+                if view::current(&e).revision() != e.saved_revision
                     && p.get("discard") != Some(&Value::Bool(true))
                 {
                     return Err("Unsaved work: save first or explicitly pass discard=true".into());
                 }
-                Some((e.doc.id.clone(), e.doc.revision))
+                Some((
+                    view::current(&e).id().to_owned(),
+                    view::current(&e).revision(),
+                ))
             } else {
                 None
             };
@@ -2142,7 +2169,9 @@ fn dispatch_project(shared: &Shared, method: &str, p: &Value) -> Result<Value, S
                     let revision = p["expected_revision"]
                         .as_u64()
                         .ok_or("Observe expected_revision before requesting a save report")?;
-                    if document != e.doc.id || revision != e.doc.revision {
+                    if document != view::current(&e).id()
+                        || revision != view::current(&e).revision()
+                    {
                         return Err(
                             "Document changed; observe again before requesting a save report"
                                 .into(),
@@ -2154,12 +2183,12 @@ fn dispatch_project(shared: &Shared, method: &str, p: &Value) -> Result<Value, S
                 "pattern_sources" => {
                     let e = shared.lock().unwrap();
                     crate::workspace::validate_target(&e, p)?;
-                    if p["document_id"].as_str() != Some(e.doc.id.as_str())
-                        || p["expected_revision"].as_u64() != Some(e.doc.revision)
+                    if p["document_id"].as_str() != Some(view::current(&e).id())
+                        || p["expected_revision"].as_u64() != Some(view::current(&e).revision())
                     {
                         return Err("Pattern inspection requires the observed document_id and expected_revision".into());
                     }
-                    let mut result = json!({"document_id":e.doc.id,"revision":e.doc.revision,"read_only":e.doc.read_only,"coordinate_space":"pattern_asset","color_space":"unmanaged_source_samples","reason":"Raw pattern pixels are inspected without interpreting Photoshop profile/color handling or layer-style placement. Original documents remain protected.","patterns":e.doc.source_patterns});
+                    let mut result = json!({"document_id":view::current(&e).id(),"revision":view::current(&e).revision(),"read_only":view::current(&e).read_only(),"coordinate_space":"pattern_asset","color_space":"unmanaged_source_samples","reason":"Raw pattern pixels are inspected without interpreting Photoshop profile/color handling or layer-style placement. Original documents remain protected.","patterns":e.doc.source_patterns});
                     if let Some(index) = p.get("pattern_index") {
                         let index = index
                             .as_u64()
@@ -2175,7 +2204,7 @@ fn dispatch_project(shared: &Shared, method: &str, p: &Value) -> Result<Value, S
                         } else {
                             raster::png(source.width, source.height, &source.pixels.rgba())?
                         };
-                        result["images"] = json!([{"data":STANDARD.encode(png),"mime_type":"image/png","width":source.width,"height":source.height,"native_depth":source.bit_depth,"coordinate_space":"pattern_asset","asset_rect":source.bounds,"source_index":source.source_index,"document_id":e.doc.id,"revision":e.doc.revision,"preview_only":true,"color_space":"unmanaged_source_samples"}]);
+                        result["images"] = json!([{"data":STANDARD.encode(png),"mime_type":"image/png","width":source.width,"height":source.height,"native_depth":source.bit_depth,"coordinate_space":"pattern_asset","asset_rect":source.bounds,"source_index":source.source_index,"document_id":view::current(&e).id(),"revision":view::current(&e).revision(),"preview_only":true,"color_space":"unmanaged_source_samples"}]);
                     }
                     return Ok(result);
                 }
@@ -2192,7 +2221,12 @@ fn dispatch_project(shared: &Shared, method: &str, p: &Value) -> Result<Value, S
                         depth,
                     )?;
                     let mut e = shared.lock().unwrap();
-                    if opening_source.as_ref() != Some(&(e.doc.id.clone(), e.doc.revision)) {
+                    if opening_source.as_ref()
+                        != Some(&(
+                            view::current(&e).id().to_owned(),
+                            view::current(&e).revision(),
+                        ))
+                    {
                         return Err("Canvas changed before opening; current work preserved".into());
                     }
                     e.replace(doc, None)?;
@@ -2214,7 +2248,12 @@ fn dispatch_project(shared: &Shared, method: &str, p: &Value) -> Result<Value, S
                             return Err("A document is already opening".into());
                         }
                         let (document, revision) = opening_source.unwrap();
-                        if (document.clone(), revision) != (e.doc.id.clone(), e.doc.revision) {
+                        if (document.clone(), revision)
+                            != (
+                                view::current(&e).id().to_owned(),
+                                view::current(&e).revision(),
+                            )
+                        {
                             return Err(
                                 "Canvas changed before opening; current work preserved".into()
                             );
