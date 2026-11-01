@@ -454,7 +454,7 @@ impl<'a> Plan<'a> {
         if actual.len() < row_bytes {
             return Err("Source36 native comparison row exceeds admitted scratch".into());
         }
-        let stripe = (expected.len() / row_bytes).min(256) as u32;
+        let stripe = stripe_rows(expected.len(), width, self.header.depth);
         if stripe == 0 {
             return Err("Source36 expected native stripe exceeds admitted scratch".into());
         }
@@ -566,7 +566,7 @@ impl<'a> Plan<'a> {
             return Ok(());
         }
         let row_bytes = w as usize * usize::from(self.header.depth / 8);
-        let stripe = (scratch.len() / row_bytes).min(256) as u32;
+        let stripe = stripe_rows(scratch.len(), w, self.header.depth);
         if stripe == 0 {
             return Err("Source36 native row exceeds admitted stripe transfer".into());
         }
@@ -816,6 +816,18 @@ fn write_extra(output: &mut impl Write, record: &Record<'_>) -> Result<(), Strin
     }
     Ok(())
 }
+/// Both emission and independent comparison use the same bounded preparation
+/// envelope even when the caller admits a larger transfer buffer.
+fn stripe_rows(scratch_bytes: usize, width: u32, depth: u16) -> u32 {
+    let row_bytes = width as usize * usize::from(depth / 8);
+    if row_bytes == 0 {
+        return 0;
+    }
+    (scratch_bytes / row_bytes)
+        .min(256)
+        .min((128 * 1024 / width.max(1)) as usize) as u32
+}
+
 fn tag_start(output: &mut impl Write, key: [u8; 4], bytes: u64) -> Result<(), String> {
     output.write_all(b"8BIM").map_err(|e| e.to_string())?;
     output.write_all(&key).map_err(|e| e.to_string())?;
@@ -871,6 +883,23 @@ mod tests {
     use super::*;
     use crate::psd::{row_stream::Source, structural};
     use std::io::Cursor;
+    #[test]
+    fn row_preparation_stays_inside_pixel_and_transfer_bounds_for_native_depths() {
+        for depth in [8, 16] {
+            for width in [1, 255, 256, 513, 8192, 16000] {
+                let row_bytes = width as usize * usize::from(depth / 8);
+                for scratch in [0, row_bytes - 1, row_bytes, 512 * 1024] {
+                    let rows = stripe_rows(scratch, width, depth);
+                    assert!(rows <= 256);
+                    assert!(u64::from(rows) * u64::from(width) <= 128 * 1024);
+                    assert!(rows as usize * row_bytes <= scratch);
+                    assert_eq!(rows == 0, scratch < row_bytes);
+                }
+            }
+        }
+        assert_eq!(stripe_rows(512 * 1024, 16000, 8), 8);
+        assert_eq!(stripe_rows(512 * 1024, 16000, 16), 8);
+    }
     fn header(format: Format, depth: u16) -> Header {
         Header {
             format,
