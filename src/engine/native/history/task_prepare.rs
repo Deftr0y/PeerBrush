@@ -266,6 +266,21 @@ impl HistorySnapshot {
                 gesture: Option<&'a str>,
                 scopes: &'a [Scope],
                 reverted: &'a [[u8; 16]],
+                reverted_revisions: Revisions<'a>,
+            }
+            struct Revisions<'a>(&'a TaskCapture);
+            impl Serialize for Revisions<'_> {
+                fn serialize<S: Serializer>(
+                    &self,
+                    serializer: S,
+                ) -> std::result::Result<S::Ok, S::Error> {
+                    use serde::ser::SerializeSeq;
+                    let mut sequence = serializer.serialize_seq(Some(self.0.entries().count()))?;
+                    for entry in self.0.entries() {
+                        sequence.serialize_element(&entry.after().metadata().revision())?;
+                    }
+                    sequence.end()
+                }
             }
             let info = copy_admitted(
                 &Borrowed {
@@ -275,6 +290,7 @@ impl HistorySnapshot {
                     gesture: None,
                     scopes: candidate.scopes.scopes(),
                     reverted: &candidate.reverted,
+                    reverted_revisions: Revisions(&candidate.capture),
                 },
                 current.budget(),
                 true,
