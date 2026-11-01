@@ -354,9 +354,23 @@ impl<E: std::fmt::Display> std::fmt::Display for Error<E> {
 /// This receipt only describes successful traversal. The source lease, result
 /// coverage, revision and cancellation still require engine admission.
 pub(super) struct Complete {
-    pub predicates: u64,
-    pub operations: u64,
-    pub spans: u64,
+    predicates: u64,
+    operations: u64,
+    spans: u64,
+    width: u32,
+    height: u32,
+}
+
+impl Complete {
+    pub fn predicates(&self) -> u64 {
+        self.predicates
+    }
+    pub fn spans(&self) -> u64 {
+        self.spans
+    }
+    pub fn shape(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
 }
 
 pub(super) struct Flood<'a> {
@@ -609,6 +623,8 @@ impl<'a> Flood<'a> {
             predicates: self.predicates,
             operations: self.operations,
             spans: self.spans,
+            width: self.shape.width as u32,
+            height: self.shape.height as u32,
         })
     }
 }

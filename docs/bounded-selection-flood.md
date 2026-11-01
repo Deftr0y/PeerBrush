@@ -34,6 +34,16 @@ Current and previous coverage plus the Wand replay baselines remain separate
 immutable sources. No backing error can become an empty selection or a
 transparent sample.
 
+The provisional span collector uses bounded caller-owned records and a row
+index. It requires a completed flood of the exact same dimensions and refuses
+record/work exhaustion, failed collectors and late source checks. Row union
+then streams scalar coverage without repeatedly rewriting immutable tiles.
+The soft-edge stage uses a `(2*radius+1)*width` byte ring, four bytes per-column
+sum, and two width-byte rows. It preserves the existing two-pass integer box
+filter, including zero canvas borders and intermediate truncation. Read,
+output or final-check failures return no completion receipt. These stages still
+need the worker's owned source storage and guarded document publication.
+
 Component checks compare complete masks with an independent pixel BFS, including
 holes, tile edges, several seed colors, Quick radius, generation rollover and
 failure after provisional output. The opt-in 256MP traversal uses computed
