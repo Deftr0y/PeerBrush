@@ -105,8 +105,16 @@ cICP chunk is a separate behavior change. Native image pixels remain intact.
 Container decoding, checksums and final source completion belong to the image
 decoder, rather than this sampler.
 
+`image_source` connects that admission to charged native row staging and final
+selection sampling. Base64 and file inputs keep the existing encoded and source
+dimension limits. File bytes, identity and version are checked before decoding
+and after sampling; a changed source returns no candidate. The completion owner
+is available only after full PNG checks. Selection imports preserve the current
+default-image APNG behavior, unapplied eXIf orientation and ignored ICC data.
+
 `regional_masks` consumes a fallible prepared evaluator bound to one captured
-scene, layer frame, origin, native depth and shared budgets. Raw fractional
+scene, layer identity, complete runtime source key, frame, origin, native depth
+and shared budgets. Raw fractional
 factors are rounded at 65535 before native selection combination, target-depth
 projection and opaque output alpha, matching the current mask command. The
 adapter supplies no alternative mask-stack evaluator and no history authority.
