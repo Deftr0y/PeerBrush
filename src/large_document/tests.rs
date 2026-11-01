@@ -899,6 +899,124 @@ fn derived_reference_identity_includes_store_spec_digest_and_offset() {
 }
 
 #[test]
+fn persistent_disk_quota_is_shared_and_recovered_files_are_not_double_charged() {
+    let fixture = Fixture::new();
+    let ram = ResidentBudget::new(1024).unwrap();
+    let disk = DiskBudget::new(700, 4).unwrap();
+    let first =
+        Store::create_with_disk_budget(&fixture.root(), ram.clone(), disk.clone(), limits())
+            .unwrap();
+    let other_root = fixture.base.join("other");
+    let other =
+        Store::create_with_disk_budget(&other_root, ram.clone(), disk.clone(), limits()).unwrap();
+    assert!(first.uses_disk_budget(&disk));
+    let spec = TileSpec::new(8, 8, 8).unwrap();
+    let block = first.put(spec, &[1; 256], &mut okay).unwrap();
+    let snapshot = first
+        .commit([1; 16], 0, None, b"a", &[block], &mut okay)
+        .unwrap();
+    let selected = snapshot.reference();
+    let charged = disk.used().unwrap();
+    assert_eq!(
+        charged,
+        first.0.file.metadata().unwrap().len() + other.0.file.metadata().unwrap().len()
+    );
+    assert_eq!(first.put(spec, &[1; 256], &mut okay).unwrap(), block);
+    assert_eq!(disk.used().unwrap(), charged);
+    assert!(matches!(
+        other.put(spec, &[2; 256], &mut okay),
+        Err(Error::Budget)
+    ));
+    assert_eq!(other.0.file.metadata().unwrap().len(), FILE_HEADER);
+    drop(snapshot);
+    drop(first);
+    assert_eq!(disk.used().unwrap(), charged);
+    let recovered = Store::recover_with_disk_budget(
+        &fixture.root(),
+        selected,
+        ram.clone(),
+        disk.clone(),
+        limits(),
+        &mut okay,
+    )
+    .unwrap();
+    assert_eq!(disk.used().unwrap(), charged);
+    assert_eq!(
+        recovered.store().pin(block, &mut okay).unwrap().bytes(),
+        [1; 256]
+    );
+    drop(recovered);
+    drop(other);
+    let inventory = DiskBudget::new(700, 4).unwrap();
+    let other_file = File::open(other_root.join("blocks.pbt")).unwrap();
+    let other_ticket = inventory
+        .retain_file(&other_root.join("blocks.pbt"), &other_file)
+        .unwrap();
+    drop(other_ticket);
+    drop(other_file);
+    let recovered = Store::recover_with_disk_budget(
+        &fixture.root(),
+        selected,
+        ram,
+        inventory.clone(),
+        limits(),
+        &mut okay,
+    )
+    .unwrap();
+    assert_eq!(inventory.used().unwrap(), charged);
+    drop(recovered);
+    assert_eq!(inventory.used().unwrap(), charged);
+}
+
+#[test]
+fn failed_partial_source_append_keeps_its_conservative_disk_charge() {
+    let fixture = Fixture::new();
+    let disk = DiskBudget::new(4096, 2).unwrap();
+    let store = Store::create_with_disk_budget(
+        &fixture.root(),
+        ResidentBudget::new(1024).unwrap(),
+        disk.clone(),
+        limits(),
+    )
+    .unwrap();
+    let before = disk.used().unwrap();
+    assert!(matches!(
+        store.put(TileSpec::new(8, 8, 8).unwrap(), &[9; 256], &mut || {
+            if store.0.file.metadata()?.len() > FILE_HEADER {
+                Err(Error::Cancelled)
+            } else {
+                Ok(())
+            }
+        }),
+        Err(Error::Cancelled)
+    ));
+    assert!(disk.used().unwrap() > before);
+    assert!(disk.used().unwrap() >= store.0.file.metadata().unwrap().len());
+    let charged = disk.used().unwrap();
+    drop(store);
+    assert_eq!(disk.used().unwrap(), charged);
+}
+
+#[test]
+fn explicit_disk_inventory_rechecks_every_file_after_the_last_callback() {
+    let fixture = Fixture::new();
+    let store = fixture.store(&ResidentBudget::new(1024).unwrap());
+    let paths = [(&store.0.path as &Path, &store.0.file)];
+    let budget = DiskBudget::from_inventory(1024, 2, &paths, &mut okay).unwrap();
+    assert_eq!(budget.used().unwrap(), FILE_HEADER);
+    let mut checks = 0;
+    let result = DiskBudget::from_inventory(1024, 2, &paths, &mut || {
+        checks += 1;
+        if checks == 2 {
+            write_all_at(&store.0.file, FILE_HEADER, b"late orphan bytes")?;
+        }
+        Ok(())
+    });
+    assert!(matches!(result, Err(Error::Changed)));
+    assert_eq!(store.0.file.metadata().unwrap().len(), FILE_HEADER + 17);
+}
+
+#[test]
 fn held_checkpoint_selection_rechecks_late_source_changes() {
     let fixture = Fixture::new();
     let store = fixture.store(&ResidentBudget::new(1024).unwrap());

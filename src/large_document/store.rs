@@ -9,7 +9,9 @@ use std::{
 
 use ring::digest::{Context, SHA256};
 
-use super::{access::Access, budget::Charge, Error, ResidentBudget, Result};
+use super::{
+    access::Access, budget::Charge, DiskBudget, DiskReservation, Error, ResidentBudget, Result,
+};
 
 const FILE_MAGIC: &[u8; 8] = b"PBTILES1";
 const SEAL: &[u8; 8] = b"PBSEAL01";
@@ -194,11 +196,11 @@ impl Limits {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct Stamp {
-    bytes: u64,
+pub(super) struct Stamp {
+    pub(super) bytes: u64,
     modified: SystemTime,
 }
-fn stamp(file: &File) -> Result<Stamp> {
+pub(super) fn stamp(file: &File) -> Result<Stamp> {
     let metadata = file.metadata()?;
     if !metadata.is_file() {
         return Err(Error::Changed);
@@ -233,6 +235,9 @@ impl PinnedBytes {
 pub struct ScratchBytes(Resident);
 
 impl ScratchBytes {
+    pub fn uses_budget(&self, budget: &ResidentBudget) -> bool {
+        self.0._charge.uses_budget(budget)
+    }
     pub fn new(budget: &ResidentBudget, length: usize, maximum: usize) -> Result<Self> {
         if maximum > 64 * 1024 * 1024 || length > maximum {
             return Err(Error::Budget);
@@ -302,6 +307,7 @@ struct Inner {
     id: [u8; 16],
     limits: Limits,
     budget: ResidentBudget,
+    disk: Option<DiskReservation>,
     access: Access,
     state: Mutex<State>,
     cache: Mutex<BTreeMap<(u8, Digest), Weak<Resident>>>,
@@ -380,6 +386,15 @@ impl Snapshot {
 }
 
 impl Store {
+    pub fn disk_budget(&self) -> Option<DiskBudget> {
+        self.0.disk.as_ref().map(DiskReservation::budget)
+    }
+    pub fn uses_disk_budget(&self, budget: &DiskBudget) -> bool {
+        self.0
+            .disk
+            .as_ref()
+            .is_some_and(|charge| charge.uses_budget(budget))
+    }
     /// Stable backing lineage identity; this grants no filesystem or pin authority.
     pub fn identity(&self) -> [u8; 16] {
         self.0.id
@@ -435,6 +450,24 @@ impl Store {
 
     /// Create a fresh private directory below an already-owned profile/session parent.
     pub fn create(root: &Path, budget: ResidentBudget, limits: Limits) -> Result<Self> {
+        Self::create_inner(root, budget, limits, None)
+    }
+
+    pub fn create_with_disk_budget(
+        root: &Path,
+        budget: ResidentBudget,
+        disk: DiskBudget,
+        limits: Limits,
+    ) -> Result<Self> {
+        Self::create_inner(root, budget, limits, Some(disk))
+    }
+
+    fn create_inner(
+        root: &Path,
+        budget: ResidentBudget,
+        limits: Limits,
+        disk: Option<DiskBudget>,
+    ) -> Result<Self> {
         let limits = limits.validate()?;
         if !root.is_absolute() || root.file_name().is_none() {
             return Err(Error::Invalid(
@@ -455,6 +488,7 @@ impl Store {
         let directory = open_directory(root)?;
         let directory_id = crate::file_safety::identity(&directory).map_err(|_| Error::Changed)?;
         let path = root.join("blocks.pbt");
+        let disk = disk.map(|budget| budget.reserve(FILE_HEADER)).transpose()?;
         let mut options = source_options();
         options.create_new(true);
         #[cfg(unix)]
@@ -465,6 +499,9 @@ impl Store {
         let file = options.open(&path)?;
         file.try_lock().map_err(|_| Error::Busy)?;
         let identity = crate::file_safety::identity(&file).map_err(|_| Error::Changed)?;
+        if let Some(charge) = &disk {
+            charge.bind(&file)?;
+        }
         let mut id = [0; 16];
         ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut id)
             .map_err(|_| Error::Invalid("Native backing identity could not be created"))?;
@@ -486,6 +523,7 @@ impl Store {
             id,
             limits,
             budget,
+            disk,
             access: Access::default(),
             state: Mutex::new(State {
                 expected: stamp(&file)?,
@@ -511,6 +549,28 @@ impl Store {
         limits: Limits,
         check: Check<'_>,
     ) -> Result<Snapshot> {
+        Self::recover_inner(root, selected, budget, limits, check, None)
+    }
+
+    pub fn recover_with_disk_budget(
+        root: &Path,
+        selected: CommitRef,
+        budget: ResidentBudget,
+        disk: DiskBudget,
+        limits: Limits,
+        check: Check<'_>,
+    ) -> Result<Snapshot> {
+        Self::recover_inner(root, selected, budget, limits, check, Some(disk))
+    }
+
+    fn recover_inner(
+        root: &Path,
+        selected: CommitRef,
+        budget: ResidentBudget,
+        limits: Limits,
+        check: Check<'_>,
+        disk: Option<DiskBudget>,
+    ) -> Result<Snapshot> {
         let limits = limits.validate()?;
         if !root.is_absolute() || selected.end > limits.disk_bytes {
             return Err(Error::Budget);
@@ -523,6 +583,9 @@ impl Store {
         let file = source_options().open(&path)?;
         file.try_lock().map_err(|_| Error::Busy)?;
         let identity = crate::file_safety::identity(&file).map_err(|_| Error::Changed)?;
+        let disk = disk
+            .map(|budget| budget.retain_file(&path, &file))
+            .transpose()?;
         let expected = stamp(&file)?;
         if expected.bytes < selected.end {
             return Err(Error::Corrupt);
@@ -542,6 +605,7 @@ impl Store {
             id: selected.store,
             limits,
             budget,
+            disk,
             access: Access::default(),
             state: Mutex::new(State {
                 expected,
@@ -960,6 +1024,9 @@ impl Store {
             .ok_or(Error::Budget)?;
         check()?;
         self.check_source(expected)?;
+        if let Some(charge) = &self.0.disk {
+            charge.grow(end - expected.bytes)?;
+        }
         let record = Record {
             kind: *kind,
             length,
@@ -1228,7 +1295,7 @@ fn read_checked(file: &File, offset: u64, bytes: &mut [u8], check: Check<'_>) ->
     Ok(())
 }
 
-fn read_exact_at(file: &File, mut offset: u64, mut bytes: &mut [u8]) -> Result<()> {
+pub(super) fn read_exact_at(file: &File, mut offset: u64, mut bytes: &mut [u8]) -> Result<()> {
     while !bytes.is_empty() {
         #[cfg(unix)]
         let n = {
@@ -1248,7 +1315,7 @@ fn read_exact_at(file: &File, mut offset: u64, mut bytes: &mut [u8]) -> Result<(
     }
     Ok(())
 }
-fn write_all_at(file: &File, mut offset: u64, mut bytes: &[u8]) -> Result<()> {
+pub(super) fn write_all_at(file: &File, mut offset: u64, mut bytes: &[u8]) -> Result<()> {
     while !bytes.is_empty() {
         #[cfg(unix)]
         let n = {
@@ -1278,7 +1345,7 @@ fn u64_at(bytes: &[u8], offset: usize) -> u64 {
     u64::from_be_bytes(bytes[offset..offset + 8].try_into().unwrap())
 }
 
-fn source_options() -> OpenOptions {
+pub(super) fn source_options() -> OpenOptions {
     let mut options = OpenOptions::new();
     options.read(true).write(true);
     #[cfg(windows)]
@@ -1303,14 +1370,14 @@ fn alias(metadata: &fs::Metadata) -> bool {
     }
     metadata.file_type().is_symlink()
 }
-fn regular(path: &Path) -> Result<()> {
+pub(super) fn regular(path: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_file() || alias(&metadata) {
         return Err(Error::Changed);
     }
     Ok(())
 }
-fn validate_ancestors(path: &Path) -> Result<()> {
+pub(super) fn validate_ancestors(path: &Path) -> Result<()> {
     for ancestor in path.ancestors() {
         let metadata = fs::symlink_metadata(ancestor)?;
         if !metadata.is_dir() || alias(&metadata) {
@@ -1319,7 +1386,7 @@ fn validate_ancestors(path: &Path) -> Result<()> {
     }
     Ok(())
 }
-fn open_directory(path: &Path) -> Result<File> {
+pub(super) fn open_directory(path: &Path) -> Result<File> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_dir() || alias(&metadata) {
         return Err(Error::Changed);
@@ -1343,12 +1410,12 @@ fn open_directory(path: &Path) -> Result<File> {
 }
 
 #[cfg(unix)]
-fn links(file: &File) -> Result<u64> {
+pub(super) fn links(file: &File) -> Result<u64> {
     use std::os::unix::fs::MetadataExt;
     Ok(file.metadata()?.nlink())
 }
 #[cfg(windows)]
-fn links(file: &File) -> Result<u64> {
+pub(super) fn links(file: &File) -> Result<u64> {
     use std::os::windows::io::AsRawHandle;
     #[repr(C)]
     #[derive(Default)]
