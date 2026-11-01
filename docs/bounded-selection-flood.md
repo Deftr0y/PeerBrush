@@ -44,6 +44,16 @@ filter, including zero canvas borders and intermediate truncation. Read,
 output or final-check failures return no completion receipt. These stages still
 need the worker's owned source storage and guarded document publication.
 
+`CoverageSource` retains the native scalar8 surface, document origin, bounds and
+shared contour metadata without a serialization or infallible pixel interface.
+Its prepared region retains both source ownership and payload pins. Sampling
+outside the declared footprint fails; metadata-proven exterior pixels are zero.
+The scalar red channel remains authoritative even when independent RGBA alpha
+is zero. Staging currently refuses retained legacy mask originals until their
+explicit scene collector can preserve them. No source is discarded to stage a
+mask. Flood workers explicitly prepare rows/stripes before memory-only matching;
+they do not turn a source getter into a backing read.
+
 Component checks compare complete masks with an independent pixel BFS, including
 holes, tile edges, several seed colors, Quick radius, generation rollover and
 failure after provisional output. The opt-in 256MP traversal uses computed
