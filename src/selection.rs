@@ -1,12 +1,16 @@
 //! Document-space selection geometry. The public rectangle stays its bounding box.
 use crate::engine::Document;
 pub mod backed;
+mod contours;
+mod coverage_writer;
 pub mod display;
 mod flood;
 pub mod import;
 pub mod masks;
 pub mod refine;
 mod rows;
+mod source;
+pub use source::{PreparedSelection, SelectionSource};
 mod system;
 #[cfg(test)]
 mod visited;

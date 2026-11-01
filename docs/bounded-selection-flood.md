@@ -58,6 +58,19 @@ explicit scene collector can preserve them. No source is discarded to stage a
 mask. Flood workers explicitly prepare rows/stripes before memory-only matching;
 they do not turn a source getter into a backing read.
 
+`SelectionSource` keeps no restriction, rectangle/polygon geometry and native
+coverage distinct. Prepared geometry preserves the existing pixel-center and
+stale-polygon rules without allocating a full mask. Matching coverage remains
+the first choice. Every prepared selection rejects undeclared samples.
+
+The scalar tile writer holds one charged 256-row stripe and writes each native
+RGBA8 mask tile once. Zero tiles are omitted only after their rows are known.
+It checks the complete scalar-row geometry and every generated block before
+returning a candidate source. Bounds and threshold-128 boundary edges are
+computed from adjacent scalar rows. The existing 500,000-edge limit remains;
+directed contours retain holes and separate diagonally touching regions. Final
+source/revision/lease admission remains the engine's responsibility.
+
 Component checks compare complete masks with an independent pixel BFS, including
 holes, tile edges, several seed colors, Quick radius, generation rollover and
 failure after provisional output. The opt-in 256MP traversal uses computed

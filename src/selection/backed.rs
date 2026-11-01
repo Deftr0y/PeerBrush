@@ -92,6 +92,9 @@ impl ContourOwner {
             charge: pool.reserve_bytes(32 * 1024 * 1024, 32 * 1024 * 1024)?,
         })
     }
+    pub(super) fn empty(pool: &ResidentBudget) -> Result<Arc<Self>> {
+        Self::copy(&[], pool)
+    }
 
     pub(super) fn push(&mut self, line: Vec<[f32; 2]>) -> Result<()> {
         self.values.try_reserve(1).map_err(|_| Error::Budget)?;
@@ -111,6 +114,37 @@ impl ContourOwner {
     }
 }
 
+fn validate_metadata(
+    mask: &Surface,
+    bounds: [i32; 4],
+    origin: [i32; 2],
+    contours: &[Vec<[f32; 2]>],
+    budget: &ResidentBudget,
+) -> Result<()> {
+    if mask.depth() != 8
+        || !mask.uses_budget(budget)
+        || origin
+            .iter()
+            .chain(bounds.iter())
+            .any(|v| v.unsigned_abs() > 100000)
+        || bounds[0] > bounds[2]
+        || bounds[1] > bounds[3]
+        || contours.len() > 500000
+        || contours
+            .iter()
+            .try_fold(0usize, |n, line| n.checked_add(line.len()))
+            .is_none_or(|n| n > 500000)
+        || contours
+            .iter()
+            .flatten()
+            .flatten()
+            .any(|v| !v.is_finite() || v.abs() > 100000.)
+    {
+        return Err(Error::Invalid("Invalid native selection source metadata"));
+    }
+    Ok(())
+}
+
 impl CoverageSource {
     /// Codec/worker source proofs and document admission remain separate. The
     /// source is native scalar8, independent of the artwork's native depth.
@@ -121,27 +155,7 @@ impl CoverageSource {
         contours: &[Vec<[f32; 2]>],
         budget: &ResidentBudget,
     ) -> Result<Self> {
-        if mask.depth() != 8
-            || !mask.uses_budget(budget)
-            || origin
-                .iter()
-                .chain(bounds.iter())
-                .any(|v| v.unsigned_abs() > 100000)
-            || bounds[0] > bounds[2]
-            || bounds[1] > bounds[3]
-            || contours.len() > 500000
-            || contours
-                .iter()
-                .try_fold(0usize, |n, line| n.checked_add(line.len()))
-                .is_none_or(|n| n > 500000)
-            || contours
-                .iter()
-                .flatten()
-                .flatten()
-                .any(|v| !v.is_finite() || v.abs() > 100000.)
-        {
-            return Err(Error::Invalid("Invalid native selection source metadata"));
-        }
+        validate_metadata(&mask, bounds, origin, contours, budget)?;
         Ok(Self {
             mask,
             bounds,
@@ -169,6 +183,21 @@ impl CoverageSource {
             &source.contours,
             &budget,
         )
+    }
+
+    pub(super) fn from_frozen(
+        mask: Surface,
+        bounds: [i32; 4],
+        origin: [i32; 2],
+        contours: Arc<ContourOwner>,
+    ) -> Result<Self> {
+        validate_metadata(&mask, bounds, origin, &contours.values, &contours.pool)?;
+        Ok(Self {
+            mask,
+            bounds,
+            origin,
+            contours,
+        })
     }
 
     pub fn mask(&self) -> &Surface {
