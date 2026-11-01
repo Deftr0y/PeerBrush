@@ -1,5 +1,5 @@
 //! Shared logical-file admission. Dropping a ticket never frees disk capacity.
-use super::{Error, Result};
+use super::{index::Index, Error, ResidentBudget, Result};
 use std::{
     collections::BTreeMap,
     fs::File,
@@ -15,17 +15,21 @@ struct Inner {
     limit: u64,
     maximum: usize,
     state: Mutex<State>,
+    resident: Option<ResidentBudget>,
 }
 struct State {
     used: u64,
     external: u64,
+    active_external: usize,
     next: u64,
     files: BTreeMap<u64, Entry>,
-    coexistence: BTreeMap<[u8; 32], ExternalEntry>,
+    coexistence: Index<[u8; 32], ExternalEntry>,
 }
+#[derive(Clone)]
 struct ExternalEntry {
     key: u64,
     bytes: u64,
+    settled: bool,
 }
 struct Entry {
     identity: Option<Identity>,
@@ -98,18 +102,32 @@ impl DiskBudget {
     /// through `retain_file` under the real instance/profile admission owner.
     /// This ledger is quota accounting; it never grants filesystem authority.
     pub fn new(limit: u64, maximum_files: usize) -> Result<Self> {
+        Self::create(limit, maximum_files, None)
+    }
+    /// Shared source-operation ledgers retain charged settled-intent metadata
+    /// until teardown. The payload pool must be the actual source runtime pool.
+    pub fn with_resident(
+        limit: u64,
+        maximum_files: usize,
+        resident: ResidentBudget,
+    ) -> Result<Self> {
+        Self::create(limit, maximum_files, Some(resident))
+    }
+    fn create(limit: u64, maximum_files: usize, resident: Option<ResidentBudget>) -> Result<Self> {
         if limit == 0 || maximum_files == 0 || maximum_files > 65536 {
             return Err(Error::Budget);
         }
         Ok(Self(Arc::new(Inner {
             limit,
             maximum: maximum_files,
+            resident,
             state: Mutex::new(State {
                 used: 0,
                 external: 0,
+                active_external: 0,
                 next: 0,
                 files: BTreeMap::new(),
-                coexistence: BTreeMap::new(),
+                coexistence: Index::new(),
             }),
         })))
     }
@@ -151,7 +169,7 @@ impl DiskBudget {
     ) -> Result<CoexistenceTicket> {
         let mut state = self.0.state.lock().map_err(|_| Error::Interrupted)?;
         if let Some(entry) = state.coexistence.get(&intent) {
-            if !restore || entry.bytes != bytes {
+            if entry.settled || !restore || entry.bytes != bytes {
                 return Err(Error::Changed);
             }
             return Ok(CoexistenceTicket {
@@ -161,7 +179,7 @@ impl DiskBudget {
                 bytes,
             });
         }
-        if state.files.len() + state.coexistence.len() >= self.0.maximum {
+        if state.files.len() + state.active_external >= self.0.maximum {
             return Err(Error::Budget);
         }
         let external = state.external.checked_add(bytes).ok_or(Error::Budget)?;
@@ -171,11 +189,20 @@ impl DiskBudget {
             .filter(|v| *v <= self.0.limit)
             .ok_or(Error::Budget)?;
         let key = state.next;
-        state.next = key.checked_add(1).ok_or(Error::Budget)?;
         state
             .coexistence
-            .insert(intent, ExternalEntry { key, bytes });
+            .reserve_one(self.0.resident.as_ref().ok_or(Error::Budget)?, 65536)?;
+        state.next = key.checked_add(1).ok_or(Error::Budget)?;
+        state.coexistence.insert_reserved(
+            intent,
+            ExternalEntry {
+                key,
+                bytes,
+                settled: false,
+            },
+        )?;
         state.external = external;
+        state.active_external += 1;
         Ok(CoexistenceTicket {
             budget: self.clone(),
             intent,
@@ -200,7 +227,7 @@ impl DiskBudget {
                     .is_some_and(|n| n <= self.0.limit)
             })
             .ok_or(Error::Budget)?;
-        if state.files.len() + state.coexistence.len() >= self.0.maximum {
+        if state.files.len() + state.active_external >= self.0.maximum {
             return Err(Error::Budget);
         }
         let key = state.next;
@@ -246,7 +273,7 @@ impl DiskBudget {
                 key,
             }
         } else {
-            if state.files.len() + state.coexistence.len() >= self.0.maximum {
+            if state.files.len() + state.active_external >= self.0.maximum {
                 return Err(Error::Budget);
             }
             let used = state
@@ -361,15 +388,24 @@ impl CoexistenceTicket {
         proof.validate(self.intent, self.bytes)?;
         let mut state = self.budget.0.state.lock().map_err(|_| Error::Interrupted)?;
         let entry = state.coexistence.get(&self.intent).ok_or(Error::Changed)?;
-        if entry.key != self.key || entry.bytes != self.bytes {
+        if entry.settled || entry.key != self.key || entry.bytes != self.bytes {
             return Err(Error::Changed);
         }
         let external = state
             .external
             .checked_sub(self.bytes)
             .ok_or(Error::Corrupt)?;
-        state.coexistence.remove(&self.intent);
+        let active_external = state.active_external.checked_sub(1).ok_or(Error::Corrupt)?;
+        state.coexistence.insert_reserved(
+            self.intent,
+            ExternalEntry {
+                key: self.key,
+                bytes: self.bytes,
+                settled: true,
+            },
+        )?;
         state.external = external;
+        state.active_external = active_external;
         Ok(())
     }
 }
@@ -392,7 +428,8 @@ mod tests {
 
     #[test]
     fn coexistence_blocks_growth_and_keeps_failed_or_dropped_debt() {
-        let budget = DiskBudget::new(1024, 4).unwrap();
+        let budget =
+            DiskBudget::with_resident(1024, 4, ResidentBudget::new(4096).unwrap()).unwrap();
         let source = budget.reserve(128).unwrap();
         let intent = [7; 32];
         let ticket = budget.reserve_coexistence(intent, 768).unwrap();
@@ -421,7 +458,8 @@ mod tests {
 
     #[test]
     fn coexistence_reconstruction_is_exact_and_stale_tickets_cannot_settle_new_debt() {
-        let budget = DiskBudget::new(1024, 1).unwrap();
+        let budget =
+            DiskBudget::with_resident(1024, 1, ResidentBudget::new(4096).unwrap()).unwrap();
         let intent = [9; 32];
         let ticket = budget.restore_coexistence(intent, 512).unwrap();
         let stale = budget.restore_coexistence(intent, 512).unwrap();
@@ -436,18 +474,61 @@ mod tests {
         assert!(matches!(budget.reserve(0), Err(Error::Budget)));
         let proof = Receipt(budget.clone(), intent, 512, true);
         ticket.settle(&proof).unwrap();
-        let replacement = budget.reserve_coexistence(intent, 512).unwrap();
+        assert!(matches!(
+            budget.reserve_coexistence(intent, 512),
+            Err(Error::Changed)
+        ));
+        assert!(matches!(
+            budget.restore_coexistence(intent, 512),
+            Err(Error::Changed)
+        ));
+        let replacement = budget.reserve_coexistence([10; 32], 512).unwrap();
         assert!(matches!(stale.settle(&proof), Err(Error::Changed)));
         assert_eq!(budget.admitted().unwrap(), 512);
-        replacement.settle(&proof).unwrap();
+        replacement
+            .settle(&Receipt(budget.clone(), [10; 32], 512, true))
+            .unwrap();
         assert_eq!(budget.admitted().unwrap(), 0);
     }
 
     #[test]
+    fn coexistence_metadata_is_admitted_before_growth_and_tombstones_keep_the_charge() {
+        let missing = DiskBudget::new(1024, 2).unwrap();
+        assert!(matches!(
+            missing.reserve_coexistence([1; 32], 1),
+            Err(Error::Budget)
+        ));
+        let tiny = ResidentBudget::new(1).unwrap();
+        let refused = DiskBudget::with_resident(1024, 2, tiny.clone()).unwrap();
+        assert!(matches!(
+            refused.reserve_coexistence([1; 32], 1),
+            Err(Error::Budget)
+        ));
+        assert_eq!(tiny.used(), 0);
+        assert_eq!(refused.admitted().unwrap(), 0);
+        let resident = ResidentBudget::new(4096).unwrap();
+        let budget = DiskBudget::with_resident(1024, 2, resident.clone()).unwrap();
+        let ticket = budget.reserve_coexistence([1; 32], 512).unwrap();
+        let metadata = resident.used();
+        assert!(metadata >= std::mem::size_of::<([u8; 32], ExternalEntry)>());
+        ticket
+            .settle(&Receipt(budget.clone(), [1; 32], 512, true))
+            .unwrap();
+        assert_eq!(budget.admitted().unwrap(), 0);
+        assert_eq!(resident.used(), metadata);
+        assert!(matches!(
+            budget.reserve_coexistence([1; 32], 512),
+            Err(Error::Changed)
+        ));
+        drop(budget);
+        assert_eq!(resident.used(), 0);
+    }
+    #[test]
     fn concurrent_source_and_coexistence_admission_cannot_overcommit() {
         use std::sync::Barrier;
         for _ in 0..64 {
-            let budget = DiskBudget::new(1024, 4).unwrap();
+            let budget =
+                DiskBudget::with_resident(1024, 4, ResidentBudget::new(4096).unwrap()).unwrap();
             let source = budget.reserve(0).unwrap();
             let start = Arc::new(Barrier::new(3));
             let a = start.clone();

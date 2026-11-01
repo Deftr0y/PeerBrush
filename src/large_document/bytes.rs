@@ -23,6 +23,9 @@ pub struct LargeSourceTemporary {
     inner: linear::Scratch,
 }
 impl LargeSourceTemporary {
+    pub(crate) fn filesystem_identity(&self) -> ((u64, u64), (u64, u64)) {
+        self.inner.filesystem_identity()
+    }
     fn layout(length: u64, role: ByteRole) -> Result<linear::Spec> {
         if length > MAX_SOURCE_PAYLOAD {
             return Err(Error::Budget);

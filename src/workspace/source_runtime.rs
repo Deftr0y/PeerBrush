@@ -15,6 +15,9 @@ use std::{
         Arc, Mutex,
     },
 };
+#[path = "source_runtime/staging.rs"]
+mod staging;
+pub(crate) use staging::{SessionBytes, SessionTemporary};
 
 pub(crate) struct Limits {
     pub resident_bytes: usize,
@@ -89,6 +92,7 @@ struct Inventory {
     files: Vec<HeldFile>,
     locations: BTreeMap<[u8; 16], Location>,
     lineages: BTreeMap<[u8; 16], [u8; 16]>,
+    staging: BTreeMap<[u8; 16], staging::Location>,
     directories: usize,
     // Payload/index/path allocations above must drop before their accounting.
     _charges: Vec<Reservation>,
@@ -109,8 +113,8 @@ impl SourceRuntime {
         limits: Limits,
     ) -> Result<Arc<Self>, String> {
         let resident = ResidentBudget::new(limits.resident_bytes).map_err(|e| e.to_string())?;
-        let disk =
-            DiskBudget::new(limits.disk_bytes, limits.max_files).map_err(|e| e.to_string())?;
+        let disk = DiskBudget::with_resident(limits.disk_bytes, limits.max_files, resident.clone())
+            .map_err(|e| e.to_string())?;
         Ok(Arc::new(Self {
             context,
             resident,
@@ -252,6 +256,7 @@ impl SourceRuntime {
             files,
             locations: BTreeMap::new(),
             lineages: BTreeMap::new(),
+            staging: BTreeMap::new(),
             directories: 0,
             _charges: charges,
         };
@@ -1123,6 +1128,192 @@ mod tests {
         drop(runtime);
         drop(context);
         drop(connection);
+    }
+    #[test]
+    fn session_byte_spools_register_before_append_and_reclaim_only_after_verified_retirement() {
+        let f = Fixture::new();
+        let (_shared, connection) = f.connection();
+        let context = PersistentRootContext::from_explicit_state(&connection).unwrap();
+        let runtime = SourceRuntime::new(context, limits()).unwrap();
+        let session = runtime.begin().unwrap();
+        for i in 0..32u8 {
+            let mut staged = session
+                .byte_temporary(4, crate::large_document::ByteRole::LayerData)
+                .unwrap();
+            staged.check().unwrap();
+            assert_eq!(
+                runtime
+                    .inventory
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .staging
+                    .len(),
+                1
+            );
+            staged.temporary().append(&[i; 4], &mut || Ok(())).unwrap();
+            let completed = staged.finish([i + 1; 32], &mut || Ok(())).unwrap();
+            completed.check().unwrap();
+            assert!(completed
+                .bytes()
+                .uses_budgets(&session.resident(), &session.disk()));
+            let mut output =
+                crate::large_document::ScratchBytes::new(&session.resident(), 4, 4).unwrap();
+            completed
+                .bytes()
+                .read_range_into(0, &mut output, &mut || Ok(()))
+                .unwrap();
+            assert_eq!(&*output, &[i; 4]);
+            completed.retire(&mut || Ok(())).unwrap();
+            assert_eq!(runtime.disk().used().unwrap(), 56);
+            let state = runtime.inventory.lock().unwrap();
+            assert_eq!(state.as_ref().unwrap().directories, 0);
+            assert!(state.as_ref().unwrap().staging.is_empty());
+        }
+        let mut staged = session
+            .byte_temporary(1024, crate::large_document::ByteRole::SourceBulk)
+            .unwrap();
+        staged.temporary().append(&[7; 64], &mut || Ok(())).unwrap();
+        staged.abort(&mut || Ok(())).unwrap();
+        assert_eq!(runtime.disk().used().unwrap(), 56);
+        assert_eq!(
+            runtime
+                .inventory
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .directories,
+            0
+        );
+    }
+    #[test]
+    fn escaped_byte_owner_keeps_inventory_and_quota_when_retirement_is_busy() {
+        let f = Fixture::new();
+        let (_shared, connection) = f.connection();
+        let context = PersistentRootContext::from_explicit_state(&connection).unwrap();
+        let runtime = SourceRuntime::new(context, limits()).unwrap();
+        let session = runtime.begin().unwrap();
+        let staged = session
+            .byte_temporary(0, crate::large_document::ByteRole::PhotoshopContainer)
+            .unwrap();
+        let completed = staged.finish([1; 32], &mut || Ok(())).unwrap();
+        let escaped = completed.bytes().clone();
+        let charged = session.disk().used().unwrap();
+        assert!(completed.retire(&mut || Ok(())).is_err());
+        assert_eq!(session.disk().used().unwrap(), charged);
+        assert_eq!(
+            runtime
+                .inventory
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .directories,
+            1
+        );
+        drop(escaped);
+        assert_eq!(session.disk().used().unwrap(), charged);
+    }
+    #[test]
+    fn orphan_byte_spool_startup_counts_actual_bytes_without_inventing_source_authority() {
+        let f = Fixture::new();
+        let (_shared, connection) = f.connection();
+        let context = PersistentRootContext::from_explicit_state(&connection).unwrap();
+        let runtime = SourceRuntime::new(context.clone(), limits()).unwrap();
+        let session = runtime.begin().unwrap();
+        let mut staged = session
+            .byte_temporary(4, crate::large_document::ByteRole::SourceBulk)
+            .unwrap();
+        staged.temporary().append(&[4; 4], &mut || Ok(())).unwrap();
+        let completed = staged.finish([3; 32], &mut || Ok(())).unwrap();
+        let charged = runtime.disk().used().unwrap();
+        drop(completed);
+        drop(session);
+        drop(runtime);
+        let runtime = SourceRuntime::new(context, limits()).unwrap();
+        assert_eq!(runtime.disk().used().unwrap(), 0);
+        let session = runtime.begin().unwrap();
+        assert_eq!(runtime.disk().used().unwrap(), charged);
+        let inventory = runtime.inventory.lock().unwrap();
+        let inventory = inventory.as_ref().unwrap();
+        assert_eq!(inventory.directories, 1);
+        assert!(inventory.locations.is_empty());
+        assert!(inventory.staging.is_empty());
+        assert_eq!(inventory.files.len(), 2);
+        session.operation.check().unwrap();
+    }
+    #[test]
+    fn byte_wrapper_preserves_specific_callback_failure_and_retains_uncertain_debt() {
+        let f = Fixture::new();
+        let (_shared, connection) = f.connection();
+        let context = PersistentRootContext::from_explicit_state(&connection).unwrap();
+        let runtime = SourceRuntime::new(context, limits()).unwrap();
+        let session = runtime.begin().unwrap();
+        let staged = session
+            .byte_temporary(0, crate::large_document::ByteRole::LayerData)
+            .unwrap();
+        let charged = runtime.disk().used().unwrap();
+        let error = staged.finish([1; 32], &mut || {
+            Err("Captured source revision changed".into())
+        });
+        assert!(matches!(error, Err(ref message) if message == "Captured source revision changed"));
+        assert_eq!(runtime.disk().used().unwrap(), charged);
+        assert_eq!(
+            runtime
+                .inventory
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .staging
+                .len(),
+            1
+        );
+    }
+    #[test]
+    fn canceled_and_foreign_byte_spools_keep_unknown_bytes_and_registration() {
+        let f = Fixture::new();
+        let (_shared, connection) = f.connection();
+        let context = PersistentRootContext::from_explicit_state(&connection).unwrap();
+        let runtime = SourceRuntime::new(context, limits()).unwrap();
+        let session = runtime.begin().unwrap();
+        let mut staged = session
+            .byte_temporary(1024, crate::large_document::ByteRole::CompositeData)
+            .unwrap();
+        staged.temporary().append(&[3; 64], &mut || Ok(())).unwrap();
+        let path = runtime
+            .inventory
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .staging
+            .values()
+            .next()
+            .unwrap()
+            .path
+            .join("bytes.pbb");
+        let old = path.with_file_name("retained.pbb");
+        fs::rename(&path, &old).unwrap();
+        fs::write(&path, b"foreign").unwrap();
+        let charged = runtime.disk().used().unwrap();
+        assert!(staged.abort(&mut || Ok(())).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"foreign");
+        assert!(old.exists());
+        assert_eq!(runtime.disk().used().unwrap(), charged);
+        assert_eq!(
+            runtime
+                .inventory
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .staging
+                .len(),
+            1
+        );
     }
     #[test]
     fn warm_runtime_refuses_a_same_bytes_foreign_source_after_the_last_store_drops() {

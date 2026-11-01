@@ -28,7 +28,7 @@ impl<K: Ord + Clone, V: Clone> Index<K, V> {
         self.entries.retain(|(key, value)| keep(key, value));
     }
     /// K/V clones here must be cheap metadata copies (digest/BlockRef/Weak), not
-    /// independently allocated payloads. Only Store's two private indexes use it.
+    /// independently allocated payloads. Only private source/ledger indexes use it.
     pub fn reserve_one(&mut self, budget: &ResidentBudget, maximum: usize) -> Result<()> {
         self.reserve_to(
             self.entries.len().checked_add(1).ok_or(Error::Budget)?,
