@@ -55,6 +55,15 @@ pub(super) struct Placement {
     dragged: bool,
 }
 impl Editor {
+    fn edge_limit(&self) -> u32 {
+        // Existing PreparedSource native admission; this does not enable native
+        // document authority or change the resident raster/import limits.
+        if self.native.is_some() {
+            16000
+        } else {
+            crate::raster::MAX_EDGE
+        }
+    }
     fn invalid(&mut self) -> Option<String> {
         // Native validation belongs to the captured worker and its actual
         // FontOwner/SVG preparation. Never consult the legacy global cache.
@@ -505,6 +514,7 @@ impl PeerBrush {
                 .collect::<Vec<_>>()
         });
         let editor = self.source_editor.as_mut().unwrap();
+        let edge_limit = editor.edge_limit();
         for (pointer, released) in positions {
             let Some(placement) = &mut editor.placement else {
                 break;
@@ -521,10 +531,10 @@ impl PeerBrush {
                 let top = point[1].min(anchor[1]).floor();
                 editor.x = left as i32;
                 editor.y = top as i32;
-                editor.source.width = ((point[0].max(anchor[0]).ceil() - left) as u32)
-                    .clamp(1, crate::raster::MAX_EDGE);
-                editor.source.height = ((point[1].max(anchor[1]).ceil() - top) as u32)
-                    .clamp(1, crate::raster::MAX_EDGE);
+                editor.source.width =
+                    ((point[0].max(anchor[0]).ceil() - left) as u32).clamp(1, edge_limit);
+                editor.source.height =
+                    ((point[1].max(anchor[1]).ceil() - top) as u32).clamp(1, edge_limit);
             }
             if released {
                 editor.placement = None;
@@ -574,6 +584,7 @@ impl PeerBrush {
             }
         }
         let before = e.signature().ok();
+        let edge_limit = e.edge_limit();
         let mut open = true;
         let mut apply = false;
         let mut cancel = false;
@@ -598,9 +609,9 @@ impl PeerBrush {
                 if matches!(e.source.content, Content::Text { .. }) {
                     ui.horizontal(|ui| {
                         ui.label("Field width");
-                        widgets::numeric(ui, &mut e.source.width, 1..=crate::raster::MAX_EDGE,e.native.as_mut());
+                        widgets::numeric(ui, &mut e.source.width, 1..=edge_limit,e.native.as_mut());
                         ui.label("Height");
-                        widgets::numeric(ui, &mut e.source.height, 1..=crate::raster::MAX_EDGE,e.native.as_mut());
+                        widgets::numeric(ui, &mut e.source.height, 1..=edge_limit,e.native.as_mut());
                         ui.label("px");
                     });
                 }
