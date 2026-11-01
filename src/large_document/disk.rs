@@ -18,8 +18,14 @@ struct Inner {
 }
 struct State {
     used: u64,
+    external: u64,
     next: u64,
     files: BTreeMap<u64, Entry>,
+    coexistence: BTreeMap<[u8; 32], ExternalEntry>,
+}
+struct ExternalEntry {
+    key: u64,
+    bytes: u64,
 }
 struct Entry {
     identity: Option<Identity>,
@@ -30,6 +36,21 @@ struct Entry {
 pub struct DiskReservation {
     budget: DiskBudget,
     key: u64,
+}
+
+/// Operation admission for bytes that can leave the source namespace. Dropping
+/// it retains the debt; it never claims that a saved destination was unlinked.
+pub(crate) struct CoexistenceTicket {
+    budget: DiskBudget,
+    intent: [u8; 32],
+    key: u64,
+    bytes: u64,
+}
+
+/// Implemented only by the caller's checked, held-identity publication or
+/// retirement receipt. An intent hash or a deserialized path is not a receipt.
+pub(crate) trait CoexistenceSettlement {
+    fn validate(&self, intent: [u8; 32], bytes: u64) -> Result<()>;
 }
 
 impl DiskBudget {
@@ -85,13 +106,82 @@ impl DiskBudget {
             maximum: maximum_files,
             state: Mutex::new(State {
                 used: 0,
+                external: 0,
                 next: 0,
                 files: BTreeMap::new(),
+                coexistence: BTreeMap::new(),
             }),
         })))
     }
     pub fn used(&self) -> Result<u64> {
         Ok(self.0.state.lock().map_err(|_| Error::Interrupted)?.used)
+    }
+    /// Persistent source bytes plus retained external operation admission.
+    /// This is an admission counter, not a physical free-space observation.
+    pub fn admitted(&self) -> Result<u64> {
+        let state = self.0.state.lock().map_err(|_| Error::Interrupted)?;
+        state.used.checked_add(state.external).ok_or(Error::Corrupt)
+    }
+
+    /// The actual caller must durably publish its authenticated orphan intent
+    /// BEFORE creating any external staging file covered by this ticket.
+    pub(crate) fn reserve_coexistence(
+        &self,
+        intent: [u8; 32],
+        bytes: u64,
+    ) -> Result<CoexistenceTicket> {
+        self.coexistence(intent, bytes, false)
+    }
+
+    /// Reconstruct retained debt from the actual owner's authenticated journal.
+    /// Re-observing the same intent is idempotent; conflicting bytes fail closed.
+    pub(crate) fn restore_coexistence(
+        &self,
+        intent: [u8; 32],
+        bytes: u64,
+    ) -> Result<CoexistenceTicket> {
+        self.coexistence(intent, bytes, true)
+    }
+
+    fn coexistence(
+        &self,
+        intent: [u8; 32],
+        bytes: u64,
+        restore: bool,
+    ) -> Result<CoexistenceTicket> {
+        let mut state = self.0.state.lock().map_err(|_| Error::Interrupted)?;
+        if let Some(entry) = state.coexistence.get(&intent) {
+            if !restore || entry.bytes != bytes {
+                return Err(Error::Changed);
+            }
+            return Ok(CoexistenceTicket {
+                budget: self.clone(),
+                intent,
+                key: entry.key,
+                bytes,
+            });
+        }
+        if state.files.len() + state.coexistence.len() >= self.0.maximum {
+            return Err(Error::Budget);
+        }
+        let external = state.external.checked_add(bytes).ok_or(Error::Budget)?;
+        state
+            .used
+            .checked_add(external)
+            .filter(|v| *v <= self.0.limit)
+            .ok_or(Error::Budget)?;
+        let key = state.next;
+        state.next = key.checked_add(1).ok_or(Error::Budget)?;
+        state
+            .coexistence
+            .insert(intent, ExternalEntry { key, bytes });
+        state.external = external;
+        Ok(CoexistenceTicket {
+            budget: self.clone(),
+            intent,
+            key,
+            bytes,
+        })
     }
     pub fn limit(&self) -> u64 {
         self.0.limit
@@ -105,9 +195,12 @@ impl DiskBudget {
         let used = state
             .used
             .checked_add(bytes)
-            .filter(|v| *v <= self.0.limit)
+            .filter(|v| {
+                v.checked_add(state.external)
+                    .is_some_and(|n| n <= self.0.limit)
+            })
             .ok_or(Error::Budget)?;
-        if state.files.len() >= self.0.maximum {
+        if state.files.len() + state.coexistence.len() >= self.0.maximum {
             return Err(Error::Budget);
         }
         let key = state.next;
@@ -153,13 +246,16 @@ impl DiskBudget {
                 key,
             }
         } else {
-            if state.files.len() >= self.0.maximum {
+            if state.files.len() + state.coexistence.len() >= self.0.maximum {
                 return Err(Error::Budget);
             }
             let used = state
                 .used
                 .checked_add(before.bytes)
-                .filter(|v| *v <= self.0.limit)
+                .filter(|v| {
+                    v.checked_add(state.external)
+                        .is_some_and(|n| n <= self.0.limit)
+                })
                 .ok_or(Error::Budget)?;
             let key = state.next;
             state.next = key.checked_add(1).ok_or(Error::Budget)?;
@@ -233,7 +329,10 @@ impl DiskReservation {
         let used = state
             .used
             .checked_add(extra)
-            .filter(|v| *v <= self.budget.0.limit)
+            .filter(|v| {
+                v.checked_add(state.external)
+                    .is_some_and(|n| n <= self.budget.0.limit)
+            })
             .ok_or(Error::Budget)?;
         let entry = state.files.get_mut(&self.key).ok_or(Error::Changed)?;
         entry.bytes = entry.bytes.checked_add(extra).ok_or(Error::Budget)?;
@@ -255,9 +354,121 @@ impl DiskReservation {
     }
 }
 
+impl CoexistenceTicket {
+    pub(crate) fn settle(self, proof: &impl CoexistenceSettlement) -> Result<()> {
+        // Native receipt validation can perform I/O and re-enter this budget.
+        // It must never run while the accounting mutex is held.
+        proof.validate(self.intent, self.bytes)?;
+        let mut state = self.budget.0.state.lock().map_err(|_| Error::Interrupted)?;
+        let entry = state.coexistence.get(&self.intent).ok_or(Error::Changed)?;
+        if entry.key != self.key || entry.bytes != self.bytes {
+            return Err(Error::Changed);
+        }
+        let external = state
+            .external
+            .checked_sub(self.bytes)
+            .ok_or(Error::Corrupt)?;
+        state.coexistence.remove(&self.intent);
+        state.external = external;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    struct Receipt(DiskBudget, [u8; 32], u64, bool);
+    impl CoexistenceSettlement for Receipt {
+        fn validate(&self, intent: [u8; 32], bytes: u64) -> Result<()> {
+            // Re-entry proves no accounting mutex is held during validation.
+            self.0.admitted()?;
+            if self.3 && self.1 == intent && self.2 == bytes {
+                Ok(())
+            } else {
+                Err(Error::Changed)
+            }
+        }
+    }
+
+    #[test]
+    fn coexistence_blocks_growth_and_keeps_failed_or_dropped_debt() {
+        let budget = DiskBudget::new(1024, 4).unwrap();
+        let source = budget.reserve(128).unwrap();
+        let intent = [7; 32];
+        let ticket = budget.reserve_coexistence(intent, 768).unwrap();
+        assert_eq!(budget.used().unwrap(), 128);
+        assert_eq!(budget.admitted().unwrap(), 896);
+        assert!(matches!(source.grow(129), Err(Error::Budget)));
+        assert!(matches!(budget.reserve(129), Err(Error::Budget)));
+        assert!(matches!(
+            budget.reserve_coexistence([8; 32], u64::MAX),
+            Err(Error::Budget)
+        ));
+        assert!(matches!(
+            ticket.settle(&Receipt(budget.clone(), intent, 768, false)),
+            Err(Error::Changed)
+        ));
+        assert_eq!(budget.admitted().unwrap(), 896);
+        drop(budget.restore_coexistence(intent, 768).unwrap());
+        assert_eq!(budget.admitted().unwrap(), 896);
+        let ticket = budget.restore_coexistence(intent, 768).unwrap();
+        ticket
+            .settle(&Receipt(budget.clone(), intent, 768, true))
+            .unwrap();
+        assert_eq!(budget.admitted().unwrap(), 128);
+        source.grow(896).unwrap();
+    }
+
+    #[test]
+    fn coexistence_reconstruction_is_exact_and_stale_tickets_cannot_settle_new_debt() {
+        let budget = DiskBudget::new(1024, 1).unwrap();
+        let intent = [9; 32];
+        let ticket = budget.restore_coexistence(intent, 512).unwrap();
+        let stale = budget.restore_coexistence(intent, 512).unwrap();
+        assert!(matches!(
+            budget.restore_coexistence(intent, 511),
+            Err(Error::Changed)
+        ));
+        assert!(matches!(
+            budget.reserve_coexistence(intent, 512),
+            Err(Error::Changed)
+        ));
+        assert!(matches!(budget.reserve(0), Err(Error::Budget)));
+        let proof = Receipt(budget.clone(), intent, 512, true);
+        ticket.settle(&proof).unwrap();
+        let replacement = budget.reserve_coexistence(intent, 512).unwrap();
+        assert!(matches!(stale.settle(&proof), Err(Error::Changed)));
+        assert_eq!(budget.admitted().unwrap(), 512);
+        replacement.settle(&proof).unwrap();
+        assert_eq!(budget.admitted().unwrap(), 0);
+    }
+
+    #[test]
+    fn concurrent_source_and_coexistence_admission_cannot_overcommit() {
+        use std::sync::Barrier;
+        for _ in 0..64 {
+            let budget = DiskBudget::new(1024, 4).unwrap();
+            let source = budget.reserve(0).unwrap();
+            let start = Arc::new(Barrier::new(3));
+            let a = start.clone();
+            let b = start.clone();
+            let external = budget.clone();
+            let source = std::thread::spawn(move || {
+                a.wait();
+                source.grow(768)
+            });
+            let external = std::thread::spawn(move || {
+                b.wait();
+                external.reserve_coexistence([11; 32], 768)
+            });
+            start.wait();
+            let source = source.join().unwrap();
+            let external = external.join().unwrap();
+            assert_ne!(source.is_ok(), external.is_ok());
+            assert_eq!(budget.admitted().unwrap(), 768);
+        }
+    }
+
     #[test]
     fn failed_and_dropped_reservations_stay_charged_and_shared() {
         let budget = DiskBudget::new(1024, 2).unwrap();
