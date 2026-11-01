@@ -509,6 +509,78 @@ mod tests {
         }
     }
     #[test]
+    fn native_preview_folder_and_fill_targets_match_the_legacy_raw_contract() {
+        for depth in [8, 16] {
+            for blend in ["normal", "pass_through"] {
+                let mut doc = document(depth, 21, 19);
+                let mut folder = Layer::new("Folder", "group", 1, 1);
+                folder.opacity = 0.37;
+                folder.visible = false;
+                folder.blend = blend.into();
+                doc.layers[0].parent = Some(folder.id.clone());
+                let mut fill = Layer::new("Fill", "fill", 21, 19);
+                fill.color = [43, 71, 119, 183];
+                fill.pixels = crate::raster::Raster::new_depth(21, 19, depth);
+                doc.layers.insert(0, folder);
+                doc.layers.push(fill);
+                let (scene, path) = capture(&doc);
+                for target in [&doc.layers[0].id, &doc.layers[1].id, &doc.layers[2].id] {
+                    for mask in [false, true] {
+                        let prepared =
+                            prepare(&scene, Some([2, 3, 20, 18]), 11, Some(target), mask);
+                        let frame = prepared.render(&scene, &mut || Ok(())).unwrap();
+                        let expected = doc
+                            .preview(Some([2, 3, 20, 18]), 11, Some(target), mask)
+                            .unwrap();
+                        assert_eq!(
+                            (frame.key().width, frame.key().height, frame.key().rect),
+                            (expected.0, expected.1, expected.3)
+                        );
+                        assert_eq!(
+                            &*frame.copy_rgba8(&mut || Ok(())).unwrap(),
+                            &expected.2,
+                            "folder target depth{depth} blend{blend} mask{mask}"
+                        );
+                    }
+                }
+                drop(scene);
+                crate::compositor::native::tests::cleanup(&path);
+            }
+        }
+    }
+    #[test]
+    fn display_stripe_admission_refusal_returns_no_frame_and_releases_candidate_charge() {
+        for depth in [8, 16] {
+            let doc = document(depth, 128, 128);
+            let (scene, path) = capture(&doc);
+            let prepared = prepare(&scene, None, 8192, Some(&doc.layers[0].id), false);
+            drop(prepared.render(&scene, &mut || Ok(())).unwrap());
+            let pool = scene.budget();
+            let baseline = pool.used();
+            let remaining = pool.limit() - baseline - 64 * 1024;
+            let other_owner = pool.reserve_bytes(remaining, pool.limit()).unwrap();
+            let refused = prepared.render(&scene, &mut || Ok(()));
+            assert!(
+                refused.is_err(),
+                "Display output must not escape its shared admission"
+            );
+            assert_eq!(pool.used(), baseline + remaining);
+            drop(other_owner);
+            assert_eq!(pool.used(), baseline);
+            let frame = prepared.render(&scene, &mut || Ok(())).unwrap();
+            assert_eq!(
+                &*frame.copy_rgba8(&mut || Ok(())).unwrap(),
+                &doc.preview(None, 8192, Some(&doc.layers[0].id), false)
+                    .unwrap()
+                    .2
+            );
+            drop(frame);
+            drop(prepared);
+            drop(scene);
+            crate::compositor::native::tests::cleanup(&path);
+        }
+    }
+    #[test]
     fn multistripe_native_previews_keep_complete_owned_bytes_and_bounded_source_regions() {
         for depth in [8, 16] {
             let doc = document(depth, 521, 523);
