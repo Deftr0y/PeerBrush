@@ -4,7 +4,9 @@ use super::{
     backed::{PinnedRegion, Plane, Region},
     Pixel, Pixel16, Raster,
 };
-use crate::large_document::{Error, ResidentBudget, Result, Store};
+use crate::large_document::{
+    DiskBudget, Error, PinnedTile, ResidentBudget, Result, ScratchBytes, Store, TileSpec,
+};
 use ring::digest::{Context, SHA256};
 use std::sync::Arc;
 
@@ -130,6 +132,12 @@ impl Surface {
             SurfaceStorage::Stored(plane) => plane.store().resident_budget().same_pool(budget),
         }
     }
+    pub fn uses_disk_budget(&self, budget: &DiskBudget) -> bool {
+        match &*self.storage {
+            SurfaceStorage::Zero => true,
+            SurfaceStorage::Stored(plane) => plane.store().uses_disk_budget(budget),
+        }
+    }
 
     pub fn prepare_region(
         &self,
@@ -150,6 +158,82 @@ impl Surface {
             region,
             pixels,
         })
+    }
+
+    /// Complete physical tile, including padded edge samples. The caller changes
+    /// only its admitted logical footprint and preserves the remaining bytes.
+    pub fn prepare_tile(
+        &self,
+        coordinate: (u32, u32),
+        check: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<SurfaceTile> {
+        check()?;
+        if coordinate.0 >= self.width.div_ceil(super::TILE)
+            || coordinate.1 >= self.height.div_ceil(super::TILE)
+        {
+            return Err(Error::Invalid("Native tile is outside the source plane"));
+        }
+        let spec = TileSpec::new(super::TILE as u16, super::TILE as u16, self.depth)?;
+        let (pixels, budget) = match &*self.storage {
+            SurfaceStorage::Zero => (None, None),
+            SurfaceStorage::Stored(plane) => {
+                let pixels = plane
+                    .blocks()
+                    .get(&coordinate)
+                    .map(|reference| plane.store().pin(*reference, check))
+                    .transpose()?;
+                (pixels, Some(plane.store().resident_budget()))
+            }
+        };
+        check()?;
+        Ok(SurfaceTile {
+            key: self.key,
+            coordinate,
+            spec,
+            pixels,
+            budget,
+        })
+    }
+}
+
+pub struct SurfaceTile {
+    key: SurfaceKey,
+    coordinate: (u32, u32),
+    spec: TileSpec,
+    pixels: Option<PinnedTile>,
+    budget: Option<ResidentBudget>,
+}
+impl SurfaceTile {
+    pub fn key(&self) -> SurfaceKey {
+        self.key
+    }
+    pub fn coordinate(&self) -> (u32, u32) {
+        self.coordinate
+    }
+    pub fn spec(&self) -> TileSpec {
+        self.spec
+    }
+    pub fn is_known_zero(&self) -> bool {
+        self.pixels.is_none()
+    }
+    pub fn bytes(&self) -> Option<&[u8]> {
+        self.pixels.as_ref().map(PinnedTile::bytes)
+    }
+    pub fn copy_to_scratch(&self, budget: &ResidentBudget) -> Result<ScratchBytes> {
+        if self
+            .budget
+            .as_ref()
+            .is_some_and(|source| !source.same_pool(budget))
+        {
+            return Err(Error::Invalid(
+                "Native tile uses a different resident admission pool",
+            ));
+        }
+        let mut output = ScratchBytes::new(budget, self.spec.bytes(), self.spec.bytes())?;
+        if let Some(pixels) = &self.pixels {
+            output.copy_from_slice(pixels.bytes());
+        }
+        Ok(output)
     }
 }
 
@@ -273,6 +357,51 @@ mod tests {
         fn require<T: Send + Sync>() {}
         require::<Surface>();
         require::<SurfaceRegion>();
+        require::<SurfaceTile>();
+    }
+    #[test]
+    fn complete_physical_tiles_keep_edge_padding_and_charge_copies() {
+        for depth in [8, 16] {
+            let budget = ResidentBudget::new(4 * 1024 * 1024).unwrap();
+            let (store, path) = store(budget.clone());
+            let mut raster = Raster::new_depth(257, 257, depth);
+            raster.set16(256, 256, [12345, 23456, 34567, 65535]);
+            if depth == 16 {
+                Arc::make_mut(raster.samples16.get_mut(&(1, 1)).unwrap())[4] = 54321;
+            } else {
+                Arc::make_mut(raster.tiles.get_mut(&(1, 1)).unwrap())[4] = 211;
+            }
+            let surface = Surface::stage_raster(&raster, store.clone(), &mut || Ok(())).unwrap();
+            let tile = surface.prepare_tile((1, 1), &mut || Ok(())).unwrap();
+            assert_eq!(tile.coordinate(), (1, 1));
+            assert_eq!(tile.key(), surface.key());
+            assert!(!tile.is_known_zero());
+            let bytes = tile.copy_to_scratch(&budget).unwrap();
+            if depth == 16 {
+                assert_eq!(&bytes[8..10], &54321u16.to_be_bytes());
+            } else {
+                assert_eq!(bytes[4], 211);
+            }
+            assert_eq!(budget.used(), 2 * tile.spec().bytes());
+            assert!(tile
+                .copy_to_scratch(&ResidentBudget::new(4 * 1024 * 1024).unwrap())
+                .is_err());
+            assert!(surface.prepare_tile((2, 1), &mut || Ok(())).is_err());
+            drop(bytes);
+            drop(tile);
+            assert_eq!(budget.used(), 0);
+            drop(surface);
+            drop(store);
+            std::fs::remove_dir_all(path).unwrap();
+        }
+        let zero = Surface::zero(257, 257, 16).unwrap();
+        let tile = zero.prepare_tile((1, 1), &mut || Ok(())).unwrap();
+        assert!(tile.is_known_zero());
+        assert!(tile.bytes().is_none());
+        let bytes = tile
+            .copy_to_scratch(&ResidentBudget::new(1024 * 1024).unwrap())
+            .unwrap();
+        assert!(bytes.iter().all(|&b| b == 0));
     }
     #[test]
     fn explicit_zero_checks_footprints_rows_depth_and_cancellation() {
