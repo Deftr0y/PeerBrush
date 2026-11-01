@@ -32,3 +32,12 @@ limits. Full gesture/engine integration, native desktop acceptance, performance,
 soft-selection reconciliation and durable publication remain separate checks.
 Smudge must preserve its ordered pigment reservoir; clone/heal require explicit
 translated sampling and healing halos rather than independent reordered dabs.
+
+`fill::native::PreparedFill` provides the corresponding foreground-fill kernel.
+It clips in the physical source frame while testing polygons in document space,
+preserving layer offsets, native blending and untouched edge padding. Its tile
+iterator allocates no full-frame buffer. Source preparation and provisional
+result delivery are explicit callbacks; a source, sink or cancellation failure
+cannot complete the visit. Previously delivered results remain provisional and
+cannot authorize partial engine publication. Use the validated current polygon
+from `selection::polygon`, preserving the legacy stale-polygon rule.
