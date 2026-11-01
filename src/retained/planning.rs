@@ -12,7 +12,7 @@ use crate::{
 use serde_json::Value;
 #[cfg(test)]
 #[path = "planning/tests.rs"]
-mod tests;
+pub(super) mod tests;
 
 pub(crate) enum Pixels<'a> {
     Native {

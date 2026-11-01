@@ -63,7 +63,20 @@ prepares a generation-bound raster patch with the original source and placement.
 Cancelled or refused output uses registered fragment retirement after every
 candidate owner drops. The caller retains the session through final adoption.
 Closing-safe retirement additionally requires the concrete runtime's cleanup-only
-admission binding. Linked and unlinked mask/selection command integration,
+admission binding.
+
+The complete-plan producer stages all planned layer and mask planes in one
+`RasterBatch`. Newly authored fill originals use `ReplaceOutput`, so their source
+and transformed pixels share the candidate's one revision and refusal cleanup.
+It validates source generations and shared pools before starting any output,
+retains packet admission through candidate preparation, and retires earlier
+completed planes if a later plane fails. It refuses an editable-source plan
+before staging until its regional renderer is connected. Small differential
+fixtures compare native8/native16 current, original and mask bytes with the
+resident operators and test cancellation and duplicate-target refusal. This
+producer does not perform final guarded Engine adoption.
+
+Linked and unlinked mask/selection command integration,
 cancellation/history acceptance and
 full dense16K qualification are separate gates. Existing live limits remain
 unchanged.
