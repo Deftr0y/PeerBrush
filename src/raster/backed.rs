@@ -251,7 +251,13 @@ mod tests {
     use crate::large_document::{Limits, ResidentBudget};
 
     fn make_store(bytes: usize) -> (Store, std::path::PathBuf) {
-        let path = std::env::temp_dir().join(format!("peerbrush-plane-{}", crate::engine::id()));
+        let path = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("peerbrush-plane-{}", crate::engine::id()));
+        assert_eq!(
+            path.parent().unwrap().canonicalize().unwrap(),
+            path.parent().unwrap()
+        );
         let store = Store::create(
             &path,
             ResidentBudget::new(bytes).unwrap(),

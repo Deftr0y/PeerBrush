@@ -245,8 +245,13 @@ mod tests {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
 
     fn store(bytes: usize) -> (Store, std::path::PathBuf) {
-        let root =
-            std::env::temp_dir().join(format!("peerbrush-engine-backing-{}", super::super::id()));
+        let root = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("peerbrush-engine-backing-{}", super::super::id()));
+        assert_eq!(
+            root.parent().unwrap().canonicalize().unwrap(),
+            root.parent().unwrap()
+        );
         let store = Store::create(
             &root,
             ResidentBudget::new(bytes).unwrap(),
