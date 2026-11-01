@@ -130,6 +130,30 @@ pub(super) fn unlocked(metadata: &Document36, target: &str) -> Result<()> {
     Err("Native group nesting limit exceeded".into())
 }
 
+/// Legacy retained reconciliation permits an unshifted, nonshrinking frame
+/// expansion with identical physical data. Store identity is deliberately not
+/// pixel equality; seals bind these immutable descriptors to owned bytes.
+pub(super) fn same_current(before: &Surface, after: &Surface) -> bool {
+    if before.depth() != after.depth()
+        || after.width() < before.width()
+        || after.height() < before.height()
+    {
+        return false;
+    }
+    let mut before = before.physical_tiles();
+    let mut after = after.physical_tiles();
+    loop {
+        match (before.next(), after.next()) {
+            (None, None) => return true,
+            (Some(before), Some(after))
+                if before.coordinate() == after.coordinate()
+                    && before.reference().spec() == after.reference().spec()
+                    && before.reference().digest() == after.reference().digest() => {}
+            _ => return false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::output::tests::{draft, Session};

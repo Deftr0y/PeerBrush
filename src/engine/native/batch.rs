@@ -314,7 +314,7 @@ impl CapturedEdit {
                 .find(|layer| super::patch::layer_contains(layer, patch.target.ordinal));
             if let Some(layer) = layer {
                 super::patch::unlocked(base, &layer.id)?;
-                let changed = old.key() != output.key();
+                let changed = !super::patch::same_current(old, output);
                 if layer.pixels.id == patch.target.ordinal
                     && layer.source.is_some()
                     && changed
@@ -331,7 +331,7 @@ impl CapturedEdit {
             }
             if matches!(patch.retained, RetainedUpdate::Keep)
                 && original.retained.is_some()
-                && old.key() != output.key()
+                && !super::patch::same_current(old, output)
             {
                 return Err(
                     "Changed retained pixels require explicit source reconciliation".into(),
