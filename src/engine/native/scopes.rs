@@ -63,6 +63,31 @@ fn roots(doc: &Document36, selected: &[String]) -> Vec<String> {
 pub(super) fn scopes(metadata: &Document36, c: &Value) -> Vec<Scope> {
     let mut scopes = command_scopes(metadata, c);
     if metadata.selection.is_some()
+        && matches!(c["op"].as_str(), Some("move" | "transform"))
+        && c["selection_only"] != false
+    {
+        if let Some(layer) = c["layer"]
+            .as_str()
+            .and_then(|id| metadata.layers.iter().find(|layer| layer.id == id))
+        {
+            if let Some(mask) = &layer.mask {
+                for scope in &mut scopes {
+                    if let Some(area) = &mut scope.rect {
+                        *area = crate::engine::reframe_scope::widen(
+                            *area,
+                            [layer.x, layer.y],
+                            [layer.pixels.width, layer.pixels.height],
+                            mask.linked,
+                            mask.steps
+                                .iter()
+                                .map(|step| [step.pixels.width, step.pixels.height]),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    if metadata.selection.is_some()
         && (c["op"] == "paint.clear_selection"
             || (matches!(c["op"].as_str(), Some("move" | "transform"))
                 && c["selection_only"] != false))
@@ -544,6 +569,66 @@ mod tests {
         }
         fn surface(&mut self, _: &Surface) -> Result<RasterRef36> {
             Err("No native source conversion in scope fixture".into())
+        }
+    }
+    #[test]
+    fn selected_linked_mask_reframe_reserves_current_and_revealed_pixels() {
+        for depth in [8, 16] {
+            let mut legacy = crate::engine::Engine::new();
+            legacy.doc = crate::engine::Document::new_depth(64, 64, depth).unwrap();
+            legacy.doc.selection = Some([4, 6, 9, 12]);
+            let layer = &mut legacy.doc.layers[0];
+            layer.x = 2;
+            layer.y = 3;
+            layer.pixels = crate::raster::Raster::new_depth(17, 19, depth);
+            let command = json!({"op":"transform","layer":layer.id,"angle":0});
+            let mut source = ZeroSources { sources: vec![] };
+            let mut metadata = Document36::capture(&legacy.doc, &mut source).unwrap();
+            metadata.layers[0].mask = Some(crate::engine::scene::Mask36 {
+                linked: true,
+                enabled: false,
+                steps: [[7, 9], [31, 29]]
+                    .into_iter()
+                    .enumerate()
+                    .map(
+                        |(index, [width, height])| crate::engine::scene::MaskStep36 {
+                            id: format!("step{index}"),
+                            kind: if index == 0 { "fill" } else { "paint" }.into(),
+                            enabled: false,
+                            weight: 1.,
+                            value: 1.,
+                            settings: Value::Null,
+                            pixels: RasterRef36 {
+                                id: index as u32 + 2,
+                                width,
+                                height,
+                                depth,
+                                retained: None,
+                            },
+                        },
+                    )
+                    .collect(),
+            });
+            let planned = scopes(&metadata, &command);
+            assert_eq!(planned[0].rect, Some([2, 3, 33, 32]));
+            // Collective reframe can reveal retained sample (16,18) at this
+            // document pixel despite an identity transform of a smaller selection.
+            let actual = [18, 21, 19, 22];
+            let reserved = planned[0].rect.unwrap();
+            assert!(
+                reserved[0] <= actual[0]
+                    && reserved[1] <= actual[1]
+                    && reserved[2] >= actual[2]
+                    && reserved[3] >= actual[3]
+            );
+            let mask = metadata.layers[0].mask.as_mut().unwrap();
+            for step in &mut mask.steps {
+                step.pixels.width = 17;
+                step.pixels.height = 19;
+            }
+            assert_eq!(scopes(&metadata, &command)[0].rect, Some([4, 6, 9, 12]));
+            metadata.layers[0].kind = "group".into();
+            assert_eq!(scopes(&metadata, &command)[0].rect, None);
         }
     }
     #[test]
