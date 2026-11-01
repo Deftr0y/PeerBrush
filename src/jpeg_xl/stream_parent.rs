@@ -701,3 +701,174 @@ pub(crate) fn encode<'scene, 'output, 'session>(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn actual_profile_staging_owned_mode1_worker_replay_and_isolated_decode_keep_native_samples() {
+        // Source-matched Cargo main is mandatory, just as for existing codec
+        // integration. This executes no application UI or PNG decoder entry.
+        let _serial = super::super::tests::PROCESS_FIXTURES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for depth in [8, 16] {
+            crate::production_export::native_rows::tests::with_staged(depth, |input| {
+                let session = input.session();
+                let raw = input.raw_bytes();
+                let profile = input.profile().to_vec();
+                let output = encode(
+                    input,
+                    Limits {
+                        output_bytes: 1024 * 1024,
+                        log_bytes: 2 * 1024 * 1024,
+                        records: 4096,
+                        input_bytes: wire::source_work_ceiling(raw).unwrap(),
+                        deadline_ms: 15000,
+                    },
+                    &|| Ok(()),
+                )
+                .unwrap();
+                output.recheck(&|| Ok(())).unwrap();
+                let mut encoded =
+                    ScratchBytes::new(&session.resident(), output.bytes() as usize, 1024 * 1024)
+                        .unwrap();
+                output.copy_range(0, &mut encoded, &|| Ok(())).unwrap();
+                assert_eq!(
+                    ring::digest::digest(&SHA256, &encoded).as_ref(),
+                    output.sha256()
+                );
+                let executable = executable().unwrap();
+                let mut command = Command::new(&executable);
+                command
+                    .arg("--jxl-worker")
+                    .current_dir(executable.parent().unwrap());
+                let decoded = invoke(
+                    request(Operation::Decode, None, None, 0, encoded.len()).unwrap(),
+                    Input::Encoded(&encoded),
+                    &|| Ok(()),
+                    Runtime {
+                        timeout: Duration::from_secs(15),
+                        command: Some(command),
+                        test_prefix: false,
+                        response_started: None,
+                        publication_started: None,
+                        primary_kill_failed: false,
+                        input_written: None,
+                        stall_writer: false,
+                    },
+                )
+                .unwrap();
+                assert_eq!(decoded.info.width, 17);
+                assert_eq!(decoded.info.height, 513);
+                assert_eq!(decoded.info.bit_depth, depth);
+                assert_eq!(decoded.profile, profile);
+                match decoded.pixels {
+                    Pixels::Eight(bytes) => {
+                        assert_eq!(depth, 8);
+                        for (at, value) in bytes.iter().enumerate() {
+                            assert_eq!(
+                                *value,
+                                crate::production_export::native_rows::tests::expected_byte(
+                                    at, depth
+                                )
+                            );
+                        }
+                    }
+                    Pixels::Sixteen(words) => {
+                        assert_eq!(depth, 16);
+                        for (at, value) in words.iter().enumerate() {
+                            assert_eq!(
+                                value.to_be_bytes(),
+                                [
+                                    crate::production_export::native_rows::tests::expected_byte(
+                                        at * 2,
+                                        depth
+                                    ),
+                                    crate::production_export::native_rows::tests::expected_byte(
+                                        at * 2 + 1,
+                                        depth
+                                    )
+                                ]
+                            );
+                        }
+                    }
+                }
+                assert!(output.source_read_bytes() <= wire::source_read_ceiling(raw).unwrap());
+                drop(encoded);
+                output.retire(&mut || session.cleanup_check()).unwrap();
+            });
+        }
+    }
+    #[test]
+    fn malformed_real_child_stdout_cannot_complete_and_owned_stop_precedes_namespace_cleanup() {
+        let _serial = super::super::tests::PROCESS_FIXTURES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::production_export::native_rows::tests::with_staged(16, |input| {
+            let session = input.session();
+            let raw = input.raw_bytes();
+            let limits = Limits {
+                output_bytes: 1024 * 1024,
+                log_bytes: 2 * 1024 * 1024,
+                records: 128,
+                input_bytes: wire::source_work_ceiling(raw).unwrap(),
+                deadline_ms: 15000,
+            };
+            let config = configuration(&input, &limits).unwrap();
+            let nonce = *uuid::Uuid::new_v4().as_bytes();
+            let log = session
+                .segment_log(
+                    SegmentLimits {
+                        output_bytes: limits.output_bytes,
+                        protocol_log_bytes: limits.log_bytes,
+                        records: limits.records,
+                        events: wire::child_event_limit(&config).unwrap(),
+                    },
+                    nonce,
+                    config.binding(nonce).unwrap(),
+                )
+                .unwrap();
+            let resources = resources(&input).unwrap();
+            let buffers = Buffers::new(&input).unwrap();
+            let source = session.retain_for_child().unwrap();
+            // Ordinary Cargo test listing is deliberately not our strict wire.
+            // The real child must be stopped/reaped before cleanup is admitted.
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .arg("--list")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null());
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                command.creation_flags(0x08000000);
+            }
+            let started = Instant::now();
+            let (input, log, result, known) = run_worker(
+                input,
+                log,
+                config,
+                nonce,
+                buffers,
+                resources,
+                source,
+                command,
+                started,
+                &|| Ok(()),
+            );
+            assert!(result.is_err());
+            assert!(
+                known,
+                "unknown child must retain its operation, never infer cleanup"
+            );
+            assert!(started.elapsed() < Duration::from_secs(18));
+            log.unwrap().abort(&mut || session.cleanup_check()).unwrap();
+            input
+                .unwrap()
+                .retire(&mut || session.cleanup_check())
+                .unwrap();
+        });
+    }
+}

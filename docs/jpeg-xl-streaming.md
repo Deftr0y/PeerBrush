@@ -116,7 +116,7 @@ scene/output and the session's straight-native byte factory. Its original frozen
 chunk hashes authenticate each full covered chunk before ROI bytes reach the
 worker. Raw/source/profile/output/encoder options, build and nonce are bound
 separately; arbitrary byte spools are not accepted as native row authority.
-Parent callback buffers stay within32MiB, with the child's96MiB callback envelope
+Parent callback buffers stay within 32 MiB, with the child's 96 MiB callback envelope
 admitted simultaneously. Native allocator/profile reservations are additional.
 
 The broker records every child event in the registered append-only segment log,
