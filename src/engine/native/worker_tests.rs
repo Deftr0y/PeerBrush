@@ -10,12 +10,12 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-struct Fixture {
+pub(crate) struct Fixture {
     path: PathBuf,
     held: Option<Directory>,
 }
 impl Fixture {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let path = fs::canonicalize(std::env::temp_dir())
             .unwrap()
             .join(format!("pb-native-worker-{}", crate::engine::id()));
@@ -25,7 +25,7 @@ impl Fixture {
             path,
         }
     }
-    fn runtime(&self) -> (Arc<SourceRuntime>, crate::server::Connection) {
+    pub(crate) fn runtime(&self) -> (Arc<SourceRuntime>, crate::server::Connection) {
         let connection = crate::server::start(
             Arc::new(Mutex::new(crate::engine::Engine::new())),
             self.path.join("state"),
@@ -67,7 +67,7 @@ impl Drop for Fixture {
         fs::remove_dir_all(&self.path).unwrap();
     }
 }
-fn capture(state: &DocumentAuthority, commands: &[serde_json::Value]) -> NativeCapture {
+pub(crate) fn capture(state: &DocumentAuthority, commands: &[serde_json::Value]) -> NativeCapture {
     let document = state.native().unwrap();
     let descriptor = CommandDescriptor::from_normalized(
         document,

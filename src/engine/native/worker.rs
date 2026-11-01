@@ -196,4 +196,4 @@ fn prepare_step(
 
 #[cfg(test)]
 #[path = "worker_tests.rs"]
-mod tests;
+pub(crate) mod tests;
