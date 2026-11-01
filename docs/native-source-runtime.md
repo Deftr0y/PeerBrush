@@ -43,3 +43,38 @@ The runtime does not retain a duplicate file handle which could keep an aborted
 file allocated after its verified quota release. Published/history/clipboard/
 task/recovery owners require a complete retirement inventory.
 
+## Exclusive marker publication
+
+`file_safety::owned_rename` verifies the expected complete SHA256 through a held
+staging file and a charged bounded scratch buffer, syncing that file before the
+proof is returned. Publication repeats the caller's source/revision checks and
+same-directory identities, refuses an existing destination atomically, and then
+checks the exact resulting named/held identity. It never deletes uncertain names
+or refunds their disk reservation.
+
+Windows uses `SetFileInformationByHandle(FileRenameInfo)` with
+`ReplaceIfExists=false` and a DELETE-capable held staging handle. The absolute
+extended target path is resolved while the verified destination directory and
+all its non-alias ancestors remain pinned by handles denying deletion. Native
+relative names with a non-null RootDirectory returned an invalid-parameter error
+and are not used. A foreign replacement at the old path is never the rename
+source. The variable aligned native packet uses the same resident budget retained
+by its SHA proof. POSIX uses an exclusive
+same-directory rename relative to the retained directory descriptor; its source
+component is still path based. Caller-held private-directory/profile writer
+admission and before/after identity checks remain necessary. This does not claim
+an atomic POSIX source-file-descriptor rename against a hostile competing writer.
+
+The helper does not change legacy SaveTemporary/backup limits or establish
+Photoshop, editable-source or recovery authority. Windows directory metadata
+power-loss durability remains unqualified because the current `sync_parent`
+implementation performs no directory flush there. Small interruption/ownership
+tests cannot substitute for actual power-loss or installed-package acceptance.
+
+The proposed recovery marker is separately recognized as version 3/type
+`native-backing`, preserving version 2 PSD discovery and cleanup. Its recovery
+domain binds canonical Document36 metadata, complete ordered raster coordinate
+bindings, every owning Store identity and selected 96-byte CommitRef, plus full
+metadata/payload hashes. This source-only recovery proof is not a standard PSD36
+layer/composite proof. Live dispatch remains gated until capture, admitted typed
+restore and the actual engine adopter retain every source and metadata owner.

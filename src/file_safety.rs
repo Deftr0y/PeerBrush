@@ -8,6 +8,8 @@ use std::{
 #[path = "file_permissions.rs"]
 mod permissions;
 pub(crate) use permissions::preserve as preserve_permissions;
+#[path = "file_safety/owned_rename.rs"]
+pub(crate) mod owned_rename;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Version {
