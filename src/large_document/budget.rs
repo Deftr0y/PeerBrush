@@ -43,7 +43,7 @@ impl Reservation {
         self.bytes = bytes;
         Ok(())
     }
-    pub(super) fn uses_budget(&self, budget: &ResidentBudget) -> bool {
+    pub(crate) fn uses_budget(&self, budget: &ResidentBudget) -> bool {
         self.budget.same_pool(budget)
     }
 }
@@ -136,6 +136,8 @@ mod tests {
         let clone = budget.clone();
         assert!(budget.same_pool(&clone));
         assert!(!budget.same_pool(&ResidentBudget::new(1024).unwrap()));
+        assert!(first.uses_budget(&clone));
+        assert!(!first.uses_budget(&ResidentBudget::new(1024).unwrap()));
         assert_eq!(clone.used(), 512);
         assert!(matches!(clone.reserve(513), Err(Error::Budget)));
         assert!(matches!(clone.reserve(usize::MAX), Err(Error::Budget)));
