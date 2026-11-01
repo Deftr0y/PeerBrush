@@ -130,6 +130,7 @@ pub(super) fn apply<'a>(
     metadata: &mut Document36,
     patches: &'a [EffectPatch],
     outputs: &mut Vec<&'a Surface>,
+    check: &dyn Fn() -> Result<()>,
 ) -> Result<()> {
     for patch in patches {
         let effects = if patch.layer.is_some() {
@@ -151,7 +152,11 @@ pub(super) fn apply<'a>(
             .find(|effect| effect.id == patch.id)
             .ok_or("Missing native effect target")?;
         if let Some(settings) = &patch.settings {
-            effect.settings = Arc::new((**settings).clone());
+            effect.settings = crate::engine::scene::MetadataPayload::copy_from(
+                &**settings,
+                base.budget(),
+                check,
+            )?;
         }
         if let Some(enabled) = patch.enabled {
             effect.enabled = enabled;
@@ -167,7 +172,7 @@ pub(super) fn apply<'a>(
             for clip in clips {
                 replacement.push(EffectClip36 {
                     stroke: clip.stroke,
-                    coverage: super::batch::coverage_ref(base, &clip.coverage, outputs)?,
+                    coverage: super::batch::coverage_ref(base, &clip.coverage, outputs, check)?,
                 });
             }
             effect.clips = replacement;
@@ -191,13 +196,13 @@ mod tests {
     fn document(pool: &ResidentBudget) -> NativeDocument {
         let base = super::super::tests::document(pool);
         let owner = MetadataCharge::reserve(pool, 64 * 1024, &|| Ok(())).unwrap();
-        let mut metadata = base.core.metadata.clone();
+        let mut metadata = wire_copy(&base.core.metadata);
         let effect = |id: &str, ordinal| Effect36 {
             id: id.into(),
             kind: "liquify".into(),
             enabled: true,
             weight: 1.,
-            settings: Arc::new(json!({"strokes":[{"x":1.,"y":2.,"coverage":null}]})),
+            settings: json!({"strokes":[{"x":1.,"y":2.,"coverage":null}]}).into(),
             clips: vec![EffectClip36 {
                 stroke: 0,
                 coverage: Coverage36 {
@@ -210,7 +215,7 @@ mod tests {
                     },
                     bounds: [0, 0, 4, 4],
                     origin: [0, 0],
-                    contours: vec![vec![[0., 0.], [4., 0.], [0., 4.]]],
+                    contours: vec![vec![[0., 0.], [4., 0.], [0., 4.]]].into(),
                 },
             }],
         };

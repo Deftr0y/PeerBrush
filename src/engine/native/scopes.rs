@@ -597,7 +597,7 @@ mod tests {
                             enabled: false,
                             weight: 1.,
                             value: 1.,
-                            settings: Value::Null,
+                            settings: Value::Null.into(),
                             pixels: RasterRef36 {
                                 id: index as u32 + 2,
                                 width,

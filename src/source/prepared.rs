@@ -87,7 +87,7 @@ impl<'a> PreparedSource<'a> {
         let charge = pool
             .reserve_bytes(4 * 1024 * 1024, 4 * 1024 * 1024)
             .map_err(|e| e.to_string())?;
-        let kind = match &source.content {
+        let kind = match source.definition() {
             Content36::Shape {
                 shape,
                 bounds,

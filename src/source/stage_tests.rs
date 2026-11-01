@@ -187,7 +187,8 @@ fn definition() -> Source36 {
             fill: [12345, 23457, 45679, 43871],
             stroke: [54321, 32109, 10987, 49153],
             stroke_width: 1.375,
-        },
+        }
+        .into(),
     }
 }
 #[test]

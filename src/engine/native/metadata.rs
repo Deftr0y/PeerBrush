@@ -73,7 +73,7 @@ impl CapturedEdit {
             command.write_scopes(),
             self.base.budget(),
         )?)?;
-        let core = copied.map_unique(|mut metadata, _| {
+        let core = copied.rehome_unique(|mut metadata, _| {
             let mut added = None;
             if operation == "layer.add" {
                 if metadata.layers.len() >= 100 {
@@ -124,7 +124,7 @@ impl CapturedEdit {
                     },
                     mask: None,
                     effects: vec![],
-                    psd_metadata: vec![],
+                    psd_metadata: vec![].into(),
                     source: None,
                 };
                 metadata
@@ -300,14 +300,7 @@ impl CapturedEdit {
                 .ok_or("Native revision overflow")?;
             self.cancellation.check()?;
             check()?;
-            Ok(Core {
-                metadata,
-                roster,
-                resident,
-                disk,
-                key: key(),
-                render_key: OnceLock::new(),
-            })
+            Core::prepare(metadata, roster, resident, disk, check)
         })?;
         Ok(PreparedDelta {
             base: self.base.key(),

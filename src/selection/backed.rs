@@ -623,7 +623,7 @@ mod tests {
         assert_eq!(dto.mask.depth, 8);
         assert_eq!(dto.bounds, source.bounds());
         assert_eq!(dto.origin, source.origin());
-        assert_eq!(dto.contours, values);
+        assert_eq!(&*dto.contours, &values);
         assert_eq!(pool.used(), charge);
         drop(source);
         assert_eq!(pool.used(), 0);

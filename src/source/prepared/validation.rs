@@ -23,7 +23,7 @@ pub(crate) fn validate_definition(
     if source.width == 0 || source.height == 0 || source.width > 16000 || source.height > 16000 {
         return Err("Editable native source frame exceeds admission".into());
     }
-    match &source.content {
+    match source.definition() {
         Content36::Bezier {
             nodes,
             closed,

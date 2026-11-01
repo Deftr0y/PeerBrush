@@ -314,7 +314,7 @@ impl<'a> LayerView<'a> {
                 crate::source::Content::Shape { .. } => "shape",
                 crate::source::Content::Svg { .. } => "svg",
             }),
-            Self::Native(layer) => layer.source().map(|source| match &source.content {
+            Self::Native(layer) => layer.source().map(|source| match source.definition() {
                 super::scene::Content36::Bezier { .. } => "bezier",
                 super::scene::Content36::Text { .. } => "text",
                 super::scene::Content36::Shape { .. } => "shape",

@@ -1,4 +1,5 @@
 //! Source36 only: compact canonical ICC bytes, without numeric-array aliases.
+use super::MetadataPayload;
 use base64::{display::Base64Display, engine::general_purpose::STANDARD, Engine as _};
 use serde::{de::Visitor, Deserialize, Deserializer, Serialize, Serializer};
 use std::{fmt, sync::Arc};
@@ -7,7 +8,7 @@ pub(crate) const MAX_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) const MAX_ENCODED: usize = MAX_BYTES.div_ceil(3) * 4;
 
 pub fn serialize<S: Serializer>(
-    profile: &Option<Arc<Vec<u8>>>,
+    profile: &Option<MetadataPayload<Vec<u8>>>,
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
     struct Text<'a>(&'a [u8]);
@@ -27,10 +28,10 @@ pub fn serialize<S: Serializer>(
 
 pub fn deserialize<'de, D: Deserializer<'de>>(
     deserializer: D,
-) -> Result<Option<Arc<Vec<u8>>>, D::Error> {
+) -> Result<Option<MetadataPayload<Vec<u8>>>, D::Error> {
     struct OptionalProfile;
     impl<'de> Visitor<'de> for OptionalProfile {
-        type Value = Option<Arc<Vec<u8>>>;
+        type Value = Option<MetadataPayload<Vec<u8>>>;
         fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.write_str("null or a bounded canonical STANDARD base64 ICC profile")
         }
@@ -43,12 +44,12 @@ pub fn deserialize<'de, D: Deserializer<'de>>(
         fn visit_some<D: Deserializer<'de>>(self, input: D) -> Result<Self::Value, D::Error> {
             struct Profile;
             impl Visitor<'_> for Profile {
-                type Value = Arc<Vec<u8>>;
+                type Value = MetadataPayload<Vec<u8>>;
                 fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                     f.write_str("a bounded canonical STANDARD base64 ICC string")
                 }
                 fn visit_str<E: serde::de::Error>(self, text: &str) -> Result<Self::Value, E> {
-                    decode(text).map(Arc::new).map_err(E::custom)
+                    decode(text).map(MetadataPayload::from).map_err(E::custom)
                 }
             }
             input.deserialize_str(Profile).map(Some)
@@ -96,7 +97,7 @@ mod tests {
     #[derive(Serialize, Deserialize)]
     struct Profile {
         #[serde(with = "super")]
-        bytes: Option<Arc<Vec<u8>>>,
+        bytes: Option<MetadataPayload<Vec<u8>>>,
     }
     #[test]
     fn source36_field_is_compact_while_legacy_profile_wire_and_metadata_owner_remain_exact() {
@@ -127,7 +128,10 @@ mod tests {
         let value = serde_json::to_value(&metadata).unwrap();
         assert_eq!(value["icc_profile"], "AAF/gP8=");
         let restored: super::super::Document36 = serde_json::from_value(value).unwrap();
-        assert_eq!(restored.icc_profile, document.icc_profile);
+        assert_eq!(
+            restored.icc_profile.as_deref(),
+            document.icc_profile.as_deref()
+        );
         assert!(serde_json::to_value(&document).unwrap()["icc_profile"].is_array());
         let pool = crate::large_document::ResidentBudget::new(128 * 1024).unwrap();
         let charge =
@@ -136,7 +140,7 @@ mod tests {
         let copy = admitted.clone();
         drop(admitted);
         assert_eq!(pool.used(), 64 * 1024);
-        assert_eq!(copy.icc_profile, document.icc_profile);
+        assert_eq!(copy.icc_profile.as_deref(), document.icc_profile.as_deref());
         drop(copy);
         assert_eq!(pool.used(), 0);
     }
@@ -149,10 +153,10 @@ mod tests {
                     .collect::<Vec<_>>(),
             );
             let source = Profile {
-                bytes: Some(bytes.clone()),
+                bytes: Some(bytes.as_ref().clone().into()),
             };
             let encoded = serde_json::to_vec(&source).unwrap();
-            assert_eq!(Arc::strong_count(&bytes), 2);
+            assert!(source.bytes.as_ref().unwrap().shared().is_err());
             let restored: Profile = serde_json::from_slice(&encoded).unwrap();
             assert_eq!(restored.bytes.as_deref(), Some(bytes.as_ref()));
             assert_eq!(serde_json::to_vec(&restored).unwrap(), encoded);
@@ -177,7 +181,7 @@ mod tests {
         excess.push('A');
         assert!(decode(&excess).is_err());
         let oversized = Profile {
-            bytes: Some(Arc::new(vec![0; MAX_BYTES + 1])),
+            bytes: Some(vec![0; MAX_BYTES + 1].into()),
         };
         assert!(serde_json::to_vec(&oversized).is_err());
     }

@@ -459,8 +459,7 @@ impl CapturedEdit {
         };
         let intent = self.planned_intent(intent)?;
         let copied = copy_metadata(base, pool, check)?;
-        let mut prepared_core = None;
-        copied.map_unique(|mut metadata, _| {
+        let core = copied.rehome_unique(|mut metadata, _| {
             // Update metadata targets before changing any captured ordinal.
             for update in layers {
                 let layer = metadata
@@ -485,7 +484,9 @@ impl CapturedEdit {
                             .ok_or("Missing native source definition")?
                             .matrix = *matrix
                     }
-                    SourceUpdate::Replace(source) => layer.source = Some((**source).clone()),
+                    SourceUpdate::Replace(source) => {
+                        layer.source = Some(source.copy_runtime(pool, check)?)
+                    }
                 }
             }
             for patch in rasters {
@@ -503,23 +504,26 @@ impl CapturedEdit {
             // changed elsewhere in this batch. Freeze that original unchanged;
             // do not recursively apply another replacement to its old ordinal.
             replace_slots(&mut metadata, &replacements);
-            super::effect_patch::apply(&self.base, &mut metadata, effects, &mut outputs)?;
+            super::effect_patch::apply(&self.base, &mut metadata, effects, &mut outputs, check)?;
             if let Some(selection) = selection {
                 valid_selection(selection)?;
                 metadata.selection = selection.bounds;
                 metadata.selection_polygon = selection
                     .polygon
                     .as_ref()
-                    .map(|polygon| (**polygon).clone());
+                    .map(|polygon| {
+                        crate::engine::scene::MetadataPayload::copy_from(&**polygon, pool, check)
+                    })
+                    .transpose()?;
                 metadata.selection_coverage = selection
                     .current
                     .as_ref()
-                    .map(|coverage| coverage_ref(&self.base, coverage, &mut outputs))
+                    .map(|coverage| coverage_ref(&self.base, coverage, &mut outputs, check))
                     .transpose()?;
                 metadata.selection_previous = selection
                     .previous
                     .as_ref()
-                    .map(|coverage| coverage_ref(&self.base, coverage, &mut outputs))
+                    .map(|coverage| coverage_ref(&self.base, coverage, &mut outputs, check))
                     .transpose()?;
             }
             let roster = rebuild_from(
@@ -549,18 +553,13 @@ impl CapturedEdit {
                 .revision
                 .checked_add(1)
                 .ok_or("Native revision overflow")?;
-            let fresh = copy_metadata(&metadata, pool, check)?;
-            prepared_core = Some(fresh.map_unique(|metadata, _| {
-                Ok(Core {
-                    metadata,
-                    roster,
-                    resident: pool.clone(),
-                    disk: self.base.disk_budget().clone(),
-                    key: key(),
-                    render_key: OnceLock::new(),
-                })
-            })?);
-            Ok(())
+            Core::prepare(
+                metadata,
+                roster,
+                pool.clone(),
+                self.base.disk_budget().clone(),
+                check,
+            )
         })?;
         drop(scopes);
         drop(outputs);
@@ -569,9 +568,7 @@ impl CapturedEdit {
         check()?;
         Ok(PreparedDelta {
             base: self.base.key(),
-            candidate: NativeDocument {
-                core: prepared_core.ok_or("Native batch handoff failed")?,
-            },
+            candidate: NativeDocument { core },
             cancellation: self.cancellation.clone(),
             intent,
             outputs: vec![],
@@ -748,6 +745,7 @@ pub(super) fn coverage_ref<'a>(
     base: &NativeDocument,
     coverage: &'a CoveragePatch,
     outputs: &mut Vec<&'a Surface>,
+    check: &dyn Fn() -> Result<()>,
 ) -> Result<Coverage36> {
     let mask = match &coverage.pixels {
         CoveragePixels::Existing(slot) => {
@@ -795,7 +793,11 @@ pub(super) fn coverage_ref<'a>(
         mask,
         bounds: coverage.bounds,
         origin: coverage.origin,
-        contours: (*coverage.contours).clone(),
+        contours: crate::engine::scene::MetadataPayload::copy_from(
+            &*coverage.contours,
+            base.budget(),
+            check,
+        )?,
     })
 }
 
@@ -810,7 +812,7 @@ mod tests {
     }
     fn document(pool: &ResidentBudget) -> NativeDocument {
         let base = super::super::tests::document(pool);
-        let mut metadata = base.core.metadata.clone();
+        let mut metadata = wire_copy(&base.core.metadata);
         metadata.layers[0].source = Some(Source36 {
             width: 8,
             height: 8,
@@ -823,7 +825,8 @@ mod tests {
                 fill: [0, 0, 0, 65535],
                 stroke: [0; 4],
                 stroke_width: 0.,
-            },
+            }
+            .into(),
         });
         metadata.layers[0].mask = Some(Mask36 {
             enabled: true,
@@ -841,7 +844,7 @@ mod tests {
                     depth: 16,
                     retained: None,
                 },
-                settings: serde_json::Value::Null,
+                settings: serde_json::Value::Null.into(),
             }],
         });
         metadata.selection_coverage = Some(Coverage36 {
@@ -854,7 +857,7 @@ mod tests {
             },
             bounds: [1, 1, 4, 4],
             origin: [0, 0],
-            contours: vec![],
+            contours: vec![].into(),
         });
         metadata.selection = Some([1, 1, 4, 4]);
         let roster = RasterRoster::new(vec![
@@ -1196,7 +1199,8 @@ mod tests {
                 fill: [123, 456, 789, 65535],
                 stroke: [0; 4],
                 stroke_width: 0.,
-            },
+            }
+            .into(),
         };
         let (output, path) = patch(&base, target);
         let batch = RasterBatch {
@@ -1224,7 +1228,8 @@ mod tests {
                 .unwrap()
                 .source()
                 .unwrap()
-                .content,
+                .content
+                .value(),
             Content36::Shape {
                 bounds: [0., 0., 4., 4.],
                 ..

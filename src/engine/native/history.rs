@@ -603,20 +603,13 @@ impl HistorySnapshot {
         if !resident.same_pool(source.budget()) || !disk.same_pool(source.disk_budget()) {
             return Err("History source admission differs".into());
         }
-        let core = copied.map_unique(|mut metadata, _| {
+        let core = copied.rehome_unique(|mut metadata, _| {
             metadata.revision = current
                 .metadata()
                 .revision()
                 .checked_add(1)
                 .ok_or("Native revision overflow")?;
-            Ok(Core {
-                metadata,
-                roster,
-                resident,
-                disk,
-                key: key(),
-                render_key: OnceLock::new(),
-            })
+            Core::prepare(metadata, roster, resident, disk, check)
         })?;
         let actor: Admitted<String> = copy_admitted(&actor, current.budget(), true, check)?;
         check()?;

@@ -14,12 +14,13 @@ fn text(layout: TextLayout) -> Source36 {
             letter_spacing: -1.75,
             align: "center".into(),
             color: [12501, 23003, 34507, 43871],
-        },
+        }
+        .into(),
     }
 }
 fn compare(source: &Source36, matrix: [f32; 6], frame: [u32; 2]) {
     let pool = ResidentBudget::new(256 * 1024 * 1024).unwrap();
-    let font = match &source.content {
+    let font = match source.definition() {
         Content36::Text { font, .. } => Some(Arc::new(
             FontOwner::load(font, &pool, &mut || Ok(())).unwrap(),
         )),
@@ -78,7 +79,8 @@ fn analytic_shape_and_cubic_regions_keep_original_native_grid_and_affine_sampler
                 fill: [12345, 23457, 45679, 43871],
                 stroke: [54321, 32109, 10987, 49153],
                 stroke_width: 2.375,
-            },
+            }
+            .into(),
         };
         for matrix in [
             [1., 0., 0., 1., 0., 0.],
@@ -116,7 +118,8 @@ fn analytic_shape_and_cubic_regions_keep_original_native_grid_and_affine_sampler
             fill: [12345, 23457, 45679, 43871],
             stroke: [54321, 32109, 10987, 49153],
             stroke_width: 2.375,
-        },
+        }
+        .into(),
     };
     compare(
         &source,
@@ -194,7 +197,7 @@ fn svg_small_full_origin_projection_preserves_clip_gradient_and_affine_phase() {
                     width: 103,
                     height: 67,
                     matrix,
-                    content: Content36::Svg { svg: svg.into() },
+                    content: Content36::Svg { svg: svg.into() }.into(),
                 },
                 matrix,
                 [111, 83],
@@ -262,7 +265,8 @@ fn large_analytic_metadata_uses_only_bounded_region_and_large_svg_fails_closed()
             fill: [12345, 23457, 45679, 43871],
             stroke: [54321, 32109, 10987, 49153],
             stroke_width: 2.375,
-        },
+        }
+        .into(),
     };
     let p = PreparedSource::new(&s, None, &pool, &mut || Ok(())).unwrap();
     let pixels = p
@@ -282,7 +286,7 @@ fn large_analytic_metadata_uses_only_bounded_region_and_large_svg_fails_closed()
         .any(|v| v % 257 != 0));
     drop((pixels, p));
     assert_eq!(pool.used(), 0);
-    let s=Source36{content:Content36::Svg{svg:r#"<svg xmlns="http://www.w3.org/2000/svg" width="16000" height="16000"><rect width="16000" height="16000"/></svg>"#.into()},..s};
+    let s=Source36{content:Content36::Svg{svg:r#"<svg xmlns="http://www.w3.org/2000/svg" width="16000" height="16000"><rect width="16000" height="16000"/></svg>"#.into()}.into(),..s};
     let p = PreparedSource::new(&s, None, &pool, &mut || Ok(())).unwrap();
     let before = pool.used();
     assert!(p

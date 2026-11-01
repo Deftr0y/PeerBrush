@@ -424,7 +424,7 @@ pub(super) mod tests {
         let stored = first.surface().clone();
         first.mark_published();
         let metadata_owner = MetadataCharge::reserve(&pool, 64 * 1024, &|| Ok(())).unwrap();
-        let mut metadata = blank.core.metadata.clone();
+        let mut metadata = wire_copy(&blank.core.metadata);
         metadata.layers[0].pixels.retained = Some(Box::new(Retained36 {
             pixels: RasterRef36 {
                 id: 2,
