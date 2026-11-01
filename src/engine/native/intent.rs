@@ -11,6 +11,7 @@ pub enum IntentKind {
     Placement,
     Selection,
     History,
+    Capture,
 }
 pub struct Intent {
     kind: IntentKind,

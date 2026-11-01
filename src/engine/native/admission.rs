@@ -1,0 +1,314 @@
+//! Pure editor capture admission. It grants no filesystem authority.
+use super::*;
+use crate::{
+    engine::{Lease, Scope},
+    large_document::Reservation,
+};
+
+pub(super) struct EditAdmission {
+    actor: String,
+    base: DocumentKey,
+    scopes: Intent,
+    _charge: Reservation,
+}
+impl NativeDocument {
+    /// Call while observing the authoritative Engine and its current write fence.
+    /// Only bounded metadata/owner allocation occurs; workers begin source I/O
+    /// later through their independently retained SourceSession admission.
+    pub(crate) fn capture_intent(
+        &self,
+        expected: DocumentKey,
+        revision: u64,
+        actor: &str,
+        scopes: &[Scope],
+        leases: &[Lease],
+        now: u64,
+        closed: bool,
+        write_available: bool,
+    ) -> Result<CapturedEdit> {
+        if closed || !write_available {
+            return Err("Native editor capture is closed or write-fenced".into());
+        }
+        if expected != self.key() || revision != self.metadata().revision() {
+            return Err("Native editor capture is stale".into());
+        }
+        if actor.is_empty()
+            || actor.len() > 4096
+            || scopes.len() > super::super::scene::MAX_RASTER_LOCATIONS
+        {
+            return Err("Invalid native editor actor or scope count".into());
+        }
+        for scope in scopes {
+            if scope.rect.is_some_and(|r| {
+                r.iter().any(|v| v.unsigned_abs() > 100000) || r[0] > r[2] || r[1] > r[3]
+            }) {
+                return Err("Invalid native editor scope rectangle".into());
+            }
+            if let Some(target) = &scope.target {
+                let layer = target.strip_prefix("@visibility:").unwrap_or(target);
+                if layer != "@selection"
+                    && !self
+                        .core
+                        .metadata
+                        .layers
+                        .iter()
+                        .any(|item| item.id == layer)
+                {
+                    return Err("Unknown native editor scope target".into());
+                }
+            }
+        }
+        let scopes = Intent::from_scopes(IntentKind::Capture, scopes, self.budget())?;
+        scopes.check(self, actor, leases, now)?;
+        let bytes = actor
+            .len()
+            .checked_add(std::mem::size_of::<EditAdmission>() + 128)
+            .ok_or("Native actor footprint overflow")?;
+        let charge = self
+            .budget()
+            .reserve_bytes(bytes, bytes)
+            .map_err(|e| e.to_string())?;
+        let mut owner = String::new();
+        owner
+            .try_reserve_exact(actor.len())
+            .map_err(|_| "Native actor allocation refused")?;
+        owner.push_str(actor);
+        let mut edit = self.capture_edit()?;
+        edit.admission = Some(Arc::new(EditAdmission {
+            actor: owner,
+            base: self.key(),
+            scopes,
+            _charge: charge,
+        }));
+        Ok(edit)
+    }
+}
+impl EditAdmission {
+    pub(super) fn check(&self, base: &NativeDocument, actor: &str, intent: &Intent) -> Result<()> {
+        if self.base != base.key() || self.actor != actor {
+            return Err("Native editor admission belongs to another actor or generation".into());
+        }
+        for actual in intent.scopes() {
+            let allowed = self.scopes.scopes().iter().any(|requested| {
+                let Some(target) = requested.target.as_deref() else {
+                    return true;
+                };
+                let Some(actual) = actual.target.as_deref() else {
+                    return false;
+                };
+                if target == actual {
+                    return true;
+                }
+                if target.starts_with('@') || actual.starts_with('@') {
+                    return false;
+                }
+                let mut current = Some(actual);
+                for _ in 0..=16 {
+                    let Some(id) = current else {
+                        return false;
+                    };
+                    if id == target {
+                        return true;
+                    }
+                    current = base
+                        .core
+                        .metadata
+                        .layers
+                        .iter()
+                        .find(|layer| layer.id == id)
+                        .and_then(|layer| layer.parent.as_deref());
+                }
+                false
+            });
+            if !allowed {
+                return Err("Prepared native edit exceeds its captured targets".into());
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn capture(
+        doc: &NativeDocument,
+        actor: &str,
+        scopes: &[Scope],
+        leases: &[Lease],
+    ) -> Result<CapturedEdit> {
+        doc.capture_intent(
+            doc.key(),
+            doc.metadata().revision(),
+            actor,
+            scopes,
+            leases,
+            1,
+            false,
+            true,
+        )
+    }
+    #[test]
+    fn current_reservations_are_checked_before_worker_source_admission() {
+        let pool = ResidentBudget::new(8 * 1024 * 1024).unwrap();
+        let doc = super::super::tests::document(&pool);
+        let layer = doc.metadata().layer(0).unwrap().id();
+        let scopes = [Scope::layer(layer)];
+        let lease = Lease {
+            id: "lease".into(),
+            owner: "other".into(),
+            description: "paint".into(),
+            scopes: vec![Scope::layer(layer)],
+            expires: 100,
+        };
+        let baseline = pool.used();
+        assert!(capture(&doc, "worker", &scopes, &[lease])
+            .err()
+            .unwrap()
+            .contains("Reserved"));
+        assert_eq!(pool.used(), baseline);
+        assert_eq!(doc.disk_budget().used().unwrap(), 0);
+    }
+    #[test]
+    fn stale_closed_fenced_and_invalid_capture_leave_owner_accounting_unchanged() {
+        let pool = ResidentBudget::new(8 * 1024 * 1024).unwrap();
+        let doc = super::super::tests::document(&pool);
+        let scopes = [Scope {
+            target: None,
+            rect: None,
+        }];
+        let baseline = pool.used();
+        assert!(doc
+            .capture_intent(doc.key(), 1, "worker", &scopes, &[], 1, false, true)
+            .is_err());
+        assert!(doc
+            .capture_intent(key(), 0, "worker", &scopes, &[], 1, false, true)
+            .is_err());
+        assert!(doc
+            .capture_intent(doc.key(), 0, "worker", &scopes, &[], 1, true, true)
+            .is_err());
+        assert!(doc
+            .capture_intent(doc.key(), 0, "worker", &scopes, &[], 1, false, false)
+            .is_err());
+        assert!(capture(&doc, "worker", &[Scope::layer("missing")], &[]).is_err());
+        assert!(capture(
+            &doc,
+            "worker",
+            &[Scope {
+                target: None,
+                rect: Some([2, 0, 1, 1])
+            }],
+            &[]
+        )
+        .is_err());
+        assert_eq!(pool.used(), baseline);
+        assert_eq!(doc.metadata().revision(), 0);
+    }
+    #[test]
+    fn admitted_actor_and_targets_are_rechecked_before_history_preparation_and_publication() {
+        let pool = ResidentBudget::new(8 * 1024 * 1024).unwrap();
+        let mut doc = super::super::tests::document(&pool);
+        let mut history = NativeHistory::new(&pool, 2).unwrap();
+        let layer = doc.metadata().layer(0).unwrap().id().to_string();
+        let captured = capture(&doc, "worker", &[Scope::layer("@selection")], &[]).unwrap();
+        let delta = captured.visibility(&layer, false, &|| Ok(())).unwrap();
+        let refused = history
+            .snapshot()
+            .prepare_commit(
+                &doc,
+                delta,
+                HistoryRequest {
+                    actor: "worker",
+                    label: "edit",
+                    task: None,
+                    gesture: None,
+                },
+                &|| Ok(()),
+            )
+            .err()
+            .unwrap();
+        assert!(refused.reason().contains("captured targets"));
+        drop(refused);
+        let captured = capture(
+            &doc,
+            "worker",
+            &[Scope {
+                target: None,
+                rect: None,
+            }],
+            &[],
+        )
+        .unwrap();
+        let delta = captured.visibility(&layer, false, &|| Ok(())).unwrap();
+        let refused = doc.publish("other", &[], 1, false, delta).unwrap_err();
+        assert!(refused.reason().contains("another actor"));
+        drop(refused);
+        let delta = doc
+            .capture_edit()
+            .unwrap()
+            .visibility(&layer, false, &|| Ok(()))
+            .unwrap();
+        let refused = history
+            .snapshot()
+            .prepare_commit(
+                &doc,
+                delta,
+                HistoryRequest {
+                    actor: "worker",
+                    label: "edit",
+                    task: None,
+                    gesture: None,
+                },
+                &|| Ok(()),
+            )
+            .err()
+            .unwrap();
+        assert!(refused.reason().contains("admission is missing"));
+        drop(refused);
+        let captured = capture(
+            &doc,
+            "worker",
+            &[Scope {
+                target: None,
+                rect: None,
+            }],
+            &[],
+        )
+        .unwrap();
+        let delta = captured.visibility(&layer, false, &|| Ok(())).unwrap();
+        let prepared = history
+            .snapshot()
+            .prepare_commit(
+                &doc,
+                delta,
+                HistoryRequest {
+                    actor: "worker",
+                    label: "edit",
+                    task: None,
+                    gesture: None,
+                },
+                &|| Ok(()),
+            )
+            .unwrap_or_else(|e| panic!("{}", e.reason()));
+        drop(
+            history
+                .commit(
+                    &mut doc,
+                    Publication {
+                        actor: "worker",
+                        leases: &[],
+                        now: 1,
+                        closed: false,
+                        write_available: true,
+                    },
+                    prepared,
+                )
+                .unwrap(),
+        );
+        assert_eq!(doc.metadata().revision(), 1);
+        assert_eq!(history.undo_len(), 1);
+        drop(history);
+        drop(doc);
+        assert_eq!(pool.used(), 0);
+    }
+}
