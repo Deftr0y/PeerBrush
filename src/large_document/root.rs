@@ -272,6 +272,12 @@ pub(crate) struct RootOperation {
 impl RootOperation {
     pub(crate) fn check(&self) -> Result<(), String> {
         self._operation.check()?;
+        self.check_retirement()
+    }
+    /// Only already-admitted, proven provisional retirement may finish after
+    /// closing starts. This value still owns the request and file-operation
+    /// permits, so InstanceLock cannot release its file during this check/I/O.
+    pub(crate) fn check_retirement(&self) -> Result<(), String> {
         self.context.validate()?;
         self.base.check()
     }

@@ -19,15 +19,23 @@ impl Namespace<'_> {
         &self,
         check: &mut dyn FnMut() -> Result<(), String>,
         failure: &mut Option<String>,
+        retiring: bool,
     ) -> crate::large_document::Result<()> {
-        if let Err(error) = check().and_then(|_| self.check()) {
+        if let Err(error) = check().and_then(|_| self.check_with(retiring)) {
             *failure = Some(error);
             return Err(Error::Cancelled);
         }
         Ok(())
     }
     fn check(&self) -> Result<(), String> {
-        self.session.check()?;
+        self.check_with(false)
+    }
+    fn check_with(&self, retiring: bool) -> Result<(), String> {
+        if retiring {
+            self.session.cleanup_check()?;
+        } else {
+            self.session.check()?;
+        }
         self.directory.check()?;
         let path = self.directory.path().join("bytes.pbb");
         let named = crate::file_safety::open_for_identity(&path)
@@ -72,12 +80,12 @@ impl Namespace<'_> {
         // Only this exact now-empty directory may release the registry slot.
         if let Err(error) = directory.retire_empty(&mut || {
             cleanup()?;
-            session.check()
+            session.cleanup_check()
         }) {
             session.runtime.tainted.store(true, Ordering::Release);
             return Err(error);
         }
-        session.check()?;
+        session.cleanup_check()?;
         let mut state = session
             .runtime
             .inventory
@@ -191,7 +199,9 @@ impl<'a> SessionTemporary<'a> {
         } = self;
         let mut failure = None;
         let bytes = temporary
-            .finish(binding, &mut || namespace.io_check(check, &mut failure))
+            .finish(binding, &mut || {
+                namespace.io_check(check, &mut failure, false)
+            })
             .map_err(|e| failure.unwrap_or_else(|| e.to_string()))?;
         namespace.check()?;
         Ok(SessionBytes { bytes, namespace })
@@ -206,7 +216,7 @@ impl<'a> SessionTemporary<'a> {
         } = self;
         let mut failure = None;
         temporary
-            .abort(&mut || namespace.io_check(cleanup, &mut failure))
+            .abort(&mut || namespace.io_check(cleanup, &mut failure, true))
             .map_err(|e| failure.unwrap_or_else(|| e.to_string()))?;
         namespace.retire(cleanup)
     }
@@ -226,7 +236,7 @@ impl SessionBytes<'_> {
         let Self { bytes, namespace } = self;
         let mut failure = None;
         bytes
-            .retire(&mut || namespace.io_check(cleanup, &mut failure))
+            .retire(&mut || namespace.io_check(cleanup, &mut failure, true))
             .map_err(|e| failure.unwrap_or_else(|| e.to_string()))?;
         namespace.retire(cleanup)
     }
