@@ -68,6 +68,11 @@ pub(crate) enum LayerView<'a> {
     Native(native::LayerMetadata<'a>),
 }
 #[derive(Clone, Copy)]
+pub(crate) enum SourceView<'a> {
+    Resident(&'a crate::source::Source),
+    Native(&'a super::scene::Source36),
+}
+#[derive(Clone, Copy)]
 pub(crate) enum EffectView<'a> {
     Resident(&'a crate::effects::Effect),
     Native(native::EffectMetadata<'a>),
@@ -128,6 +133,18 @@ macro_rules! doc_ref {
     };
 }
 impl<'a> DocumentView<'a> {
+    pub(crate) fn native(self) -> Option<&'a native::NativeDocument> {
+        match self {
+            Self::Native(doc) => Some(doc),
+            Self::Resident(_) => None,
+        }
+    }
+    pub(crate) fn resident(self) -> Option<&'a Document> {
+        match self {
+            Self::Resident(doc) => Some(doc),
+            Self::Native(_) => None,
+        }
+    }
     doc_ref!(id, id, &'a str);
     doc_ref!(name, name, &'a str);
     doc_field!(width, width, u32);
@@ -261,6 +278,12 @@ macro_rules! layer_ref {
     };
 }
 impl<'a> LayerView<'a> {
+    pub(crate) fn source(self) -> Option<SourceView<'a>> {
+        match self {
+            Self::Resident(layer) => layer.source.as_deref().map(SourceView::Resident),
+            Self::Native(layer) => layer.source().map(SourceView::Native),
+        }
+    }
     layer_ref!(id, &'a str);
     layer_ref!(name, &'a str);
     layer_ref!(kind, &'a str);
@@ -325,6 +348,20 @@ impl<'a> LayerView<'a> {
                 super::scene::Content36::Shape { .. } => "shape",
                 super::scene::Content36::Svg { .. } => "svg",
             }),
+        }
+    }
+}
+impl SourceView<'_> {
+    pub(crate) fn dimensions(self) -> [u32; 2] {
+        match self {
+            Self::Resident(source) => [source.width, source.height],
+            Self::Native(source) => [source.width, source.height],
+        }
+    }
+    pub(crate) fn matrix(self) -> [f32; 6] {
+        match self {
+            Self::Resident(source) => source.matrix,
+            Self::Native(source) => source.matrix,
         }
     }
 }
