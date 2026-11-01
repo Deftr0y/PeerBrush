@@ -91,7 +91,7 @@ impl CapturedEdit {
             check()?;
             self.cancellation.check()
         };
-        self.prepare_batch(std::slice::from_ref(patch), &[], None, &checked)
+        self.prepare_batch(std::slice::from_ref(patch), &[], None, &[], &checked)
     }
 }
 
