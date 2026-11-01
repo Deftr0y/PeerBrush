@@ -5,7 +5,7 @@ pub(in crate::retained) struct FolderPlan<'a> {
     _charge: Reservation,
 }
 
-fn belongs(
+pub(in crate::retained) fn belongs(
     document: &NativeDocument,
     layer: LayerMetadata<'_>,
     root: &str,
