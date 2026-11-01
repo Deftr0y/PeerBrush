@@ -37,6 +37,11 @@ an immutable `Reservation` without allocating a placeholder buffer; external COW
 paths must retain that handle until the actual buffer is released or transferred
 to another separately enforced admission policy. A reservation is not permission
 to release accounting while an otherwise unaccounted allocation remains live.
+The crate-private frozen-owner finalization hook may reduce only unused peak
+reservation after all replaced growth buffers have dropped; the remaining charge
+must cover actual surviving capacities. The payload and charge remain inseparable
+through clones and history. Pins, byte scratch and disk reservations cannot use
+this external-owner hook or resize their accounted payloads.
 
 This budget excludes allocator overhead, indexing structures, document/history
 metadata and buffers not admitted through these pin/scratch APIs. The explicit
