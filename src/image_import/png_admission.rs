@@ -465,12 +465,59 @@ mod tests {
         }
     }
     #[test]
-    fn actual_session_cancel_crc_and_disk_refusal_keep_no_partial_authority() {
+    fn actual_session_cancellation_between_complete_rows_retires_unpublished_source() {
         let f = Fixture::new();
         let (runtime, _connection) = f.runtime(16 * 1024 * 1024);
         let session = runtime.begin().unwrap();
         let baseline = runtime.disk().used().unwrap();
         let source = encoded(&png(true, 16), &runtime);
+        let cancelled = std::cell::Cell::new(false);
+        // Reserved disk grows before append, so it cannot identify a completed
+        // write boundary. Observe the existing sink only AFTER push succeeds;
+        // cancellation then occurs outside Store's record transaction.
+        let result = stage_with(
+            &session,
+            source.binding(&runtime.resident()).unwrap(),
+            ColorPolicy::Raw,
+            &mut || {
+                if cancelled.get() {
+                    Err("Cancelled after completed native rows".into())
+                } else {
+                    Ok(())
+                }
+            },
+            |guard, sink| {
+                prepared_png::decode_pass_rows(
+                    &source,
+                    Limits::SELECTION,
+                    ColorPolicy::Raw,
+                    &runtime.resident(),
+                    guard,
+                    |header, event, row| {
+                        sink(header, event, row)?;
+                        if runtime.disk().used().unwrap() > baseline + 24 {
+                            cancelled.set(true);
+                        }
+                        Ok(())
+                    },
+                )
+            },
+        );
+        assert!(cancelled.get());
+        assert!(result.is_err());
+        assert_eq!(runtime.disk().used().unwrap(), baseline);
+    }
+
+    #[test]
+    fn actual_session_mid_append_cancellation_retains_unconfirmed_source_inventory() {
+        let f = Fixture::new();
+        let (runtime, _connection) = f.runtime(16 * 1024 * 1024);
+        let session = runtime.begin().unwrap();
+        let baseline = runtime.disk().used().unwrap();
+        let source = encoded(&png(true, 16), &runtime);
+        // Deliberately cancel after quota reservation while the append is in
+        // progress. Its partial record is unconfirmed: fail closed and retain
+        // both disk charge and inventory instead of pretending cleanup passed.
         let result = stage(
             &session,
             &source,
@@ -478,13 +525,36 @@ mod tests {
             ColorPolicy::Raw,
             &mut || {
                 if runtime.disk().used().unwrap() > baseline + 24 {
-                    Err("Cancelled after staged pixels".into())
+                    Err("Cancelled during native append".into())
                 } else {
                     Ok(())
                 }
             },
         );
-        assert!(result.is_err());
+        let error = result
+            .err()
+            .expect("Interrupted append returned no PNG authority");
+        assert!(
+            error.contains("PNG source cleanup retained inventory"),
+            "{error}"
+        );
+        assert!(runtime.disk().used().unwrap() > baseline);
+    }
+
+    #[test]
+    fn actual_session_cancel_crc_and_disk_refusal_keep_no_partial_authority() {
+        let f = Fixture::new();
+        let (runtime, _connection) = f.runtime(16 * 1024 * 1024);
+        let session = runtime.begin().unwrap();
+        let baseline = runtime.disk().used().unwrap();
+        assert!(stage(
+            &session,
+            &encoded(&png(false, 8), &runtime),
+            Limits::SELECTION,
+            ColorPolicy::Raw,
+            &mut || Err("Cancelled before PNG preparation".into())
+        )
+        .is_err());
         assert_eq!(runtime.disk().used().unwrap(), baseline);
         let mut bad = png(false, 8);
         let end = bad.len() - 1;
