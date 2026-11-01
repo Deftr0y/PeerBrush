@@ -26,6 +26,7 @@ mod image_open;
 mod layers;
 mod lifecycle;
 mod liquify;
+mod native_preview;
 mod new_canvas;
 mod pattern_source;
 mod pen;
@@ -498,6 +499,7 @@ pub struct PeerBrush {
     pending: bool,
     preview_epoch: Arc<std::sync::atomic::AtomicU64>,
     preview_job: u64,
+    native_preview: native_preview::Presentation,
     #[cfg(test)]
     parameter_worker_gate: Option<Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>>,
     #[cfg(test)]
@@ -875,6 +877,7 @@ impl PeerBrush {
             pending: false,
             preview_epoch,
             preview_job: 0,
+            native_preview: native_preview::Presentation::default(),
             #[cfg(test)]
             parameter_worker_gate: None,
             #[cfg(test)]
@@ -6274,6 +6277,7 @@ impl eframe::App for PeerBrush {
     }
     fn on_exit(&mut self) {
         self.preview_worker.stop();
+        self.native_preview.clear();
         crate::production_export::jobs::cancel_all(&self.shared.lock().unwrap().export_library);
         if self.update_exit_committed() {
             return;
