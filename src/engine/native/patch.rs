@@ -1,11 +1,17 @@
 use super::*;
-use crate::engine::scene::{Retained36, Warp36};
+use crate::engine::scene::Warp36;
 
 pub enum RetainedUpdate {
     Keep,
     Clear,
     Replace {
         source: RasterSlot,
+        matrix: [f64; 6],
+        projective: Option<[f64; 9]>,
+        warps: Vec<Warp36>,
+    },
+    ReplaceOutput {
+        source: StagedOutput,
         matrix: [f64; 6],
         projective: Option<[f64; 9]>,
         warps: Vec<Warp36>,
@@ -34,7 +40,13 @@ impl RefusedPatch {
         session: &impl super::super::scene::StageSession,
         cleanup: &dyn Fn() -> Result<()>,
     ) -> Result<()> {
-        self.patch.output.into_draft().abort(session, cleanup)
+        let mut error = self.patch.output.abort(session, cleanup).err();
+        if let RetainedUpdate::ReplaceOutput { source, .. } = self.patch.retained {
+            if let Err(reason) = source.abort(session, cleanup) {
+                error.get_or_insert(reason);
+            }
+        }
+        error.map_or(Ok(()), Err)
     }
 }
 impl CapturedEdit {
@@ -47,13 +59,21 @@ impl CapturedEdit {
     ) -> std::result::Result<PreparedDelta, RefusedPatch> {
         match self.prepare_raster(&patch, check) {
             Ok(mut prepared) => {
-                if let Err(_) = prepared.outputs.try_reserve_exact(1) {
+                let count = if matches!(patch.retained, RetainedUpdate::ReplaceOutput { .. }) {
+                    2
+                } else {
+                    1
+                };
+                if prepared.outputs.try_reserve_exact(count).is_err() {
                     return Err(RefusedPatch {
                         reason: "Native output owner allocation refused".into(),
                         patch,
                     });
                 }
                 prepared.outputs.push(patch.output);
+                if let RetainedUpdate::ReplaceOutput { source, .. } = patch.retained {
+                    prepared.outputs.push(source);
+                }
                 Ok(prepared)
             }
             Err(reason) => Err(RefusedPatch { reason, patch }),
@@ -69,201 +89,10 @@ impl CapturedEdit {
             check()?;
             self.cancellation.check()
         };
-        let check = &checked;
-        check()?;
-        let old = self.base.source(patch.target)?;
-        let output = patch.output.surface();
-        if output.depth() != old.depth()
-            || !output.uses_budget(self.base.budget())
-            || !output.uses_disk_budget(self.base.disk_budget())
-        {
-            return Err("Native output depth or admission differs".into());
-        }
-        let mut old_reference = None;
-        self.base.core.metadata.visit_rasters(|reference| {
-            if reference.id == patch.target.ordinal {
-                old_reference = Some(reference);
-            }
-            Ok(())
-        })?;
-        let old_reference = old_reference.ok_or("Missing native patch target")?;
-        if matches!(patch.retained, RetainedUpdate::Keep)
-            && old_reference.retained.is_some()
-            && old.key() != output.key()
-        {
-            return Err("Changed retained pixels require explicit source reconciliation".into());
-        }
-        let layer = self
-            .base
-            .core
-            .metadata
-            .layers
-            .iter()
-            .find(|layer| layer_contains(layer, patch.target.ordinal));
-        if let Some(layer) = layer {
-            unlocked(&self.base.core.metadata, &layer.id)?;
-            if layer.pixels.id == patch.target.ordinal
-                && layer.source.is_some()
-                && old.key() != output.key()
-            {
-                return Err(
-                    "Native editable source pixels require an explicit source-definition update"
-                        .into(),
-                );
-            }
-        }
-        let layer_id = layer
-            .map(|layer| layer.id.clone())
-            .unwrap_or_else(|| "@selection".into());
-        if let Some(origin) = patch.layer_origin {
-            if origin.iter().any(|v| v.unsigned_abs() > 100_000)
-                || !layer.is_some_and(|l| l.pixels.id == patch.target.ordinal)
-            {
-                return Err("Native layer origin does not match its raster target".into());
-            }
-        }
-        let intent = Intent::layers(
-            if patch.layer_origin.is_some() {
-                IntentKind::Placement
-            } else {
-                IntentKind::Pixels
-            },
-            &[layer_id],
-            self.base.budget(),
-        )?;
-        let working = MetadataCharge::reserve(self.base.budget(), 32 * 1024, check)?;
-        let retained = match &patch.retained {
-            RetainedUpdate::Keep => old_reference.retained.clone(),
-            RetainedUpdate::Clear => None,
-            RetainedUpdate::Replace {
-                source,
-                matrix,
-                projective,
-                warps,
-            } => {
-                let original = self.base.source(*source)?;
-                if warps.len() > crate::warp::MAX_STAGES {
-                    return Err("Retained Warp stage limit exceeded".into());
-                }
-                let mut stages = Vec::new();
-                stages
-                    .try_reserve_exact(warps.len())
-                    .map_err(|_| "Retained placement allocation refused")?;
-                for warp in warps {
-                    stages.push(crate::warp::Stage {
-                        before: warp.before,
-                        grid: crate::warp::Grid {
-                            rect: warp.grid.rect,
-                            points: warp.grid.points,
-                        },
-                    });
-                }
-                crate::retained::geometry::validate(
-                    original.width(),
-                    original.height(),
-                    original.depth(),
-                    output.depth(),
-                    *matrix,
-                    *projective,
-                    &stages,
-                )?;
-                Some(Box::new(Retained36 {
-                    pixels: RasterRef36 {
-                        id: source.ordinal,
-                        width: original.width(),
-                        height: original.height(),
-                        depth: original.depth(),
-                        retained: None,
-                    },
-                    matrix: *matrix,
-                    projective: *projective,
-                    warps: warps.clone(),
-                }))
-            }
-        };
-        let copied = copy_metadata(&self.base.core.metadata, self.base.budget(), check)?;
-        let virtual_id = u32::try_from(self.base.core.roster.roster.len())
-            .map_err(|_| "Native source ordinal overflow")?
-            .checked_add(1)
-            .ok_or("Native source ordinal overflow")?;
-        let metadata = copied.map_unique(|mut metadata, _| {
-            let mut found = false;
-            metadata.remap_rasters(|reference| {
-                if reference.id == patch.target.ordinal && !found {
-                    reference.id = virtual_id;
-                    reference.width = output.width();
-                    reference.height = output.height();
-                    reference.depth = output.depth();
-                    reference.retained = retained.clone();
-                    found = true;
-                }
-                Ok(())
-            })?;
-            if !found {
-                return Err("Native patch target disappeared".into());
-            }
-            if let Some(origin) = patch.layer_origin {
-                let layer = metadata
-                    .layers
-                    .iter_mut()
-                    .find(|l| l.pixels.id == virtual_id)
-                    .ok_or("Native layer origin target disappeared")?;
-                layer.x = origin[0];
-                layer.y = origin[1];
-            }
-            metadata.revision = metadata
-                .revision
-                .checked_add(1)
-                .ok_or("Native revision overflow")?;
-            Ok(metadata)
-        })?;
-        // Move the provisional header while preserving every temporary admission.
-        let resident = self.base.core.resident.clone();
-        let disk = self.base.core.disk.clone();
-        let source = &self.base.core.roster.roster;
-        let mut result = None;
-        metadata.map_unique(|mut header, _| {
-            let roster = rebuild_from(
-                &mut header,
-                source.len() + 1,
-                &resident,
-                &disk,
-                check,
-                |reference| {
-                    if reference.id == virtual_id {
-                        Ok(output.clone())
-                    } else {
-                        source.get(reference).cloned()
-                    }
-                },
-            )?;
-            let fresh = copy_metadata(&header, &resident, check)?;
-            // The final header has a fresh complete owner, without an old-ticket chain.
-            result = Some(fresh.map_unique(|metadata, _| {
-                Ok(Core {
-                    metadata,
-                    roster,
-                    resident,
-                    disk,
-                    key: key(),
-                    render_key: OnceLock::new(),
-                })
-            })?);
-            Ok(())
-        })?;
-        drop(working);
-        check()?;
-        Ok(PreparedDelta {
-            base: self.base.key(),
-            candidate: NativeDocument {
-                core: result.ok_or("Native header handoff failed")?,
-            },
-            cancellation: self.cancellation.clone(),
-            intent,
-            outputs: vec![],
-        })
+        self.prepare_batch(std::slice::from_ref(patch), &[], None, &checked)
     }
 }
+
 fn contains(reference: &RasterRef36, id: u32) -> bool {
     reference.id == id
         || reference
@@ -271,7 +100,7 @@ fn contains(reference: &RasterRef36, id: u32) -> bool {
             .as_ref()
             .is_some_and(|o| o.pixels.id == id)
 }
-fn layer_contains(layer: &Layer36, id: u32) -> bool {
+pub(super) fn layer_contains(layer: &Layer36, id: u32) -> bool {
     contains(&layer.pixels, id)
         || layer
             .mask
@@ -282,7 +111,7 @@ fn layer_contains(layer: &Layer36, id: u32) -> bool {
             .iter()
             .any(|e| e.clips.iter().any(|c| contains(&c.coverage.mask, id)))
 }
-fn unlocked(metadata: &Document36, target: &str) -> Result<()> {
+pub(super) fn unlocked(metadata: &Document36, target: &str) -> Result<()> {
     let mut current = Some(target);
     for _ in 0..=16 {
         let Some(id) = current else { return Ok(()) };

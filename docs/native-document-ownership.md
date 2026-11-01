@@ -53,6 +53,15 @@ closed/read-only state, exact generation/revision and cancellation before markin
 source fragments. Marking and document adoption perform no source I/O or caller
 callbacks. Metadata-only adoption cannot publish a generated raster update.
 
+A raster batch prepares linked planes, layer placement, source definitions,
+selection geometry and both coverage sources in one candidate and revision.
+New retained originals have their own sealed output owners. Duplicate targets,
+ambiguous origins and foreign metadata admissions fail with the complete batch
+available for cleanup. Changed source definitions/transforms require the rendered
+color output; fill materialization is an explicit transition paired with output.
+Source replacement currently retains the existing definition validator and caps.
+The native source evaluator and complete command policies remain separate gates.
+
 This is the data preparation boundary. Engine actor/reservation enforcement,
 history publication, complete source mutation/renumbering, native operators,
 recovery and coordinated live document replacement must be connected and tested
