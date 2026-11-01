@@ -31,6 +31,7 @@ pub mod icons;
 pub mod image_import;
 pub mod image_open;
 pub mod jpeg_xl;
+pub(crate) mod large_document;
 pub mod layer_clipboard;
 pub mod liquify;
 pub mod loading;
