@@ -30,7 +30,10 @@ immutable snapshot; serialization itself must not perform file I/O.
 
 Metadata JSON must have unique object keys, finite numbers, no trailing JSON and
 canonical ordered object keys/serialization. The complete decompressed PBR1
-manifest is capped at 16 MiB. Raster count, reference count, unique tile count,
+manifest is capped at 64 MiB, retaining room for the current 32 MiB editable
+pattern-asset envelope and ICC metadata. Parsed trees, canonical core/manifest
+buffers, typed metadata, tile transfer and index scratch need combined RAM
+admission in one shared pool. Raster count, reference count, unique tile count,
 chunk count and metadata/index allocation require explicit operation admission.
 These are additional internal bounds, not a promise of arbitrary document size.
 
@@ -68,8 +71,11 @@ each raster_id:u32BE/tx:u32BE/ty:u32BE/digest32 tuple in reference order.
 
 The additional-information key is `Pb36`, signature `8BIM`. It uses an ordinary
 32-bit payload length even in PSB. Each payload is at most 64 MiB. The layer/mask
-container retains its normal PSD/PSB length width; large saves require PSB when
-the standard container cannot represent the admitted output.
+container retains its normal PSD/PSB length width. Adobe's documented PSD size
+limit is [2 GB](https://helpx.adobe.com/photoshop/desktop/save-and-export/export-files-to-different-formats/photoshop-file-formats-overview.html);
+larger admitted outputs require PSB even when individual fields fit u32. Refuse
+an oversized PSD request before touching the destination and explain the PSB
+choice; do not silently change the requested extension.
 
 Each payload begins with this 56-byte header:
 
