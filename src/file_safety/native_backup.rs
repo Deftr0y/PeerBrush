@@ -15,8 +15,15 @@ impl NativeInventory<'_> {
     ) -> Result<Option<PathBuf>, String> {
         let key = destination_key(self.lease.path());
         let name = OsString::from(format!(
-            "{:016x}{:016x}-{}.{}", key[0], key[1], crate::engine::id(),
-            self.lease.path().extension().unwrap_or_default().to_string_lossy()
+            "{:016x}{:016x}-{}.{}",
+            key[0],
+            key[1],
+            crate::engine::id(),
+            self.lease
+                .path()
+                .extension()
+                .unwrap_or_default()
+                .to_string_lossy()
         ));
         self.preserve_with_name(name, check)
     }
@@ -29,7 +36,10 @@ impl NativeInventory<'_> {
             return Err("Native backup plan belongs to another destination version".into());
         }
         match (self.lease.expected(), plan.name()) {
-            (None, None) => { self.validate(check)?; Ok(None) }
+            (None, None) => {
+                self.validate(check)?;
+                Ok(None)
+            }
             (Some(_), Some(name)) => self.preserve_with_name(name.into(), check),
             _ => Err("Native backup name differs from the admitted source".into()),
         }
@@ -54,20 +64,29 @@ impl NativeInventory<'_> {
         let mut buffer =
             ScratchBytes::new(&self.budget, 65536, 65536).map_err(|e| e.to_string())?;
         if name.as_encoded_bytes().len() > 1024
-            || !matches!((Path::new(&name).components().next(), Path::new(&name).components().nth(1)),
-                (Some(std::path::Component::Normal(_)), None))
+            || !matches!(
+                (
+                    Path::new(&name).components().next(),
+                    Path::new(&name).components().nth(1)
+                ),
+                (Some(std::path::Component::Normal(_)), None)
+            )
         {
             return Err("Native backup plan contains an invalid component".into());
         }
         #[cfg(windows)]
         {
             use std::os::windows::ffi::OsStrExt;
-            if name.encode_wide().any(|unit| unit == 0 || unit == b':' as u16) {
+            if name
+                .encode_wide()
+                .any(|unit| unit == 0 || unit == b':' as u16)
+            {
                 return Err("Native backup plan contains a stream alias".into());
             }
         }
         let path = self.directory.join(&name);
         let mut source = open_native_read(self.lease.path()).map_err(|e| e.to_string())?;
+        super::super::native_access::supported(&source)?;
         if identity(&source)? != expected.identity {
             return Err("Native previous source identity changed".into());
         }
@@ -105,7 +124,7 @@ impl NativeInventory<'_> {
             Ok(())
         };
         named()?;
-        permissions::preserve_held(&source, &output)?;
+        super::super::native_access::preserve(&source, &output, &self.budget, check)?;
         let mut left = expected.bytes;
         let mut digest = Context::new(&SHA256);
         while left != 0 {
