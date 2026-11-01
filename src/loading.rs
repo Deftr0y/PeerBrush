@@ -63,6 +63,11 @@ impl Control {
             preview: None,
         }
     }
+    /// Inspect metadata for admission before copying it. The callback must not
+    /// perform I/O or recursively access this control.
+    pub(crate) fn read_status<T>(&self, read: impl FnOnce(&Status) -> T) -> T {
+        read(&self.status.lock().unwrap())
+    }
     pub fn take_preview(&self) -> Option<(u32, u32, Vec<u8>)> {
         self.status.lock().unwrap().preview.take()
     }
