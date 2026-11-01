@@ -126,9 +126,17 @@ lifetimes and mid-band work refusal. Invalid kernel state refuses the whole plan
 `maximum_rows()` supplies a guaranteed band height under the original logical
 isolated-group width bound and128KiPixel physical allocation limit; it does not
 translate geometry or guess an interpolation halo. The caller may emit smaller
-bands. Ordinary stroke outlines and dashed paths are still rebuilt under admitted
-temporary scopes and cumulative point-count work admission; their throughput
-still requires qualification. Legacy uncached rendering remains available at
+bands. An operation-owned geometry cache builds dashes, stroke outlines and the
+original ordered tile transforms once. It binds original source geometry,
+stroke state including exact dash/scalar bits, matrix and logical frame on every
+reuse. Retained paths carry the actual reservation owner, including any temporary
+clone that survives the cache itself. Shader transforms still follow the
+original full tile traversal. Geometry and scan invocations share the retained
+byte and invocation limits; output regions do not reset cumulative work.
+The independent primitive corpus must remain byte-identical after this reuse.
+Cached tile-path comparisons and hairline-program traversal still consume
+whole-operation work, so full-document throughput requires measurement.
+Legacy uncached rendering remains available at
 its existing supported limits. Full 16000-square resource/performance tests,
 source-bound tile-band staging, native8/16 editor/history/save/reopen/recovery and
 cross-platform qualification remain mandatory before live adoption or any cap
