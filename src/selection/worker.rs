@@ -455,11 +455,19 @@ mod tests {
                     }
                 }
                 drop(view);
+                let descriptors = if source.mask().is_known_zero() {
+                    0
+                } else {
+                    source.mask().physical_tiles().count() * 512 + 128
+                };
+                assert_eq!(pool.payload_used(), source.metadata_bytes() + descriptors);
                 drop(source);
-                assert_eq!(pool.used(), 0);
+                // The reused Store still owns its admitted block/weak indexes.
+                assert_eq!(pool.payload_used(), 0);
             }
         }
         drop(store);
+        assert_eq!(pool.used(), 0);
         std::fs::remove_dir_all(path).unwrap();
     }
 
