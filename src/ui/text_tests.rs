@@ -870,7 +870,10 @@ fn overlapping_text_field_hit_follows_visible_group_order_instead_of_flat_storag
 
 #[test]
 fn pending_source_apply_preserves_its_draft_until_real_terminal_completion() {
-    for depth in [8, 16] {
+    for (depth, cancel) in [8, 16]
+        .into_iter()
+        .flat_map(|depth| [false, true].map(|cancel| (depth, cancel)))
+    {
         let (mut app, ctx, file) = fixture(depth);
         let doc = app.shared.lock().unwrap().doc.clone();
         app.open_source(&doc, "text");
@@ -921,8 +924,24 @@ fn pending_source_apply_preserves_its_draft_until_real_terminal_completion() {
         assert!(!app.exit_approved);
         app.source_edit_finished_nonce(token.nonce().wrapping_add(1), Ok(()));
         assert_eq!(app.source_editor.as_ref().unwrap().token(), token);
+        if cancel {
+            app.cancel_pending_edit();
+            assert!(app.message.starts_with("Cancelling"));
+        }
         drop(guard);
         wait_edit(&mut app);
+        if cancel {
+            assert_eq!(app.source_editor.as_ref().unwrap().command(), draft);
+            let engine = shared.lock().unwrap();
+            assert_eq!(engine.doc.revision, revision);
+            assert_eq!(engine.undo.len(), history);
+            assert!(app.message.contains("cancelled"), "{}", app.message);
+            drop(engine);
+            app.cancel_source();
+            assert!(app.source_editor.is_none());
+            file.unchanged();
+            continue;
+        }
         assert!(app.source_editor.is_none(), "{}", app.message);
         let mut engine = shared.lock().unwrap();
         assert_eq!(engine.doc.revision, revision + 1);

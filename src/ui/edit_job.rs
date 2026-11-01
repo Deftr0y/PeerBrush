@@ -33,22 +33,26 @@ pub(super) struct Request {
     pub selection_edit: bool,
     pub origin: Origin,
 }
-pub(super) struct Completed {
+pub(super) struct Completed<T> {
     pub request: Arc<Request>,
-    pub result: Result<Value, String>,
+    pub result: Result<T, String>,
     // Keep the admitted command allocation alive through terminal handling.
     _commands: Commands,
 }
-struct Pending {
+struct Pending<T> {
     request: Arc<Request>,
     commands: Commands,
-    result: mpsc::Receiver<Result<Value, String>>,
+    result: mpsc::Receiver<Result<T, String>>,
 }
-#[derive(Default)]
-pub(super) struct Worker {
-    pending: Option<Pending>,
+pub(super) struct Worker<T> {
+    pending: Option<Pending<T>>,
 }
-impl Worker {
+impl<T> Default for Worker<T> {
+    fn default() -> Self {
+        Self { pending: None }
+    }
+}
+impl<T: Send + 'static> Worker<T> {
     pub(super) fn pending(&self) -> bool {
         self.pending.is_some()
     }
@@ -59,7 +63,7 @@ impl Worker {
         &mut self,
         request: Request,
         commands: Commands,
-        edit: impl FnOnce(&Request, &[Value]) -> Result<Value, String> + Send + 'static,
+        edit: impl FnOnce(&Request, &[Value]) -> Result<T, String> + Send + 'static,
         repaint: impl FnOnce() + Send + 'static,
     ) -> Result<(), String> {
         if self.pending.is_some() {
@@ -89,7 +93,7 @@ impl Worker {
         });
         Ok(())
     }
-    pub(super) fn poll(&mut self) -> Option<Completed> {
+    pub(super) fn poll(&mut self) -> Option<Completed<T>> {
         let pending = self.pending.as_ref()?;
         let result = match pending.result.try_recv() {
             Ok(result) => result,
@@ -125,7 +129,7 @@ mod tests {
             origin,
         }
     }
-    fn wait(worker: &mut Worker) -> Completed {
+    fn wait(worker: &mut Worker<Value>) -> Completed<Value> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             if let Some(completed) = worker.poll() {

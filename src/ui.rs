@@ -432,7 +432,8 @@ pub struct PeerBrush {
     free_transform_cancelled_pointer: bool,
     source_editor: Option<source::Editor>,
     native_source_preview: Option<crate::psd::memory36::Admitted<Value>>,
-    edit_worker: edit_job::Worker,
+    edit_worker: edit_job::Worker<server::EditReply>,
+    edit_control: Option<server::EditControl>,
     pen: pen::State,
     straight: brush::Straight,
     filter_editor: Option<filters::Editor>,
@@ -812,6 +813,7 @@ impl PeerBrush {
             source_editor: None,
             native_source_preview: None,
             edit_worker: Default::default(),
+            edit_control: None,
             pen: pen::State::default(),
             straight: brush::Straight::default(),
             filter_editor: None,
@@ -1037,12 +1039,14 @@ impl PeerBrush {
             source::EditCommand::Native(command) => edit_job::Commands::Native(command),
         };
         let shared = self.shared.clone();
+        let control = server::EditControl::default();
+        let worker_control = control.clone();
         let ctx = ctx.clone();
         self.edit_worker.submit(
             request,
             commands,
             move |request, commands| {
-                server::edit_shared(
+                server::edit_shared_controlled(
                     &shared,
                     "human",
                     commands,
@@ -1051,10 +1055,12 @@ impl PeerBrush {
                     &request.label,
                     None,
                     Some(&request.document),
+                    &worker_control,
                 )
             },
             move || ctx.request_repaint(),
         )?;
+        self.edit_control = Some(control);
         self.lifecycle_frame = true;
         self.message = "Applying source changes…".into();
         Ok(())
@@ -1070,6 +1076,7 @@ impl PeerBrush {
         let Some(completed) = self.edit_worker.poll() else {
             return;
         };
+        self.edit_control = None;
         let request = &completed.request;
         if let edit_job::Origin::Source(nonce) = request.origin {
             self.source_edit_finished_nonce(
@@ -1081,7 +1088,7 @@ impl PeerBrush {
         if current {
             match &completed.result {
                 Ok(value) => {
-                    if let Some(id) = value["created"]
+                    if let Some(id) = value.data()["created"]
                         .as_array()
                         .and_then(|ids| ids.first())
                         .and_then(Value::as_str)
@@ -1092,7 +1099,10 @@ impl PeerBrush {
                         self.mask = false;
                         self.mask_step = None;
                     }
-                    self.message = request.label.clone();
+                    self.message = value.data()["cleanup_warning"]
+                        .as_str()
+                        .map(|warning| format!("{}; {warning}", request.label))
+                        .unwrap_or_else(|| request.label.clone());
                     self.native_source_preview = None;
                     self.last_preview = None;
                 }
@@ -1108,6 +1118,16 @@ impl PeerBrush {
                 .map(|_| request.label.clone())
                 .unwrap_or_else(Clone::clone);
         }
+    }
+    fn cancel_pending_edit(&mut self) {
+        let Some(control) = &self.edit_control else {
+            return;
+        };
+        self.message = if control.cancel() {
+            "Cancelling edit before publication…".into()
+        } else {
+            "Waiting for the edit result…".into()
+        };
     }
     fn select_tool(&mut self, tool: Tool) {
         self.alt_sample = None;
@@ -5275,6 +5295,9 @@ impl PeerBrush {
     }
     fn draw(&mut self, ctx: &egui::Context) {
         self.poll_edit_job();
+        if self.edit_worker.pending() && ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+            self.cancel_pending_edit();
+        }
         if self.edit_worker.pending() && ctx.input(|input| input.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.message = "Wait for the edit result before closing PeerBrush".into();
@@ -6424,6 +6447,9 @@ impl eframe::App for PeerBrush {
         self.draw(ctx);
     }
     fn on_exit(&mut self) {
+        if let Some(control) = &self.edit_control {
+            control.cancel();
+        }
         self.preview_worker.stop();
         self.animation.clear();
         self.native_preview.clear();
