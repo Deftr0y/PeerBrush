@@ -21,6 +21,9 @@ mod segments;
 mod staging;
 pub(crate) use segments::{SessionJxlOutput, SessionSegmentLog, SessionSegments};
 pub(crate) use staging::{SessionBytes, SessionTemporary};
+#[path = "source_runtime/destination.rs"]
+mod destination;
+pub(crate) use destination::SourceDestination;
 #[path = "source_runtime/checkpoints.rs"]
 mod checkpoints;
 #[path = "source_runtime/recovery_marker.rs"]
@@ -896,12 +899,12 @@ fn valid_pending_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    struct Fixture {
+    pub(super) struct Fixture {
         base: PathBuf,
         held: Option<Directory>,
     }
     impl Fixture {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             let base = std::env::temp_dir()
                 .join(format!("peerbrush-source-runtime-{}", uuid::Uuid::new_v4()));
             fs::create_dir(&base).unwrap();
@@ -917,7 +920,7 @@ mod tests {
                 cache: self.base.join("cache"),
             }
         }
-        fn connection(&self) -> (crate::server::Shared, crate::server::Connection) {
+        pub(super) fn connection(&self) -> (crate::server::Shared, crate::server::Connection) {
             let shared = Arc::new(Mutex::new(crate::engine::Engine::new()));
             let connection =
                 crate::server::start(shared.clone(), self.base.join("runtime")).unwrap();
@@ -940,7 +943,7 @@ mod tests {
             }
         }
     }
-    fn limits() -> Limits {
+    pub(super) fn limits() -> Limits {
         Limits {
             resident_bytes: 8 * 1024 * 1024,
             disk_bytes: 8 * 1024 * 1024,

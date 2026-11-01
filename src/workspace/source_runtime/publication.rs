@@ -49,6 +49,55 @@ struct ClosedRegistration {
     file: (u64, u64),
 }
 impl Registry {
+    pub(super) fn refuse_destination(
+        &self,
+        parent: (u64, u64),
+        name: &std::ffi::OsStr,
+        identity: Option<(u64, u64)>,
+    ) -> Result<(), String> {
+        use closed_frame::Place;
+        for entry in &self.entries {
+            let retained = entry.closed.as_ref().is_some_and(|closed| {
+                closed
+                    .frame
+                    .bindings
+                    .iter()
+                    .any(|binding| binding.place == Place::Temporary)
+            });
+            if entry.closed.is_none() || retained {
+                if entry.frame.parent == parent && same_native_name(&entry.frame.temporary, name) {
+                    return Err("Pending native temporary is not a user destination".into());
+                }
+                if identity.is_some_and(|id| {
+                    entry
+                        .created
+                        .iter()
+                        .flatten()
+                        .any(|created| created.record.fact.identity == id)
+                }) {
+                    return Err("Pending native output identity is not a user destination".into());
+                }
+            }
+            if identity.is_some_and(|id| {
+                entry
+                    .frame
+                    .facts
+                    .iter()
+                    .any(|fact| fact.role == Role::Backup && fact.fact.identity == id)
+                    || entry.closed.as_ref().is_some_and(|closed| {
+                        closed.frame.bindings.iter().any(|binding| {
+                            matches!(
+                                binding.place,
+                                Place::BackupOrdinal(_) | Place::CreatedBackup
+                            ) && binding.fact.identity == id
+                        })
+                    })
+            }) {
+                return Err("Managed previous-save identity is not a user destination".into());
+            }
+        }
+        Ok(())
+    }
     pub(super) fn new(maximum: usize) -> Result<Self, String> {
         let mut entries = Vec::new();
         entries
@@ -87,6 +136,20 @@ impl Registry {
             created: [None, None],
         });
         Ok(())
+    }
+}
+// Temporary components are generated ASCII. Windows name lookup ignores ASCII
+// case even while an absent planned name has no FileId to compare yet.
+fn same_native_name(a: &std::ffi::OsStr, b: &std::ffi::OsStr) -> bool {
+    #[cfg(windows)]
+    {
+        a.to_str()
+            .zip(b.to_str())
+            .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b))
+    }
+    #[cfg(unix)]
+    {
+        a == b
     }
 }
 /// A live exact-operation pre-create receipt. No serialized record constructs it.
@@ -457,6 +520,7 @@ impl SourceSession {
         check()?;
         self.check()?;
         candidate.check_session(self)?;
+        observed.check_session(self)?;
         if !observed.uses_budget(&self.resident()) {
             return Err("External observation uses another resident pool".into());
         }
