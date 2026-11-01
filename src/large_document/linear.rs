@@ -97,6 +97,13 @@ pub(super) struct Owned {
 }
 impl Owned {
     pub(super) fn check(&self) -> Result<()> {
+        self.check_identity()?;
+        if stamp(&self.file)? != self.expected {
+            return Err(Error::Changed);
+        }
+        Ok(())
+    }
+    fn check_identity(&self) -> Result<()> {
         validate_ancestors(&self.root)?;
         regular(&self.path)?;
         let dir = open_directory(&self.root)?;
@@ -109,7 +116,6 @@ impl Owned {
             || crate::file_safety::identity(&self.file).map_err(|_| Error::Changed)?
                 != self.identity
             || links(&self.file)? != 1
-            || stamp(&self.file)? != self.expected
         {
             return Err(Error::Changed);
         }
@@ -124,6 +130,7 @@ pub(super) struct Scratch {
     header: [u8; 64],
     pub(super) index: ScratchBytes,
     rows: u64,
+    written: u64,
     content: Context,
     chunk: Context,
     chunk_bytes: usize,
@@ -217,6 +224,7 @@ impl Scratch {
             header,
             index,
             rows: 0,
+            written: 0,
             content,
             chunk,
             chunk_bytes: 0,
@@ -261,6 +269,10 @@ impl Scratch {
                 write_all_at(&self.owned.file, at, part)?;
                 self.content.update(part);
                 self.chunk.update(part);
+                self.written = self
+                    .written
+                    .checked_add(count as u64)
+                    .ok_or(Error::Budget)?;
                 self.chunk_bytes += count;
                 at += count as u64;
                 input = &input[count..];
@@ -353,6 +365,42 @@ impl Scratch {
             index: self.index.freeze(),
             budget: self.budget,
         }))
+    }
+
+    /// Never-published writers only. Reconcile only a byte-exact known prefix;
+    /// partial unknown writes, changed headers and foreign names remain held.
+    pub fn abort(mut self, check: Check<'_>) -> Result<()> {
+        check()?;
+        self.owned.check_identity()?;
+        let before = stamp(&self.owned.file)?;
+        if before.bytes != HEADER.checked_add(self.written).ok_or(Error::Budget)? {
+            return Err(Error::Changed);
+        }
+        let expected = finish(self.content);
+        let mut buffer = ScratchBytes::new(&self.budget, CHUNK, CHUNK)?;
+        read_exact_at(&self.owned.file, 0, &mut buffer[..64])?;
+        if &buffer[..64] != &self.header {
+            return Err(Error::Corrupt);
+        }
+        let mut observed = self.spec.kind.content_start(&self.header);
+        let mut at = 0;
+        while at < self.written {
+            check()?;
+            let count = (self.written - at).min(CHUNK as u64) as usize;
+            read_exact_at(&self.owned.file, HEADER + at, &mut buffer[..count])?;
+            observed.update(&buffer[..count]);
+            at += count as u64;
+        }
+        if finish(observed) != expected {
+            return Err(Error::Corrupt);
+        }
+        check()?;
+        self.owned.check_identity()?;
+        if stamp(&self.owned.file)? != before {
+            return Err(Error::Changed);
+        }
+        self.owned.expected = before;
+        retire_owned(self.owned, check)
     }
 }
 
@@ -618,12 +666,16 @@ fn verify(
 /// needs no staged bytes. Failure preserves the quota charge and foreign names.
 pub(super) fn retire(owner: Arc<Complete>, check: Check<'_>) -> Result<()> {
     let complete = Arc::try_unwrap(owner).map_err(|_| Error::Busy)?;
+    retire_owned(complete.owned, check)
+}
+
+fn retire_owned(owned: Owned, check: Check<'_>) -> Result<()> {
     check()?;
-    complete.owned.check()?;
+    owned.check()?;
     check()?;
-    complete.owned.check()?;
-    unlink_owned(&complete.owned.file, &complete.owned.path)?;
-    crate::server::sync_parent(&complete.owned.path).map_err(|_| Error::Changed)?;
+    owned.check()?;
+    unlink_owned(&owned.file, &owned.path)?;
+    crate::server::sync_parent(&owned.path).map_err(|_| Error::Changed)?;
     let Owned {
         root,
         directory,
@@ -633,7 +685,7 @@ pub(super) fn retire(owner: Arc<Complete>, check: Check<'_>) -> Result<()> {
         identity,
         disk,
         ..
-    } = complete.owned;
+    } = owned;
     drop(file);
     let named_dir = open_directory(&root)?;
     if crate::file_safety::identity(&directory).map_err(|_| Error::Changed)? != directory_id

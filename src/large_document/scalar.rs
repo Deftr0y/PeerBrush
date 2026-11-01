@@ -43,6 +43,9 @@ pub struct ScalarScratch {
     inner: linear::Scratch,
 }
 impl ScalarScratch {
+    pub fn abort(self, check: Check<'_>) -> Result<()> {
+        self.inner.abort(check)
+    }
     pub fn create(
         root: &Path,
         spec: ScalarSpec,
@@ -395,6 +398,113 @@ mod tests {
         assert_eq!(fs::metadata(moved).unwrap().len(), spec.encoded_bytes());
         assert_eq!(budget.used(), 0);
         assert_eq!(disk.used().unwrap(), spec.encoded_bytes());
+    }
+
+    #[test]
+    fn explicit_abort_reclaims_only_a_fully_verified_known_prefix() {
+        let fixture = Fixture::new();
+        let spec = ScalarSpec::new(16000, 2).unwrap();
+        let budget = ResidentBudget::new(1024 * 1024).unwrap();
+        let disk = DiskBudget::new(spec.encoded_bytes(), 1).unwrap();
+        let mut scratch =
+            ScalarScratch::create(&fixture.field(), spec, budget.clone(), disk.clone()).unwrap();
+        let row = ScratchBytes::new(&budget, spec.row_bytes(), spec.row_bytes()).unwrap();
+        let probe = scratch.inner.owned.file.try_clone().unwrap();
+        assert!(matches!(
+            scratch.append_rows(0, &row, &mut || {
+                if probe.metadata()?.len() > 64 {
+                    Err(Error::Cancelled)
+                } else {
+                    Ok(())
+                }
+            }),
+            Err(Error::Cancelled)
+        ));
+        assert_eq!(probe.metadata().unwrap().len(), 64 + 65536);
+        drop(probe);
+        drop(row);
+        scratch.abort(&mut okay).unwrap();
+        assert!(!fixture.field().join("field.pbf").exists());
+        assert_eq!(budget.used(), 0);
+        assert_eq!(disk.used().unwrap(), 0);
+    }
+
+    #[test]
+    fn abort_preserves_unknown_partial_bytes_and_mismatched_prefixes() {
+        for extra in [false, true] {
+            let fixture = Fixture::new();
+            let spec = ScalarSpec::new(16000, 2).unwrap();
+            let budget = ResidentBudget::new(1024 * 1024).unwrap();
+            let disk = DiskBudget::new(spec.encoded_bytes(), 1).unwrap();
+            let mut scratch =
+                ScalarScratch::create(&fixture.field(), spec, budget.clone(), disk.clone())
+                    .unwrap();
+            let row = ScratchBytes::new(&budget, spec.row_bytes(), spec.row_bytes()).unwrap();
+            let probe = scratch.inner.owned.file.try_clone().unwrap();
+            assert!(scratch
+                .append_rows(0, &row, &mut || {
+                    let length = probe.metadata()?.len();
+                    if length > 64 {
+                        write_all_at(&probe, if extra { length } else { 64 }, b"unknown")?;
+                        Err(Error::Io(std::io::ErrorKind::StorageFull.into()))
+                    } else {
+                        Ok(())
+                    }
+                })
+                .is_err());
+            let length = probe.metadata().unwrap().len();
+            drop(probe);
+            drop(row);
+            let result = scratch.abort(&mut okay);
+            assert!(matches!(result, Err(Error::Changed | Error::Corrupt)));
+            assert_eq!(
+                fs::metadata(fixture.field().join("field.pbf"))
+                    .unwrap()
+                    .len(),
+                length
+            );
+            assert_eq!(budget.used(), 0);
+            assert_eq!(disk.used().unwrap(), spec.encoded_bytes());
+        }
+    }
+
+    #[test]
+    fn abort_rechecks_late_changes_and_foreign_names_before_deleting() {
+        for foreign in [false, true] {
+            let fixture = Fixture::new();
+            let spec = ScalarSpec::new(17, 2).unwrap();
+            let budget = ResidentBudget::new(1024 * 1024).unwrap();
+            let disk = DiskBudget::new(spec.encoded_bytes(), 1).unwrap();
+            let mut scratch =
+                ScalarScratch::create(&fixture.field(), spec, budget.clone(), disk.clone())
+                    .unwrap();
+            scratch.append_rows(0, &[0; 17 * 8], &mut okay).unwrap();
+            let path = fixture.field().join("field.pbf");
+            if foreign {
+                fs::rename(&path, fixture.root.join("original")).unwrap();
+                fs::write(&path, b"foreign abort path").unwrap();
+                assert!(scratch.abort(&mut okay).is_err());
+                assert_eq!(fs::read(&path).unwrap(), b"foreign abort path");
+            } else {
+                let probe = scratch.inner.owned.file.try_clone().unwrap();
+                let mut checks = 0;
+                assert!(matches!(
+                    scratch.abort(&mut || {
+                        checks += 1;
+                        if checks == 3 {
+                            let length = probe.metadata()?.len();
+                            write_all_at(&probe, length, b"late")?;
+                        }
+                        Ok(())
+                    }),
+                    Err(Error::Changed)
+                ));
+                drop(probe);
+                assert!(path.exists());
+            }
+            assert_eq!(budget.used(), 0);
+            assert_eq!(disk.used().unwrap(), spec.encoded_bytes());
+        }
     }
 
     #[test]
