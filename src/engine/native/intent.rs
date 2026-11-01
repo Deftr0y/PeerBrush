@@ -10,6 +10,7 @@ pub enum IntentKind {
     Pixels,
     Placement,
     Selection,
+    History,
 }
 pub struct Intent {
     kind: IntentKind,
@@ -17,6 +18,52 @@ pub struct Intent {
     _charge: Reservation,
 }
 impl Intent {
+    pub(super) fn from_scopes(
+        kind: IntentKind,
+        source: &[Scope],
+        pool: &ResidentBudget,
+    ) -> Result<Self> {
+        let bytes = source.iter().try_fold(
+            source
+                .len()
+                .checked_mul(std::mem::size_of::<Scope>())
+                .and_then(|n| n.checked_add(128))
+                .ok_or("Native scope footprint overflow")?,
+            |n, scope| {
+                n.checked_add(scope.target.as_ref().map_or(0, String::len))
+                    .ok_or("Native scope footprint overflow")
+            },
+        )?;
+        let charge = pool
+            .reserve_bytes(bytes, bytes)
+            .map_err(|e| e.to_string())?;
+        let mut scopes = Vec::new();
+        scopes
+            .try_reserve_exact(source.len())
+            .map_err(|_| "Native scope allocation refused")?;
+        for scope in source {
+            let target = scope
+                .target
+                .as_ref()
+                .map(|text| {
+                    let mut copy = String::new();
+                    copy.try_reserve_exact(text.len())
+                        .map_err(|_| "Native scope target allocation refused")?;
+                    copy.push_str(text);
+                    Ok::<_, String>(copy)
+                })
+                .transpose()?;
+            scopes.push(Scope {
+                target,
+                rect: scope.rect,
+            });
+        }
+        Ok(Self {
+            kind,
+            scopes,
+            _charge: charge,
+        })
+    }
     pub fn kind(&self) -> &IntentKind {
         &self.kind
     }

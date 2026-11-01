@@ -62,6 +62,15 @@ color output; fill materialization is an explicit transition paired with output.
 Source replacement currently retains the existing definition validator and caps.
 The native source evaluator and complete command policies remain separate gates.
 
+Native history captures a constant-size cursor/owner snapshot. Workers prepare
+the history record, coalesced gesture scopes, immutable undo/redo header and
+retirement capacity before publication. The final write-fenced step rechecks the
+cursor, actor, leases, document generation and cancellation, then adopts the
+candidate and history record together without allocation or source I/O. Retired
+owners are returned for release after leaving the engine mutex. Undo and redo
+advance revision monotonically while sharing the exact native sources. Selective
+task compensation and runtime selection replay ownership still require migration.
+
 This is the data preparation boundary. Engine actor/reservation enforcement,
 history publication, complete source mutation/renumbering, native operators,
 recovery and coordinated live document replacement must be connected and tested
