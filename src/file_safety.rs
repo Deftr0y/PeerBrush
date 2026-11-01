@@ -38,6 +38,8 @@ impl FilePolicy {
         }
     }
 }
+#[path = "file_safety/owned_rename.rs"]
+pub(crate) mod owned_rename;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Version {
