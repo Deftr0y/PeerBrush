@@ -1678,7 +1678,7 @@ impl PeerBrush {
                 }
                 Err(error) => {
                     editor.error = Some(error.clone());
-                    self.message = error;
+                    self.message = error.into();
                     self.free_transform = Some(editor);
                 }
             }

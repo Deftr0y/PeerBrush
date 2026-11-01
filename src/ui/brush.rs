@@ -778,7 +778,7 @@ impl PeerBrush {
                         self.brush_preset = None;
                         self.shared.lock().unwrap().status = "Custom brush deleted".into();
                     }
-                    Err(e) => self.shared.lock().unwrap().status = e,
+                    Err(e) => self.shared.lock().unwrap().status = e.into(),
                 }
             }
         });
@@ -818,7 +818,7 @@ impl PeerBrush {
                 self.select_brush_preset(&preset);
                 self.shared.lock().unwrap().status = "Custom brush saved".into();
             }
-            Err(error) => self.shared.lock().unwrap().status = error,
+            Err(error) => self.shared.lock().unwrap().status = error.into(),
         }
     }
 }

@@ -137,7 +137,7 @@ impl PeerBrush {
                                 self.view = view::View::default();
                                 self.last_preview = None;
                             }
-                            Err(error) => self.message = error,
+                            Err(error) => self.message = error.into(),
                         }
                     }
                     if ui.button("Cancel").clicked() {

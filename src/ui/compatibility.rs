@@ -129,7 +129,7 @@ impl PeerBrush {
         let result = crate::compatibility::report_snapshot(&snapshot);
         match result {
             Ok(report) => self.save_report = Some(report),
-            Err(error) => self.message = error,
+            Err(error) => self.message = error.into(),
         }
     }
     pub(super) fn compatibility_window<'a>(

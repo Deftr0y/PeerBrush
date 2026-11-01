@@ -84,7 +84,7 @@ impl PeerBrush {
             ui.label(RichText::new("Restored work is unsaved. Choose a destination with Save As; recovery versions remain until discarded.").color(MUTED));
             if let Some(error) = &failure { ui.colored_label(ACCENT, error); }
             if let Some(error) = &self.recovery.error { ui.colored_label(ACCENT, error); }
-            if self.message.to_lowercase().contains("recover") { ui.label(&self.message); }
+            if self.message.to_lowercase().contains("recover") { ui.label(self.message.as_str()); }
             egui::ScrollArea::vertical().max_height(340.).show(ui, |ui| {
                 for entry in &self.recovery.entries {
                     let selected = self.recovery.selected.as_deref() == Some(&entry.snapshot);

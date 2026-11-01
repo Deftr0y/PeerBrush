@@ -75,12 +75,12 @@ pub(super) fn poll(app: &mut PeerBrush, ctx: &egui::Context) {
             app.message = "Pattern import could not complete · current work preserved".into()
         }
         Ok(Ok(None)) => {}
-        Ok(Err(error)) => app.message = error,
+        Ok(Err(error)) => app.message = error.into(),
         Ok(Ok(Some(source))) => {
             app.animation.cancel();
             app.message = apply(&mut app.shared.lock().unwrap(), &pending, &source)
                 .map(|_| "Embedded bitmap pattern".into())
-                .unwrap_or_else(|e| e);
+                .unwrap_or_else(|e| e).into();
             app.last_preview = None;
         }
     }

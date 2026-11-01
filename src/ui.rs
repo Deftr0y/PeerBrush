@@ -64,6 +64,7 @@ mod workspace_tests;
 use crate::{controls, thumbnails};
 use crate::{
     engine::{
+        runtime_value::RuntimeValue,
         view::{DocumentSnapshot, DocumentView, LayerView},
         Document,
     },
@@ -305,7 +306,7 @@ struct ProjectView {
     zoom: f32,
     pan: Vec2,
     view: view::View,
-    message: String,
+    message: RuntimeValue<String>,
 }
 struct LayerDrag {
     gesture: String,
@@ -526,8 +527,8 @@ pub struct PeerBrush {
     drag_start: Option<[f32; 2]>,
     view_rect: Option<Rect>,
     view: view::View,
-    message: String,
-    last_status: String,
+    message: RuntimeValue<String>,
+    last_status: RuntimeValue<String>,
     import_tx: mpsc::Sender<ImportReply>,
     import_rx: mpsc::Receiver<ImportReply>,
     pending_import: Option<PendingImport>,
@@ -1010,7 +1011,7 @@ impl PeerBrush {
             }
             Err(e) => {
                 self.selection_commit_failed |= selection_edit;
-                self.message = e;
+                self.message = e.into();
                 false
             }
         }
@@ -1102,13 +1103,14 @@ impl PeerBrush {
                     self.message = value.data()["cleanup_warning"]
                         .as_str()
                         .map(|warning| format!("{}; {warning}", request.label))
-                        .unwrap_or_else(|| request.label.clone());
+                        .unwrap_or_else(|| request.label.clone())
+                        .into();
                     self.native_source_preview = None;
                     self.last_preview = None;
                 }
                 Err(error) => {
                     self.selection_commit_failed |= request.selection_edit;
-                    self.message = error.clone();
+                    self.message = error.clone().into();
                 }
             }
         } else if let Some(view) = self.project_views.get_mut(&request.project) {
@@ -1116,7 +1118,8 @@ impl PeerBrush {
                 .result
                 .as_ref()
                 .map(|_| request.label.clone())
-                .unwrap_or_else(Clone::clone);
+                .unwrap_or_else(Clone::clone)
+                .into();
         }
     }
     fn cancel_pending_edit(&mut self) {
@@ -1362,7 +1365,7 @@ impl PeerBrush {
                 self.last_preview = None;
                 self.message = "Grouped selected layers".into();
             }
-            Err(error) => self.message = error,
+            Err(error) => self.message = error.into(),
         }
     }
     fn selection_points<'a>(
@@ -1432,7 +1435,7 @@ impl PeerBrush {
                 self.message = "Duplicated layers".into();
                 self.last_preview = None;
             }
-            Err(e) => self.message = e,
+            Err(e) => self.message = e.into(),
         }
     }
     fn duplicate_selection<'a>(&mut self, doc: impl Into<DocumentView<'a>>) {
@@ -1456,7 +1459,7 @@ impl PeerBrush {
                 self.message = "Duplicated layer selection".into();
                 self.last_preview = None;
             }
-            Err(error) => self.message = error,
+            Err(error) => self.message = error.into(),
         }
     }
     fn layer_cmd(&mut self, op: &str, extra: Value, label: &str) {
@@ -1559,7 +1562,8 @@ impl PeerBrush {
                 &edit.label,
             )
             .map(|_| edit.label)
-            .unwrap_or_else(|error| error);
+            .unwrap_or_else(|error| error)
+            .into();
     }
     fn layer_parameter(&mut self, extra: Value, label: &str, response: &egui::Response) {
         if response
@@ -1723,7 +1727,8 @@ impl PeerBrush {
                 .unwrap()
                 .edit("human", &commands, None, None, label)
                 .map(|_| label.into())
-                .unwrap_or_else(|error| error);
+                .unwrap_or_else(|error| error)
+                .into();
         }
         self.last_preview = None;
     }
@@ -1760,7 +1765,7 @@ impl PeerBrush {
         let ctx = ctx.clone();
         self.connecting = true;
         self.connect_feedback = "Preparing MCP discovery and installed AI clients…".into();
-        self.message = self.connect_feedback.clone();
+        self.message = self.connect_feedback.clone().into();
         if let Err(error) = std::thread::Builder::new()
             .name("peerbrush-ai-connect".into())
             .spawn(move || {
@@ -1793,7 +1798,8 @@ impl PeerBrush {
             .connect_feedback
             .split_whitespace()
             .collect::<Vec<_>>()
-            .join(" ");
+            .join(" ")
+            .into();
         // Client presence belongs to the live MCP handshake, never to a setup result.
     }
     fn merge_layers<'a>(&mut self, ctx: &egui::Context, doc: impl Into<DocumentView<'a>>) {
@@ -1842,7 +1848,7 @@ impl PeerBrush {
         {
             self.busy = false;
             self.jobs.remove(&self.project_id);
-            self.message = format!("Could not start merging layers: {error}");
+            self.message = format!("Could not start merging layers: {error}").into();
         }
     }
     fn open(&mut self) {
@@ -1955,7 +1961,7 @@ impl PeerBrush {
         let report = match crate::compatibility::report_snapshot(&self.doc_snapshot) {
             Ok(report) => report,
             Err(error) => {
-                self.message = error;
+                self.message = error.into();
                 return;
             }
         };
@@ -2480,7 +2486,7 @@ impl PeerBrush {
                         }
                         Err(error) => {
                             self.finish_parameter(true);
-                            self.message = error;
+                            self.message = error.into();
                             ctx.request_repaint();
                             return;
                         }
@@ -2868,7 +2874,8 @@ impl PeerBrush {
                 self.last_preview = None;
                 self.message = format!(
                     "Canvas preview worker could not start: {error}; current work preserved"
-                );
+                )
+                .into();
                 request_context.request_repaint();
             }
         }
@@ -3151,7 +3158,7 @@ impl PeerBrush {
                 self.last_preview = None;
                 self.message = "Added masks".into();
             }
-            Err(error) => self.message = error,
+            Err(error) => self.message = error.into(),
         }
     }
     fn channel_tabs<'a>(
@@ -3544,7 +3551,7 @@ impl PeerBrush {
                         self.transient.push(command);
                     }
                     Err(error) => {
-                        self.message = error;
+                        self.message = error.into();
                         self.transient.clear();
                     }
                 }
@@ -3649,7 +3656,8 @@ impl PeerBrush {
             );
             self.message = result
                 .map(|_| "Transform applied · Undo to try again".into())
-                .unwrap_or_else(|e| e);
+                .unwrap_or_else(|e| e)
+                .into();
             self.last_preview = None;
             self.drag_start = None;
             self.gizmo_handle = 0;
@@ -4543,7 +4551,7 @@ impl PeerBrush {
         self.thumbs.clear();
         self.thumb_pending.clear();
         self.thumb_document.clear();
-        self.last_status.clear();
+        self.last_status = "".into();
     }
     fn draw_header(&mut self, ctx: &egui::Context) {
         let (connected, activity) = {
@@ -4715,7 +4723,7 @@ impl PeerBrush {
                                     ),
                                 ));
                             }
-                            Err(error) => self.message = error,
+                            Err(error) => self.message = error.into(),
                         }
                     }
                 }
@@ -4754,7 +4762,7 @@ impl PeerBrush {
                             }
                             .into();
                         }
-                        Err(error) => self.message = error,
+                        Err(error) => self.message = error.into(),
                     }
                     self.last_preview = None;
                 }
@@ -5198,7 +5206,8 @@ impl PeerBrush {
                                 "Copying selection…".into()
                             }
                         })
-                        .unwrap_or_else(|e| e);
+                        .unwrap_or_else(|e| e)
+                        .into();
                 }
             }
             if paste {
@@ -5211,7 +5220,8 @@ impl PeerBrush {
                         revision: doc.revision,
                     })
                     .map(|_| "Pasting image…".into())
-                    .unwrap_or_else(|e| e);
+                    .unwrap_or_else(|e| e)
+                    .into();
             }
             ctx.input(|i| {
                 if i.events.iter().any(|event| matches!(event,
@@ -5227,7 +5237,7 @@ impl PeerBrush {
                         self.shared.lock().unwrap().undo("human")
                     };
                     if let Err(e) = r {
-                        self.message = e;
+                        self.message = e.into();
                     }
                     self.last_preview = None;
                 }
@@ -5467,7 +5477,8 @@ impl PeerBrush {
                     view.message = reply
                         .result
                         .map(|_| "Merged layers".into())
-                        .unwrap_or_else(|e| e);
+                        .unwrap_or_else(|e| e)
+                        .into();
                 }
                 continue;
             }
@@ -5491,7 +5502,7 @@ impl PeerBrush {
                     self.last_preview = None;
                 }
                 Err(error) => {
-                    self.message = error;
+                    self.message = error.into();
                 }
             }
         }
@@ -5515,7 +5526,7 @@ impl PeerBrush {
                 self.select_content(&id);
                 self.layer_clipboard = false;
             }
-            self.message = reply.result.unwrap_or_else(|e| e);
+            self.message = reply.result.unwrap_or_else(|e| e).into();
             self.last_preview = None;
         }
         let status = self
@@ -5553,9 +5564,9 @@ impl PeerBrush {
                 Ok(_) => {}
                 Err(error) => {
                     if reply.project == self.project_id {
-                        self.message = error;
+                        self.message = error.into();
                     } else if let Some(view) = self.project_views.get_mut(&reply.project) {
-                        view.message = error;
+                        view.message = error.into();
                     }
                 }
             }
@@ -5568,7 +5579,7 @@ impl PeerBrush {
             let result = reply.result;
             if reply.project != self.project_id {
                 if let Some(view) = self.project_views.get_mut(&reply.project) {
-                    view.message = result.unwrap_or_else(|e| e);
+                    view.message = result.unwrap_or_else(|e| e).into();
                 }
                 continue;
             }
@@ -5584,7 +5595,7 @@ impl PeerBrush {
                     self.mask_step = None;
                 }
             }
-            self.message = result.unwrap_or_else(|e| e);
+            self.message = result.unwrap_or_else(|e| e).into();
             self.last_preview = None;
         }
         if self.save_loss_review.is_some() {
@@ -5979,7 +5990,7 @@ impl PeerBrush {
                         ), 11., MUTED, 300.,
                     );
                     ui.separator();
-                    ui.label(RichText::new(&self.message).size(11.0));
+                    ui.label(RichText::new(self.message.as_str()).size(11.0));
                     if doc.read_only {
                         ui.label(RichText::new("READ ONLY").size(10.0).color(ACCENT))
                             .on_hover_text(doc.warnings.join("\n"));

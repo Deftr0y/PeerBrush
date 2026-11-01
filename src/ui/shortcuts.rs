@@ -469,7 +469,7 @@ impl PeerBrush {
             let larger = self.shortcuts.pressed("Larger size", input);
             if smaller || larger {
                 self.radius = (self.radius * if larger { 1.1 } else { 1. / 1.1 }).clamp(0.5, 512.);
-                self.message = format!("Brush size {} px", (self.radius * 2.).round());
+                self.message = format!("Brush size {} px", (self.radius * 2.).round()).into();
             }
         }
         if self.points.is_empty()

@@ -103,7 +103,7 @@ impl PeerBrush {
                 self.load_tool_profile(tool, snapshot, false);
             }
             Err(error) => {
-                self.message = error.clone();
+                self.message = error.clone().into();
                 let snapshot = self.tool_settings_store.lock().unwrap().get(tool).unwrap();
                 self.load_tool_profile(tool, snapshot, false);
                 return Err(error);
@@ -151,7 +151,7 @@ impl PeerBrush {
             && !ctx.wants_keyboard_input()
         {
             if let Err(error) = self.tool_settings_store.lock().unwrap().flush() {
-                self.message = format!("Tool settings not saved · {error}");
+                self.message = format!("Tool settings not saved · {error}").into();
             }
         }
         let human_input = ctx.input(|i| {

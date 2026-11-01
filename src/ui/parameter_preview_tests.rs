@@ -639,7 +639,8 @@ fn completed_worker_errors_cannot_cancel_newer_input_or_touch_other_projects() {
             let current = app.shared.lock().unwrap().doc.clone();
             app.request_preview(&ctx, &current);
             assert_ne!(
-                app.message, old_error,
+                app.message.as_str(),
+                old_error.as_str(),
                 "A completed obsolete error must not replace current status"
             );
             assert_eq!(

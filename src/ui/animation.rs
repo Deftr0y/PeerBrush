@@ -6,7 +6,7 @@ const DURATION: f64 = 0.36;
 const HIGHLIGHT: f64 = 3.0;
 
 struct Transition {
-    change: AiChange,
+    change: RuntimeValue<AiChange>,
     before: DocumentSnapshot,
     after: DocumentSnapshot,
     started: f64,
@@ -91,7 +91,7 @@ impl Animation {
     pub(super) fn observe<'a>(
         &mut self,
         source: impl Into<Observation<'a>>,
-        change: Option<AiChange>,
+        change: Option<RuntimeValue<AiChange>>,
         time: f64,
     ) -> bool {
         let source = source.into();
