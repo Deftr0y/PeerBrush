@@ -37,11 +37,33 @@ profile and file-operation guards while closing; ordinary source sessions,
 factories and cursors continue refusing new work. Retirement-only checks never
 grant publication authority.
 
-This is not an activated save route or complete restart settlement. Closed
-receipt persistence, linked repeated-save reconstruction, destination writer
-integration and native interruption acceptance remain required. Existing source
-and canvas limits remain unchanged. Windows directory power-loss durability is
-not qualified by the current no-op parent-directory sync helper. Published
+The actual exclusive zero-byte temporary or backup has a separate sealed
+creation proof. Its physical identity and exact planned role/name/parent are
+durably registered before the first payload byte; a live token gates replay.
+Decoding that record cannot reconstruct a token or adopt a name/hash match.
+
+Before commit, the operation precreates an exclusive fixed 256 KiB outcome slot
+and admits its buffers, metadata, file bytes and quota-transfer workspace. It
+fills that existing handle forward only. The final complete checksum/footer
+selects the outcome; sync and complete readback precede in-memory selection and
+the atomic accounting transfer. Empty/truncated outcome records linked to a
+valid intent retain full pending growth and block competing destination writes
+while native checkpoint reads remain available. Unknown intents or ambiguous
+chains remain refused. Complete crash records are read-only quota evidence,
+without resumed publication/deletion authority.
+
+Each subsequent target intent binds its previous closed checksum. Reconstruction
+validates the complete chain, preserved backup identities and current named
+facts before counting the latest state. A changed live target or retained
+temporary blocks another write instead of silently forgetting uncertain debt.
+Read-only pending reconstruction conservatively counts an old external identity
+and a newly reused internal identity separately; it cannot retire the internal
+file or convert an existing pending ticket into a settled one.
+
+This is not an activated save route. Destination writer/Engine integration and
+native interruption acceptance remain required. Existing source and canvas
+limits remain unchanged. Windows directory power-loss durability is not
+qualified by the current no-op parent-directory sync helper. Published
 source/history/recovery garbage collection remains closed.
 
 ## New destinations
