@@ -414,6 +414,7 @@ impl<R: Read + Seek, S: ImportSession> QualifiedImport<'_, R, S> {
                 .source
                 .recheck(&candidate.binding, &mut scratch, check)?;
             check()?;
+            candidate.session.check()?;
             let value = adopt(candidate.pending, owner)?;
             // Bindings/source/session stay in this frame until adopt returns.
             Ok(value)
