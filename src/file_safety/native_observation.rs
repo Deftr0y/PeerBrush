@@ -10,6 +10,18 @@ pub(crate) struct NativeExternalFile {
     modified_nanos: u128,
 }
 impl NativeExternalFile {
+    #[cfg(test)]
+    pub(crate) fn for_accounting_tests(
+        identity: (u64, u64),
+        bytes: u64,
+        modified_nanos: u128,
+    ) -> Self {
+        Self {
+            identity,
+            bytes,
+            modified_nanos,
+        }
+    }
     pub(crate) fn identity(self) -> (u64, u64) {
         self.identity
     }

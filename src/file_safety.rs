@@ -608,6 +608,11 @@ pub(crate) struct NativeLease(Lease);
 mod native_inventory;
 pub(crate) use native_inventory::NativeInventory;
 pub(crate) use native_inventory::{NativeExternalFile, NativeExternalSnapshot};
+#[path = "file_safety/native_outcome.rs"]
+mod native_outcome;
+#[cfg(test)]
+pub(crate) use native_outcome::AccountingOutcome;
+pub(crate) use native_outcome::ExternalOutcomeProof;
 impl NativeLease {
     pub(crate) fn acquire(
         path: &Path,

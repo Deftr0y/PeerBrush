@@ -293,6 +293,7 @@
     "src/file_safety/native_backup.rs",
     "src/file_safety/native_inventory.rs",
     "src/file_safety/native_observation.rs",
+    "src/file_safety/native_outcome.rs",
     "src/file_safety/owned_rename.rs",
     "src/fill.rs",
     "src/fill/input.rs",
