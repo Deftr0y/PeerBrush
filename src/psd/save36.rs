@@ -771,3 +771,5 @@ impl<'source> CompletedSave36<'source> {
 #[cfg(test)]
 #[path = "save36_tests.rs"]
 mod tests;
+#[cfg(test)]
+pub(crate) use tests::{with_session_candidate, with_session_candidate_join};
