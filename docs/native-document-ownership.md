@@ -96,6 +96,11 @@ initial and working command scopes, and enters one history record. Foreign,
 duplicate, out-of-order or cancelled steps cannot advance the working state.
 An intermediate step receipt cannot enter history or publish independently, even
 when its first working generation still equals the public document generation.
+An accepted command with a proven semantic no-op still advances revision and
+records history/task information, matching the existing editor contract. Its
+token-bound unchanged receipt shares exact source owners and creates no fake
+pixel output or source I/O. A raw-pixel no-op that also changes kind, frame or
+editable source metadata must use its ordinary atomic metadata/source batch.
 History preparation admits a final physical Store reachability plan. Publication
 marks only surviving fragments and returns every intermediate output view/token
 with the retired history owners. After leaving the engine mutex, the caller uses
