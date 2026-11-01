@@ -1,6 +1,7 @@
 //! Flattened production exports. Plans and renders never mutate editable sources.
 pub mod jobs;
 pub mod library;
+pub(crate) mod native;
 pub(crate) mod native_grid;
 pub(crate) mod native_png;
 pub(crate) mod native_rows;
