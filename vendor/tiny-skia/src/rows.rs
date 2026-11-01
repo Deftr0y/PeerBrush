@@ -6,6 +6,8 @@ use core::sync::atomic::{AtomicBool, Ordering};
 #[path = "rows/cache.rs"]
 mod cache;
 #[cfg(feature = "std")]
+pub(crate) use cache::PreparedGeometry;
+#[cfg(feature = "std")]
 pub use cache::{InvocationKey, ScanCache};
 
 #[derive(Clone, Copy, PartialEq, Debug)]
