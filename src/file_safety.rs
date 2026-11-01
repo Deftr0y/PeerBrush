@@ -48,6 +48,14 @@ pub struct Version {
     modified: u128,
     fingerprint: [u8; 32],
 }
+impl Version {
+    pub(crate) fn modified_nanos(&self) -> u128 {
+        self.modified
+    }
+    pub(crate) fn sha256(&self) -> [u8; 32] {
+        self.fingerprint
+    }
+}
 
 pub(crate) fn open_for_identity(path: &Path) -> std::io::Result<fs::File> {
     let mut options = fs::OpenOptions::new();
@@ -599,6 +607,7 @@ pub(crate) struct NativeLease(Lease);
 #[path = "file_safety/native_inventory.rs"]
 mod native_inventory;
 pub(crate) use native_inventory::NativeInventory;
+pub(crate) use native_inventory::{NativeExternalFile, NativeExternalSnapshot};
 impl NativeLease {
     pub(crate) fn acquire(
         path: &Path,

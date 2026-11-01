@@ -4,9 +4,14 @@ use crate::large_document::{Reservation, ResidentBudget};
 use std::{ffi::OsString, time::SystemTime};
 
 const MAX_ENTRIES: usize = 4096;
-const INVENTORY_BYTES: usize = 8 * 1024 * 1024;
+// Two simultaneous 4096x1024-byte name sets, entry/vector headers and bounded
+// transient path observations must all fit, rather than just the name payloads.
+const INVENTORY_BYTES: usize = 12 * 1024 * 1024;
 #[path = "native_backup.rs"]
 mod native_backup;
+#[path = "native_observation.rs"]
+mod native_observation;
+pub(crate) use native_observation::{NativeExternalFile, NativeExternalSnapshot};
 struct Entry {
     name: OsString,
     file: fs::File,
@@ -241,6 +246,11 @@ impl NativeInventory<'_> {
             .ok_or_else(|| "Native destination coexistence overflow".into())
     }
     pub(crate) fn validate(&self, check: &dyn Fn() -> Result<(), String>) -> Result<(), String> {
+        self.validate_files(check)?;
+        self.lease.validate(check)?;
+        check()
+    }
+    fn validate_files(&self, check: &dyn Fn() -> Result<(), String>) -> Result<(), String> {
         check()?;
         regular_directory(&self.directory)?;
         if identity(&self.held_directory)? != self.directory_identity
@@ -264,7 +274,6 @@ impl NativeInventory<'_> {
             check()?;
             entry.validate(&self.directory)?;
         }
-        self.lease.validate(check)?;
         check()
     }
 }
