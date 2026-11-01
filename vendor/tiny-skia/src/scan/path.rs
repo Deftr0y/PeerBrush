@@ -4,6 +4,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+use alloc::vec::Vec;
 use core::convert::TryFrom;
 
 use tiny_skia_path::SaturateCast;
@@ -48,6 +49,36 @@ pub fn fill_path(
         ir.bottom(),
         0,
         path_contained_in_clip,
+        blitter,
+    );
+}
+
+#[cfg(feature = "std")]
+pub(crate) fn fill_path_prepared(
+    path: &Path,
+    rule: FillRule,
+    clip: &ScreenIntRect,
+    cache: &crate::ScanCache,
+    key: crate::InvocationKey,
+    band: [u32; 2],
+    blitter: &mut dyn Blitter,
+) {
+    let Some(ir) = conservative_round_to_int(&path.bounds()) else {
+        return;
+    };
+    let contained = ir
+        .to_screen_int_rect()
+        .is_some_and(|bounds| clip.contains(&bounds));
+    cache.draw(
+        key,
+        path,
+        rule,
+        clip,
+        ir.y(),
+        ir.bottom(),
+        0,
+        contained,
+        band,
         blitter,
     );
 }
@@ -97,7 +128,7 @@ fn round_up_to_int(x: f32) -> i32 {
     i32::saturate_from(xx.floor())
 }
 
-pub fn fill_path_impl(
+pub(crate) fn prepare_edges(
     path: &Path,
     fill_rule: FillRule,
     clip_rect: &ScreenIntRect,
@@ -105,11 +136,10 @@ pub fn fill_path_impl(
     mut stop_y: i32,
     shift_edges_up: i32,
     path_contained_in_clip: bool,
-    blitter: &mut dyn Blitter,
-) {
+) -> Option<PreparedEdges> {
     let shifted_clip = match ShiftedIntRect::new(clip_rect, shift_edges_up) {
         Some(v) => v,
-        None => return,
+        None => return None,
     };
 
     let clip = if path_contained_in_clip {
@@ -119,7 +149,7 @@ pub fn fill_path_impl(
     };
     let mut edges = match BasicEdgeBuilder::build_edges(path, clip, shift_edges_up) {
         Some(v) => v,
-        None => return, // no edges to render, just return
+        None => return None, // no edges to render, just return
     };
 
     sort_edges(&mut edges);
@@ -169,21 +199,89 @@ pub fn fill_path_impl(
 
     let start_y = match u32::try_from(start_y) {
         Ok(v) => v,
-        Err(_) => return,
+        Err(_) => return None,
     };
     let stop_y = match u32::try_from(stop_y) {
         Ok(v) => v,
-        Err(_) => return,
+        Err(_) => return None,
     };
 
-    // TODO: walk_simple_edges
-
-    walk_edges(
-        fill_rule,
+    Some(PreparedEdges {
+        edges,
         start_y,
         stop_y,
-        shifted_clip.shifted().right(),
-        &mut edges,
+        right_clip: shifted_clip.shifted().right(),
+        next_y: start_y,
+        pending: None,
+        fill_rule,
+    })
+}
+/// Mutable scan state at a complete subscan boundary. No pixel source or I/O.
+pub(crate) struct PreparedEdges {
+    edges: Vec<Edge>,
+    start_y: u32,
+    stop_y: u32,
+    right_clip: u32,
+    next_y: u32,
+    pending: Option<usize>,
+    fill_rule: FillRule,
+}
+impl PreparedEdges {
+    pub(crate) fn allocation_bytes(&self) -> Option<usize> {
+        self.edges
+            .capacity()
+            .checked_mul(core::mem::size_of::<Edge>())
+    }
+    /// Resume the exact next subscan. The original next-edge insertion is
+    /// deferred across a cut and performed exactly once before its next row.
+    pub(crate) fn advance(&mut self, until: u32, blitter: &mut dyn Blitter) {
+        let until = until.min(self.stop_y);
+        while self.next_y < until {
+            if let Some(cursor) = self.pending.take() {
+                insert_new_edges(cursor, self.next_y as i32, &mut self.edges);
+            }
+            tiny_skia_path::allocation::checkpoint();
+            let cursor = walk_row(
+                self.fill_rule,
+                self.next_y,
+                self.right_clip,
+                &mut self.edges,
+                blitter,
+            );
+            self.next_y += 1;
+            if self.next_y < self.stop_y {
+                self.pending = Some(cursor);
+            }
+        }
+    }
+}
+pub fn fill_path_impl(
+    path: &Path,
+    fill_rule: FillRule,
+    clip_rect: &ScreenIntRect,
+    start_y: i32,
+    stop_y: i32,
+    shift_edges_up: i32,
+    path_contained_in_clip: bool,
+    blitter: &mut dyn Blitter,
+) {
+    let Some(mut prepared) = prepare_edges(
+        path,
+        fill_rule,
+        clip_rect,
+        start_y,
+        stop_y,
+        shift_edges_up,
+        path_contained_in_clip,
+    ) else {
+        return;
+    };
+    walk_edges(
+        fill_rule,
+        prepared.start_y,
+        prepared.stop_y,
+        prepared.right_clip,
+        &mut prepared.edges,
         blitter,
     );
 }
@@ -198,110 +296,116 @@ fn walk_edges(
     blitter: &mut dyn Blitter,
 ) {
     let mut curr_y = start_y;
+    loop {
+        tiny_skia_path::allocation::checkpoint();
+        let cursor = walk_row(fill_rule, curr_y, right_clip, edges, blitter);
+        curr_y += 1;
+        if curr_y >= stop_y {
+            break;
+        }
+        insert_new_edges(cursor, curr_y as i32, edges);
+    }
+}
+fn walk_row(
+    fill_rule: FillRule,
+    curr_y: u32,
+    right_clip: u32,
+    edges: &mut [Edge],
+    blitter: &mut dyn Blitter,
+) -> usize {
     let winding_mask = if fill_rule == FillRule::EvenOdd {
         1
     } else {
         -1
     };
+    let mut w = 0i32;
+    let mut left = 0u32;
+    let mut prev_x = edges[0].x;
 
-    loop {
+    let mut curr_idx = edges[0].next.unwrap() as usize;
+    while edges[curr_idx].first_y <= curr_y as i32 {
         tiny_skia_path::allocation::checkpoint();
-        let mut w = 0i32;
-        let mut left = 0u32;
-        let mut prev_x = edges[0].x;
+        debug_assert!(edges[curr_idx].last_y >= curr_y as i32);
 
-        let mut curr_idx = edges[0].next.unwrap() as usize;
-        while edges[curr_idx].first_y <= curr_y as i32 {
-            tiny_skia_path::allocation::checkpoint();
-            debug_assert!(edges[curr_idx].last_y >= curr_y as i32);
+        let x = fdot16::round_to_i32(edges[curr_idx].x) as u32; // TODO: check
 
-            let x = fdot16::round_to_i32(edges[curr_idx].x) as u32; // TODO: check
-
-            if (w & winding_mask) == 0 {
-                // we're starting interval
-                left = x;
-            }
-
-            w += i32::from(edges[curr_idx].winding);
-
-            if (w & winding_mask) == 0 {
-                // we finished an interval
-                if let Some(width) = LengthU32::new(x - left) {
-                    blitter.blit_h(left, curr_y, width);
-                }
-            }
-
-            let next_idx = edges[curr_idx].next.unwrap();
-            let new_x;
-
-            if edges[curr_idx].last_y == curr_y as i32 {
-                // are we done with this edge?
-                match &mut edges[curr_idx] {
-                    Edge::Line(_) => {
-                        remove_edge(curr_idx, edges);
-                    }
-                    Edge::Quadratic(ref mut quad) => {
-                        if quad.curve_count > 0 && quad.update() {
-                            new_x = quad.line.x;
-
-                            if new_x < prev_x {
-                                // ripple current edge backwards until it is x-sorted
-                                backward_insert_edge_based_on_x(curr_idx, edges);
-                            } else {
-                                prev_x = new_x;
-                            }
-                        } else {
-                            remove_edge(curr_idx, edges);
-                        }
-                    }
-                    Edge::Cubic(ref mut cubic) => {
-                        if cubic.curve_count < 0 && cubic.update() {
-                            debug_assert!(cubic.line.first_y == curr_y as i32 + 1);
-
-                            new_x = cubic.line.x;
-
-                            if new_x < prev_x {
-                                // ripple current edge backwards until it is x-sorted
-                                backward_insert_edge_based_on_x(curr_idx, edges);
-                            } else {
-                                prev_x = new_x;
-                            }
-                        } else {
-                            remove_edge(curr_idx, edges);
-                        }
-                    }
-                }
-            } else {
-                debug_assert!(edges[curr_idx].last_y > curr_y as i32);
-                new_x = edges[curr_idx].x + edges[curr_idx].dx;
-                edges[curr_idx].x = new_x;
-
-                if new_x < prev_x {
-                    // ripple current edge backwards until it is x-sorted
-                    backward_insert_edge_based_on_x(curr_idx, edges);
-                } else {
-                    prev_x = new_x;
-                }
-            }
-
-            curr_idx = next_idx as usize;
+        if (w & winding_mask) == 0 {
+            // we're starting interval
+            left = x;
         }
 
-        if (w & winding_mask) != 0 {
-            // was our right-edge culled away?
-            if let Some(width) = LengthU32::new(right_clip - left) {
+        w += i32::from(edges[curr_idx].winding);
+
+        if (w & winding_mask) == 0 {
+            // we finished an interval
+            if let Some(width) = LengthU32::new(x - left) {
                 blitter.blit_h(left, curr_y, width);
             }
         }
 
-        curr_y += 1;
-        if curr_y >= stop_y {
-            break;
+        let next_idx = edges[curr_idx].next.unwrap();
+        let new_x;
+
+        if edges[curr_idx].last_y == curr_y as i32 {
+            // are we done with this edge?
+            match &mut edges[curr_idx] {
+                Edge::Line(_) => {
+                    remove_edge(curr_idx, edges);
+                }
+                Edge::Quadratic(ref mut quad) => {
+                    if quad.curve_count > 0 && quad.update() {
+                        new_x = quad.line.x;
+
+                        if new_x < prev_x {
+                            // ripple current edge backwards until it is x-sorted
+                            backward_insert_edge_based_on_x(curr_idx, edges);
+                        } else {
+                            prev_x = new_x;
+                        }
+                    } else {
+                        remove_edge(curr_idx, edges);
+                    }
+                }
+                Edge::Cubic(ref mut cubic) => {
+                    if cubic.curve_count < 0 && cubic.update() {
+                        debug_assert!(cubic.line.first_y == curr_y as i32 + 1);
+
+                        new_x = cubic.line.x;
+
+                        if new_x < prev_x {
+                            // ripple current edge backwards until it is x-sorted
+                            backward_insert_edge_based_on_x(curr_idx, edges);
+                        } else {
+                            prev_x = new_x;
+                        }
+                    } else {
+                        remove_edge(curr_idx, edges);
+                    }
+                }
+            }
+        } else {
+            debug_assert!(edges[curr_idx].last_y > curr_y as i32);
+            new_x = edges[curr_idx].x + edges[curr_idx].dx;
+            edges[curr_idx].x = new_x;
+
+            if new_x < prev_x {
+                // ripple current edge backwards until it is x-sorted
+                backward_insert_edge_based_on_x(curr_idx, edges);
+            } else {
+                prev_x = new_x;
+            }
         }
 
-        // now current edge points to the first edge with a Yint larger than curr_y
-        insert_new_edges(curr_idx, curr_y as i32, edges);
+        curr_idx = next_idx as usize;
     }
+
+    if (w & winding_mask) != 0 {
+        // was our right-edge culled away?
+        if let Some(width) = LengthU32::new(right_clip - left) {
+            blitter.blit_h(left, curr_y, width);
+        }
+    }
+    curr_idx
 }
 
 fn remove_edge(curr_idx: usize, edges: &mut [Edge]) {

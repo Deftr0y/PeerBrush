@@ -52,6 +52,8 @@ mod path_geometry;
 mod pipeline;
 mod pixmap;
 mod rows;
+#[cfg(feature = "std")]
+pub use rows::{InvocationKey, ScanCache};
 mod scan;
 mod shaders;
 mod wide;

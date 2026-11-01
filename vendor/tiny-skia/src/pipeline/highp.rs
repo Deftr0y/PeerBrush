@@ -174,10 +174,7 @@ pub fn start(
         dy: 0,
     };
 
-    for y in rect.y()..rect.bottom() {
-        if !p.pixmap_dst.stores(y) {
-            continue;
-        }
+    for y in rect.y().max(p.pixmap_dst.rows.start)..rect.bottom().min(p.pixmap_dst.rows.end()) {
         let mut x = rect.x() as usize;
         let end = rect.right() as usize;
 

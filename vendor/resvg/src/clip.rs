@@ -11,6 +11,7 @@ pub fn apply(
     let ctx = Context {
         max_bbox: tiny_skia::IntRect::from_xywh(0, 0, 1, 1).unwrap(),
         rows: None,
+        prepared: None,
     };
     apply_with_context(clip, transform, pixmap, &ctx);
 }
@@ -20,6 +21,10 @@ pub fn apply_with_context(
     pixmap: &mut tiny_skia::Pixmap,
     ctx: &Context,
 ) {
+    let Some(clip_context) = ctx.child(2, clip as *const usvg::ClipPath as usize as u64) else {
+        return;
+    };
+    let ctx = &clip_context;
     let Some(mut clip_pixmap) = ctx.new_pixmap(
         pixmap.width(),
         pixmap.height(),
@@ -92,6 +97,7 @@ fn draw_children(
                 let ctx = Context {
                     max_bbox: tiny_skia::IntRect::from_xywh(0, 0, 1, 1).unwrap(),
                     rows: ctx.rows,
+                    prepared: ctx.prepared,
                 };
 
                 crate::path::fill_path(path, mode, &ctx, transform, pixmap);
@@ -100,6 +106,12 @@ fn draw_children(
                 draw_children(text.flattened(), mode, transform, pixmap, ctx);
             }
             usvg::Node::Group(group) => {
+                let Some(group_context) =
+                    ctx.child(1, group.as_ref() as *const usvg::Group as usize as u64)
+                else {
+                    return;
+                };
+                let ctx = &group_context;
                 let transform = transform.pre_concat(group.transform());
 
                 if let Some(clip) = group.clip_path() {
@@ -141,14 +153,7 @@ fn clip_group(
 
     let mut paint = tiny_skia::PixmapPaint::default();
     paint.blend_mode = tiny_skia::BlendMode::Xor;
-    pixmap.draw_pixmap(
-        0,
-        0,
-        clip_pixmap.as_ref(),
-        &paint,
-        tiny_skia::Transform::identity(),
-        None,
-    );
+    ctx.draw_pixmap(pixmap, 0, 0, clip_pixmap.as_ref(), &paint, 1);
     if clip_pixmap.row_storage_failed() {
         if let Some(rows) = ctx.rows {
             rows.refuse("SVG nested clip escaped prepared rows");

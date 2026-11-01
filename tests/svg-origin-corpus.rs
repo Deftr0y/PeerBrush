@@ -32,6 +32,9 @@ pub fn cases() -> Vec<Case> {
             });
         }
     }
+    for matrix in matrices {
+        result.push(Case{name:"reused-identical-clip-sites",frame:[113,79],matrix,rows:(0..79).collect(),svg:"<svg xmlns='http://www.w3.org/2000/svg' width='113' height='79'><defs><clipPath id='shared'><rect x='7.375' y='5.125' width='96.25' height='66.375' rx='11.625'/></clipPath></defs><g opacity='.43' clip-path='url(#shared)'><rect x='1.125' y='2.375' width='107.625' height='72.25' fill='#d24731'/></g><g opacity='.61' clip-path='url(#shared)'><rect x='1.125' y='2.375' width='107.625' height='72.25' fill='#296bc1'/></g></svg>".into()});
+    }
     // The original renderer tiles at8191; preserve its f32 round trips, not
     // just a crop translated into a fresh local-coordinate canvas.
     for (name, frame, rows) in [

@@ -1,5 +1,8 @@
 // PeerBrush isolated bounded-row prototype. Upstream renderer notices remain
 // in LICENSE-APACHE and LICENSE-MIT; no upstream version is changed.
+#[path = "rows/plan.rs"]
+mod plan;
+pub use plan::{PlanLimits, RowPlan};
 use std::{
     cell::RefCell,
     ops::{Deref, DerefMut},
@@ -126,6 +129,7 @@ fn inspect(
         return Err("Unsupported SVG row group or depth".into());
     }
     for node in group.children() {
+        tiny_skia::allocation::checkpoint();
         *nodes = nodes
             .checked_add(1)
             .filter(|n| *n <= 4096)
@@ -217,9 +221,30 @@ pub fn render_rows(
     count: u32,
     budget: &dyn RowBudget,
 ) -> Result<RowImage, String> {
+    render_rows_internal(tree, transform, frame, y, count, budget, None, true)
+}
+pub(crate) fn render_rows_internal(
+    tree: &usvg::Tree,
+    transform: tiny_skia::Transform,
+    frame: [u32; 2],
+    y: u32,
+    count: u32,
+    budget: &dyn RowBudget,
+    cache: Option<&tiny_skia::ScanCache>,
+    inspect_tree: bool,
+) -> Result<RowImage, String> {
     #[cfg(panic = "abort")]
     {
-        let _ = (tree, transform, frame, y, count, budget);
+        let _ = (
+            tree,
+            transform,
+            frame,
+            y,
+            count,
+            budget,
+            cache,
+            inspect_tree,
+        );
         return Err("SVG bounded rendering requires an unwind-capable Rust profile".into());
     }
     if frame.iter().any(|n| *n == 0 || *n > 16000)
@@ -246,9 +271,11 @@ pub fn render_rows(
         limits,
         Box::new(working),
         || -> Result<OwnedPixmap, String> {
-            let mut nodes = 0;
-            let mut geometry = 0;
-            inspect(tree.root(), 0, &mut nodes, &mut geometry)?;
+            if inspect_tree {
+                let mut nodes = 0;
+                let mut geometry = 0;
+                inspect(tree.root(), 0, &mut nodes, &mut geometry)?;
+            }
             let rows = RowContext {
                 budget,
                 error: RefCell::new(None),
@@ -263,6 +290,10 @@ pub fn render_rows(
             let context = crate::render::Context {
                 max_bbox: crate::max_filter_bbox(frame[0], frame[1]),
                 rows: Some(&rows),
+                prepared: cache.map(|cache| crate::render::PreparedContext {
+                    cache,
+                    key: tiny_skia::InvocationKey::root(),
+                }),
             };
             crate::render::render_nodes(tree.root(), &context, transform, &mut image.as_mut());
             if image.row_storage_failed() {
@@ -429,6 +460,137 @@ mod tests {
             &budget
         )
         .is_err());
+        assert_eq!(budget.live.load(Ordering::SeqCst), 0);
+    }
+    fn plan_limits(work: u64) -> PlanLimits {
+        PlanLimits {
+            retained_bytes: 64 * 1024 * 1024,
+            maximum_invocations: 128,
+            work,
+        }
+    }
+    #[test]
+    fn prepared_rows_match_full_origin_and_retain_owner_until_plan_drop() {
+        let tree = tree(BODY);
+        let transform = tiny_skia::Transform::from_row(0.9375, 0.125, -0.0625, 1.125, 7.25, 0.625);
+        let mut expected = tiny_skia::Pixmap::new(113, 79).unwrap();
+        crate::render(&tree, transform, &mut expected.as_mut());
+        let budget = Budget::new(256 * 1024 * 1024, usize::MAX);
+        let mut plan =
+            RowPlan::new(&tree, transform, [113, 79], plan_limits(1_000_000), &budget).unwrap();
+        let initial = plan.work_used();
+        while !plan.is_complete() {
+            let y = plan.next_y();
+            let count = 7.min(79 - y);
+            let band = plan.next(count).unwrap();
+            let start = y as usize * 113 * 4;
+            assert_eq!(
+                band.data(),
+                &expected.data()[start..start + count as usize * 113 * 4]
+            );
+            drop(band);
+            assert_eq!(budget.live.load(Ordering::SeqCst), 64 * 1024 * 1024);
+        }
+        assert!(plan.work_used() > initial);
+        assert!(plan.next(1).is_err());
+        assert!(!plan.is_complete());
+        drop(plan);
+        assert_eq!(budget.live.load(Ordering::SeqCst), 0);
+    }
+    #[test]
+    fn prepared_work_is_cumulative_and_refusals_cannot_resume_after_control_reset() {
+        let tree = tree(BODY);
+        let budget = Budget::new(256 * 1024 * 1024, usize::MAX);
+        let mut probe = RowPlan::new(
+            &tree,
+            tiny_skia::Transform::identity(),
+            [113, 79],
+            plan_limits(1_000_000),
+            &budget,
+        )
+        .unwrap();
+        drop(probe.next(7).unwrap());
+        let first = probe.work_used();
+        drop(probe);
+        let mut plan = RowPlan::new(
+            &tree,
+            tiny_skia::Transform::identity(),
+            [113, 79],
+            plan_limits(first),
+            &budget,
+        )
+        .unwrap();
+        drop(plan.next(7).unwrap());
+        assert_eq!(plan.work_used(), first);
+        let error = plan.next(7).err().unwrap();
+        assert!(error.contains("total operation work"));
+        assert_eq!(plan.next_y(), 7);
+        assert!(plan.next(7).is_err());
+        drop(plan);
+        assert_eq!(budget.live.load(Ordering::SeqCst), 0);
+        let mut plan = RowPlan::new(
+            &tree,
+            tiny_skia::Transform::identity(),
+            [113, 79],
+            plan_limits(1_000_000),
+            &budget,
+        )
+        .unwrap();
+        drop(plan.next(7).unwrap());
+        budget.control.calls.store(usize::MAX, Ordering::SeqCst);
+        assert!(plan.next(7).is_err());
+        budget.control.calls.store(0, Ordering::SeqCst);
+        assert!(plan.next(7).is_err());
+        drop(plan);
+        assert_eq!(budget.live.load(Ordering::SeqCst), 0);
+    }
+    #[test]
+    fn prepared_resource_and_nested_scope_refusals_preserve_all_owner_charges() {
+        let tree = tree(BODY);
+        let budget = Budget::new(256 * 1024 * 1024, usize::MAX);
+        let mut limits = plan_limits(1_000_000);
+        limits.retained_bytes = 4096;
+        let mut plan = RowPlan::new(
+            &tree,
+            tiny_skia::Transform::identity(),
+            [113, 79],
+            limits,
+            &budget,
+        )
+        .unwrap();
+        assert!(plan.next(7).is_err());
+        assert_eq!(budget.live.load(Ordering::SeqCst), 4096);
+        assert!(plan.next(7).is_err());
+        drop(plan);
+        assert_eq!(budget.live.load(Ordering::SeqCst), 0);
+        let result = tiny_skia::allocation::with_limits(
+            tiny_skia::allocation::Limits {
+                bytes: 8,
+                elements: 128,
+                work: 100000,
+                cancellation: Arc::new(Control {
+                    calls: AtomicUsize::new(0),
+                    stop: usize::MAX,
+                }),
+            },
+            Box::new(()),
+            || {
+                let _ignored = RowPlan::new(
+                    &tree,
+                    tiny_skia::Transform::identity(),
+                    [113, 79],
+                    plan_limits(1_000_000),
+                    &budget,
+                );
+                Ok::<_, ()>(())
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(tiny_skia::allocation::Failure::Refused(
+                tiny_skia::allocation::Refusal::Bytes
+            ))
+        ));
         assert_eq!(budget.live.load(Ordering::SeqCst), 0);
     }
 }

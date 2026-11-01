@@ -42,6 +42,7 @@ pub fn render(
     let ctx = render::Context {
         max_bbox,
         rows: None,
+        prepared: None,
     };
     render::render_nodes(tree.root(), &ctx, transform, pixmap);
 }
@@ -70,6 +71,7 @@ pub fn render_node(
     let ctx = render::Context {
         max_bbox,
         rows: None,
+        prepared: None,
     };
     render::render_node(node, &ctx, transform, pixmap);
 

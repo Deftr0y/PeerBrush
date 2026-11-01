@@ -30,8 +30,16 @@ pub fn fill_path(
     clip: &ScreenIntRect,
     blitter: &mut dyn Blitter,
 ) {
-    // Unlike `path.bounds.to_rect()?.round_out()`,
-    // this method rounds out first and then converts into a Rect.
+    let Some((ir, without_aa)) = admit_path(path, clip) else {
+        return;
+    };
+    if without_aa {
+        super::path::fill_path(path, fill_rule, clip, blitter);
+        return;
+    }
+    fill_path_impl(path, fill_rule, &ir, clip, blitter);
+}
+fn admit_path(path: &Path, clip: &ScreenIntRect) -> Option<(IntRect, bool)> {
     let ir = Rect::from_ltrb(
         path.bounds().left().floor(),
         path.bounds().top().floor(),
@@ -41,7 +49,7 @@ pub fn fill_path(
     .and_then(|r| r.round_out());
     let ir = match ir {
         Some(v) => v,
-        None => return,
+        None => return None,
     };
 
     // TODO: remove
@@ -50,11 +58,10 @@ pub fn fill_path(
     // so draw without antialiasing.
     let clipped_ir = match ir.intersect(&clip.to_int_rect()) {
         Some(v) => v,
-        None => return,
+        None => return None,
     };
     if rect_overflows_short_shift(&clipped_ir, SHIFT as i32) != 0 {
-        super::path::fill_path(path, fill_rule, clip, blitter);
-        return;
+        return Some((ir, true));
     }
 
     // TODO: remove
@@ -63,14 +70,47 @@ pub fn fill_path(
     {
         const MAX_CLIP_COORD: u32 = 32767;
         if clip.right() > MAX_CLIP_COORD || clip.bottom() > MAX_CLIP_COORD {
-            return;
+            return None;
         }
     }
 
-    // TODO: SkScanClipper
-    // TODO: AAA
-
-    fill_path_impl(path, fill_rule, &ir, clip, blitter)
+    Some((ir, false))
+}
+#[cfg(feature = "std")]
+pub(crate) fn fill_path_prepared(
+    path: &Path,
+    rule: FillRule,
+    clip: &ScreenIntRect,
+    cache: &crate::ScanCache,
+    key: crate::InvocationKey,
+    band: [u32; 2],
+    blitter: &mut dyn Blitter,
+) {
+    let Some((bounds, without_aa)) = admit_path(path, clip) else {
+        return;
+    };
+    if without_aa {
+        super::path::fill_path_prepared(path, rule, clip, cache, key, band, blitter);
+        return;
+    }
+    let Some(mut super_blitter) = SuperBlitter::new(&bounds, clip, blitter) else {
+        return;
+    };
+    let contained = bounds
+        .to_screen_int_rect()
+        .is_some_and(|bounds| clip.contains(&bounds));
+    cache.draw(
+        key,
+        path,
+        rule,
+        clip,
+        bounds.top(),
+        bounds.bottom(),
+        SHIFT as i32,
+        contained,
+        band,
+        &mut super_blitter,
+    );
 }
 
 // Would any of the coordinates of this rectangle not fit in a short,
