@@ -69,7 +69,7 @@ impl ResidentBudget {
         self.0.used.load(Ordering::Acquire)
     }
     #[cfg(test)]
-    pub(super) fn payload_used(&self) -> usize {
+    pub(crate) fn payload_used(&self) -> usize {
         self.used()
             .checked_sub(self.0.index.load(Ordering::Acquire))
             .expect("Index charges exceed all admission")
