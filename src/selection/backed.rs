@@ -1,7 +1,7 @@
 //! Immutable selection coverage authority. Source staging and preparation are
 //! explicit; no source I/O or implicit empty coverage occurs in sampling.
 use crate::{
-    large_document::{Error, ResidentBudget, Result, Store},
+    large_document::{Error, Reservation, ResidentBudget, Result, Store},
     raster::{
         backed::Region,
         surface::{Surface, SurfaceKey, SurfaceRegion},
@@ -14,7 +14,101 @@ pub struct CoverageSource {
     mask: Surface,
     bounds: [i32; 4],
     origin: [i32; 2],
-    contours: Arc<Vec<Vec<[f32; 2]>>>,
+    contours: Arc<ContourOwner>,
+}
+
+pub(super) struct ContourOwner {
+    // Payload must be destroyed before its reservation can be released.
+    values: Vec<Vec<[f32; 2]>>,
+    pool: ResidentBudget,
+    charge: Reservation,
+}
+
+impl std::fmt::Debug for ContourOwner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SelectionContours")
+            .field("contours", &self.values.len())
+            .field("charged_bytes", &self.charge.bytes())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ContourOwner {
+    fn allocated(values: &Vec<Vec<[f32; 2]>>) -> Result<usize> {
+        values.iter().try_fold(
+            values
+                .capacity()
+                .checked_mul(std::mem::size_of::<Vec<[f32; 2]>>())
+                .ok_or(Error::Budget)?,
+            |n, line| {
+                n.checked_add(
+                    line.capacity()
+                        .checked_mul(std::mem::size_of::<[f32; 2]>())
+                        .ok_or(Error::Budget)?,
+                )
+                .ok_or(Error::Budget)
+            },
+        )
+    }
+
+    fn copy(values: &[Vec<[f32; 2]>], pool: &ResidentBudget) -> Result<Arc<Self>> {
+        let bytes = values.iter().try_fold(
+            values
+                .len()
+                .checked_mul(std::mem::size_of::<Vec<[f32; 2]>>())
+                .ok_or(Error::Budget)?,
+            |n, line| {
+                n.checked_add(
+                    line.len()
+                        .checked_mul(std::mem::size_of::<[f32; 2]>())
+                        .ok_or(Error::Budget)?,
+                )
+                .ok_or(Error::Budget)
+            },
+        )?;
+        let mut owner = Self {
+            values: Vec::new(),
+            pool: pool.clone(),
+            charge: pool.reserve_bytes(bytes, 64 * 1024 * 1024)?,
+        };
+        owner
+            .values
+            .try_reserve_exact(values.len())
+            .map_err(|_| Error::Budget)?;
+        for source in values {
+            let mut line = Vec::new();
+            line.try_reserve_exact(source.len())
+                .map_err(|_| Error::Budget)?;
+            line.extend_from_slice(source);
+            owner.values.push(line);
+        }
+        owner.freeze()
+    }
+
+    pub(super) fn peak(pool: &ResidentBudget) -> Result<Self> {
+        Ok(Self {
+            values: Vec::new(),
+            pool: pool.clone(),
+            charge: pool.reserve_bytes(32 * 1024 * 1024, 32 * 1024 * 1024)?,
+        })
+    }
+
+    pub(super) fn push(&mut self, line: Vec<[f32; 2]>) -> Result<()> {
+        self.values.try_reserve(1).map_err(|_| Error::Budget)?;
+        self.values.push(line);
+        if Self::allocated(&self.values)? > self.charge.bytes() {
+            return Err(Error::Budget);
+        }
+        Ok(())
+    }
+
+    pub(super) fn freeze(mut self) -> Result<Arc<Self>> {
+        // Vec growth has returned and all previous allocation generations have
+        // been freed. Only actual surviving capacities are refunded here.
+        let bytes = Self::allocated(&self.values)?;
+        self.charge.shrink_to(bytes)?;
+        Ok(Arc::new(self))
+    }
 }
 
 impl CoverageSource {
@@ -24,15 +118,18 @@ impl CoverageSource {
         mask: Surface,
         bounds: [i32; 4],
         origin: [i32; 2],
-        contours: Arc<Vec<Vec<[f32; 2]>>>,
+        contours: &[Vec<[f32; 2]>],
+        budget: &ResidentBudget,
     ) -> Result<Self> {
         if mask.depth() != 8
+            || !mask.uses_budget(budget)
             || origin
                 .iter()
                 .chain(bounds.iter())
                 .any(|v| v.unsigned_abs() > 100000)
             || bounds[0] > bounds[2]
             || bounds[1] > bounds[3]
+            || contours.len() > 500000
             || contours
                 .iter()
                 .try_fold(0usize, |n, line| n.checked_add(line.len()))
@@ -49,7 +146,7 @@ impl CoverageSource {
             mask,
             bounds,
             origin,
-            contours,
+            contours: ContourOwner::copy(contours, budget)?,
         })
     }
 
@@ -63,12 +160,14 @@ impl CoverageSource {
             .map_err(|_| Error::Invalid("Invalid legacy selection coverage"))?;
         // Whole-raster staging refuses retained originals until the scene's
         // explicit retained-source collector can carry them without loss.
+        let budget = store.resident_budget();
         let mask = Surface::stage_raster(&source.mask, store, check)?;
         Self::new(
             mask,
             source.bounds,
             source.origin,
-            Arc::new(source.contours.clone()),
+            &source.contours,
+            &budget,
         )
     }
 
@@ -84,8 +183,11 @@ impl CoverageSource {
     pub fn origin(&self) -> [i32; 2] {
         self.origin
     }
-    pub fn contours(&self) -> &Arc<Vec<Vec<[f32; 2]>>> {
-        &self.contours
+    pub fn contours(&self) -> &[Vec<[f32; 2]>] {
+        &self.contours.values
+    }
+    pub fn metadata_bytes(&self) -> usize {
+        self.contours.charge.bytes()
     }
 
     /// `region` is in document coordinates. Only its exact physical mask
@@ -97,7 +199,7 @@ impl CoverageSource {
         check: &mut dyn FnMut() -> Result<()>,
     ) -> Result<PreparedCoverageRegion> {
         check()?;
-        if !self.mask.uses_budget(budget) {
+        if !self.mask.uses_budget(budget) || !self.contours.pool.same_pool(budget) {
             return Err(Error::Invalid(
                 "Selection source uses a different payload ledger",
             ));
@@ -219,12 +321,14 @@ mod tests {
             CoverageSource::stage_legacy(&original, store.clone(), &mut || Ok(())).unwrap();
         assert_eq!(source.bounds(), original.bounds);
         assert_eq!(source.origin(), original.origin);
-        assert_eq!(&**source.contours(), &original.contours);
+        assert_eq!(source.contours(), &original.contours);
+        let metadata = source.metadata_bytes();
+        assert_eq!(pool.used(), metadata);
         let prepared = source
             .prepare_region(Region::new([0, 0, 8, 4]).unwrap(), &pool, &mut || Ok(()))
             .unwrap();
         assert_eq!(prepared.key(), source.key());
-        assert_eq!(pool.used(), 256 * 256 * 4);
+        assert_eq!(pool.used(), 256 * 256 * 4 + metadata);
         for y in 0..4 {
             for x in 0..8 {
                 assert_eq!(prepared.value(x, y).unwrap(), original.value(x, y));
@@ -237,7 +341,7 @@ mod tests {
         assert!(prepared.copy_row(1, &mut row[..2]).is_err());
         drop(source);
         drop(store);
-        assert_eq!(pool.used(), 256 * 256 * 4);
+        assert_eq!(pool.used(), 256 * 256 * 4 + metadata);
         assert_eq!(prepared.value(3, 1).unwrap(), 31. / 255.);
         drop(prepared);
         assert_eq!(pool.used(), 0);
@@ -251,6 +355,7 @@ mod tests {
             let (store, path) = store(pool.clone());
             let source =
                 CoverageSource::stage_legacy(&legacy(), store.clone(), &mut || Ok(())).unwrap();
+            let metadata = source.metadata_bytes();
             assert!(source
                 .prepare_region(
                     Region::new([3, 1, 7, 3]).unwrap(),
@@ -260,7 +365,7 @@ mod tests {
                 .is_err());
             let result =
                 source.prepare_region(Region::new([3, 1, 7, 3]).unwrap(), &pool, &mut || {
-                    if cancel && pool.used() > 0 {
+                    if cancel && pool.used() > metadata {
                         Err(Error::Cancelled)
                     } else {
                         Ok(())
@@ -270,7 +375,7 @@ mod tests {
                 (cancel, result),
                 (false, Err(Error::Budget)) | (true, Err(Error::Cancelled))
             ));
-            assert_eq!(pool.used(), 0);
+            assert_eq!(pool.used(), metadata);
             drop(source);
             drop(store);
             std::fs::remove_dir_all(path).unwrap();
@@ -283,7 +388,8 @@ mod tests {
             Surface::zero(16000, 16000, 8).unwrap(),
             [0; 4],
             [-100000, -100000],
-            Arc::new(vec![]),
+            &[],
+            &pool,
         )
         .unwrap();
         let view = source
@@ -296,13 +402,10 @@ mod tests {
         assert_eq!(view.value(15999, 7).unwrap(), 0.);
         assert!(view.value(16000, 7).is_err());
         assert_eq!(pool.used(), 0);
-        assert!(CoverageSource::new(
-            Surface::zero(1, 1, 16).unwrap(),
-            [0; 4],
-            [0; 2],
-            Arc::new(vec![])
-        )
-        .is_err());
+        assert!(
+            CoverageSource::new(Surface::zero(1, 1, 16).unwrap(), [0; 4], [0; 2], &[], &pool,)
+                .is_err()
+        );
     }
 
     #[test]
@@ -317,5 +420,36 @@ mod tests {
         assert_eq!(pool.used(), 0);
         drop(store);
         std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn frozen_contour_owner_shares_actual_capacity_charge_until_its_last_reference() {
+        let pool = ResidentBudget::new(64 * 1024 * 1024).unwrap();
+        let mut owner = ContourOwner::peak(&pool).unwrap();
+        assert_eq!(pool.used(), 32 * 1024 * 1024);
+        let mut line = Vec::with_capacity(1024);
+        line.extend([[0., 0.], [4., 0.], [4., 4.], [0., 4.]]);
+        owner.push(line).unwrap();
+        let actual = ContourOwner::allocated(&owner.values).unwrap();
+        let owner = owner.freeze().unwrap();
+        assert_eq!(pool.used(), actual);
+        let second = owner.clone();
+        drop(owner);
+        assert_eq!(pool.used(), actual);
+        drop(second);
+        assert_eq!(pool.used(), 0);
+        let values = vec![vec![[0., 0.], [4., 0.], [4., 4.], [0., 4.]]];
+        let small = ResidentBudget::new(1).unwrap();
+        assert!(matches!(
+            CoverageSource::new(
+                Surface::zero(4, 4, 8).unwrap(),
+                [0, 0, 4, 4],
+                [0; 2],
+                &values,
+                &small
+            ),
+            Err(Error::Budget)
+        ));
+        assert_eq!(small.used(), 0);
     }
 }
