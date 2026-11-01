@@ -170,6 +170,11 @@ struct RuntimeViews {
     patterns: Vec<crate::psd::patterns::Source>,
 }
 impl SceneSnapshot {
+    /// Exact immutable source generation; document ID/revision alone cannot
+    /// distinguish a captured in-progress gesture or a different native owner.
+    pub(crate) fn key(&self) -> super::native::DocumentKey {
+        self.binding
+    }
     pub(crate) fn new(
         identity: SceneIdentity,
         pending: PendingScene,
