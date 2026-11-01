@@ -279,7 +279,7 @@ impl PeerBrush {
         }
         let result = {
             let mut e = self.shared.lock().unwrap();
-            if e.doc.id != edit.document {
+            if e.view().id() != edit.document {
                 Err("The document changed while renaming".into())
             } else {
                 e.edit(
@@ -291,7 +291,10 @@ impl PeerBrush {
                 )
             }
         };
-        self.message = result.map(|_| "Renamed layer".into()).unwrap_or_else(|e| e).into();
+        self.message = result
+            .map(|_| "Renamed layer".into())
+            .unwrap_or_else(|e| e)
+            .into();
         self.last_preview = None;
     }
     fn inline_rename(&mut self, ui: &mut egui::Ui, width: f32) {

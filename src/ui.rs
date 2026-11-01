@@ -729,10 +729,10 @@ impl PeerBrush {
         let selected = shared
             .lock()
             .unwrap()
-            .doc
-            .layers
-            .first()
-            .map(|l| l.id.clone())
+            .view()
+            .layers()
+            .next()
+            .map(|layer| layer.id().to_owned())
             .unwrap_or_default();
         let tool_settings_store = shared.lock().unwrap().tool_settings.clone();
         let tool_profile = tool_settings::initial(&tool_settings_store);
@@ -1273,7 +1273,7 @@ impl PeerBrush {
                 );
                 if response.clicked() {
                     if tool == Tool::None {
-                        let doc = self.shared.lock().unwrap().doc.clone();
+                        let doc = self.shared.lock().unwrap().doc_snapshot();
                         self.deselect_area(&doc, true);
                     } else {
                         self.select_tool(tool);
@@ -1516,7 +1516,7 @@ impl PeerBrush {
                 ctx.request_repaint_after(Duration::from_millis(16));
                 return None;
             };
-            if engine.doc.id != edit.document || engine.doc.revision != edit.revision {
+            if engine.view().id() != edit.document || engine.view().revision() != edit.revision {
                 edit.preview = None;
                 return None;
             }
@@ -1548,7 +1548,7 @@ impl PeerBrush {
             return;
         }
         let mut engine = self.shared.lock().unwrap();
-        if engine.doc.id != edit.document || engine.doc.revision != edit.revision {
+        if engine.view().id() != edit.document || engine.view().revision() != edit.revision {
             self.cancelled_parameter = Some(edit.control);
             self.message = "Image changed during parameter edit · preview cancelled".into();
             return;
@@ -1876,7 +1876,7 @@ impl PeerBrush {
         let control = crate::loading::Control::default();
         {
             let e = s.lock().unwrap();
-            control.bind(e.doc.id.clone(), e.doc.revision);
+            control.bind(e.view().id().to_owned(), e.view().revision());
         }
         self.load_control = Some(control.clone());
         self.load_preview = None;
@@ -2069,7 +2069,7 @@ impl PeerBrush {
         let project = self.project_id.clone();
         let (document, revision) = {
             let e = self.shared.lock().unwrap();
-            (e.doc.id.clone(), e.doc.revision)
+            (e.view().id().to_owned(), e.view().revision())
         };
         self.busy = true;
         self.jobs.insert(project.clone());
@@ -2138,7 +2138,7 @@ impl PeerBrush {
                 commands.push(command); pixels.push(image);
             }
             let count = commands.len(); let mut engine = shared.lock().unwrap();
-            if engine.doc.id != pending.document || engine.doc.revision != pending.revision { return Err("The source project changed; import the images again".into()); }
+            if engine.view().id() != pending.document || engine.view().revision() != pending.revision { return Err("The source project changed; import the images again".into()); }
             engine.import_images(&commands,pixels,pending.revision)?;
             Ok(format!("Imported {count} image layers"))
         });

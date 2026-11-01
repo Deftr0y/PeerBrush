@@ -299,15 +299,15 @@ impl PeerBrush {
             });
         let (document, revision) = {
             let e = self.shared.lock().unwrap();
-            (e.doc.id.clone(), e.doc.revision)
+            (e.view().id().to_owned(), e.view().revision())
         };
         self.edit(vec![command], label);
         let e = self.shared.lock().unwrap();
         self.straight.last = last
-            .filter(|_| e.doc.id == document && e.doc.revision == revision + 1)
+            .filter(|_| e.view().id() == document && e.view().revision() == revision + 1)
             .map(|(point, pressure)| Last {
                 document,
-                revision: e.doc.revision,
+                revision: e.view().revision(),
                 layer: self.selected.clone(),
                 mask: self.mask,
                 step: self.mask_step.clone(),

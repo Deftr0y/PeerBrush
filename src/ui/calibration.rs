@@ -231,7 +231,7 @@ impl PeerBrush {
                 });
                 let mut settings = self.brush;
                 settings.radius = self.radius;
-                let depth = self.shared.lock().unwrap().doc.bit_depth;
+                let depth = self.shared.lock().unwrap().view().depth();
                 self.calibration.draw(ui, settings, depth);
                 let state = self.tool_settings_store.lock().unwrap().state();
                 let note = if state["error"].is_string() || state["save_error"].is_string() {

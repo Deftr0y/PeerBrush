@@ -252,11 +252,9 @@ impl PeerBrush {
                     .shared
                     .lock()
                     .unwrap()
-                    .doc
-                    .layers
-                    .iter()
-                    .find(|l| l.id == *id)
-                    .is_some_and(|l| l.color != editor.rgba);
+                    .view()
+                    .find_layer(id)
+                    .is_some_and(|l| l.color() != editor.rgba);
                 if changed {
                     let result = self.shared.lock().unwrap().edit_with_gesture(
                         "human",

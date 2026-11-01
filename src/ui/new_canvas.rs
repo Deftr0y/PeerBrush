@@ -119,7 +119,8 @@ impl PeerBrush {
                         )
                         .and_then(|doc| {
                             let mut engine = crate::engine::Engine::new();
-                            engine.doc = doc;
+                            engine.authority =
+                                crate::engine::authority::DocumentAuthority::resident(doc);
                             crate::workspace::register_in(
                                 &self.workspace,
                                 engine,
