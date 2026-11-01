@@ -208,8 +208,11 @@ or establish dense16K editing/recovery qualification.
 authorized PNG path. It borrows the actual `SourceSession` until the file owner
 drops. A read-only file handle and its parent directory stay bound to their
 filesystem identities, byte length, modification stamp and single-link checks.
-Windows also denies writes/deletion while the handle survives; Unix opens with
-no-follow. Unexpected source changes fail the operation.
+Windows also denies writes/deletion while the handle survives. Both initial and
+identity-check Unix opens use nonblocking/no-follow and immediately reject an
+opened nonregular file. A regular-file-to-FIFO race therefore cannot stall a
+blocking read-open before cancellation checks. Unexpected source changes fail
+the operation.
 
 The transport retains one charged64KiB input buffer and a conservative bounded
 path reservation. Its streaming preflight hashes every original byte and checks

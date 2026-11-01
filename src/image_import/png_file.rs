@@ -110,22 +110,7 @@ impl<'a> FilePng<'a> {
         if !named.is_file() || named.file_type().is_symlink() {
             return Err("Held PNG source must be an ordinary file".into());
         }
-        let mut options = OpenOptions::new();
-        options.read(true);
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::OpenOptionsExt;
-            // Retain a read-only owner and deny concurrent writes/deletion.
-            options.share_mode(1).custom_flags(0x00200000);
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-        }
-        let file = options
-            .open(&path)
-            .map_err(|_| "Cannot hold the selected PNG source")?;
+        let file = open_source(&path, false)?;
         let metadata = file
             .metadata()
             .map_err(|_| "Held PNG source metadata unavailable")?;
@@ -184,15 +169,15 @@ impl<'a> FilePng<'a> {
         self.directory.check()?;
         let named =
             fs::symlink_metadata(&self.path).map_err(|_| "Held PNG source name disappeared")?;
-        let opened = crate::file_safety::open_for_identity(&self.path)
-            .map_err(|_| "Held PNG source identity unavailable")?;
+        if !named.is_file() || named.file_type().is_symlink() {
+            return Err("Held PNG source is no longer an ordinary file".into());
+        }
+        let opened = open_source(&self.path, true)?;
         let actual = self
             .file
             .metadata()
             .map_err(|_| "Held PNG source metadata unavailable")?;
-        if !named.is_file()
-            || named.file_type().is_symlink()
-            || !actual.is_file()
+        if !actual.is_file()
             || crate::file_safety::identity(&self.file)? != self.identity
             || crate::file_safety::identity(&opened)? != self.identity
             || crate::file_safety::link_count(&self.file)? != 1
@@ -275,6 +260,94 @@ impl<'a> FilePng<'a> {
             return Err("Bytes consumed by the PNG decoder differ from the admitted source".into());
         }
         Ok(actual)
+    }
+}
+
+#[cfg(unix)]
+const INPUT_FLAGS: i32 = libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+
+/// A named regular file can become a FIFO between lstat and open. Both initial
+/// data admission and identity rechecks must remain nonblocking, then validate
+/// the actual opened type before any read. Never use the general identity-open
+/// helper here: its Unix read-open can block on an untrusted replacement.
+fn open_source(path: &Path, identity_only: bool) -> Result<File, String> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x00200000);
+        if identity_only {
+            options.access_mode(0).share_mode(7);
+        } else {
+            options.share_mode(1);
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let _ = identity_only;
+        options.custom_flags(INPUT_FLAGS);
+    }
+    let file = options
+        .open(path)
+        .map_err(|_| "Cannot hold the selected ordinary PNG source")?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| "Held PNG source metadata unavailable")?;
+    if !metadata.is_file() {
+        return Err("Opened PNG source is not an ordinary file".into());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x400 != 0 {
+            return Err("Opened PNG source alias refused".into());
+        }
+    }
+    Ok(file)
+}
+
+#[cfg(all(test, unix))]
+mod unix_tests {
+    use super::*;
+    use std::{
+        ffi::CString,
+        os::unix::{ffi::OsStrExt, io::AsRawFd},
+    };
+    #[test]
+    fn actual_open_refuses_a_fifo_replacing_a_previously_checked_regular_file() {
+        // Assert the actual helper's flag before attempting FIFO opens, so an
+        // accidental removal fails instead of leaving the regression test hung.
+        assert_ne!(INPUT_FLAGS & libc::O_NONBLOCK, 0);
+        let parent = fs::canonicalize(std::env::temp_dir()).unwrap();
+        let root = parent.join(format!("pb-png-fifo-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let held = Directory::open(&root).unwrap();
+        let path = root.join("source.png");
+        fs::write(&path, b"ordinary").unwrap();
+        let checked = fs::symlink_metadata(&path).unwrap();
+        let original = open_source(&path, false).unwrap();
+        // SAFETY: a live file descriptor is queried without ownership transfer.
+        let flags = unsafe { libc::fcntl(original.as_raw_fd(), libc::F_GETFL) };
+        assert!(
+            flags >= 0,
+            "Cannot query the actual source descriptor flags"
+        );
+        assert_ne!(flags & libc::O_NONBLOCK, 0);
+        fs::remove_file(&path).unwrap();
+        let cpath = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: the NUL-terminated path is owned by this private fixture.
+        assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
+        assert!(checked.is_file());
+        assert!(open_source(&path, false).is_err());
+        assert!(open_source(&path, true).is_err());
+        assert_eq!(original.metadata().unwrap().len(), 8);
+        drop(original);
+        held.check().unwrap();
+        fs::remove_file(&path).unwrap();
+        drop(held);
+        fs::remove_dir(&root).unwrap();
     }
 }
 impl BufRead for FilePng<'_> {
