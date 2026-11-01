@@ -15,8 +15,11 @@ use std::{
         Arc, Mutex,
     },
 };
+#[path = "source_runtime/segments.rs"]
+mod segments;
 #[path = "source_runtime/staging.rs"]
 mod staging;
+pub(crate) use segments::{SessionJxlOutput, SessionSegmentLog, SessionSegments};
 pub(crate) use staging::{SessionBytes, SessionTemporary};
 #[path = "source_runtime/recovery_marker.rs"]
 mod recovery_marker;
@@ -285,7 +288,7 @@ impl SourceRuntime {
                 let (_, uuid) = name
                     .split_once('-')
                     .ok_or("Unknown source directory retained")?;
-                if !["source", "planar", "scalar", "bytes"]
+                if !["source", "planar", "scalar", "bytes", "segments"]
                     .iter()
                     .any(|prefix| name.starts_with(&format!("{prefix}-")))
                     || uuid::Uuid::parse_str(uuid).is_err()
@@ -308,6 +311,7 @@ impl SourceRuntime {
                         "planar" => "planes.pbp",
                         "scalar" => "field.pbf",
                         "bytes" => "bytes.pbb",
+                        "segments" => "segments.pbj",
                         _ => unreachable!(),
                     };
                     if file_name != expected {
@@ -1581,5 +1585,224 @@ mod tests {
         drop(runtime);
         drop(context);
         drop(connection);
+    }
+    #[test]
+    fn compatible_jxl_log_keeps_actual_session_and_canonical_inventory_until_retirement() {
+        use crate::large_document::{
+            segments::{SegmentEvent, SegmentLimits},
+            ScratchBytes,
+        };
+        let f = Fixture::new();
+        let (_shared, connection) = f.connection();
+        let context = PersistentRootContext::from_explicit_state(&connection).unwrap();
+        let runtime = SourceRuntime::new(context, limits()).unwrap();
+        let session = runtime.begin().unwrap();
+        let spec = SegmentLimits {
+            output_bytes: 1024,
+            protocol_log_bytes: 65536,
+            records: 32,
+            events: 128,
+        };
+        let directories = runtime
+            .inventory
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .directories;
+        assert!(session.segment_log(spec, [0; 16], [8; 32]).is_err());
+        assert_eq!(
+            runtime
+                .inventory
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .directories,
+            directories
+        );
+        let mut log = session.segment_log(spec, [7; 16], [8; 32]).unwrap();
+        log.append(
+            0,
+            SegmentEvent::Observed { wire_kind: 2 },
+            None,
+            &mut || Ok(()),
+        )
+        .unwrap();
+        let mut bytes = ScratchBytes::new(&session.resident(), 8, 65536).unwrap();
+        bytes.copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        let sha = ring::digest::digest(&SHA256, &bytes)
+            .as_ref()
+            .try_into()
+            .unwrap();
+        log.append(
+            1,
+            SegmentEvent::Data {
+                offset: 0,
+                sha256: sha,
+            },
+            Some((&bytes, bytes.len())),
+            &mut || Ok(()),
+        )
+        .unwrap();
+        log.append(
+            2,
+            SegmentEvent::Finalized { position: 8 },
+            None,
+            &mut || Ok(()),
+        )
+        .unwrap();
+        log.append(
+            3,
+            SegmentEvent::Done {
+                bytes: 8,
+                records: 1,
+            },
+            None,
+            &mut || Ok(()),
+        )
+        .unwrap();
+        let log = log.finish(&mut || Ok(())).unwrap();
+        let canonical = log.canonical(&mut || Ok(())).unwrap();
+        assert_eq!(
+            canonical.bytes().role(),
+            crate::large_document::ByteRole::CompatibleJxlMode1
+        );
+        assert_eq!(canonical.bytes().payload_sha256(), sha);
+        assert_eq!(
+            runtime
+                .inventory
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .staging
+                .len(),
+            2
+        );
+        canonical.check_session(&session).unwrap();
+        let foreign = runtime.begin().unwrap();
+        assert!(canonical.check_session(&foreign).is_err());
+        drop(foreign);
+        canonical.retire(&mut || session.cleanup_check()).unwrap();
+        assert_eq!(
+            runtime
+                .inventory
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .staging
+                .len(),
+            0
+        );
+        assert_eq!(
+            runtime
+                .inventory
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .directories,
+            0
+        );
+        assert_eq!(runtime.disk().used().unwrap(), 56);
+        drop(bytes);
+        drop(session);
+        drop(runtime);
+        drop(connection);
+    }
+    #[test]
+    fn unsealed_jxl_log_restart_accounts_actual_bytes_without_resuming_encoder() {
+        use crate::large_document::segments::{SegmentEvent, SegmentLimits};
+        let f = Fixture::new();
+        let (_shared, connection) = f.connection();
+        let context = PersistentRootContext::from_explicit_state(&connection).unwrap();
+        let runtime = SourceRuntime::new(context.clone(), limits()).unwrap();
+        let session = runtime.begin().unwrap();
+        let mut log = session
+            .segment_log(
+                SegmentLimits {
+                    output_bytes: 1024,
+                    protocol_log_bytes: 65536,
+                    records: 32,
+                    events: 128,
+                },
+                [7; 16],
+                [8; 32],
+            )
+            .unwrap();
+        log.append(
+            0,
+            SegmentEvent::Observed { wire_kind: 2 },
+            None,
+            &mut || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(runtime.disk().used().unwrap(), 56 + 256 + 96);
+        drop(log);
+        drop(session);
+        drop(runtime);
+        let runtime = SourceRuntime::new(context, limits()).unwrap();
+        let session = runtime.begin().unwrap();
+        assert_eq!(runtime.disk().used().unwrap(), 56 + 128 + 96);
+        {
+            let state = runtime.inventory.lock().unwrap();
+            let inventory = state.as_ref().unwrap();
+            assert_eq!(inventory.directories, 1);
+            assert_eq!(inventory.files.len(), 2);
+            assert!(inventory.locations.is_empty());
+            assert!(inventory.staging.is_empty());
+        }
+        drop(session);
+        drop(runtime);
+        drop(connection);
+    }
+    #[test]
+    fn connection_drop_waits_for_jxl_abort_without_authorizing_new_output_after_stop() {
+        use crate::large_document::segments::{SegmentEvent, SegmentLimits};
+        use std::{
+            sync::mpsc,
+            thread,
+            time::{Duration, Instant},
+        };
+        let f = Fixture::new();
+        let (_shared, connection) = f.connection();
+        let context = PersistentRootContext::from_explicit_state(&connection).unwrap();
+        let runtime = SourceRuntime::new(context, limits()).unwrap();
+        let session = runtime.begin().unwrap();
+        let spec = SegmentLimits {
+            output_bytes: 1024,
+            protocol_log_bytes: 65536,
+            records: 32,
+            events: 128,
+        };
+        let mut log = session.segment_log(spec, [7; 16], [8; 32]).unwrap();
+        log.append(
+            0,
+            SegmentEvent::Observed { wire_kind: 2 },
+            None,
+            &mut || Ok(()),
+        )
+        .unwrap();
+        let (finished, done) = mpsc::channel();
+        let closer = thread::spawn(move || {
+            drop(connection);
+            finished.send(()).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while session.check().is_ok() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(session.check().is_err());
+        assert!(done.try_recv().is_err());
+        assert!(session.segment_log(spec, [7; 16], [8; 32]).is_err());
+        log.abort(&mut || session.cleanup_check()).unwrap();
+        assert_eq!(runtime.disk().used().unwrap(), 56);
+        assert!(done.try_recv().is_err());
+        drop(session);
+        done.recv_timeout(Duration::from_secs(2)).unwrap();
+        closer.join().unwrap();
+        drop(runtime);
     }
 }
