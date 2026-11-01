@@ -9,6 +9,7 @@ mod bytes;
 mod disk;
 mod linear;
 mod planar;
+pub(crate) mod root;
 mod scalar;
 mod store;
 
@@ -19,6 +20,7 @@ pub use bytes::{
 pub use disk::{DiskBudget, DiskReservation};
 pub use planar::{CompletedPlanar, PlanarRole, PlanarScratch, PlanarSpec};
 pub use scalar::{CompletedScalar, ScalarScratch, ScalarSpec};
+pub(crate) use store::WeakStore;
 pub use store::{
     BlockRef, CommitRef, FreshFragment, Limits, PinnedBytes, PinnedTile, ScratchBytes, Snapshot,
     Store, TileSpec,

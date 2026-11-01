@@ -37,7 +37,7 @@ pub(crate) fn identity(file: &fs::File) -> Result<(u64, u64), String> {
     Ok((m.dev(), m.ino()))
 }
 #[cfg(windows)]
-pub(crate) fn identity(file: &fs::File) -> Result<(u64, u64), String> {
+fn file_identity_and_links(file: &fs::File) -> Result<((u64, u64), u64), String> {
     use std::os::windows::io::AsRawHandle;
     #[repr(C)]
     #[derive(Default)]
@@ -62,9 +62,28 @@ pub(crate) fn identity(file: &fs::File) -> Result<(u64, u64), String> {
         return Err(std::io::Error::last_os_error().to_string());
     }
     Ok((
-        info.volume as u64,
-        ((info.index_high as u64) << 32) | info.index_low as u64,
+        (
+            info.volume as u64,
+            ((info.index_high as u64) << 32) | info.index_low as u64,
+        ),
+        info.links as u64,
     ))
+}
+
+#[cfg(windows)]
+pub(crate) fn identity(file: &fs::File) -> Result<(u64, u64), String> {
+    file_identity_and_links(file).map(|info| info.0)
+}
+#[cfg(windows)]
+pub(crate) fn link_count(file: &fs::File) -> Result<u64, String> {
+    file_identity_and_links(file).map(|info| info.1)
+}
+#[cfg(unix)]
+pub(crate) fn link_count(file: &fs::File) -> Result<u64, String> {
+    use std::os::unix::fs::MetadataExt;
+    file.metadata()
+        .map(|metadata| metadata.nlink())
+        .map_err(|error| error.to_string())
 }
 
 fn stamp(file: &fs::File) -> Result<(u64, u128), String> {
