@@ -60,6 +60,28 @@ fn retained_owner_waits_for_weak_upgrade_and_seals_future_resurrection_before_re
     wait_empty(&pool);
 }
 #[test]
+fn new_admission_retires_released_images_before_reserving_replacement_pixels() {
+    let pool = ResidentBudget::new(1024 * 1024).unwrap();
+    let (retirement, release) = retirement::paused(&pool).unwrap();
+    let ctx = egui::Context::default();
+    let texture = image(&retirement, [3, 2], 43).upload(&ctx);
+    let delta = ctx.tex_manager().write().take_delta();
+    let pressure = pool
+        .reserve_bytes(pool.limit() - pool.used() - 100, pool.limit())
+        .unwrap();
+    drop(texture);
+    drop(ctx);
+    drop(delta);
+    // The background reaper is gated, and132 bytes cannot fit until the old
+    // actual image is synchronously destroyed by the admission path itself.
+    let replacement = image(&retirement, [1, 1], 97);
+    drop(replacement);
+    drop(pressure);
+    release.send(()).unwrap();
+    drop(retirement);
+    wait_empty(&pool);
+}
+#[test]
 fn whole_overwrite_and_partial_delta_owners_retire_independently() {
     let pool = ResidentBudget::new(4 * 1024 * 1024).unwrap();
     let retirement = retirement::small(&pool, 8).unwrap();
