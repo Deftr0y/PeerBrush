@@ -5,6 +5,7 @@ mod contours;
 mod coverage_writer;
 pub mod display;
 mod flood;
+pub(crate) mod image_source;
 pub mod import;
 pub mod masks;
 mod native_tiles;
