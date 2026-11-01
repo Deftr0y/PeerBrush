@@ -1,0 +1,14 @@
+[package]
+name = "peerbrush-svg-origin-rows"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+resvg = { path = "../../vendor/resvg", default-features = false, features = ["text"] }
+
+[patch.crates-io]
+tiny-skia = { path = "../../vendor/tiny-skia" }
+tiny-skia-path = { path = "../../vendor/tiny-skia-path" }
