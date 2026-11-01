@@ -705,6 +705,71 @@ pub(crate) fn encode<'scene, 'output, 'session>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[derive(Clone, Copy)]
+    enum FixturePhase {
+        Staging,
+        Encode,
+        Recheck,
+        Copy,
+        Decode,
+        Pixels,
+        Retire,
+        Cleanup,
+    }
+    impl FixturePhase {
+        fn label(self) -> &'static str {
+            match self {
+                Self::Staging => "staging",
+                Self::Encode => "encode",
+                Self::Recheck => "recheck",
+                Self::Copy => "copy",
+                Self::Decode => "decode",
+                Self::Pixels => "pixels",
+                Self::Retire => "retire",
+                Self::Cleanup => "cleanup",
+            }
+        }
+    }
+    fn fixture_category(error: &str) -> &'static str {
+        if error.contains("read work") || error.contains("budget") || error.contains("admission") {
+            "quota"
+        } else if error.contains("timed out") {
+            "timeout"
+        } else if error.contains("retained") {
+            "retained"
+        } else if error == FAILED {
+            "worker"
+        } else if error == PROTOCOL || error.contains("transport") {
+            "protocol"
+        } else {
+            "other"
+        }
+    }
+    fn fixture_mark(depth: u16, phase: FixturePhase, category: &'static str) {
+        assert!(matches!(depth, 8 | 16));
+        assert!(matches!(
+            category,
+            "begin" | "ok" | "quota" | "timeout" | "retained" | "worker" | "protocol" | "other"
+        ));
+        eprintln!(
+            "JXL_STREAM_STATUS phase={} depth={} category={}",
+            phase.label(),
+            depth,
+            category
+        );
+    }
+    fn fixture_result<T>(depth: u16, phase: FixturePhase, result: Result<T>) -> T {
+        match result {
+            Ok(value) => {
+                fixture_mark(depth, phase, "ok");
+                value
+            }
+            Err(error) => {
+                fixture_mark(depth, phase, fixture_category(&error));
+                panic!("native streaming fixture refused at declared stage")
+            }
+        }
+    }
     #[test]
     fn actual_profile_staging_owned_mode1_worker_replay_and_isolated_decode_keep_native_samples() {
         // Source-matched Cargo main is mandatory, just as for existing codec
@@ -713,52 +778,69 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         for depth in [8, 16] {
+            fixture_mark(depth, FixturePhase::Staging, "begin");
             crate::production_export::staged_rows::tests::with_staged(depth, |input| {
+                fixture_mark(depth, FixturePhase::Staging, "ok");
+                fixture_mark(depth, FixturePhase::Encode, "begin");
                 let session = input.session();
                 let raw = input.raw_bytes();
                 let profile = input.profile().to_vec();
-                let output = encode(
-                    input,
-                    Limits {
-                        output_bytes: 1024 * 1024,
-                        log_bytes: 2 * 1024 * 1024,
-                        records: 4096,
-                        input_bytes: wire::source_work_ceiling(raw).unwrap(),
-                        deadline_ms: 15000,
-                    },
-                    &|| Ok(()),
-                )
-                .unwrap();
-                output.recheck(&|| Ok(())).unwrap();
+                let output = fixture_result(
+                    depth,
+                    FixturePhase::Encode,
+                    encode(
+                        input,
+                        Limits {
+                            output_bytes: 1024 * 1024,
+                            log_bytes: 2 * 1024 * 1024,
+                            records: 4096,
+                            input_bytes: wire::source_work_ceiling(raw).unwrap(),
+                            deadline_ms: 15000,
+                        },
+                        &|| Ok(()),
+                    ),
+                );
+                fixture_mark(depth, FixturePhase::Recheck, "begin");
+                fixture_result(depth, FixturePhase::Recheck, output.recheck(&|| Ok(())));
+                fixture_mark(depth, FixturePhase::Copy, "begin");
                 let mut encoded =
                     ScratchBytes::new(&session.resident(), output.bytes() as usize, 1024 * 1024)
                         .unwrap();
-                output.copy_range(0, &mut encoded, &|| Ok(())).unwrap();
+                fixture_result(
+                    depth,
+                    FixturePhase::Copy,
+                    output.copy_range(0, &mut encoded, &|| Ok(())),
+                );
                 assert_eq!(
                     ring::digest::digest(&SHA256, &encoded).as_ref(),
                     output.sha256()
                 );
+                fixture_mark(depth, FixturePhase::Decode, "begin");
                 let executable = executable().unwrap();
                 let mut command = Command::new(&executable);
                 command
                     .arg("--jxl-worker")
                     .current_dir(executable.parent().unwrap());
-                let decoded = invoke(
-                    request(Operation::Decode, None, None, 0, encoded.len()).unwrap(),
-                    Input::Encoded(&encoded),
-                    &|| Ok(()),
-                    Runtime {
-                        timeout: Duration::from_secs(15),
-                        command: Some(command),
-                        test_prefix: false,
-                        response_started: None,
-                        publication_started: None,
-                        primary_kill_failed: false,
-                        input_written: None,
-                        stall_writer: false,
-                    },
-                )
-                .unwrap();
+                let decoded = fixture_result(
+                    depth,
+                    FixturePhase::Decode,
+                    invoke(
+                        request(Operation::Decode, None, None, 0, encoded.len()).unwrap(),
+                        Input::Encoded(&encoded),
+                        &|| Ok(()),
+                        Runtime {
+                            timeout: Duration::from_secs(15),
+                            command: Some(command),
+                            test_prefix: false,
+                            response_started: None,
+                            publication_started: None,
+                            primary_kill_failed: false,
+                            input_written: None,
+                            stall_writer: false,
+                        },
+                    ),
+                );
+                fixture_mark(depth, FixturePhase::Pixels, "begin");
                 assert_eq!(decoded.info.width, 17);
                 assert_eq!(decoded.info.height, 513);
                 assert_eq!(decoded.info.bit_depth, depth);
@@ -794,10 +876,18 @@ mod tests {
                         }
                     }
                 }
+                fixture_mark(depth, FixturePhase::Pixels, "ok");
                 assert!(output.source_read_bytes() <= wire::source_read_ceiling(raw).unwrap());
                 drop(encoded);
-                output.retire(&mut || session.cleanup_check()).unwrap();
+                fixture_mark(depth, FixturePhase::Retire, "begin");
+                fixture_result(
+                    depth,
+                    FixturePhase::Retire,
+                    output.retire(&mut || session.cleanup_check()),
+                );
+                fixture_mark(depth, FixturePhase::Cleanup, "begin");
             });
+            fixture_mark(depth, FixturePhase::Cleanup, "ok");
         }
     }
     #[test]
