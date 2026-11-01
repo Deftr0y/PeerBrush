@@ -16,19 +16,23 @@ pub(crate) struct Rows<'a> {
 }
 impl<'a> Rows<'a> {
     pub(crate) fn new(scene: &'a SceneSnapshot) -> Result<Self> {
+        Self::for_target(scene, None)
+    }
+    pub(crate) fn for_target(scene: &'a SceneSnapshot, target: Option<&str>) -> Result<Self> {
         if scene.metadata().depth() != 8 && scene.metadata().depth() != 16 {
             return Err("Composite rows require native RGB8 or RGB16".into());
         }
-        if scene
-            .metadata()
-            .filters()
-            .any(|filter| filter.enabled() && filter.weight() > 0.)
+        if target.is_none()
+            && scene
+                .metadata()
+                .filters()
+                .any(|filter| filter.enabled() && filter.weight() > 0.)
         {
             return Err("Document filters require their explicit regional provider".into());
         }
         Ok(Self {
             scene,
-            topology: Topology::new(scene)?,
+            topology: Topology::for_target(scene, target)?,
         })
     }
     pub(crate) fn scene(&self) -> &'a SceneSnapshot {
@@ -48,8 +52,8 @@ impl<'a> Rows<'a> {
         check: &dyn Fn() -> Result<()>,
     ) -> Result<()> {
         check()?;
-        if output.target.is_some() {
-            return Err("Isolated export requires its explicit captured tree provider".into());
+        if output.target.as_deref() != self.topology.target() {
+            return Err("Export target differs from its captured tree provider".into());
         }
         if depth != self.scene.metadata().depth() || output.native_source_depth != depth {
             return Err("Export rows differ from the captured native precision".into());
@@ -68,7 +72,7 @@ impl<'a> Rows<'a> {
         while let Some(window) = grid.next()? {
             check()?;
             let mut failed_check = None;
-            let prepared = RawLayers::prepare(self.scene, window.source, &mut || {
+            let prepared = RawLayers::for_topology(&self.topology, window.source, &mut || {
                 check().map_err(|reason| {
                     failed_check = Some(reason);
                     Error::Cancelled
@@ -196,6 +200,91 @@ mod tests {
                     .is_err());
             }
             drop(provider);
+            drop(scene);
+            crate::compositor::native::tests::cleanup(&path);
+        }
+    }
+    #[test]
+    fn isolated_hidden_root_excludes_ancestors_siblings_and_document_filters() {
+        for depth in [8, 16] {
+            let mut doc = crate::compositor::native::tests::doc(depth, true, "screen");
+            doc.layers[0].visible = false;
+            let effect = crate::effects::Effect {
+                id: crate::engine::id(),
+                kind: "invert".into(),
+                enabled: true,
+                weight: 0.67,
+                settings: serde_json::json!({}).into(),
+            };
+            doc.layers[3].effects.push(effect.clone());
+            doc.filters.push(effect);
+            let (scene, path) = crate::compositor::native::tests::capture_kind(&doc, true);
+            assert!(Rows::new(&scene).is_err());
+            assert!(Rows::for_target(&scene, Some(&doc.layers[2].id)).is_err());
+            assert!(Rows::for_target(&scene, Some("missing")).is_err());
+            let free = scene.budget().limit() - scene.budget().used();
+            let held = scene.budget().reserve_bytes(free, free).unwrap();
+            assert!(Rows::for_target(&scene, Some(&doc.layers[0].id)).is_err());
+            assert_eq!(scene.budget().used(), scene.budget().limit());
+            drop(held);
+            for index in [0, 1, 4] {
+                let target = &doc.layers[index].id;
+                let expected = Image::render(&doc, Some(target), &Control::default()).unwrap();
+                let provider = Rows::for_target(&scene, Some(target)).unwrap();
+                if index == 0 {
+                    let region = crate::raster::backed::Region::new([0, 0, 9, 7]).unwrap();
+                    let prepared =
+                        RawLayers::for_topology(&provider.topology, region, &mut || Ok(()))
+                            .unwrap();
+                    let other = Topology::for_target(&scene, Some(&doc.layers[4].id)).unwrap();
+                    if depth == 8 {
+                        assert!(
+                            Plan::<Native8, _>::with_topology(other, &prepared, region).is_err()
+                        );
+                    } else {
+                        assert!(
+                            Plan::<Native16, _>::with_topology(other, &prepared, region).is_err()
+                        );
+                    }
+                }
+                let output = Output {
+                    target: Some(target.clone()),
+                    target_name: String::new(),
+                    variant: String::new(),
+                    filename: "test.png".into(),
+                    document_rect: [-2, -1, 11, 9],
+                    width: 17,
+                    height: 13,
+                    format: Format::Png,
+                    native_source_depth: depth,
+                    bit_depth: depth,
+                    scale_xy: [17. / 13., 13. / 10.],
+                };
+                let stride = usize::from(depth / 2);
+                for method in [Resampling::Nearest, Resampling::Bilinear] {
+                    let mut bytes = vec![0xcd; 17 * 13 * stride];
+                    provider
+                        .fill(&output, depth, method, 0, 13, &mut bytes, &|| Ok(()))
+                        .unwrap();
+                    let grid = native_grid::Grid::new(&output, method, 0, 13).unwrap();
+                    for y in 0..13 {
+                        for x in 0..17 {
+                            let [sx, sy] = grid.position(x, y).unwrap();
+                            let expected = expected.resampled(sx, sy, method);
+                            let at = (y * 17 + x) as usize * stride;
+                            let actual: Vec<u16> = if depth == 8 {
+                                bytes[at..at + 4].iter().map(|v| u16::from(*v)).collect()
+                            } else {
+                                bytes[at..at + 8]
+                                    .chunks_exact(2)
+                                    .map(|v| u16::from_be_bytes(v.try_into().unwrap()))
+                                    .collect()
+                            };
+                            assert_eq!(actual, expected, "{depth} root{index} {method:?} {x},{y}");
+                        }
+                    }
+                }
+            }
             drop(scene);
             crate::compositor::native::tests::cleanup(&path);
         }
