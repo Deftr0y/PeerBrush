@@ -19,6 +19,10 @@ use std::{
     },
 };
 
+#[path = "backed/checkpoint.rs"]
+mod checkpoint;
+pub(crate) use checkpoint::{Parts as CheckpointParts, Proof as CheckpointProof};
+
 type Result<T> = std::result::Result<T, String>;
 const MAGIC: &[u8; 16] = b"PBRECOVERY3\0\0\0\0\0";
 const DOMAIN: &[u8] = b"PeerBrushNativeBackingRecovery3\0";
@@ -483,6 +487,17 @@ impl Capture {
         self.write_body(snapshot, &mut full)?;
         full.write_all(&payload_sha).map_err(|e| e.to_string())?;
         let sha256 = full.hash.finish().as_ref().try_into().unwrap();
+        let proof = CheckpointProof::from_validated(
+            snapshot,
+            full.bytes,
+            sha256,
+            self.tables.iter().map(|table| table.selected.clone()),
+            session,
+            check,
+        )
+        .inspect_err(|_| {
+            self.failed.store(true, Ordering::Release);
+        })?;
         let mut scratch = ScratchBytes::new(&session.resident(), 64 * 1024, 64 * 1024)
             .map_err(|e| e.to_string())?;
         let result = session.publish_recovery_marker(
@@ -509,6 +524,10 @@ impl Capture {
                 Ok(())
             },
         );
+        let result = result.and_then(|_| {
+            let mut marker = session.open_recovery_marker(snapshot)?;
+            session.register_checkpoint(proof, &mut marker, check)
+        });
         if result.is_err() {
             self.failed.store(true, Ordering::Release);
         }
@@ -564,6 +583,7 @@ struct Input<'a> {
     filled: usize,
     consumed: u64,
     hash: Context,
+    whole: Context,
 }
 impl<'a> Input<'a> {
     fn new(marker: NativeMarker<'a>, session: &SourceSession) -> Result<Self> {
@@ -578,6 +598,7 @@ impl<'a> Input<'a> {
             filled: 0,
             consumed: 0,
             hash,
+            whole: Context::new(&SHA256),
         })
     }
     fn read_into(&mut self, mut output: &mut [u8], hashed: bool) -> Result<()> {
@@ -594,6 +615,7 @@ impl<'a> Input<'a> {
             }
             let count = output.len().min(self.filled - self.at);
             output[..count].copy_from_slice(&self.scratch[self.at..self.at + count]);
+            self.whole.update(&output[..count]);
             if hashed {
                 self.hash.update(&output[..count]);
             }
@@ -611,7 +633,7 @@ impl<'a> Input<'a> {
         self.read_into(&mut bytes, true)?;
         Ok(bytes)
     }
-    fn finish(mut self, expected: u64) -> Result<NativeMarker<'a>> {
+    fn finish(mut self, expected: u64) -> Result<(NativeMarker<'a>, [u8; 32])> {
         let mut footer = [0; 32];
         self.read_into(&mut footer, false)?;
         if self.consumed != expected
@@ -630,7 +652,10 @@ impl<'a> Input<'a> {
             return Err("Native recovery marker has a trailing record".into());
         }
         self.marker.check()?;
-        Ok(self.marker)
+        Ok((
+            self.marker,
+            self.whole.finish().as_ref().try_into().unwrap(),
+        ))
     }
 }
 
@@ -804,7 +829,7 @@ pub(crate) fn load<'a>(
     if remaining != 0 {
         return Err("Recovery reference total does not match its complete roster".into());
     }
-    let marker = input.finish(expected)?;
+    let (mut marker, marker_sha256) = input.finish(expected)?;
     check()?;
     let stats = Stats::scan(&raw, limits.metadata, check)?;
     let capacity = metadata_len
@@ -939,6 +964,15 @@ pub(crate) fn load<'a>(
     )?;
     marker.check()?;
     check()?;
+    let proof = CheckpointProof::from_validated(
+        snapshot,
+        length,
+        marker_sha256,
+        seals.iter().cloned(),
+        session,
+        check,
+    )?;
+    session.register_checkpoint(proof, &mut marker, check)?;
     Ok(DecodedNativeRecovery {
         pending,
         seals,
@@ -1322,5 +1356,196 @@ mod tests {
         assert!(load(&session, id, limits(), &|| Ok(())).is_err());
         assert_eq!(fs::read(&path).unwrap(), bytes);
         assert!(retained.is_file());
+    }
+    #[test]
+    fn registered_checkpoint_keeps_selected_owners_after_live_scene_and_capture_drop() {
+        let mut f = Fixture::new();
+        let staged = stage(&f, 16);
+        let session = f.runtime().begin().unwrap();
+        let physical = staged.seals[0].store();
+        let weak = physical.downgrade();
+        let identity = physical.identity();
+        let selected = staged.seals[0].reference();
+        let capture =
+            Capture::new(&staged.scene, &staged.seals, &session, limits(), &|| Ok(())).unwrap();
+        let id = *uuid::Uuid::new_v4().as_bytes();
+        capture.publish(id, &session, &|| Ok(())).unwrap();
+        assert_eq!(
+            session
+                .checkpoint_census(&|| Ok(()))
+                .unwrap()
+                .registered_count(),
+            1
+        );
+        drop((capture, physical, staged));
+        assert!(weak.upgrade().is_some());
+        let restored = session.resolve_store(identity, selected).unwrap();
+        drop(restored);
+        assert_eq!(
+            session
+                .checkpoint_census(&|| Ok(()))
+                .unwrap()
+                .registered_count(),
+            1
+        );
+        drop(session);
+        let runtime = f.runtime.take().unwrap();
+        drop(runtime);
+        assert!(weak.upgrade().is_none());
+        assert!(f
+            .connection
+            .as_ref()
+            .unwrap()
+            .state_dir
+            .join("native-sources-v1")
+            .read_dir()
+            .unwrap()
+            .next()
+            .is_some());
+    }
+    #[test]
+    fn only_complete_load_can_register_an_independently_published_marker() {
+        let f = Fixture::new();
+        let staged = stage(&f, 8);
+        let session = f.runtime().begin().unwrap();
+        let capture =
+            Capture::new(&staged.scene, &staged.seals, &session, limits(), &|| Ok(())).unwrap();
+        let id = *uuid::Uuid::new_v4().as_bytes();
+        capture.publish(id, &session, &|| Ok(())).unwrap();
+        let copied = rewritten(&session, marker_bytes(&session, id), |_| {});
+        assert!(session.checkpoint_census(&|| Ok(())).is_err());
+        let decoded = load(&session, copied, limits(), &|| Ok(())).unwrap();
+        assert_eq!(
+            session
+                .checkpoint_census(&|| Ok(()))
+                .unwrap()
+                .registered_count(),
+            2
+        );
+        drop(decoded);
+        let decoded = load(&session, copied, limits(), &|| Ok(())).unwrap();
+        assert_eq!(
+            session
+                .checkpoint_census(&|| Ok(()))
+                .unwrap()
+                .registered_count(),
+            2
+        );
+        drop(decoded);
+    }
+    #[test]
+    fn checkpoint_census_preserves_pending_and_corrupt_marker_bytes_and_source_debt() {
+        for corrupt in [false, true] {
+            let f = Fixture::new();
+            let staged = stage(&f, 16);
+            let session = f.runtime().begin().unwrap();
+            let capture =
+                Capture::new(&staged.scene, &staged.seals, &session, limits(), &|| Ok(())).unwrap();
+            let id = *uuid::Uuid::new_v4().as_bytes();
+            capture.publish(id, &session, &|| Ok(())).unwrap();
+            assert_eq!(
+                session
+                    .checkpoint_census(&|| Ok(()))
+                    .unwrap()
+                    .registered_count(),
+                1
+            );
+            if corrupt {
+                session.corrupt_checkpoint_for_test(id, 112).unwrap();
+                // Restored mtime keeps cheap owner checks satisfied; full SHA must refuse.
+                session.check().unwrap();
+            } else {
+                let pending = *uuid::Uuid::new_v4().as_bytes();
+                assert!(session
+                    .publish_recovery_marker(
+                        pending,
+                        8,
+                        [3; 32],
+                        &mut |writer| {
+                            writer.write_all(&[4; 3]).map_err(|e| e.to_string())?;
+                            Err("Injected incomplete marker".into())
+                        },
+                        &|| Ok(())
+                    )
+                    .is_err());
+            }
+            let retained = session.disk().used().unwrap();
+            assert!(session.checkpoint_census(&|| Ok(())).is_err());
+            assert_eq!(session.disk().used().unwrap(), retained);
+            assert!(staged.seals[0].store().publication_marked());
+        }
+    }
+    #[test]
+    fn checkpoint_census_callbacks_can_publish_but_registration_race_refuses_observation() {
+        let f = Fixture::new();
+        let staged = stage(&f, 8);
+        let session = f.runtime().begin().unwrap();
+        let capture =
+            Capture::new(&staged.scene, &staged.seals, &session, limits(), &|| Ok(())).unwrap();
+        capture
+            .publish(*uuid::Uuid::new_v4().as_bytes(), &session, &|| Ok(()))
+            .unwrap();
+        let calls = std::cell::Cell::new(0);
+        let inserted = std::cell::Cell::new(false);
+        let result = session.checkpoint_census(&|| {
+            calls.set(calls.get() + 1);
+            if calls.get() >= 2 && !inserted.replace(true) {
+                capture
+                    .publish(*uuid::Uuid::new_v4().as_bytes(), &session, &|| Ok(()))
+                    .unwrap();
+            }
+            Ok(())
+        });
+        assert!(inserted.get());
+        assert!(result.is_err());
+        assert_eq!(
+            session
+                .checkpoint_census(&|| Ok(()))
+                .unwrap()
+                .registered_count(),
+            2
+        );
+    }
+    #[test]
+    fn checkpoint_census_refuses_foreign_child_without_removing_owned_sources_or_debt() {
+        let f = Fixture::new();
+        let staged = stage(&f, 8);
+        let session = f.runtime().begin().unwrap();
+        let capture =
+            Capture::new(&staged.scene, &staged.seals, &session, limits(), &|| Ok(())).unwrap();
+        capture
+            .publish(*uuid::Uuid::new_v4().as_bytes(), &session, &|| Ok(()))
+            .unwrap();
+        assert_eq!(
+            session
+                .checkpoint_census(&|| Ok(()))
+                .unwrap()
+                .registered_count(),
+            1
+        );
+        let source_root = f
+            .connection
+            .as_ref()
+            .unwrap()
+            .state_dir
+            .join("native-sources-v1");
+        let child = fs::read_dir(source_root)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with("source-"))
+            })
+            .unwrap()
+            .path();
+        let foreign = child.join("foreign-checkpoint");
+        fs::write(&foreign, b"retain").unwrap();
+        let debt = session.disk().used().unwrap();
+        assert!(session.checkpoint_census(&|| Ok(())).is_err());
+        assert_eq!(fs::read(&foreign).unwrap(), b"retain");
+        assert!(child.join("blocks.pbt").is_file());
+        assert_eq!(session.disk().used().unwrap(), debt);
     }
 }

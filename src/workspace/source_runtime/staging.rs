@@ -8,6 +8,11 @@ pub(super) struct Location {
     directory: (u64, u64),
     file: (u64, u64),
 }
+impl Location {
+    pub(super) fn filesystem_identity(&self) -> ((u64, u64), (u64, u64)) {
+        (self.directory, self.file)
+    }
+}
 pub(super) struct Namespace<'a> {
     pub(super) session: &'a SourceSession,
     id: [u8; 16],
