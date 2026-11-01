@@ -399,6 +399,7 @@
     "src/recovery/backed/checkpoint.rs",
     "src/recovery/worker.rs",
     "src/render.rs",
+    "src/render/native_preview.rs",
     "src/render/region.rs",
     "src/retained.rs",
     "src/retained/geometry.rs",
