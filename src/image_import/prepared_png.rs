@@ -18,7 +18,7 @@ const DECODER_LIMIT: usize = 8 * 1024 * 1024;
 const DECODER_BYTES: usize = 32 * 1024 * 1024;
 const PATTERN_BYTES: usize = 4 * 1024 * 1024;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ColorPolicy {
     Raw,
     /// Existing selection imports ignore ICC; do not decompress unused iCCP.
@@ -63,6 +63,15 @@ pub(crate) struct EncodedPng {
     base64_sha256: Option<[u8; 32]>,
 }
 impl EncodedPng {
+    pub(crate) fn source_sha256(&self) -> [u8; 32] {
+        self.source_sha256
+    }
+    pub(crate) fn base64_sha256(&self) -> Option<[u8; 32]> {
+        self.base64_sha256
+    }
+    pub(crate) fn uses_budget(&self, pool: &ResidentBudget) -> bool {
+        self.bytes.uses_budget(pool)
+    }
     /// The file reader owns byte/identity/stamp checks outside engine locks.
     /// This constructor accepts only its immutable already-charged result and
     /// does not grant path, lease or document authority.
@@ -153,8 +162,12 @@ pub(crate) struct Complete {
     source_sha256: [u8; 32],
     base64_sha256: Option<[u8; 32]>,
     profile: Option<PinnedBytes>,
+    color_policy: ColorPolicy,
 }
 impl Complete {
+    pub(crate) fn color_policy(&self) -> ColorPolicy {
+        self.color_policy
+    }
     pub(crate) fn header(&self) -> Header {
         self.header
     }
@@ -585,6 +598,7 @@ fn decode_native_pass_rows(
         source_sha256: encoded.source_sha256,
         base64_sha256: encoded.base64_sha256,
         profile,
+        color_policy: color,
     })
 }
 

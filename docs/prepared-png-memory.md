@@ -50,6 +50,33 @@ disk quotas/abort/compaction, live large-document admission and native16K
 qualification remain separate work. A small row-charge/once-only coverage test
 does not close those gates.
 
+The provisional kernel in `image_import/png_surface.rs` now supplies compact
+pass staging and final physical-tile assembly. It holds one admitted native
+band of at most256 sample rows, plus one bounded output tile. Adam7 blocks use
+the actual sample-plane dimensions, rather than writing seven sparse physical
+images. Every logical pixel belongs to exactly one pass; the dense payload sum
+of those compact planes is one image. A final tile reads at most one checked
+compact block from each pass and preserves all native channels and full physical
+padding. Plain PNG rows can stage final tiles directly.
+
+Both pass and final metadata indices have reservations retained until their
+maps drop. Source byte hash, optional base64 transport hash and color policy
+are captured from the actual charged input and must match the final decoder
+completion. Missing/out-of-order rows, mismatched native precision, cancellation
+or storage refusal poisons the producer. Absent descriptors represent only
+all-zero blocks from complete verified coverage; a present bad reference still
+fails checked pinning.
+
+The returned tile index deliberately grants no Surface or publication authority.
+The genuine SourceSession adapter must still create the private fragments,
+seal the final referenced blocks, retain index admission through Surface handoff
+and retire the partial fragment only after all owners and pins are released.
+Cleanup uncertainty retains files/quota and must be reported. The two-fragment
+compact approach is designed for roughly one compact source plus one padded
+final source at peak disk use; that estimate has not been measured on dense16K
+input. Store index/cache accounting, disk/lifecycle qualification and actual
+large-document admission remain required.
+
 `decode_rows` remains a resident compatibility adapter for interlaced input and
 color-normalized bitmap preparation. It reconstructs native RGBA bands and runs
 CMS on completed rows rather than sparse pass samples. Combined orientation,
