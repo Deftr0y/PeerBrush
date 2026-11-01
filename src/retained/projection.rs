@@ -119,6 +119,47 @@ mod tests {
         .unwrap()
     }
     #[test]
+    fn full_warp_support_matches_legacy_transparent_halo_and_frame_composition() {
+        for retained in [false, true] {
+            let pool = ResidentBudget::new(8 * 1024 * 1024).unwrap();
+            let document = document(&pool, retained);
+            let id = document.metadata().layers().next().unwrap().id();
+            let input = Original::layer(&document, id).unwrap();
+            let source = input.source().unwrap();
+            let legacy = crate::retained::Original {
+                pixels: Box::new(crate::raster::Raster::new_depth(
+                    source.width(),
+                    source.height(),
+                    16,
+                )),
+                matrix: if retained {
+                    [1., 0., 0., 1., 2., 3.]
+                } else {
+                    super::super::IDENTITY
+                },
+                projective: None,
+                warps: vec![],
+            };
+            let baseline = pool.used();
+            for frame in [
+                crate::projective::Map::IDENTITY,
+                crate::projective::Map::affine_matrix([1.25, 0.125, -0.25, 0.75, -3.5, 6.25]),
+            ] {
+                assert_eq!(
+                    input.support_bounds_in(frame, &|| Ok(())).unwrap(),
+                    legacy.support_bounds_in(frame).unwrap()
+                );
+                assert_eq!(pool.used(), baseline);
+            }
+            assert!(input
+                .support_bounds_in(crate::projective::Map::IDENTITY, &|| Err(
+                    crate::large_document::Error::Cancelled
+                ))
+                .is_err());
+            assert_eq!(pool.used(), baseline);
+        }
+    }
+    #[test]
     fn projection_keeps_original_placement_and_generation_owner() {
         let pool = ResidentBudget::new(8 * 1024 * 1024).unwrap();
         let document = document(&pool, true);
@@ -291,6 +332,49 @@ impl<'a> Original<'a> {
             &stages.values,
         )?;
         let bounds = super::geometry::bounds(pixels, matrix, projective, &stages.values)?;
+        check().map_err(|e| e.to_string())?;
+        Ok(bounds)
+    }
+    /// Full interpolation support for Warp domains, including transparent edge
+    /// samples. This is a geometry query; it never substitutes painted bounds.
+    pub(crate) fn support_bounds_in(
+        &self,
+        frame: crate::projective::Map,
+        check: &dyn Fn() -> SourceResult<()>,
+    ) -> Result<[f64; 4], String> {
+        check().map_err(|e| e.to_string())?;
+        let source = self.source()?;
+        let stages = copy_stages(self.retained, self.document.budget())?;
+        let _prepared = if stages.values.is_empty() {
+            None
+        } else {
+            Some(
+                self.document
+                    .budget()
+                    .reserve_bytes(64 * 1024, 64 * 1024)
+                    .map_err(|e| e.to_string())?,
+            )
+        };
+        let matrix = self
+            .retained
+            .map_or(super::IDENTITY, |original| original.matrix());
+        let projective = self.retained.and_then(|original| original.projective());
+        super::geometry::validate(
+            source.width(),
+            source.height(),
+            source.depth(),
+            source.depth(),
+            matrix,
+            projective,
+            &stages.values,
+        )?;
+        let placement = frame.compose(super::geometry::placement(matrix, projective)?)?;
+        let bounds = crate::warp::Placement::new(&stages.values, placement)?.bounds([
+            -1.,
+            -1.,
+            source.width() as f64 + 1.,
+            source.height() as f64 + 1.,
+        ])?;
         check().map_err(|e| e.to_string())?;
         Ok(bounds)
     }
