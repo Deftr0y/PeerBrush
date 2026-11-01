@@ -1088,22 +1088,28 @@ pub(crate) fn move_layer(layer: &mut Layer, c: &Value) -> Result<(), String> {
 
 /// Includes hidden descendants so a later visibility change cannot leave old geometry behind.
 pub fn tree_ids(doc: &Document, roots: &[String]) -> Vec<String> {
+    tree_ids_view(doc.into(), roots)
+}
+/// Metadata only; native callers admit the returned IDs and temporary set first.
+pub(crate) fn tree_ids_view(
+    doc: crate::engine::view::DocumentView<'_>,
+    roots: &[String],
+) -> Vec<String> {
     let mut ids: std::collections::HashSet<_> = roots.iter().cloned().collect();
     for _ in 0..=16 {
         let before = ids.len();
-        for layer in &doc.layers {
-            if layer.parent.as_ref().is_some_and(|p| ids.contains(p)) {
-                ids.insert(layer.id.clone());
+        for layer in doc.layers() {
+            if layer.parent().is_some_and(|p| ids.contains(p)) {
+                ids.insert(layer.id().to_owned());
             }
         }
         if ids.len() == before {
             break;
         }
     }
-    doc.layers
-        .iter()
-        .filter(|l| ids.contains(&l.id))
-        .map(|l| l.id.clone())
+    doc.layers()
+        .filter(|l| ids.contains(l.id()))
+        .map(|l| l.id().to_owned())
         .collect()
 }
 pub fn tree_bounds(doc: &Document, roots: &[String]) -> Option<[i32; 4]> {
