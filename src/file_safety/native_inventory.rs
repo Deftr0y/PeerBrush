@@ -208,6 +208,33 @@ impl Entry {
     }
 }
 impl NativeInventory<'_> {
+    pub(in crate::file_safety) fn writer_lease(&self) -> &NativeLease {
+        self.lease
+    }
+    pub(in crate::file_safety) fn writer_budget(&self) -> &ResidentBudget {
+        &self.budget
+    }
+    /// Final accounting observes the original backup set independently of the
+    /// destination lease, whose old version is intentionally replaced on success.
+    pub(in crate::file_safety) fn writer_facts(
+        &self,
+        check: &dyn Fn() -> Result<(), String>,
+    ) -> Result<Vec<NativeExternalFile>, String> {
+        self.validate_files(check)?;
+        let mut facts = Vec::new();
+        facts
+            .try_reserve_exact(self.entries.len() + 1)
+            .map_err(|_| "Native outcome fact allocation refused")?;
+        if facts.capacity() > MAX_ENTRIES + 1 {
+            return Err("Native outcome fact allocation exceeds admission".into());
+        }
+        for entry in &self.entries {
+            check()?;
+            facts.push(NativeExternalFile::observe_held(&entry.file)?);
+        }
+        self.validate_files(check)?;
+        Ok(facts)
+    }
     fn names(&self, check: &dyn Fn() -> Result<(), String>) -> Result<Vec<OsString>, String> {
         let mut names = Vec::new();
         names
