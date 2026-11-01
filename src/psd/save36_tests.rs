@@ -538,3 +538,189 @@ fn closed_driver_resident_admission_refusal_preserves_source_before_any_staging_
     drop(doc);
     f.finish();
 }
+
+struct ImportOwner {
+    store: Store,
+    alive: Cell<bool>,
+}
+impl crate::psd::import36::ImportSession for ImportOwner {
+    fn store(&self) -> &Store {
+        &self.store
+    }
+    fn check(&self) -> Result<(), String> {
+        if self.alive.get() {
+            Ok(())
+        } else {
+            Err("Import session closed".into())
+        }
+    }
+}
+#[test]
+fn actual_owned_native_save_import_keeps_provisional_gate_and_exact_physical_source_payloads() {
+    use crate::psd::import36::{self, ProvisionalImport, QualifiedImport};
+    for depth in [8, 16] {
+        let f = Fixture::new();
+        let doc = document(depth);
+        let scene = capture(&f, &doc);
+        let (layers, composite, manifest, container) = f.roots();
+        let mut rows = provider(&scene);
+        let saved = prepare(
+            &scene,
+            Format::Psb,
+            OwnedRoots {
+                layers: &layers,
+                composite: &composite,
+                manifest: &manifest,
+                container: &container,
+            },
+            &mut rows,
+            limits(),
+            &|| Ok(()),
+            &|| Ok(()),
+        )
+        .unwrap();
+        let fresh = Store::create_with_disk_budget(
+            &f.root.join("import"),
+            f.pool.clone(),
+            f.disk.clone(),
+            StoreLimits {
+                disk_bytes: 16 * 1024 * 1024,
+                max_blocks: 64,
+                max_resident_blocks: 8,
+                manifest_bytes: 1024 * 1024,
+            },
+        )
+        .unwrap();
+        assert_ne!(fresh.identity(), f.store.identity());
+        let session = ImportOwner {
+            store: fresh,
+            alive: Cell::new(true),
+        };
+        let index_owner = MetadataCharge::reserve(&f.pool, 4 * 1024 * 1024, &|| Ok(())).unwrap();
+        let mut guarded = || Ok(());
+        let input = saved
+            .candidate()
+            .cursor(0, saved.bytes(), &mut guarded)
+            .unwrap();
+        let source = Source::new(input, saved.bytes()).unwrap();
+        let index = Arc::new(
+            structural::index(
+                &mut source
+                    .range(
+                        Span {
+                            offset: 0,
+                            bytes: saved.bytes(),
+                        },
+                        &|| Ok(()),
+                    )
+                    .unwrap(),
+                structural::Limits::current(),
+                || Ok(()),
+            )
+            .unwrap(),
+        );
+        let import_limits = import36::ImportLimits {
+            metadata: limits().metadata,
+            bulk: limits().bulk,
+            working: WorkingSet {
+                raw_bytes: 65536,
+                canonical_core_bytes: 65536,
+                canonical_manifest_bytes: 65536,
+                typed_metadata_bytes: 2 * 1024 * 1024,
+                tile_scratch_bytes: bulk36::MAX_TILE_BYTES,
+                index_scratch_bytes: 2 * 1024 * 1024,
+            },
+        };
+        let provisional = import36::prepare(
+            &source,
+            index,
+            index_owner,
+            saved.sha256(),
+            &session,
+            "import-codec-fixture".into(),
+            import_limits,
+            &|| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(provisional.scene().metadata().id, doc.id);
+        assert_eq!(provisional.scene().metadata().layers[0].x, -2);
+        assert!(
+            !provisional.scene().metadata().layers[0]
+                .mask
+                .as_ref()
+                .unwrap()
+                .enabled
+        );
+        assert!(provisional
+            .compare(&mut rows, &|_| Ok(()), &|| Ok(()))
+            .is_err());
+        let mut imported_rows = provider(provisional.scene());
+        assert!(provisional
+            .compare(
+                &mut imported_rows,
+                &|_| Err("Unsupported fixture semantics".into()),
+                &|| Ok(())
+            )
+            .is_err());
+        let compared = provisional
+            .compare(
+                &mut imported_rows,
+                &|s| {
+                    // Actual fixture semantic subset only, not the application's complete
+                    // supported-source validator or installed-profile admission.
+                    if s.metadata().read_only
+                        || s.metadata().icc_profile.is_some()
+                        || s.metadata().layers.len() != 1
+                        || s.metadata().layers[0].kind != "paint"
+                        || !s.metadata().filters.is_empty()
+                        || !s.metadata().layers[0].effects.is_empty()
+                    {
+                        return Err("Fixture semantics differ".into());
+                    }
+                    s.metadata().visit_rasters(|r| {
+                        s.raster(r)?;
+                        Ok(())
+                    })?;
+                    Ok(())
+                },
+                &|| Ok(()),
+            )
+            .unwrap();
+        drop(imported_rows);
+        let qualified = ProvisionalImport::qualify(provisional, compared, &|| Ok(())).unwrap();
+        let pending =
+            QualifiedImport::map_pending(qualified, &|| Ok(()), |pending, _| Ok(pending)).unwrap();
+        let reference = &pending.metadata().layers[0].pixels;
+        let surface = pending.rasters().get(reference).unwrap();
+        assert_ne!(
+            surface.key(),
+            scene
+                .raster(&scene.metadata().layers[0].pixels)
+                .unwrap()
+                .key()
+        );
+        let tile = surface.prepare_tile((0, 0), &mut || Ok(())).unwrap();
+        let bytes = tile.bytes().unwrap();
+        let at = (255 * 256 + 255) * 4;
+        if depth == 16 {
+            assert_eq!(
+                &bytes[at * 2..at * 2 + 8],
+                &[44445u16, 55551, 12345, 56789]
+                    .into_iter()
+                    .flat_map(u16::to_be_bytes)
+                    .collect::<Vec<_>>()
+            );
+        } else {
+            assert_eq!(&bytes[at..at + 4], &[171, 219, 43, 231]);
+        }
+        drop(tile);
+        drop(pending);
+        drop(source);
+        drop(session);
+        saved.retire(&|| Ok(())).unwrap();
+        drop(rows);
+        drop(scene);
+        drop(doc);
+        f.finish();
+    }
+}
