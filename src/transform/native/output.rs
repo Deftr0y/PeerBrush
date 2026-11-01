@@ -123,7 +123,7 @@ pub(crate) fn write_plane(
                 work,
                 check,
             )?;
-            if tile.bytes().iter().any(|b| *b != 0) {
+            if tile.preserve_empty || tile.bytes().iter().any(|b| *b != 0) {
                 let reference = store
                     .put(spec, tile.bytes(), &mut || check())
                     .map_err(|e| e.to_string())?;

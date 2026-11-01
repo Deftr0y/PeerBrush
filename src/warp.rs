@@ -397,13 +397,14 @@ pub(crate) fn parse(command: &Value) -> Result<Option<Grid>, String> {
         .ok_or("Warp requires rect and points, or rect/preset/amount")?;
     let grid = if fields.len() == 2 && fields.contains_key("rect") && fields.contains_key("points")
     {
-        serde_json::from_value::<Grid>(value.clone()).map_err(|_| ERROR.to_string())?
+        Grid::deserialize(value).map_err(|_| ERROR.to_string())?
     } else if fields.len() == 3
         && fields.contains_key("rect")
         && fields.contains_key("preset")
         && fields.contains_key("amount")
     {
-        let rect = serde_json::from_value(fields["rect"].clone()).map_err(|_| ERROR.to_string())?;
+        let rect =
+            serde::Deserialize::deserialize(&fields["rect"]).map_err(|_| ERROR.to_string())?;
         Grid::preset(
             rect,
             fields["preset"].as_str().ok_or(ERROR)?,
