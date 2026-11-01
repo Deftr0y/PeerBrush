@@ -1,6 +1,6 @@
 //! Own only this editor's private TextEdit undo state. This is not an admission
 //! for egui's independent font, layout, or paint caches.
-use crate::large_document::{Reservation, ResidentBudget};
+use crate::{large_document::ResidentBudget, psd::memory36::MetadataCharge};
 use eframe::egui::{self, text_edit::TextEditState, Context, Id};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -30,7 +30,7 @@ struct Inner {
     bytes: usize,
     closed: bool,
     acknowledged: bool,
-    owner: Option<Reservation>,
+    owner: Option<Arc<MetadataCharge>>,
 }
 impl Drop for Inner {
     fn drop(&mut self) {
@@ -54,9 +54,7 @@ impl TextState {
         let nonce = NEXT
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
             .map_err(|_| "Source editor nonce exhausted")?;
-        let owner = pool
-            .reserve_bytes(BYTES, BYTES)
-            .map_err(|e| e.to_string())?;
+        let owner = MetadataCharge::reserve(pool, BYTES, &|| Ok(()))?;
         let mut slots = Vec::new();
         slots
             .try_reserve_exact(SLOTS)
@@ -227,7 +225,7 @@ mod tests {
         assert_eq!(pool.used(), 0);
         let mut slots = Vec::new();
         slots.try_reserve_exact(SLOTS).unwrap();
-        let debt = pool.reserve_bytes(BYTES, BYTES).unwrap();
+        let debt = MetadataCharge::reserve(&pool, BYTES, &|| Ok(())).unwrap();
         drop(Inner {
             slots,
             bytes: 0,
