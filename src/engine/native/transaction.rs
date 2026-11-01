@@ -782,7 +782,7 @@ mod tests {
         assert!(captured.unchanged(token, &|| Ok(())).is_err());
     }
 }
-fn restamp(
+pub(super) fn restamp(
     source: &NativeDocument,
     revision: u64,
     check: &dyn Fn() -> Result<()>,

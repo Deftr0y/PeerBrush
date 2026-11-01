@@ -5,9 +5,16 @@ use crate::{
     large_document::Reservation,
 };
 use serde::Deserialize;
+#[path = "history/metadata_inverse.rs"]
+pub(crate) mod metadata_inverse;
 #[path = "history/task_capture.rs"]
 mod task_capture;
+#[path = "history/task_prepare.rs"]
+mod task_prepare;
+#[path = "history/task_sources.rs"]
+mod task_sources;
 pub(crate) use task_capture::{TaskCapture, TaskEntry, TaskRequest};
+pub(crate) use task_prepare::{RefusedTask, TaskCandidate, TaskPreparationError};
 
 pub(crate) struct NativeHistory {
     identity: DocumentKey,

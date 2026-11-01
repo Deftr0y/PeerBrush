@@ -10,6 +10,9 @@ use std::{
 
 pub(crate) trait StageSession {
     fn check(&self) -> Result<()>;
+    fn fresh_fragment(&self) -> Result<crate::large_document::FreshFragment> {
+        Err("Source service provisional fragments are unavailable".into())
+    }
     /// Existing implementations remain conservative until the concrete service
     /// supplies its retained-instance cleanup-only admission check.
     fn cleanup_check(&self) -> Result<()> {

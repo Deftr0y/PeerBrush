@@ -44,7 +44,8 @@ pub(crate) use descriptor::{Command, CommandDescriptor, CommandToken, Method};
 pub(crate) use effect_patch::{EffectClipPatch, EffectPatch};
 pub(crate) use history::{
     Direction, HistoryRequest, HistorySnapshot, NativeHistory, PreparedCommit, PreparedMove,
-    Publication, RefusedCommit, RefusedMove, RetiredHistory, TaskCapture, TaskEntry, TaskRequest,
+    Publication, RefusedCommit, RefusedMove, RefusedTask, RetiredHistory, TaskCandidate,
+    TaskCapture, TaskEntry, TaskPreparationError, TaskRequest,
 };
 pub(crate) use insertion::RefusedInsertion;
 pub use intent::{Intent, IntentKind};
