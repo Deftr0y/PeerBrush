@@ -2019,7 +2019,23 @@ fn dispatch_project(
                 .get("commands")
                 .and_then(Value::as_array)
                 .ok_or("commands must be an array")?;
-            let result = if commands.len() == 1 && commands[0]["op"] == "layer.merge" {
+            let native = {
+                let engine = shared.lock().unwrap();
+                crate::workspace::validate_target(&engine, p)?;
+                engine.native_document().is_some()
+            };
+            let result = if native {
+                edit_shared(
+                    shared,
+                    actor,
+                    commands,
+                    p.get("expected_revision").and_then(Value::as_u64),
+                    p.get("task").and_then(Value::as_str),
+                    p.get("label").and_then(Value::as_str).unwrap_or("AI edit"),
+                    None,
+                    p["document_id"].as_str(),
+                )?.into_response(admission)?
+            } else if commands.len() == 1 && commands[0]["op"] == "layer.merge" {
                 let ids = crate::merge::requested(&commands[0])?;
                 crate::merge::edit_guarded(
                     shared,
