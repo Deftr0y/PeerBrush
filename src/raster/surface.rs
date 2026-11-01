@@ -332,7 +332,13 @@ mod tests {
     use std::collections::BTreeMap;
 
     fn store(budget: ResidentBudget) -> (Store, std::path::PathBuf) {
-        let path = std::env::temp_dir().join(format!("peerbrush-surface-{}", crate::engine::id()));
+        let path = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("peerbrush-surface-{}", crate::engine::id()));
+        assert_eq!(
+            path.parent().unwrap().canonicalize().unwrap(),
+            path.parent().unwrap()
+        );
         let store = Store::create(
             &path,
             budget,
