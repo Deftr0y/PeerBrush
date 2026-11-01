@@ -10,6 +10,7 @@ pub(super) struct EditAdmission {
     base: DocumentKey,
     scopes: Arc<Intent>,
     descriptor: Option<Arc<CommandDescriptor>>,
+    transaction_step: bool,
     _output_charge: Option<Arc<Reservation>>,
     _charge: Reservation,
 }
@@ -149,6 +150,7 @@ impl NativeDocument {
             base: self.key(),
             scopes,
             descriptor: None,
+            transaction_step: false,
             _output_charge: None,
             _charge: charge,
         }));
@@ -156,6 +158,20 @@ impl NativeDocument {
     }
 }
 impl EditAdmission {
+    pub(super) fn is_transaction_step(&self) -> bool {
+        self.transaction_step
+    }
+    pub(super) fn check_publication(
+        &self,
+        base: &NativeDocument,
+        actor: &str,
+        intent: &Intent,
+    ) -> Result<()> {
+        if self.transaction_step {
+            return Err("Native transaction steps cannot publish independently".into());
+        }
+        self.check(base, actor, intent)
+    }
     pub(super) fn shared_descriptor(&self) -> Option<Arc<CommandDescriptor>> {
         self.descriptor.clone()
     }
@@ -167,6 +183,7 @@ impl EditAdmission {
         base: &NativeDocument,
         scopes: Arc<Intent>,
         output_charge: Arc<Reservation>,
+        transaction_step: bool,
     ) -> Result<Arc<Self>> {
         let bytes = self
             .actor
@@ -187,6 +204,7 @@ impl EditAdmission {
             base: base.key(),
             scopes,
             descriptor: self.descriptor.clone(),
+            transaction_step,
             _output_charge: Some(output_charge),
             _charge: charge,
         }))
@@ -243,6 +261,17 @@ impl EditAdmission {
             }
         }
         Ok(())
+    }
+}
+impl CapturedEdit {
+    pub(super) fn into_transaction_step(mut self) -> Result<Self> {
+        let admission = self
+            .admission
+            .as_mut()
+            .and_then(Arc::get_mut)
+            .ok_or("Native step admission unexpectedly shared")?;
+        admission.transaction_step = true;
+        Ok(self)
     }
 }
 

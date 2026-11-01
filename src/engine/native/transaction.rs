@@ -89,7 +89,7 @@ impl NativeTransaction {
             .working
             .capture_descriptor(descriptor, actor, &[], 0, false, true)?;
         next.cancellation = self.captured.cancellation.clone();
-        Ok(next)
+        next.into_transaction_step()
     }
     /// All checks/allocation precede the swap. Refusal returns the exact staged
     /// output tokens so the caller can retire them using its retained session.
@@ -115,6 +115,7 @@ impl NativeTransaction {
                 .descriptor()
                 .ok_or("Native transaction step has no descriptor")?;
             if descriptor.commands().len() != 1
+                || !admission.is_transaction_step()
                 || descriptor.commands().next().unwrap().token() != expected
                 || descriptor.generation() != self.working.key()
                 || delta.base != self.working.key()
@@ -202,6 +203,7 @@ impl NativeTransaction {
                     &self.captured.base,
                     self.scopes.clone(),
                     self._output_charge.clone(),
+                    false,
                 )?;
             let intent = Intent::from_scopes(
                 IntentKind::Capture,
@@ -525,6 +527,47 @@ mod tests {
             .is_known_zero());
         std::fs::remove_dir(path).unwrap();
         drop(base);
+        assert_eq!(pool.used(), 0);
+    }
+    #[test]
+    fn an_intermediate_step_cannot_enter_history_or_publish_even_at_the_original_key() {
+        let pool = ResidentBudget::new(16 * 1024 * 1024).unwrap();
+        let base = super::super::tests::document(&pool);
+        let layer = base.metadata().layer(0).unwrap().id().to_owned();
+        let command = [json!({"op":"layer.update","layer":layer,"visible":false})];
+        let mut transaction = begin(&base, &command);
+        let delta = transaction
+            .next(&|| Ok(()))
+            .unwrap()
+            .visibility(&layer, false, &|| Ok(()))
+            .unwrap();
+        let refused = base.publish("worker", &[], 1, false, delta).unwrap_err();
+        assert!(refused.reason().contains("cannot publish independently"));
+        let refused = base.adopt(refused.into_prepared()).unwrap_err();
+        let history = NativeHistory::new(&pool, 20).unwrap();
+        let refused = history
+            .snapshot()
+            .prepare_commit(
+                &base,
+                refused.into_prepared(),
+                HistoryRequest {
+                    actor: "worker",
+                    label: "step",
+                    task: None,
+                    gesture: None,
+                },
+                &|| Ok(()),
+            )
+            .err()
+            .unwrap();
+        assert!(refused.reason().contains("cannot publish independently"));
+        transaction
+            .complete(refused.into_prepared(), &|| Ok(()))
+            .unwrap();
+        let final_delta = transaction.finish(&|| Ok(())).unwrap();
+        assert!(base.publish("worker", &[], 1, false, final_delta).is_ok());
+        drop(base);
+        drop(history);
         assert_eq!(pool.used(), 0);
     }
 }
