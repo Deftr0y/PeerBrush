@@ -149,3 +149,11 @@ can move a raced foreign version to that backup. This is a different contract an
 must not be described as destination-ID compare-and-replace. Until a replacement
 contract is reviewed and qualified, existing-target native Save remains a gate;
 new-name no-clobber Save As is the available safe primitive, not full Save readiness.
+
+Destination admission also retains the actual source operation and destination
+parent descriptors before creating a versions directory or lock. Source
+namespaces, their descendants, managed backup directories and known internal
+file identities are refused before those mutations. The guarded lease creates
+relative to its held parent and retains the admission through publication.
+Current ancestry is reobserved; these checks do not provide an atomic prohibition
+on a concurrent POSIX directory rename. Unknown ownership remains a refusal.

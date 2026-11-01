@@ -148,6 +148,14 @@ impl DiskBudget {
         let state = self.0.state.lock().map_err(|_| Error::Interrupted)?;
         state.used.checked_add(state.external).ok_or(Error::Corrupt)
     }
+    /// Observation for destination refusal only, never filesystem authority.
+    pub(crate) fn is_internal_identity(&self, identity: (u64, u64)) -> Result<bool> {
+        let state = self.0.state.lock().map_err(|_| Error::Interrupted)?;
+        Ok(state
+            .files
+            .values()
+            .any(|entry| entry.identity == Some(identity)))
+    }
 
     /// The actual caller must durably publish its authenticated orphan intent
     /// BEFORE creating any external staging file covered by this ticket.
