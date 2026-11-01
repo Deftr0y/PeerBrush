@@ -29,7 +29,7 @@ impl FileOperation {
     }
     pub(crate) fn begin(shared: &Shared) -> Result<Self, String> {
         let engine = shared.lock().unwrap();
-        engine.ensure_open()?;
+        engine.ensure_write_available()?;
         Ok(Self::track(engine.file_operations.clone()))
     }
     pub(crate) fn track(counter: Arc<std::sync::atomic::AtomicUsize>) -> Self {

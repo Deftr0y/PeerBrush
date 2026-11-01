@@ -66,6 +66,20 @@ impl Control {
     pub fn check(&self) -> Result<(), String> {
         Self::check_status(&self.0.lock().unwrap().status)
     }
+    /// Publication may verify a large file without holding the engine mutex.
+    /// Reads/navigation remain available; mutations wait for the final outcome.
+    pub(crate) fn ensure_editable(&self) -> Result<(), String> {
+        let state = self.0.lock().unwrap();
+        if state.started
+            && !state.status.finished
+            && !state.status.can_cancel
+            && !state.status.cancel_requested
+        {
+            Err("Finishing save publication; wait before changing this project".into())
+        } else {
+            Ok(())
+        }
+    }
     /// True only when this request accepted cancellation before publication.
     pub fn cancel(&self) -> bool {
         let mut state = self.0.lock().unwrap();
@@ -120,6 +134,34 @@ impl Control {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn publication_blocks_mutations_until_success_or_failure_without_blocking_reads() {
+        for outcome in [Ok(()), Err("late publication verification failed".into())] {
+            let control = Control::default();
+            control.ensure_editable().unwrap();
+            control.begin("source".into(), 17).unwrap();
+            control.ensure_editable().unwrap();
+            control.progress("Encoding", 12, 31).unwrap();
+            control.ensure_editable().unwrap();
+            control.commit().unwrap();
+            assert!(control.ensure_editable().is_err());
+            assert_eq!(control.status().revision, 17);
+            control
+                .progress("Verifying published bytes", 19, 31)
+                .unwrap();
+            assert!(control.ensure_editable().is_err());
+            assert!(!control.cancel());
+            control.finish(&outcome);
+            control.ensure_editable().unwrap();
+        }
+        let cancelled = Control::default();
+        cancelled.begin("source".into(), 17).unwrap();
+        assert!(cancelled.cancel());
+        cancelled.ensure_editable().unwrap();
+        assert!(cancelled.commit().is_err());
+        cancelled.ensure_editable().unwrap();
+    }
 
     #[test]
     fn cancel_and_commit_have_one_winner_and_completed_controls_cannot_be_reused() {
