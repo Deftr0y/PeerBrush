@@ -610,6 +610,8 @@ pub(crate) use native_inventory::NativeInventory;
 pub(crate) use native_inventory::{NativeExternalFile, NativeExternalSnapshot};
 #[path = "file_safety/native_outcome.rs"]
 mod native_outcome;
+#[path = "file_safety/native_access.rs"]
+mod native_access;
 #[cfg(test)]
 pub(crate) use native_outcome::{AccountingOutcome,AccountingCreation};
 pub(crate) use native_outcome::{ExternalOutcomeProof,ExternalCreationProof,ExternalCreationRole};
