@@ -355,8 +355,11 @@ impl FreshFragment {
     }
     /// Mark before any engine, history, clipboard or marker visibility. A late
     /// refused publication deliberately cannot undo this conservative mark.
-    pub fn publish(self) -> Store {
+    pub(crate) fn mark_published(&self) {
         self.store.0.may_be_published.store(true, Ordering::Release);
+    }
+    pub fn publish(self) -> Store {
+        self.mark_published();
         self.store
     }
     pub fn abort(self, check: Check<'_>) -> Result<()> {
@@ -441,6 +444,10 @@ impl Snapshot {
 }
 
 impl Store {
+    /// Conservative one-way visibility mark, not document/checkpoint authority.
+    pub(crate) fn publication_marked(&self) -> bool {
+        self.0.may_be_published.load(Ordering::Acquire)
+    }
     /// Tests with a dedicated pool distinguish retained index capacity from
     /// leaked payload/pin/scratch owners without relaxing production admission.
     #[cfg(test)]
