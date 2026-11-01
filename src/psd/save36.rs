@@ -627,6 +627,22 @@ pub(crate) struct CompletedSave36<'a> {
     failed: Cell<bool>,
 }
 impl<'source> CompletedSave36<'source> {
+    /// Namespace/owner proof only. Complete source/native fidelity and the final
+    /// full candidate SHA recheck remain mandatory publication requirements.
+    pub(crate) fn check_session(&self, session: &SourceSession) -> Result<(), String> {
+        self.check_cursor_guard()?;
+        session.check()?;
+        if !self.scene.budget().same_pool(&session.resident())
+            || !self.scene.disk_budget().same_pool(&session.disk())
+        {
+            return Err("Completed native save uses another resource admission".into());
+        }
+        self.candidate.check_session(session)?;
+        for staged in &self.staging {
+            staged.check_session(session)?;
+        }
+        Ok(())
+    }
     pub(crate) fn scene(&self) -> &SceneSnapshot {
         self.scene
     }
