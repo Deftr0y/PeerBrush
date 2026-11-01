@@ -1,6 +1,8 @@
 //! Immutable native document owners. No live Engine field is switched here.
 #[path = "native/batch.rs"]
 mod batch;
+#[path = "native/history.rs"]
+mod history;
 #[path = "native/intent.rs"]
 mod intent;
 #[path = "native/output.rs"]
@@ -19,6 +21,10 @@ use crate::{
 pub(crate) use batch::{
     CoveragePatch, CoveragePixels, LayerPatch, RasterBatch, RefusedBatch, SelectionPatch,
     SourceUpdate,
+};
+pub(crate) use history::{
+    Direction, HistoryRequest, HistorySnapshot, NativeHistory, PreparedCommit, PreparedMove,
+    Publication, RefusedCommit, RefusedMove, RetiredHistory,
 };
 pub use intent::{Intent, IntentKind};
 pub use output::{OutputDraft, RefusedOutput, StagedOutput};
@@ -292,6 +298,12 @@ impl<'a> Metadata<'a> {
     ) -> impl ExactSizeIterator<Item = LayerMetadata<'a>> + DoubleEndedIterator + 'a {
         let binding = self.1;
         self.0.layers.iter().map(move |l| LayerMetadata(l, binding))
+    }
+    pub fn layer(&self, index: usize) -> Option<LayerMetadata<'a>> {
+        self.0
+            .layers
+            .get(index)
+            .map(|layer| LayerMetadata(layer, self.1))
     }
     pub fn filters(
         &self,
