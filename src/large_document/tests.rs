@@ -453,6 +453,7 @@ fn cancelled_append_keeps_checkpoint_and_marks_unknown_tail_readonly_on_recovery
         .unwrap();
     let selected = snapshot.reference();
     let before = owned_bytes(&store);
+    assert!(!snapshot.has_unconfirmed_tail().unwrap());
     let result = store.put(spec, &[2; 256], &mut || {
         if store.0.file.metadata()?.len() > before.len() as u64 {
             Err(Error::Cancelled)
@@ -461,6 +462,7 @@ fn cancelled_append_keeps_checkpoint_and_marks_unknown_tail_readonly_on_recovery
         }
     });
     assert!(matches!(result, Err(Error::Cancelled)));
+    assert!(snapshot.has_unconfirmed_tail().unwrap());
     assert_eq!(&owned_bytes(&store)[..before.len()], before);
     assert!(matches!(
         store.put(spec, &[3; 256], &mut okay),
@@ -516,6 +518,7 @@ fn cancelled_complete_seal_is_not_silently_promoted_or_replayed() {
     });
     assert!(matches!(result, Err(Error::Cancelled)));
     assert_eq!(store.state().unwrap().head, Some(selected));
+    assert!(snapshot.has_unconfirmed_tail().unwrap());
     drop(snapshot);
     drop(store);
     let recovered = Store::recover(&fixture.root(), selected, budget, limits(), &mut okay).unwrap();

@@ -327,7 +327,8 @@ impl Snapshot {
         self.commit
     }
     pub fn has_unconfirmed_tail(&self) -> Result<bool> {
-        Ok(self.store.state()?.readonly)
+        let state = self.store.state()?;
+        Ok(state.readonly || state.poisoned)
     }
 
     pub fn metadata(&self, check: Check<'_>) -> Result<PinnedBytes> {
