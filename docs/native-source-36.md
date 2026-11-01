@@ -182,3 +182,6 @@ borrowed source/index and complete manifest proofs; row counts cannot construct
 it. A separate whole-source recheck precedes handoff, alongside the caller's file
 identity/lease and engine revision checks. Stream validity still does not prove
 that a styled layer or merged composite equals the current typed scene render.
+A failed source completion stays failed even if the bytes later reappear. The
+successful handoff consumes it and moves the typed metadata with its retained
+charge owner into PendingScene; it does not return a bare uncharged payload.

@@ -1112,5 +1112,126 @@ mod tests {
         assert!(proof
             .recheck(&source, &index, &manifest, sha, &mut scratch, &check)
             .is_err());
+        bytes.borrow_mut()[index.composite.span.offset as usize + 4] ^= 1;
+        assert!(
+            proof
+                .recheck(&source, &index, &manifest, sha, &mut scratch, &check)
+                .is_err(),
+            "A failed completion cannot regain authority after bytes reappear"
+        );
+    }
+
+    #[test]
+    fn verified_typed_metadata_moves_into_the_scene_owner_without_a_bare_payload_escape() {
+        use crate::large_document::ResidentBudget;
+        use crate::psd::{
+            memory36::WorkingSet,
+            read36::{self, VerificationLimits},
+        };
+        #[derive(serde::Serialize, serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct FixtureMetadata {
+            scope: String,
+        }
+        let check = || Ok(());
+        let f = fixture(Format::Psb, 16);
+        let (bulk, standard) = proofs(&f);
+        let (encoded, compressed) = encoded(&f);
+        let mut output = vec![];
+        write(
+            &mut output,
+            f.header,
+            &f.manifest,
+            metadata(),
+            &compressed,
+            &mut encoded.as_slice(),
+            &standard,
+            &bulk,
+            &mut f.layer.as_slice(),
+            &mut f.composite.as_slice(),
+            None,
+            &mut [0; 65536],
+            &check,
+        )
+        .unwrap();
+        let index = structural::index(
+            &mut Cursor::new(&output),
+            structural::Limits::current(),
+            || Ok(()),
+        )
+        .unwrap();
+        let sha = digest(&output);
+        let source = Source::new(Cursor::new(&output), output.len() as u64).unwrap();
+        let resource = index.resources.iter().find(|r| r.peerbrush_source).unwrap();
+        let encoded_span = Span {
+            offset: resource.data.offset + 4,
+            bytes: resource.data.bytes - 4,
+        };
+        let pool = ResidentBudget::new(8 * 1024 * 1024).unwrap();
+        let admitted = manifest36::inflate_admitted(
+            &mut source.range(encoded_span, &check).unwrap(),
+            encoded_span.bytes,
+            metadata(),
+            limits(),
+            WorkingSet {
+                raw_bytes: 16384,
+                canonical_core_bytes: 16384,
+                canonical_manifest_bytes: 16384,
+                typed_metadata_bytes: 65536,
+                tile_scratch_bytes: bulk36::MAX_TILE_BYTES,
+                index_scratch_bytes: 4096,
+            },
+            &pool,
+            &check,
+        )
+        .unwrap();
+        let typed = admitted
+            .map_unique(|manifest, _| {
+                manifest.into_typed::<FixtureMetadata>(
+                    metadata(),
+                    &check,
+                    |metadata, roster, _, revision| {
+                        if metadata.scope != "container framing fixture"
+                            || roster.len() != 1
+                            || revision != 7
+                        {
+                            return Err("Fixture typed binding differs".into());
+                        }
+                        Ok(())
+                    },
+                )
+            })
+            .unwrap();
+        let charged = pool.used();
+        let mut entries = [TileIndexEntry::vacant(); 2];
+        let mut counts = [0];
+        let mut scratch = vec![0; bulk36::MAX_TILE_BYTES];
+        let proof = read36::verify(
+            &source,
+            &index,
+            sha,
+            &typed,
+            VerificationLimits {
+                bulk: limits(),
+                native_streams: 5,
+            },
+            &mut entries,
+            &mut counts,
+            &mut scratch,
+            &check,
+            |_| Ok(()),
+        )
+        .unwrap();
+        let metadata = proof
+            .into_metadata(&source, &index, typed, sha, &mut scratch, &check)
+            .unwrap();
+        drop(scratch);
+        assert_eq!(metadata.scope, "container framing fixture");
+        assert_eq!(pool.used(), charged);
+        let retained = metadata.clone();
+        drop(metadata);
+        assert_eq!(pool.used(), charged);
+        drop(retained);
+        assert_eq!(pool.used(), 0);
     }
 }

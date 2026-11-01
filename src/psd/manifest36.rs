@@ -531,6 +531,11 @@ impl<T> Manifest<T> {
     pub(crate) fn resource_origin(&self) -> Option<(u64, Digest)> {
         self.origin
     }
+    /// Use inside the admitted-owner handoff. This moves the typed payload;
+    /// semantic/file publication authority is deliberately not returned here.
+    pub(super) fn into_metadata(self) -> T {
+        self.core.wire.metadata
+    }
     pub(crate) fn verify_standard<L: Read, C: Read>(
         &self,
         layer: &mut L,
