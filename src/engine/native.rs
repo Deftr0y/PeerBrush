@@ -13,6 +13,8 @@ mod history;
 mod insertion;
 #[path = "native/intent.rs"]
 mod intent;
+#[path = "native/metadata.rs"]
+mod metadata;
 #[path = "native/output.rs"]
 mod output;
 #[path = "native/patch.rs"]
