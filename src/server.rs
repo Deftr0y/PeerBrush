@@ -1,7 +1,7 @@
 mod fonts;
 mod instance;
 mod native_edit;
-pub(crate) use native_edit::{edit_shared, edit_shared_controlled, EditControl};
+pub(crate) use native_edit::{edit_shared, edit_shared_controlled, EditControl, EditReply};
 mod reply;
 mod stream;
 #[cfg(test)]
