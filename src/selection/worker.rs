@@ -47,8 +47,8 @@ pub fn prepare_for_scene(
 ) -> std::result::Result<CoverageSource, String> {
     let metadata = scene.metadata();
     if scene.identity() != expected
-        || request.width != metadata.width
-        || request.height != metadata.height
+        || request.width != metadata.width()
+        || request.height != metadata.height()
         || !store.resident_budget().same_pool(scene.budget())
         || !store.uses_disk_budget(scene.disk_budget())
     {
@@ -63,20 +63,20 @@ pub fn prepare_for_scene(
         None
     } else {
         let coverage = metadata
-            .selection_coverage
-            .as_ref()
-            .filter(|coverage| metadata.selection == Some(coverage.bounds))
+            .selection_coverage()
+            .filter(|coverage| metadata.selection() == Some(coverage.bounds()))
             .map(|coverage| {
-                if coverage.mask.retained.is_some() {
+                let mask = coverage.mask();
+                if mask.retained().is_some() {
                     return Err(
                         "Retained coverage needs its complete native scene source".to_owned()
                     );
                 }
                 CoverageSource::new(
-                    scene.raster(&coverage.mask)?.clone(),
-                    coverage.bounds,
-                    coverage.origin,
-                    &coverage.contours,
+                    scene.raster(mask.slot())?.clone(),
+                    coverage.bounds(),
+                    coverage.origin(),
+                    coverage.contours(),
                     scene.budget(),
                 )
                 .map_err(|e| e.to_string())
@@ -84,9 +84,8 @@ pub fn prepare_for_scene(
             .transpose()?;
         let polygon = if coverage.is_none() {
             metadata
-                .selection_polygon
-                .as_ref()
-                .filter(|points| super::bounds(points).ok() == metadata.selection)
+                .selection_polygon()
+                .filter(|points| super::bounds(points).ok() == metadata.selection())
                 .map(|points| {
                     let bytes = points
                         .len()
@@ -113,7 +112,7 @@ pub fn prepare_for_scene(
             None
         };
         Some(
-            SelectionSource::from_metadata(metadata.selection, polygon, coverage)
+            SelectionSource::from_metadata(metadata.selection(), polygon, coverage)
                 .map_err(|e| e.to_string())?,
         )
     };
@@ -259,6 +258,159 @@ pub fn prepare(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn borrowed_scene_metadata_keeps_matching_soft_coverage_priority_and_identity_guards() {
+        use crate::{
+            engine::{
+                scene::{
+                    Coverage36, Document36, PendingScene, RasterCollector, RasterRef36,
+                    RasterRoster, SceneIdentity, SceneSnapshot,
+                },
+                Document,
+            },
+            large_document::{DiskBudget, Limits, ResidentBudget},
+            psd::memory36::{Admitted, MetadataCharge},
+            raster::{Raster, Surface},
+        };
+        use std::sync::Arc;
+        struct Collector(Vec<Surface>);
+        impl RasterCollector for Collector {
+            fn resident(&mut self, r: &Raster) -> std::result::Result<RasterRef36, String> {
+                self.0
+                    .push(Surface::zero(r.width, r.height, r.depth).unwrap());
+                Ok(RasterRef36 {
+                    id: self.0.len() as u32,
+                    width: r.width,
+                    height: r.height,
+                    depth: r.depth,
+                    retained: None,
+                })
+            }
+            fn surface(&mut self, _: &Surface) -> std::result::Result<RasterRef36, String> {
+                Err("Unexpected fixture source".into())
+            }
+        }
+        let pool = ResidentBudget::new(16 * 1024 * 1024).unwrap();
+        let disk = DiskBudget::new(8 * 1024 * 1024, 4).unwrap();
+        let path = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("peerbrush-selection-scene-{}", crate::engine::id()));
+        let store = Store::create_with_disk_budget(
+            &path,
+            pool.clone(),
+            disk.clone(),
+            Limits {
+                disk_bytes: 8 * 1024 * 1024,
+                max_blocks: 32,
+                max_resident_blocks: 8,
+                manifest_bytes: 65536,
+            },
+        )
+        .unwrap();
+        let source = Document::new_depth(4, 4, 16).unwrap();
+        let mut collector = Collector(Vec::new());
+        let mut metadata = Document36::capture(&source, &mut collector).unwrap();
+        let mut mask = Raster::new_depth(2, 2, 8);
+        mask.set(1, 1, [127, 0, 0, 0]);
+        let coverage = Surface::stage_raster(&mask, store.clone(), &mut || Ok(())).unwrap();
+        let before = coverage.key();
+        collector.0.push(coverage.clone());
+        metadata.selection = Some([0, 0, 2, 2]);
+        metadata.selection_polygon = Some(vec![[0., 0.], [2., 0.], [0., 2.]]);
+        metadata.selection_coverage = Some(Coverage36 {
+            mask: RasterRef36 {
+                id: collector.0.len() as u32,
+                width: 2,
+                height: 2,
+                depth: 8,
+                retained: None,
+            },
+            bounds: [0, 0, 2, 2],
+            origin: [0, 0],
+            contours: Vec::new(),
+        });
+        let identity = SceneIdentity {
+            project_id: "selection-fixture".into(),
+            document_id: source.id.clone(),
+            revision: source.revision,
+        };
+        let charge = MetadataCharge::reserve(&pool, 64 * 1024, &|| Ok(())).unwrap();
+        let scene = SceneSnapshot::new(
+            identity.clone(),
+            PendingScene::new(
+                Admitted::from_parts(Arc::new(metadata), charge),
+                RasterRoster::new(collector.0).unwrap(),
+                pool.clone(),
+                disk.clone(),
+            )
+            .unwrap(),
+            vec![],
+            None,
+            None,
+        )
+        .unwrap();
+        let request = Request {
+            width: 4,
+            height: 4,
+            seeds: &[[0, 0]],
+            quick_radius: None,
+            feather: 0,
+            mode: Combine::Intersect,
+            maximum_work: 1000,
+        };
+        let wrong = SceneIdentity {
+            project_id: "different".into(),
+            ..identity.clone()
+        };
+        assert!(prepare_for_scene(
+            &scene,
+            &wrong,
+            &request,
+            store.clone(),
+            &|| Ok(()),
+            |_| panic!("Wrong identity reached source preparation"),
+            |_, _, _| Ok(true)
+        )
+        .is_err());
+        let candidate = prepare_for_scene(
+            &scene,
+            &identity,
+            &request,
+            store.clone(),
+            &|| Ok(()),
+            |_| Ok(()),
+            |_, _, _| Ok(true),
+        )
+        .unwrap();
+        assert_eq!(candidate.bounds(), [1, 1, 2, 2]);
+        let prepared = candidate
+            .prepare_region(Region::new([0, 0, 4, 4]).unwrap(), &pool, &mut || Ok(()))
+            .unwrap();
+        for y in 0..4 {
+            for x in 0..4 {
+                assert_eq!(
+                    prepared.value(x, y).unwrap(),
+                    if [x, y] == [1, 1] { 127. / 255. } else { 0. }
+                );
+            }
+        }
+        assert_eq!(coverage.key(), before);
+        assert_eq!(
+            coverage
+                .prepare_region(Region::new([1, 1, 2, 2]).unwrap(), &mut || Ok(()))
+                .unwrap()
+                .pixel(1, 1)
+                .unwrap(),
+            [127, 0, 0, 0]
+        );
+        drop(prepared);
+        drop(candidate);
+        drop(scene);
+        drop(coverage);
+        drop(store);
+        assert_eq!(pool.used(), 0);
+        std::fs::remove_dir_all(path).unwrap();
+    }
     use super::*;
     use crate::{
         large_document::{Limits, ResidentBudget},
