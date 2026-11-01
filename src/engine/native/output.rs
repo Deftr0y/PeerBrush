@@ -138,18 +138,31 @@ impl OutputDraft {
         } = self;
         drop(surface);
         drop(seals);
+        let mut error = None;
         for fragment in fragments {
-            session.cleanup_check()?;
-            cleanup()?;
-            session.abort_fragment(fragment, cleanup)?;
+            let result = session
+                .cleanup_check()
+                .and_then(|_| cleanup())
+                .and_then(|_| session.abort_fragment(fragment, cleanup));
+            if let Err(reason) = result {
+                error.get_or_insert(reason);
+            }
         }
         drop(charge);
-        Ok(())
+        error.map_or(Ok(()), Err)
     }
 }
 impl StagedOutput {
     pub fn surface(&self) -> &Surface {
         &self.draft.surface
+    }
+    /// Producer supersession/cancellation retires only owned provisional files.
+    pub(crate) fn abort(
+        self,
+        session: &impl StageSession,
+        cleanup: &dyn Fn() -> Result<()>,
+    ) -> Result<()> {
+        self.draft.abort(session, cleanup)
     }
     /// Final Engine path only, after guards. No callbacks or file operations.
     pub(super) fn mark_published(self) {
