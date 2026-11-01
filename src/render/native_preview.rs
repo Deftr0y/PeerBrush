@@ -9,7 +9,7 @@ use crate::{
     },
     large_document::{Error, PinnedBytes, Reservation, ResidentBudget, ScratchBytes},
     raster::backed::{Region, MAX_REGION_PIXELS},
-    workspace::source_runtime::SourceSession,
+    workspace::source_runtime::SourceReadSession,
 };
 use std::sync::Arc;
 type Result<T> = std::result::Result<T, String>;
@@ -19,19 +19,20 @@ type Result<T> = std::result::Result<T, String>;
 pub(crate) struct Request {
     scene: Arc<SceneSnapshot>,
     prepared: Arc<Prepared>,
-    session: Arc<SourceSession>,
+    session: SourceReadSession,
 }
 impl Request {
     /// Capture and source-session admission run outside Engine/UI locks.
     pub(crate) fn capture(
         scene: Arc<SceneSnapshot>,
-        session: Arc<SourceSession>,
+        session: impl Into<SourceReadSession>,
         rect: Option<[i32; 4]>,
         edge: u32,
         target: Option<&str>,
         mask: bool,
     ) -> Result<Self> {
-        session.check()?;
+        let session = session.into();
+        session.check_scene(&scene)?;
         if !scene.budget().same_pool(&session.resident())
             || !scene.disk_budget().same_pool(&session.disk())
         {

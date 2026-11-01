@@ -604,6 +604,7 @@
     "src/workspace/native_dispatch.rs",
     "src/workspace/source_runtime.rs",
     "src/workspace/source_runtime/checkpoints.rs",
+    "src/workspace/source_runtime/read_session.rs",
     "src/workspace/source_runtime/recovery_marker.rs",
     "src/workspace/source_runtime/segments.rs",
     "src/workspace/source_runtime/staging.rs",
