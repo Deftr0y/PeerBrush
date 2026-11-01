@@ -30,7 +30,7 @@ pub(crate) use recovery_marker::{NativeMarker, NativeMarkerIds};
 #[path = "source_runtime/publication.rs"]
 mod publication;
 pub(crate) use publication::{
-    ArmedPublication, CommittedPublication, PublicationIntent, PublicationPlan,
+    ArmedPublication, CommittedPublication, PublicationIntent, PublicationPlan, RegisteredCreation,
 };
 
 pub(crate) struct Limits {

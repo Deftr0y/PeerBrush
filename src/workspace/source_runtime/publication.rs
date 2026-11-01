@@ -16,8 +16,19 @@ use std::{
     path::Path,
     sync::{atomic::Ordering, Arc},
 };
+#[path = "publication/chain.rs"]
+mod chain;
+#[path = "publication/closed_frame.rs"]
+mod closed_frame;
+#[path = "publication/creation.rs"]
+mod creation;
+#[path = "publication/creation_frame.rs"]
+mod creation_frame;
 #[path = "publication/frame.rs"]
 mod frame;
+#[path = "publication/settlement.rs"]
+mod settlement;
+pub(crate) use creation::RegisteredCreation;
 use frame::{Expected, IntentFrame, NamedFact, Role};
 
 pub(super) struct Registry {
@@ -28,6 +39,14 @@ struct Registered {
     frame: Admitted<IntentFrame>,
     sha256: [u8; 32],
     file: Option<(u64, u64)>,
+    closed: Option<ClosedRegistration>,
+    closing: Option<(u64, u64)>,
+    created: [Option<creation::Created>; 2],
+}
+struct ClosedRegistration {
+    frame: closed_frame::ChargedClosed,
+    sha256: [u8; 32],
+    file: (u64, u64),
 }
 impl Registry {
     pub(super) fn new(maximum: usize) -> Result<Self, String> {
@@ -63,6 +82,9 @@ impl Registry {
             frame,
             sha256,
             file,
+            closed: None,
+            closing: None,
+            created: [None, None],
         });
         Ok(())
     }
@@ -75,14 +97,17 @@ pub(crate) struct PublicationIntent<'a> {
     frame: Admitted<IntentFrame>,
     sha256: [u8; 32],
     ticket: PublicationTicket,
+    readback: std::sync::Mutex<ScratchBytes>,
 }
 pub(crate) struct ArmedPublication<'a> {
     intent: PublicationIntent<'a>,
     prepared: crate::saving::PreparedCommit,
+    closing: settlement::Closing,
 }
 pub(crate) struct CommittedPublication<'a> {
     intent: PublicationIntent<'a>,
     permit: crate::server::FinalizationPermit,
+    closing: Option<settlement::Closing>,
 }
 /// Immutable live-minted binding, independently owned across the Engine fence.
 /// It grants no I/O without the separately retained lease/candidate/session.
@@ -96,6 +121,19 @@ pub(crate) struct PublicationPlan {
     disk: crate::large_document::DiskBudget,
 }
 impl<'a> PublicationIntent<'a> {
+    /// Quota-only abort completion under ordinary admission. The caller may
+    /// ignore a canceled gesture, but never the source session's closing gate.
+    pub(crate) fn abort(
+        self,
+        proof: &dyn crate::file_safety::ExternalOutcomeProof,
+        check: &dyn Fn() -> Result<(), String>,
+    ) -> Result<(), String> {
+        let closing = settlement::Closing::prepare(&self, check)?;
+        closing.finish(&self, proof, &|| {
+            check()?;
+            self.check()
+        })
+    }
     pub(crate) fn check(&self) -> Result<(), String> {
         self.session.check()?;
         self.check_record()
@@ -109,8 +147,10 @@ impl<'a> PublicationIntent<'a> {
         {
             return Err("External intent belongs to another operation or quota pool".into());
         }
-        let mut scratch = ScratchBytes::new(&self.session.resident(), 64 * 1024, 64 * 1024)
-            .map_err(|e| e.to_string())?;
+        let mut scratch = self
+            .readback
+            .try_lock()
+            .map_err(|_| "External intent readback is busy")?;
         // Contention is retryable; it must not latch a corruption diagnosis.
         let state = self
             .session
@@ -233,11 +273,13 @@ impl<'a> PublicationIntent<'a> {
         }
         let identity = candidate.scene().identity();
         let prepared = control.prepare_commit(&identity.document_id, identity.revision)?;
+        let closing = settlement::Closing::prepare(&self, check)?;
         check()?;
         self.check()?;
         Ok(ArmedPublication {
             intent: self,
             prepared,
+            closing,
         })
     }
     pub(crate) fn id(&self) -> [u8; 16] {
@@ -263,6 +305,16 @@ impl<'a> PublicationIntent<'a> {
     }
 }
 impl<'a> ArmedPublication<'a> {
+    pub(crate) fn abort(
+        self,
+        proof: &dyn crate::file_safety::ExternalOutcomeProof,
+        check: &dyn Fn() -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.closing.finish(&self.intent, proof, &|| {
+            check()?;
+            self.intent.check()
+        })
+    }
     /// Success performs no filesystem I/O or allocation. Root invokes this only
     /// inside the final Engine source/save fence; both this value and its saving
     /// preparation are consumed, so it cannot mint a second committed permit.
@@ -278,10 +330,25 @@ impl<'a> ArmedPublication<'a> {
         Ok(CommittedPublication {
             intent: self.intent,
             permit,
+            closing: Some(self.closing),
         })
     }
 }
 impl CommittedPublication<'_> {
+    pub(crate) fn finish(
+        mut self,
+        proof: &dyn crate::file_safety::ExternalOutcomeProof,
+        check: &dyn Fn() -> Result<(), String>,
+    ) -> Result<(), String> {
+        let closing = self
+            .closing
+            .take()
+            .ok_or("Committed settlement already consumed")?;
+        closing.finish(&self.intent, proof, &|| {
+            check()?;
+            self.check()
+        })
+    }
     pub(crate) fn check(&self) -> Result<(), String> {
         self.intent
             .session
@@ -422,6 +489,9 @@ impl SourceSession {
             return Err("External journal uses another resident pool".into());
         }
         let encoded = frame.encode(&self.resident(), check)?;
+        let readback = std::sync::Mutex::new(
+            ScratchBytes::new(&self.resident(), 64 * 1024, 64 * 1024).map_err(|e| e.to_string())?,
+        );
         let sha256 = digest(&SHA256, &encoded).as_ref().try_into().unwrap();
         let facts = facts(&frame, &self.resident(), check)?;
         let ticket = self
@@ -520,6 +590,7 @@ impl SourceSession {
                 frame,
                 sha256,
                 ticket,
+                readback,
             };
             intent.check()?;
             Ok(intent)
@@ -608,12 +679,38 @@ fn capture(
         });
     }
     facts.sort_unstable_by_key(|f| f.fact.identity);
+    let target_key = hash.finish().as_ref().try_into().unwrap();
+    let previous = {
+        let state = session
+            .runtime
+            .inventory
+            .try_lock()
+            .map_err(|_| "Source inventory is busy")?;
+        let inventory = state.as_ref().ok_or("Source inventory unavailable")?;
+        match inventory
+            .publications
+            .entries
+            .iter()
+            .rev()
+            .find(|r| r.frame.target_key == target_key)
+        {
+            Some(entry) => Some(
+                entry
+                    .closed
+                    .as_ref()
+                    .ok_or("Target has a pending external intent; debt retained")?
+                    .sha256,
+            ),
+            None => None,
+        }
+    };
     let frame = IntentFrame {
         id,
         owner,
         operation: session.id,
         target: observed.target().to_owned(),
-        target_key: hash.finish().as_ref().try_into().unwrap(),
+        target_key,
+        previous,
         parent: observed.destination_parent_identity(),
         backups: observed.backup_directory().to_owned(),
         backups_identity: observed.backup_directory_identity(),
@@ -632,6 +729,26 @@ fn capture(
         facts,
     };
     frame.validate()?;
+    if let Some(previous) = frame.previous {
+        let state = session
+            .runtime
+            .inventory
+            .try_lock()
+            .map_err(|_| "Source inventory is busy")?;
+        let entry = state
+            .as_ref()
+            .ok_or("Source inventory unavailable")?
+            .publications
+            .entries
+            .iter()
+            .find(|r| r.closed.as_ref().is_some_and(|c| c.sha256 == previous))
+            .ok_or("Previous closed receipt is missing")?;
+        let closed = entry
+            .closed
+            .as_ref()
+            .ok_or("Previous closed receipt absent")?;
+        chain::continues(&entry.frame, &closed.frame, closed.sha256, &frame)?;
+    }
     Ok(Admitted::from_parts(Arc::new(frame), charge))
 }
 fn convert(f: crate::file_safety::NativeExternalFile) -> ExternalFact {
@@ -669,9 +786,15 @@ pub(super) fn recognized_name(name: &str) -> bool {
             name.strip_prefix("external-intent-")
                 .and_then(|s| s.strip_suffix(".pbi"))
         })
+        .or_else(|| {
+            name.strip_prefix("external-closed-")
+                .and_then(|s| s.strip_suffix(".pbc"))
+        })
         .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+        || creation::parse_name(name).is_some()
 }
-/// Rebuild quota only. Decoded paths are NEVER opened, adopted or modified.
+/// Rebuild quota only. Decoded paths can be observed read-only under the held
+/// profile/instance, but NEVER adopted as writer/deletion/source authority.
 /// Pending frames retain full growth even if a destination write may have won.
 pub(super) fn restore(
     runtime: &SourceRuntime,
@@ -715,23 +838,248 @@ pub(super) fn restore(
             return Err("External intent belongs to another namespace; debt retained".into());
         }
         let sha256 = digest(&SHA256, &bytes).as_ref().try_into().unwrap();
-        let facts = facts(&decoded, &runtime.resident, &|| operation.check())?;
-        runtime
-            .disk
-            .restore_publication(
-                sha256,
-                decoded.target_key,
-                &facts,
-                decoded.expected.map(|e| e.identity),
-                decoded.growth,
-            )
-            .map_err(|e| e.to_string())?;
         held.check()?;
         inventory
             .publications
             .insert(decoded, sha256, Some(held.identity))?;
     }
+    for held in &inventory.files {
+        let Some((id, role)) = held
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(creation::parse_name)
+        else {
+            continue;
+        };
+        let entry = inventory
+            .publications
+            .entries
+            .iter_mut()
+            .find(|r| r.frame.id == id)
+            .ok_or("Creation phase has no valid pending intent")?;
+        operation.check()?;
+        held.check()?;
+        if held.bytes > creation::BYTES as u64 {
+            return Err("Creation phase exceeds strict length".into());
+        }
+        if held.bytes == 0 {
+            continue;
+        }
+        let mut bytes = [0u8; creation::BYTES];
+        let length = held.bytes as usize;
+        let mut file = &held.file;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|_| "Cannot seek creation phase")?;
+        file.read_exact(&mut bytes[..length])
+            .map_err(|_| "Cannot read creation phase")?;
+        if length < creation::BYTES {
+            creation::Record::incomplete(&bytes[..length], &entry.frame, entry.sha256, role)?;
+        } else {
+            let record = creation::Record::decode(&bytes, &entry.frame, entry.sha256)?;
+            if record.role != role {
+                return Err("Creation phase name and body role differ".into());
+            }
+            let slot = match role {
+                crate::file_safety::ExternalCreationRole::Temporary => 0,
+                crate::file_safety::ExternalCreationRole::Backup => 1,
+            };
+            if entry.created[slot]
+                .replace(creation::Created {
+                    record,
+                    file: held.identity,
+                    sha256: digest(&SHA256, &bytes).as_ref().try_into().unwrap(),
+                })
+                .is_some()
+            {
+                return Err("Duplicate physical creation phase retained".into());
+            }
+        }
+        held.check()?;
+    }
+    for held in &inventory.files {
+        let Some(id) = held
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_prefix("external-closed-"))
+            .and_then(|n| n.strip_suffix(".pbc"))
+        else {
+            continue;
+        };
+        let id = *uuid::Uuid::parse_str(id)
+            .map_err(|_| "Invalid closed receipt name")?
+            .as_bytes();
+        let entry = inventory
+            .publications
+            .entries
+            .iter_mut()
+            .find(|r| r.frame.id == id)
+            .ok_or("Closed receipt has no valid pending intent; retained")?;
+        if entry.closing.replace(held.identity).is_some() || held.bytes > closed_frame::BYTES as u64
+        {
+            return Err("Closed receipt registration is ambiguous".into());
+        }
+        operation.check()?;
+        held.check()?;
+        if held.bytes == 0 {
+            continue;
+        }
+        let mut bytes =
+            ScratchBytes::new(&runtime.resident, held.bytes as usize, closed_frame::BYTES)
+                .map_err(|e| e.to_string())?;
+        let mut file = &held.file;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|_| "Cannot seek closed receipt")?;
+        for chunk in bytes.chunks_mut(65536) {
+            operation.check()?;
+            held.check()?;
+            file.read_exact(chunk)
+                .map_err(|_| "Cannot read held closed receipt")?;
+        }
+        if held.bytes < closed_frame::BYTES as u64 {
+            closed_frame::ClosedFrame::incomplete(&bytes, &entry.frame, entry.sha256)?;
+        } else {
+            let frame = closed_frame::ClosedFrame::decode(
+                &bytes,
+                &entry.frame,
+                entry.sha256,
+                &runtime.resident,
+                &|| operation.check(),
+            )?;
+            creation::validate_closed(entry, &frame)?;
+            entry.closed = Some(ClosedRegistration {
+                frame,
+                sha256: digest(&SHA256, &bytes).as_ref().try_into().unwrap(),
+                file: held.identity,
+            });
+        }
+        held.check()?;
+    }
+    let ordered = chain_order(&inventory.publications, &runtime.resident, &|| {
+        operation.check()
+    })?;
+    settlement::census(&inventory.publications, &ordered.latest, &|| {
+        operation.check()
+    })?;
+    for at in &ordered.latest {
+        let entry = &inventory.publications.entries[*at];
+        if let Some(closed) = &entry.closed {
+            settlement::reobserve(&entry.frame, &closed.frame, &|| operation.check())?;
+            let charge = MetadataCharge::reserve(
+                &runtime.resident,
+                closed.frame.bindings.len() * 2 * std::mem::size_of::<ExternalFact>() + 128,
+                &|| operation.check(),
+            )?;
+            let mut current = Vec::new();
+            current
+                .try_reserve_exact(closed.frame.bindings.len())
+                .map_err(|_| "Restored external facts allocation refused")?;
+            current.extend(closed.frame.bindings.iter().map(|b| b.fact));
+            runtime
+                .disk
+                .restore_external(
+                    entry.sha256,
+                    entry.frame.target_key,
+                    &current,
+                    entry.frame.growth,
+                )
+                .map_err(|e| e.to_string())?;
+            drop(current);
+            drop(charge);
+        } else {
+            let facts = facts(&entry.frame, &runtime.resident, &|| operation.check())?;
+            runtime
+                .disk
+                .restore_publication(
+                    entry.sha256,
+                    entry.frame.target_key,
+                    &facts,
+                    entry.frame.expected.map(|e| e.identity),
+                    entry.frame.growth,
+                )
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    for entry in &inventory.publications.entries {
+        if entry.closed.is_some() {
+            runtime
+                .disk
+                .retain_settled_intent(entry.sha256, entry.frame.growth)
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    reorder(
+        &mut inventory.publications,
+        &ordered.entries,
+        &runtime.resident,
+        &|| operation.check(),
+    )?;
     Ok(())
+}
+fn reorder(
+    registry: &mut Registry,
+    order: &[usize],
+    pool: &crate::large_document::ResidentBudget,
+    check: &dyn Fn() -> Result<(), String>,
+) -> Result<(), String> {
+    let owner = MetadataCharge::reserve(
+        pool,
+        registry
+            .maximum
+            .checked_mul(3 * std::mem::size_of::<Option<Registered>>())
+            .and_then(|n| n.checked_add(128))
+            .ok_or("External reorder footprint overflow")?,
+        check,
+    )?;
+    let mut slots = Vec::new();
+    slots
+        .try_reserve_exact(registry.entries.len())
+        .map_err(|_| "External reorder allocation refused")?;
+    let mut ordered = Vec::new();
+    ordered
+        .try_reserve_exact(registry.maximum)
+        .map_err(|_| "External ordered registry allocation refused")?;
+    slots.extend(registry.entries.drain(..).map(Some));
+    for at in order {
+        ordered.push(
+            slots
+                .get_mut(*at)
+                .and_then(Option::take)
+                .ok_or("External reorder index differs")?,
+        );
+    }
+    if slots.iter().any(Option::is_some) {
+        return Err("External reorder omitted records".into());
+    }
+    let old = std::mem::replace(&mut registry.entries, ordered);
+    drop(old);
+    drop(slots);
+    drop(owner);
+    Ok(())
+}
+fn chain_order(
+    registry: &Registry,
+    pool: &crate::large_document::ResidentBudget,
+    check: &dyn Fn() -> Result<(), String>,
+) -> Result<Admitted<chain::Order>, String> {
+    let owner = MetadataCharge::reserve(
+        pool,
+        registry.entries.len() * 2 * std::mem::size_of::<chain::Node<'_>>() + 128,
+        check,
+    )?;
+    let mut nodes = Vec::new();
+    nodes
+        .try_reserve_exact(registry.entries.len())
+        .map_err(|_| "External chain view allocation refused")?;
+    nodes.extend(registry.entries.iter().map(|r| chain::Node {
+        frame: &r.frame,
+        closed: r.closed.as_ref().map(|c| (&*c.frame, c.sha256)),
+    }));
+    let ordered = chain::order(&nodes, pool, check)?;
+    drop(nodes);
+    drop(owner);
+    Ok(ordered)
 }
 
 #[cfg(test)]
