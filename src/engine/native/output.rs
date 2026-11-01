@@ -15,6 +15,10 @@ pub struct OutputDraft {
 pub struct StagedOutput {
     draft: OutputDraft,
 }
+struct Retirement {
+    fragments: Vec<FreshFragment>,
+    _charge: Option<Reservation>,
+}
 #[must_use]
 pub struct RefusedOutput {
     reason: String,
@@ -111,7 +115,7 @@ impl OutputDraft {
             .try_reserve_exact(stores.len())
             .map_err(|_| "Generated checkpoint allocation refused")?;
         for (_, (store, mut refs)) in stores {
-            refs.sort_unstable_by_key(|r| r.digest());
+            refs.sort_unstable_by_key(|r| r.fingerprint());
             refs.dedup();
             self.seals.push(session.seal_store(
                 &store,
@@ -130,6 +134,9 @@ impl OutputDraft {
         session: &impl StageSession,
         cleanup: &dyn Fn() -> Result<()>,
     ) -> Result<()> {
+        self.into_retirement().abort(session, cleanup)
+    }
+    fn into_retirement(self) -> Retirement {
         let Self {
             surface,
             seals,
@@ -138,8 +145,16 @@ impl OutputDraft {
         } = self;
         drop(surface);
         drop(seals);
+        Retirement {
+            fragments,
+            _charge: charge,
+        }
+    }
+}
+impl Retirement {
+    fn abort(self, session: &impl StageSession, cleanup: &dyn Fn() -> Result<()>) -> Result<()> {
         let mut error = None;
-        for fragment in fragments {
+        for fragment in self.fragments {
             let result = session
                 .cleanup_check()
                 .and_then(|_| cleanup())
@@ -148,9 +163,30 @@ impl OutputDraft {
                 error.get_or_insert(reason);
             }
         }
-        drop(charge);
         error.map_or(Ok(()), Err)
     }
+}
+/// Release every output view/checkpoint before the first unique-owner retire.
+pub(super) fn abort_outputs(
+    outputs: Vec<StagedOutput>,
+    session: &impl StageSession,
+    cleanup: &dyn Fn() -> Result<()>,
+) -> Result<()> {
+    let mut retired = Vec::new();
+    // Every sealed output retains its 4KiB metadata envelope through this array.
+    retired
+        .try_reserve_exact(outputs.len())
+        .map_err(|_| "Native retirement allocation refused; provisional bytes remain charged")?;
+    for output in outputs {
+        retired.push(output.draft.into_retirement());
+    }
+    let mut error = None;
+    for retirement in retired {
+        if let Err(reason) = retirement.abort(session, cleanup) {
+            error.get_or_insert(reason);
+        }
+    }
+    error.map_or(Ok(()), Err)
 }
 impl StagedOutput {
     pub fn surface(&self) -> &Surface {
@@ -286,6 +322,25 @@ pub(super) mod tests {
         assert_eq!(staged.draft.seals.len(), 1);
         staged.into_draft().abort(&Session, &|| Ok(())).unwrap();
         assert_eq!(base.disk_budget().used().unwrap(), 0);
+        std::fs::remove_dir(path).unwrap();
+    }
+    #[test]
+    fn all_shared_store_output_views_drop_before_unique_fragment_retirement() {
+        let pool = ResidentBudget::new(8 * 1024 * 1024).unwrap();
+        let base = super::super::tests::document(&pool);
+        let (first, path) = draft(&base);
+        let second = OutputDraft::new(first.surface.clone(), vec![]);
+        let first = first
+            .seal(&base, &Session, &|| Ok(()))
+            .unwrap_or_else(|e| panic!("{}", e.reason()));
+        let second = second
+            .seal(&base, &Session, &|| Ok(()))
+            .unwrap_or_else(|e| panic!("{}", e.reason()));
+        let baseline = pool.used();
+        assert!(base.disk_budget().used().unwrap() > 0);
+        abort_outputs(vec![first, second], &Session, &|| Ok(())).unwrap();
+        assert_eq!(base.disk_budget().used().unwrap(), 0);
+        assert!(pool.used() < baseline);
         std::fs::remove_dir(path).unwrap();
     }
 }
