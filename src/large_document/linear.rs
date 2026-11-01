@@ -106,6 +106,74 @@ pub(super) struct Owned {
     disk: DiskReservation,
 }
 impl Owned {
+    pub(super) fn create(
+        root: &Path,
+        filename: &str,
+        header: &[u8],
+        admitted: u64,
+        disk: DiskBudget,
+    ) -> Result<Self> {
+        if !root.is_absolute() || root.file_name().is_none() || admitted < header.len() as u64 {
+            return Err(Error::Invalid(
+                "Linear temporary requires a fresh absolute owned namespace",
+            ));
+        }
+        validate_ancestors(root.parent().ok_or(Error::Changed)?)?;
+        let charge = disk.reserve(admitted)?;
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(root)?;
+        let directory = open_directory(root)?;
+        let directory_id = crate::file_safety::identity(&directory).map_err(|_| Error::Changed)?;
+        let path = root.join(filename);
+        let mut options = source_options();
+        options.create_new(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // DELETE is needed to retire this owned handle without unlinking a
+            // foreign replacement at the original name.
+            options.access_mode(0xC0010000);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(&path)?;
+        file.try_lock().map_err(|_| Error::Busy)?;
+        charge.bind(&file)?;
+        let identity = crate::file_safety::identity(&file).map_err(|_| Error::Changed)?;
+        write_all_at(&file, 0, header)?;
+        file.sync_all()?;
+        crate::server::sync_parent(&path).map_err(|_| Error::Changed)?;
+        let owned = Self {
+            root: root.into(),
+            directory,
+            directory_id,
+            path,
+            identity,
+            expected: stamp(&file)?,
+            file,
+            disk: charge,
+        };
+        owned.check()?;
+        Ok(owned)
+    }
+    pub(super) fn filesystem_identity(&self) -> ((u64, u64), (u64, u64)) {
+        (self.directory_id, self.identity)
+    }
+    pub(super) fn disk_budget(&self) -> DiskBudget {
+        self.disk.budget()
+    }
+    pub(super) fn grow(&self, bytes: u64) -> Result<()> {
+        self.disk.grow(bytes)
+    }
+
     pub(super) fn check(&self) -> Result<()> {
         self.check_identity()?;
         if stamp(&self.file)? != self.expected {
@@ -113,7 +181,7 @@ impl Owned {
         }
         Ok(())
     }
-    fn check_identity(&self) -> Result<()> {
+    pub(super) fn check_identity(&self) -> Result<()> {
         validate_ancestors(&self.root)?;
         regular(&self.path)?;
         let dir = open_directory(&self.root)?;
@@ -170,35 +238,6 @@ impl Scratch {
         }
         validate_ancestors(root.parent().ok_or(Error::Changed)?)?;
         let index = ScratchBytes::new(&budget, spec.chunks() * 32, 64 * 1024 * 1024)?;
-        let charge = disk.reserve(spec.encoded_bytes())?;
-        let mut builder = fs::DirBuilder::new();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
-        }
-        builder.create(root)?;
-        let directory = open_directory(root)?;
-        let directory_id = crate::file_safety::identity(&directory).map_err(|_| Error::Changed)?;
-        let path = root.join(spec.kind.filename());
-        let mut options = source_options();
-        options.create_new(true);
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::OpenOptionsExt;
-            // DELETE is needed to retire this owned handle without unlinking a
-            // foreign replacement at the original name.
-            options.access_mode(0xC0010000);
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let file = options.open(&path)?;
-        file.try_lock().map_err(|_| Error::Busy)?;
-        charge.bind(&file)?;
-        let identity = crate::file_safety::identity(&file).map_err(|_| Error::Changed)?;
         let mut header = [0; 64];
         header[..8].copy_from_slice(spec.kind.magic());
         ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut header[8..24])
@@ -214,20 +253,13 @@ impl Scratch {
         header[40..48].copy_from_slice(&spec.payload_bytes().to_be_bytes());
         header[48..56].copy_from_slice(&(spec.chunks() as u64).to_be_bytes());
         header[56..64].copy_from_slice(&(CHUNK as u64).to_be_bytes());
-        write_all_at(&file, 0, &header)?;
-        file.sync_all()?;
-        crate::server::sync_parent(&path).map_err(|_| Error::Changed)?;
-        let owned = Owned {
-            root: root.into(),
-            directory,
-            directory_id,
-            path,
-            identity,
-            expected: stamp(&file)?,
-            file,
-            disk: charge,
-        };
-        owned.check()?;
+        let owned = Owned::create(
+            root,
+            spec.kind.filename(),
+            &header,
+            spec.encoded_bytes(),
+            disk,
+        )?;
         let content = spec.kind.content_start(&header);
         let chunk = chunk_start(&header, 0);
         Ok(Self {
@@ -590,6 +622,10 @@ impl Complete {
         }
         check()?;
         self.owned.check()?;
+        if output.is_empty() {
+            check()?;
+            return self.owned.check();
+        }
         self.copy_range(
             start,
             start + output.len() as u64,
@@ -753,7 +789,7 @@ pub(super) fn retire(owner: Arc<Complete>, check: Check<'_>) -> Result<()> {
     retire_owned(complete.owned, check)
 }
 
-fn retire_owned(owned: Owned, check: Check<'_>) -> Result<()> {
+pub(super) fn retire_owned(owned: Owned, check: Check<'_>) -> Result<()> {
     check()?;
     owned.check()?;
     check()?;

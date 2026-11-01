@@ -12,6 +12,7 @@ mod linear;
 mod planar;
 pub(crate) mod root;
 mod scalar;
+pub(crate) mod segments;
 mod store;
 
 pub use budget::{Reservation, ResidentBudget};
