@@ -13,7 +13,7 @@ mod bounds;
 pub(crate) use bounds::source_bounds;
 #[path = "native/output.rs"]
 mod output;
-pub(crate) use output::write_plane;
+pub(crate) use output::{write_fill, write_plane};
 
 enum Kind {
     Affine { matrix: [f64; 6], determinant: f64 },
@@ -533,6 +533,61 @@ mod tests {
         raster::Raster,
     };
     use std::sync::Arc;
+
+    #[test]
+    fn generated_fill_originals_match_native_set_and_physical_padding() {
+        for depth in [8, 16] {
+            let pool = ResidentBudget::new(16 * 1024 * 1024).unwrap();
+            let (store, _, path) = fixture(&pool);
+            for color in [[31, 127, 243, 0], [13, 79, 211, 127], [0; 4]] {
+                let output = write_fill(
+                    [257, 3],
+                    depth,
+                    color,
+                    &store,
+                    &mut Work::new(1_000_000).unwrap(),
+                    &|| Ok(()),
+                )
+                .unwrap();
+                let mut expected = Raster::new_depth(257, 3, depth);
+                for y in 0..3 {
+                    for x in 0..257 {
+                        expected.set(x, y, color);
+                    }
+                }
+                for x in 0..2 {
+                    let bytes = output
+                        .prepare_tile((x, 0), &mut || Ok(()))
+                        .unwrap()
+                        .copy_to_scratch(&pool)
+                        .unwrap()
+                        .freeze();
+                    assert_tile(
+                        &Tile {
+                            source: output.key(),
+                            coordinate: (x, 0),
+                            frame: [257, 3],
+                            depth,
+                            bytes,
+                        },
+                        &expected,
+                    );
+                }
+            }
+            assert!(write_fill(
+                [257, 3],
+                depth,
+                [31, 127, 243, 0],
+                &store,
+                &mut Work::new(1).unwrap(),
+                &|| Ok(())
+            )
+            .is_err());
+            drop(store);
+            assert_eq!(pool.used(), 0);
+            std::fs::remove_dir_all(path).unwrap();
+        }
+    }
 
     #[test]
     fn whole_plane_output_preserves_native_tiles_and_retires_zero_and_refused_candidates() {
