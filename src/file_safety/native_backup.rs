@@ -8,8 +8,35 @@ impl NativeInventory<'_> {
     /// external backup/output bytes. This guard authenticates actual files; it
     /// neither creates that journal nor grants final destination publication.
     /// Uncertain partial files remain present and charged by that admission.
+    #[cfg(test)]
     pub(crate) fn preserve_current(
         &mut self,
+        check: &dyn Fn() -> Result<(), String>,
+    ) -> Result<Option<PathBuf>, String> {
+        let key = destination_key(self.lease.path());
+        let name = OsString::from(format!(
+            "{:016x}{:016x}-{}.{}", key[0], key[1], crate::engine::id(),
+            self.lease.path().extension().unwrap_or_default().to_string_lossy()
+        ));
+        self.preserve_with_name(name, check)
+    }
+    pub(in crate::file_safety) fn preserve_planned(
+        &mut self,
+        plan: &super::super::native_outcome::BackupPlan,
+        check: &dyn Fn() -> Result<(), String>,
+    ) -> Result<Option<PathBuf>, String> {
+        if plan.target() != self.lease.path() || plan.expected() != self.lease.expected() {
+            return Err("Native backup plan belongs to another destination version".into());
+        }
+        match (self.lease.expected(), plan.name()) {
+            (None, None) => { self.validate(check)?; Ok(None) }
+            (Some(_), Some(name)) => self.preserve_with_name(name.into(), check),
+            _ => Err("Native backup name differs from the admitted source".into()),
+        }
+    }
+    fn preserve_with_name(
+        &mut self,
+        name: OsString,
         check: &dyn Fn() -> Result<(), String>,
     ) -> Result<Option<PathBuf>, String> {
         self.validate(check)?;
@@ -26,18 +53,19 @@ impl NativeInventory<'_> {
         }
         let mut buffer =
             ScratchBytes::new(&self.budget, 65536, 65536).map_err(|e| e.to_string())?;
-        let key = destination_key(self.lease.path());
-        let name = OsString::from(format!(
-            "{:016x}{:016x}-{}.{}",
-            key[0],
-            key[1],
-            crate::engine::id(),
-            self.lease
-                .path()
-                .extension()
-                .unwrap_or_default()
-                .to_string_lossy()
-        ));
+        if name.as_encoded_bytes().len() > 1024
+            || !matches!((Path::new(&name).components().next(), Path::new(&name).components().nth(1)),
+                (Some(std::path::Component::Normal(_)), None))
+        {
+            return Err("Native backup plan contains an invalid component".into());
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
+            if name.encode_wide().any(|unit| unit == 0 || unit == b':' as u16) {
+                return Err("Native backup plan contains a stream alias".into());
+            }
+        }
         let path = self.directory.join(&name);
         let mut source = open_native_read(self.lease.path()).map_err(|e| e.to_string())?;
         if identity(&source)? != expected.identity {

@@ -1,6 +1,24 @@
 //! Closed filesystem outcome boundary for external-disk accounting.
 //! Raw fact records and journal checksums never implement this authority.
 use super::NativeExternalFile;
+use std::{ffi::{OsStr, OsString}, path::{Path, PathBuf}};
+
+/// Internal name binding; only the closed writer can mint a production value
+/// from the durable publication plan. A raw name is never backup authority.
+pub(super) struct BackupPlan {
+    target: PathBuf,
+    expected: Option<super::Version>,
+    name: Option<OsString>,
+}
+impl BackupPlan {
+    pub(super) fn target(&self) -> &Path { &self.target }
+    pub(super) fn expected(&self) -> Option<super::Version> { self.expected }
+    pub(super) fn name(&self) -> Option<&OsStr> { self.name.as_deref() }
+    #[cfg(test)]
+    pub(super) fn for_tests(target: PathBuf, expected: Option<super::Version>, name: Option<OsString>) -> Self {
+        Self { target, expected, name }
+    }
+}
 
 mod sealed {
     pub trait RootOutcome {}
