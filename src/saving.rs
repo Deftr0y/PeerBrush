@@ -3,6 +3,21 @@ use std::sync::{Arc, Mutex};
 
 #[derive(Clone)]
 pub struct Control(Arc<Mutex<State>>);
+/// Prepared outside the final Engine fence; successful consumption allocates
+/// nothing and retains the exact begun request identity.
+pub(crate) struct PreparedCommit {
+    control: Control,
+    document: String,
+    run: String,
+    revision: u64,
+    stage: String,
+}
+pub(crate) struct CommittedControl {
+    control: Control,
+    document: String,
+    run: String,
+    revision: u64,
+}
 struct State {
     started: bool,
     status: Status,
@@ -40,6 +55,38 @@ impl Default for Control {
     }
 }
 impl Control {
+    pub(crate) fn prepare_commit(
+        &self,
+        document: &str,
+        revision: u64,
+    ) -> Result<PreparedCommit, String> {
+        let state = self.0.lock().map_err(|_| "Save state is unavailable")?;
+        if document.is_empty()
+            || !state.started
+            || state.status.document_id != document
+            || state.status.revision != revision
+            || state.status.finished
+            || !state.status.can_cancel
+            || state.status.cancel_requested
+        {
+            return Err("Save request cannot arm this source publication".into());
+        }
+        fn copy(value: &str) -> Result<String, String> {
+            let mut result = String::new();
+            result
+                .try_reserve_exact(value.len())
+                .map_err(|_| "Save fence allocation refused")?;
+            result.push_str(value);
+            Ok(result)
+        }
+        Ok(PreparedCommit {
+            control: self.clone(),
+            document: copy(document)?,
+            run: copy(&state.status.run)?,
+            revision,
+            stage: copy("Finishing save")?,
+        })
+    }
     pub(crate) fn begin(&self, document: String, revision: u64) -> Result<(), String> {
         let mut state = self.0.lock().unwrap();
         if state.started {
@@ -136,9 +183,111 @@ impl Control {
     }
 }
 
+impl PreparedCommit {
+    /// The caller serializes its source-operation closing gate around this.
+    /// All success-path strings and owners were allocated during preparation.
+    pub(crate) fn commit(self, control: &Control) -> Result<CommittedControl, &'static str> {
+        if !self.control.same(control) {
+            return Err("Publication was armed for another save request");
+        }
+        let mut state = control.0.lock().map_err(|_| "Save state is unavailable")?;
+        if !state.started
+            || state.status.document_id != self.document
+            || state.status.revision != self.revision
+            || state.status.run != self.run
+            || state.status.finished
+            || !state.status.can_cancel
+            || state.status.cancel_requested
+        {
+            return Err("Save publication lost cancellation or request ownership");
+        }
+        state.status.can_cancel = false;
+        state.status.stage = self.stage;
+        state.status.completed = 0;
+        state.status.total = 0;
+        drop(state);
+        Ok(CommittedControl {
+            control: self.control,
+            document: self.document,
+            run: self.run,
+            revision: self.revision,
+        })
+    }
+}
+impl CommittedControl {
+    pub(crate) fn check(&self) -> Result<(), String> {
+        let state = self
+            .control
+            .0
+            .lock()
+            .map_err(|_| "Save state is unavailable")?;
+        if !state.started
+            || state.status.document_id != self.document
+            || state.status.revision != self.revision
+            || state.status.run != self.run
+            || state.status.finished
+            || state.status.can_cancel
+            || state.status.cancel_requested
+        {
+            return Err("Committed save request no longer owns finalization".into());
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepared_publication_rejects_unstarted_foreign_finished_stale_and_reused_controls() {
+        let control = Control::default();
+        assert!(control.prepare_commit("source", 7).is_err());
+        control.begin("source".into(), 7).unwrap();
+        assert!(control.prepare_commit("other", 7).is_err());
+        assert!(control.prepare_commit("source", 8).is_err());
+        let prepared = control.prepare_commit("source", 7).unwrap();
+        let foreign = Control::default();
+        foreign.begin("source".into(), 7).unwrap();
+        assert!(prepared.commit(&foreign).is_err());
+        assert!(control.status().can_cancel);
+        assert!(foreign.status().can_cancel);
+        let prepared = control.prepare_commit("source", 7).unwrap();
+        let stale = control.prepare_commit("source", 7).unwrap();
+        let committed = prepared.commit(&control).unwrap();
+        committed.check().unwrap();
+        assert!(stale.commit(&control).is_err());
+        assert!(control.prepare_commit("source", 7).is_err());
+        assert!(!control.cancel());
+        control.finish(&Ok(()));
+        assert!(committed.check().is_err());
+        assert!(control.prepare_commit("source", 7).is_err());
+        let cancelled = Control::default();
+        cancelled.begin("source".into(), 7).unwrap();
+        let prepared = cancelled.prepare_commit("source", 7).unwrap();
+        assert!(cancelled.cancel());
+        assert!(prepared.commit(&cancelled).is_err());
+    }
+
+    #[test]
+    fn prepared_commit_and_cancel_have_exactly_one_winner() {
+        for _ in 0..32 {
+            let control = Control::default();
+            control.begin("source".into(), 7).unwrap();
+            let prepared = control.prepare_commit("source", 7).unwrap();
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let cancel = control.clone();
+            let worker_barrier = barrier.clone();
+            let worker = std::thread::spawn(move || {
+                worker_barrier.wait();
+                cancel.cancel()
+            });
+            barrier.wait();
+            let committed = prepared.commit(&control).is_ok();
+            assert_ne!(worker.join().unwrap(), committed);
+            assert!(!control.status().can_cancel);
+        }
+    }
 
     #[test]
     fn publication_blocks_mutations_until_success_or_failure_without_blocking_reads() {
