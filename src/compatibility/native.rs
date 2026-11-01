@@ -6,7 +6,7 @@ use crate::{
         native::NativeDocument,
         scene::{SceneIdentity, SceneSnapshot},
     },
-    psd::{scene_save36::ScenePlan, standard36::RowSource, structural::Format},
+    psd::{scene_save36::ScenePlan, standard36::RowSource},
 };
 
 pub(super) fn report(
@@ -116,7 +116,7 @@ pub(super) fn report(
         None,
         None,
     )?;
-    let plan = ScenePlan::new(&scene, Format::Psb, &[], check)?;
+    let plan = ScenePlan::for_report(&scene, check)?;
     let records = plan.standard().records();
     report.standard_records = records.len();
     report.standard_layer_count = records.iter().filter(|r| r.section != 3).count();
