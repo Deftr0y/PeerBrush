@@ -3,6 +3,8 @@
 mod admission;
 #[path = "native/batch.rs"]
 mod batch;
+#[path = "native/descriptor.rs"]
+mod descriptor;
 #[path = "native/effect_patch.rs"]
 mod effect_patch;
 #[path = "native/history.rs"]
@@ -13,6 +15,8 @@ mod intent;
 mod output;
 #[path = "native/patch.rs"]
 mod patch;
+#[path = "native/scopes.rs"]
+mod scopes;
 use super::scene::{Document36, Layer36, PendingScene, RasterRef36, RasterRoster, Result};
 use crate::{
     large_document::{DiskBudget, ResidentBudget, ScratchBytes},
@@ -26,6 +30,7 @@ pub(crate) use batch::{
     CoveragePatch, CoveragePixels, LayerPatch, RasterBatch, RefusedBatch, SelectionPatch,
     SourceUpdate,
 };
+pub(crate) use descriptor::{Command, CommandDescriptor, CommandToken, Method};
 pub(crate) use effect_patch::{EffectClipPatch, EffectPatch};
 pub(crate) use history::{
     Direction, HistoryRequest, HistorySnapshot, NativeHistory, PreparedCommit, PreparedMove,
@@ -585,6 +590,17 @@ impl PreparedDelta {
     }
 }
 impl CapturedEdit {
+    pub(crate) fn descriptor(&self) -> Option<&CommandDescriptor> {
+        self.admission
+            .as_ref()
+            .and_then(|admission| admission.descriptor())
+    }
+    fn planned_intent(&self, intent: Intent) -> Result<Intent> {
+        match self.admission.as_ref() {
+            Some(admission) => admission.planned_intent(&self.base, intent),
+            None => Ok(intent),
+        }
+    }
     pub fn base_key(&self) -> DocumentKey {
         self.base.key()
     }
@@ -617,7 +633,26 @@ impl CapturedEdit {
             .iter()
             .position(|l| l.id == layer)
             .ok_or("Unknown native layer")?;
-        let intent = Intent::visibility(layer, visible, self.base.budget())?;
+        if let Some(descriptor) = self.descriptor() {
+            let command = descriptor
+                .commands()
+                .next()
+                .ok_or("Missing normalized visibility command")?;
+            if descriptor.commands().len() != 1
+                || command.parameters()["op"] != "layer.update"
+                || command.parameters()["layer"] != layer
+                || command.parameters()["visible"] != visible
+                || !command.parameters().as_object().is_some_and(|object| {
+                    object
+                        .keys()
+                        .all(|key| ["op", "layer", "visible"].contains(&key.as_str()))
+                })
+            {
+                return Err("Visibility preparation differs from its normalized command".into());
+            }
+        }
+        let intent =
+            self.planned_intent(Intent::visibility(layer, visible, self.base.budget())?)?;
         // The shared engine permits visibility-only changes on locked layers.
         let copied = copy_metadata(&self.base.core.metadata, self.base.budget(), check)?;
         let roster = self.base.core.roster.clone();
@@ -664,6 +699,11 @@ impl CapturedEdit {
         };
         let check = &checked;
         check()?;
+        if self.descriptor().is_some() {
+            return Err(
+                "Use the normalized native metadata dispatcher for reorder commands".into(),
+            );
+        }
         if order.len() != self.base.core.metadata.layers.len()
             || self
                 .base

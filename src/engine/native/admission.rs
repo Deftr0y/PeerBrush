@@ -8,14 +8,16 @@ use crate::{
 pub(super) struct EditAdmission {
     actor: String,
     base: DocumentKey,
-    scopes: Intent,
+    scopes: Arc<Intent>,
+    descriptor: Option<Arc<CommandDescriptor>>,
     _charge: Reservation,
 }
 impl NativeDocument {
     /// Call while observing the authoritative Engine and its current write fence.
     /// Only bounded metadata/owner allocation occurs; workers begin source I/O
     /// later through their independently retained SourceSession admission.
-    pub(crate) fn capture_intent(
+    #[cfg(test)]
+    pub(super) fn capture_intent(
         &self,
         expected: DocumentKey,
         revision: u64,
@@ -25,6 +27,64 @@ impl NativeDocument {
         now: u64,
         closed: bool,
         write_available: bool,
+    ) -> Result<CapturedEdit> {
+        self.capture_impl(
+            expected,
+            revision,
+            actor,
+            scopes,
+            leases,
+            now,
+            closed,
+            write_available,
+            false,
+            None,
+        )
+    }
+    pub(crate) fn capture_descriptor(
+        &self,
+        descriptor: Arc<CommandDescriptor>,
+        actor: &str,
+        leases: &[Lease],
+        now: u64,
+        closed: bool,
+        write_available: bool,
+    ) -> Result<CapturedEdit> {
+        if !descriptor.uses_budget(self.budget()) {
+            return Err("Native command descriptor uses another admission".into());
+        }
+        let mut edit = self.capture_impl(
+            descriptor.generation(),
+            descriptor.revision(),
+            actor,
+            descriptor.scopes(),
+            leases,
+            now,
+            closed,
+            write_available,
+            true,
+            Some(descriptor.shared_scopes()),
+        )?;
+        let admission = edit
+            .admission
+            .as_mut()
+            .and_then(Arc::get_mut)
+            .ok_or("Native capture admission unexpectedly shared")?;
+        admission.descriptor = Some(descriptor);
+        Ok(edit)
+    }
+    fn capture_impl(
+        &self,
+        expected: DocumentKey,
+        revision: u64,
+        actor: &str,
+        scopes: &[Scope],
+        leases: &[Lease],
+        now: u64,
+        closed: bool,
+        write_available: bool,
+        engine_derived: bool,
+        shared_scopes: Option<Arc<Intent>>,
     ) -> Result<CapturedEdit> {
         if closed || !write_available {
             return Err("Native editor capture is closed or write-fenced".into());
@@ -39,9 +99,11 @@ impl NativeDocument {
             return Err("Invalid native editor actor or scope count".into());
         }
         for scope in scopes {
-            if scope.rect.is_some_and(|r| {
-                r.iter().any(|v| v.unsigned_abs() > 100000) || r[0] > r[2] || r[1] > r[3]
-            }) {
+            if !engine_derived
+                && scope.rect.is_some_and(|r| {
+                    r.iter().any(|v| v.unsigned_abs() > 100000) || r[0] > r[2] || r[1] > r[3]
+                })
+            {
                 return Err("Invalid native editor scope rectangle".into());
             }
             if let Some(target) = &scope.target {
@@ -58,7 +120,14 @@ impl NativeDocument {
                 }
             }
         }
-        let scopes = Intent::from_scopes(IntentKind::Capture, scopes, self.budget())?;
+        let scopes = match shared_scopes {
+            Some(scopes) => scopes,
+            None => Arc::new(Intent::from_scopes(
+                IntentKind::Capture,
+                scopes,
+                self.budget(),
+            )?),
+        };
         scopes.check(self, actor, leases, now)?;
         let bytes = actor
             .len()
@@ -78,12 +147,24 @@ impl NativeDocument {
             actor: owner,
             base: self.key(),
             scopes,
+            descriptor: None,
             _charge: charge,
         }));
         Ok(edit)
     }
 }
 impl EditAdmission {
+    pub(super) fn descriptor(&self) -> Option<&CommandDescriptor> {
+        self.descriptor.as_deref()
+    }
+    pub(super) fn planned_intent(&self, base: &NativeDocument, intent: Intent) -> Result<Intent> {
+        self.check(base, &self.actor, &intent)?;
+        if self.descriptor.is_some() {
+            Intent::from_scopes(*intent.kind(), self.scopes.scopes(), base.budget())
+        } else {
+            Ok(intent)
+        }
+    }
     pub(super) fn check(&self, base: &NativeDocument, actor: &str, intent: &Intent) -> Result<()> {
         if self.base != base.key() || self.actor != actor {
             return Err("Native editor admission belongs to another actor or generation".into());
@@ -211,24 +292,11 @@ mod tests {
         let mut history = NativeHistory::new(&pool, 2).unwrap();
         let layer = doc.metadata().layer(0).unwrap().id().to_string();
         let captured = capture(&doc, "worker", &[Scope::layer("@selection")], &[]).unwrap();
-        let delta = captured.visibility(&layer, false, &|| Ok(())).unwrap();
-        let refused = history
-            .snapshot()
-            .prepare_commit(
-                &doc,
-                delta,
-                HistoryRequest {
-                    actor: "worker",
-                    label: "edit",
-                    task: None,
-                    gesture: None,
-                },
-                &|| Ok(()),
-            )
+        let refused = captured
+            .visibility(&layer, false, &|| Ok(()))
             .err()
             .unwrap();
-        assert!(refused.reason().contains("captured targets"));
-        drop(refused);
+        assert!(refused.contains("captured targets"));
         let captured = capture(
             &doc,
             "worker",
