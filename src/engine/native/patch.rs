@@ -40,13 +40,15 @@ impl RefusedPatch {
         session: &impl super::super::scene::StageSession,
         cleanup: &dyn Fn() -> Result<()>,
     ) -> Result<()> {
-        let mut error = self.patch.output.abort(session, cleanup).err();
+        let mut outputs = Vec::new();
+        outputs.try_reserve_exact(2).map_err(|_| {
+            "Native retirement allocation refused; provisional bytes remain charged"
+        })?;
+        outputs.push(self.patch.output);
         if let RetainedUpdate::ReplaceOutput { source, .. } = self.patch.retained {
-            if let Err(reason) = source.abort(session, cleanup) {
-                error.get_or_insert(reason);
-            }
+            outputs.push(source);
         }
-        error.map_or(Ok(()), Err)
+        super::output::abort_outputs(outputs, session, cleanup)
     }
 }
 impl CapturedEdit {
