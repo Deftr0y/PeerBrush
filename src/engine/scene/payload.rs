@@ -46,6 +46,9 @@ impl<T: fmt::Debug> fmt::Debug for MetadataPayload<T> {
 }
 impl<T: PartialEq> PartialEq for MetadataPayload<T> {
     fn eq(&self, other: &Self) -> bool {
+        if self.same_allocation(other) {
+            return true;
+        }
         self.value() == other.value()
     }
 }
@@ -82,7 +85,6 @@ impl<T> MetadataPayload<T> {
             State::Shared(value) => Some(value.charge.bytes()),
         }
     }
-    #[cfg(test)]
     pub(crate) fn same_allocation(&self, other: &Self) -> bool {
         matches!((&self.state,&other.state),(State::Shared(a),State::Shared(b)) if Arc::ptr_eq(a,b))
     }

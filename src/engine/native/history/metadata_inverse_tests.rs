@@ -18,7 +18,10 @@ struct Sources {
 }
 impl Sources {
     fn new() -> Self {
-        let pool = ResidentBudget::new(128 * 1024 * 1024).unwrap();
+        Self::with_resident_limit(128 * 1024 * 1024)
+    }
+    fn with_resident_limit(bytes: usize) -> Self {
+        let pool = ResidentBudget::new(bytes).unwrap();
         let disk = DiskBudget::new(32 * 1024 * 1024, 4).unwrap();
         let path = std::fs::canonicalize(std::env::temp_dir())
             .unwrap()
@@ -112,6 +115,90 @@ impl Sources {
         )
         .unwrap()
     }
+}
+
+#[test]
+fn compensation_shares_unchanged_large_settings_and_merges_only_edited_assets() {
+    let mut sources = Sources::with_resident_limit(768 * 1024 * 1024);
+    let pool = sources.pool.clone();
+    let construction = MetadataCharge::reserve(&pool, 128 * 1024 * 1024, &|| Ok(())).unwrap();
+    let doc = document(16);
+    let raw = sources.capture(&doc, Side::Before);
+    sources.originals[1] = sources.originals[0].clone();
+    sources.originals[2] = sources.originals[0].clone();
+    let mut before = copy_metadata(&raw, &pool, &|| Ok(())).unwrap();
+    before = before
+        .map_unique(|mut value, _| {
+            for index in 0..8 {
+                value.layers[0].effects.push(Effect36 {
+                    id: format!("asset{index}"),
+                    kind: "test".into(),
+                    enabled: true,
+                    weight: 1.,
+                    settings: MetadataPayload::from(
+                        serde_json::json!({"asset":"x".repeat(4*1024*1024-512)}),
+                    )
+                    .bind(&pool, &|| Ok(()))?,
+                    clips: vec![],
+                });
+            }
+            value.layers[0].effects.push(Effect36 {
+                id: "small".into(),
+                kind: "test".into(),
+                enabled: true,
+                weight: 1.,
+                settings: MetadataPayload::from(serde_json::json!({"agent":1,"human":2}))
+                    .bind(&pool, &|| Ok(()))?,
+                clips: vec![],
+            });
+            Ok(value)
+        })
+        .unwrap();
+    // Rehome the newly built headers before they enter an immutable capture.
+    let before = before
+        .rehome_unique(|value, _| value.bind_runtime(&pool, &|| Ok(())))
+        .unwrap();
+    let after = before
+        .copy_runtime(&pool, &|| Ok(()))
+        .unwrap()
+        .map_unique(|mut value, _| {
+            value.layers[0].name = "Task name".into();
+            value.layers[0].effects[8].settings =
+                MetadataPayload::from(serde_json::json!({"agent":3,"human":2}))
+                    .bind(&pool, &|| Ok(()))?;
+            Ok(value)
+        })
+        .unwrap();
+    let current = after
+        .copy_runtime(&pool, &|| Ok(()))
+        .unwrap()
+        .map_unique(|mut value, _| {
+            value.layers[0].opacity = 0.4;
+            value.layers[0].effects[8].settings =
+                MetadataPayload::from(serde_json::json!({"agent":3,"human":4}))
+                    .bind(&pool, &|| Ok(()))?;
+            Ok(value)
+        })
+        .unwrap();
+    drop(construction);
+    let retained = pool.used();
+    let result = inverse(&before, &after, current, &mut sources, &pool, &|| Ok(())).unwrap();
+    assert!(result.report.conflicts.is_empty());
+    assert_eq!(result.candidate.layers[0].name, before.layers[0].name);
+    assert_eq!(result.candidate.layers[0].opacity, 0.4);
+    assert_eq!(
+        *result.candidate.layers[0].effects[8].settings,
+        serde_json::json!({"agent":1,"human":4})
+    );
+    for index in 0..8 {
+        assert!(result.candidate.layers[0].effects[index]
+            .settings
+            .same_allocation(&before.layers[0].effects[index].settings));
+    }
+    assert!(pool.used() < retained + 16 * 1024 * 1024);
+    drop(result);
+    drop(after);
+    drop(before);
 }
 impl Drop for Sources {
     fn drop(&mut self) {

@@ -2,7 +2,13 @@
 //! establish equality. The caller retains all source owners and refuses the
 //! entire candidate if the report contains a conflict.
 use super::super::*;
-use crate::engine::{scene::*, Scope};
+use crate::engine::{
+    scene::{
+        assets::{AssetEntry, AssetKind, MetadataAsset, Part},
+        *,
+    },
+    Scope,
+};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
@@ -65,6 +71,7 @@ enum Node {
     Object(BTreeMap<String, Node>),
     Array(Vec<Node>),
     Raster(usize, Option<Box<Node>>),
+    Asset(usize),
 }
 impl Node {
     fn from_value(value: Value) -> Self {
@@ -139,6 +146,8 @@ const REPORT_BYTES: usize = 8 * 1024 * 1024;
 struct Inverse<'a, R> {
     resolver: &'a mut R,
     sources: Vec<Entry>,
+    assets: Vec<MetadataAsset>,
+    pool: &'a ResidentBudget,
     report: Report,
     text: usize,
     check: &'a dyn Fn() -> Result<()>,
@@ -152,7 +161,7 @@ pub(crate) fn inverse<'a>(
     after: &'a Document36,
     current: Admitted<Document36>,
     rasters: &'a mut impl Resolver,
-    pool: &ResidentBudget,
+    pool: &'a ResidentBudget,
     check: &'a dyn Fn() -> Result<()>,
 ) -> Result<MetadataResult> {
     check()?;
@@ -162,16 +171,39 @@ pub(crate) fn inverse<'a>(
     // Each fresh tree is measured/admitted before parsing. The separate flat
     // workspace owner covers node conversion, merged clones, materialization,
     // typed output, source-token storage and bounded diagnostics simultaneously.
-    let b: Admitted<Value> = copy_admitted(before, pool, false, check)?;
-    let a: Admitted<Value> = copy_admitted(after, pool, false, check)?;
-    let c: Admitted<Value> = copy_admitted(&*current, pool, false, check)?;
-    let bytes = [b.owner().bytes(), a.owner().bytes(), c.owner().bytes()]
-        .into_iter()
-        .try_fold(REPORT_BYTES, |sum, n| {
+    // Physical assets remain shared, side-qualified owners. Only the bounded
+    // header graph enters the generic metadata workspace.
+    let before = copy_metadata(before, pool, check)?;
+    let after = copy_metadata(after, pool, check)?;
+    let mut bp = before.project_assets(pool, check)?;
+    let mut ap = after.project_assets(pool, check)?;
+    let mut cp = current.project_assets(pool, check)?;
+    let asset_count = bp
+        .entries
+        .len()
+        .checked_add(ap.entries.len())
+        .and_then(|n| n.checked_add(cp.entries.len()))
+        .and_then(|n| n.checked_mul(2))
+        .ok_or("Native inverse asset count overflow")?;
+    let asset_bytes = asset_count
+        .checked_mul(std::mem::size_of::<MetadataAsset>() + 128)
+        .ok_or("Native inverse asset index overflow")?;
+    let bytes = [
+        bp.header.owner().bytes(),
+        ap.header.owner().bytes(),
+        cp.header.owner().bytes(),
+    ]
+    .into_iter()
+    .try_fold(
+        REPORT_BYTES
+            .checked_add(asset_bytes)
+            .ok_or("Native inverse workspace overflow")?,
+        |sum, n| {
             n.checked_mul(12)
                 .and_then(|n| sum.checked_add(n))
                 .ok_or("Native inverse workspace footprint overflow")
-        })?;
+        },
+    )?;
     let _workspace_owner = MetadataCharge::reserve(pool, bytes, check)?;
     let count = before.visit_rasters(|_| Ok(()))?
         + after.visit_rasters(|_| Ok(()))?
@@ -183,20 +215,51 @@ pub(crate) fn inverse<'a>(
     sources
         .try_reserve_exact(capacity)
         .map_err(|_| "Native inverse source index allocation refused")?;
+    let mut assets = Vec::new();
+    assets
+        .try_reserve_exact(asset_count)
+        .map_err(|_| "Native inverse asset allocation refused")?;
+    if assets.capacity() > asset_count {
+        return Err("Native inverse asset index exceeds admission".into());
+    }
     let mut work = Inverse {
         resolver: rasters,
         sources,
+        assets,
+        pool,
         report: Report::default(),
         text: 0,
         check,
     };
-    let b = b.map_unique(|value, _| work.project(value, before, Side::Before))?;
-    let a = a.map_unique(|value, _| work.project(value, after, Side::After))?;
-    let c = c.map_unique(|value, _| work.project(value, &current, Side::Current))?;
+    let b = bp.header.map_unique(|value, _| {
+        let mut node = work.project(value, &before, Side::Before)?;
+        work.asset_nodes(&mut node, bp.entries.drain(..))?;
+        Ok(node)
+    })?;
+    let a = ap.header.map_unique(|value, _| {
+        let mut node = work.project(value, &after, Side::After)?;
+        work.asset_nodes(&mut node, ap.entries.drain(..))?;
+        Ok(node)
+    })?;
+    let c = cp.header.map_unique(|value, _| {
+        let mut node = work.project(value, &current, Side::Current)?;
+        work.asset_nodes(&mut node, cp.entries.drain(..))?;
+        Ok(node)
+    })?;
     let mut candidate = (*c).clone();
     work.document(&b, &a, &mut candidate)?;
     let value = work.materialize(candidate)?;
     let mut candidate: Document36 = serde_json::from_value(value).map_err(|e| e.to_string())?;
+    candidate.restore_assets(|id, kind| {
+        let asset = work
+            .assets
+            .get(id as usize - 1)
+            .ok_or("Unknown inverse asset token")?;
+        if asset.kind() != kind {
+            return Err("Inverse asset token kind changed".into());
+        }
+        asset.shared()
+    })?;
     candidate.revision = current.revision;
     work.import_document(&mut candidate)?;
     candidate.visit_rasters(|_| Ok(()))?;
@@ -206,12 +269,94 @@ pub(crate) fn inverse<'a>(
     let candidate = copy_metadata(&candidate, pool, check)?;
     let report = copy_admitted(&work.report, pool, false, check)?;
     drop(work.sources);
+    drop(work.assets);
     // All scratch trees/payloads are gone before their admission is released.
-    drop((b, a, c, current));
+    drop((b, a, c, current, before, after));
     Ok(MetadataResult { candidate, report })
 }
 
 impl<'a, R: Resolver> Inverse<'a, R> {
+    fn asset_nodes(
+        &mut self,
+        root: &mut Node,
+        entries: impl Iterator<Item = AssetEntry>,
+    ) -> Result<()> {
+        for entry in entries {
+            (self.check)()?;
+            let mut node = &mut *root;
+            for part in entry.path.parts() {
+                node = match part {
+                    Part::Key(key) => node
+                        .object_mut()?
+                        .get_mut(key)
+                        .ok_or("Missing typed asset field")?,
+                    Part::Index(index) => match node {
+                        Node::Array(values) => {
+                            values.get_mut(index).ok_or("Missing typed asset item")?
+                        }
+                        _ => return Err("Invalid typed asset container".into()),
+                    },
+                };
+            }
+            if self.assets.len() == self.assets.capacity() {
+                return Err("Inverse asset index exceeds admission".into());
+            }
+            let token = self.assets.len();
+            self.assets.push(entry.asset);
+            *node = Node::Asset(token);
+        }
+        Ok(())
+    }
+    fn merge_asset(
+        &mut self,
+        b: usize,
+        a: usize,
+        c: &mut Node,
+        target: Option<&str>,
+        field: &str,
+        origin: [i32; 2],
+    ) -> Result<()> {
+        let Node::Asset(ci) = c else {
+            return self.atomic(&Node::Asset(b), &Node::Asset(a), c, target, field);
+        };
+        let ci = *ci;
+        if self.assets[ci].same(&self.assets[a]) {
+            self.scope(target, None)?;
+            *c = Node::Asset(b);
+            return Ok(());
+        }
+        let kind = self.assets[b].kind();
+        if !matches!(kind, AssetKind::Settings | AssetKind::Content)
+            || self.assets[a].kind() != kind
+            || self.assets[ci].kind() != kind
+        {
+            return self.atomic(&Node::Asset(b), &Node::Asset(a), c, target, field);
+        }
+        // Only genuinely edited assets require generic recursive copies. Their
+        // workspace is reserved separately before the first payload allocation.
+        let bytes = [b, a, ci].into_iter().try_fold(4096usize, |total, id| {
+            self.assets[id]
+                .retained_bytes()?
+                .checked_mul(12)
+                .and_then(|n| total.checked_add(n))
+                .ok_or_else(|| String::from("Inverse asset workspace overflow"))
+        })?;
+        let _scratch = MetadataCharge::reserve(self.pool, bytes, self.check)?;
+        let bn = Node::from_value(self.assets[b].value()?);
+        let an = Node::from_value(self.assets[a].value()?);
+        let mut cn = Node::from_value(self.assets[ci].value()?);
+        self.merge(&bn, &an, &mut cn, target, field, origin)?;
+        let value = self.materialize(cn)?;
+        let asset = MetadataAsset::from_value(kind, value, self.pool, self.check)?;
+        if self.assets.len() == self.assets.capacity() {
+            return Err("Inverse merged asset index exceeds admission".into());
+        }
+        let token = self.assets.len();
+        self.assets.push(asset);
+        *c = Node::Asset(token);
+        Ok(())
+    }
+
     fn source_node(&mut self, node: &mut Node, reference: &RasterRef36, side: Side) -> Result<()> {
         (self.check)()?;
         let mut retained = node
@@ -340,6 +485,7 @@ impl<'a, R: Resolver> Inverse<'a, R> {
         (self.check)()?;
         Ok(match (left, right) {
             (Node::Value(a), Node::Value(b)) => a == b,
+            (Node::Asset(a), Node::Asset(b)) => self.assets[*a].same(&self.assets[*b]),
             (Node::Raster(a, ar), Node::Raster(b, br)) => {
                 self.resolver
                     .same(self.sources[*a].source(), self.sources[*b].source())?
@@ -533,6 +679,9 @@ impl<'a, R: Resolver> Inverse<'a, R> {
         }
         if self.equal(b, a)? {
             return Ok(());
+        }
+        if let (Node::Asset(bi), Node::Asset(ai)) = (b, a) {
+            return self.merge_asset(*bi, *ai, c, target, field, origin);
         }
         if matches!(b, Node::Raster(..)) {
             return self.raster(b, a, c, target, field, origin);
@@ -897,6 +1046,11 @@ impl<'a, R: Resolver> Inverse<'a, R> {
         (self.check)()?;
         Ok(match node {
             Node::Value(value) => value,
+            Node::Asset(token) => self
+                .assets
+                .get(token)
+                .ok_or("Unknown inverse metadata asset")?
+                .marker(u32::try_from(token + 1).map_err(|_| "Inverse asset ordinal overflow")?)?,
             Node::Object(map) => Value::Object(
                 map.into_iter()
                     .map(|(key, node)| Ok((key, self.materialize(node)?)))
