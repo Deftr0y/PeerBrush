@@ -1,6 +1,7 @@
 pub mod backed;
 pub mod native;
 pub mod scene;
+pub(crate) mod view;
 use crate::raster::{blend, check_size, Pixel, Raster};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
