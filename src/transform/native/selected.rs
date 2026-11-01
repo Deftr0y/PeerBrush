@@ -12,6 +12,7 @@ mod render;
 mod shift;
 pub(crate) use coverage::write_coverage;
 pub(crate) use geometry::Placement;
+pub(crate) use input::Prepared as PreparedSelection;
 pub(crate) use input::Selection;
 pub(crate) use render::{write, Written};
 pub(crate) use shift::shift;

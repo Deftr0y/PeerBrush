@@ -1,5 +1,11 @@
 # Large-document loading and derived caches
 
+## Source-backed internal clipboard preparation (unreleased)
+
+The native clipboard producer prepares bounded tiles from an immutable source scene and seals a private output before any clipboard assignment. Native16 words remain native16. Selection coverage, target opacity, cropping, hidden channels and cancellation retain the legacy copy order. Color-graph promotion preserves physical tiles and retained originals while leaving scalar coverage at its original depth. Layer-tree copy and placement keep charged source owners instead of rebuilding a resident document.
+
+These producers do not yet activate a new clipboard path. Final generation-checked clipboard publication, cross-project source admission, structural paste, shared history and the complete derived color/mask renderer still require integration and acceptance. Unsupported derived preparation refuses explicitly. The live document limits are unchanged; small differential tests do not qualify a full 16,000-square document or establish a memory/performance improvement.
+
 File → Open, dropping a PSD and recovering an autosave use the same cancellable loader as MCP and CLI. The progress window reports reading, saved-image decoding, layer decoding and editable-source restoration. Its saved-image preview is display-only; the current document stays editable until a complete replacement is ready. Cancel, a changed current document, a changed file or decoding failure preserves the existing project and history. Reservations are checked before replacement.
 
 The codec streams raw, PackBits RLE, ZIP and ZIP-predicted 8/16-bit composites and color-layer channels into 256-pixel native tiles. It uses row-sized decompression buffers instead of complete channel and interleaved-image buffers. Encoded resources/layer sections are read in cancellable 1 MiB chunks; the complete encoded file is not buffered. A bounded saved-image projection is available before source restoration finishes. Valid PeerBrush definitions are restored directly after verifying the standard data checksum, avoiding a duplicate standard-layer allocation. Unsupported or invalid definitions retain the existing protected Photoshop fallback.

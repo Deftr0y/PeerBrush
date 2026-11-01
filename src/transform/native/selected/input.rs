@@ -91,7 +91,7 @@ impl<'a> Selection<'a> {
             _ => None,
         }
     }
-    pub(super) fn prepare(
+    pub(crate) fn prepare(
         &self,
         region: Region,
         check: &dyn Fn() -> Result<()>,
@@ -122,13 +122,13 @@ impl<'a> Selection<'a> {
         })
     }
 }
-pub(super) struct Prepared<'a> {
+pub(crate) struct Prepared<'a> {
     source: &'a Selection<'a>,
     region: Region,
     view: Option<SurfaceRegion>,
 }
 impl Prepared<'_> {
-    pub(super) fn byte(&self, x: i32, y: i32, work: &mut Work) -> std::result::Result<u8, String> {
+    pub(crate) fn byte(&self, x: i32, y: i32, work: &mut Work) -> std::result::Result<u8, String> {
         let [l, t, r, b] = self.region.bounds();
         if x < l || x >= r || y < t || y >= b {
             return Err("Selected coverage sample exceeds prepared footprint".into());
