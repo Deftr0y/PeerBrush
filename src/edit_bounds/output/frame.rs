@@ -17,12 +17,239 @@ pub(crate) fn stage_frame_with<'d, 's>(
     plan: &InputFrame,
     session: &'s SourceSession,
     check: &mut dyn FnMut() -> Result<(), String>,
-    mut edit: impl FnMut(
+    edit: impl FnMut(
         (u32, u32),
         &PinnedBytes,
         &mut dyn FnMut() -> Result<(), String>,
     ) -> Result<PinnedBytes, String>,
 ) -> Result<TileDraft<'d, 's>, String> {
+    stage_frame_seed(input, plan, session, check, edit)?.finish(check)
+}
+
+pub(crate) struct FrameSeed<'d, 's> {
+    base: &'d NativeDocument,
+    session: &'s SourceSession,
+    surface: Surface,
+    fragments: Vec<FreshFragment>,
+    poisoned: bool,
+    _charge: Reservation,
+}
+impl<'d, 's> FrameSeed<'d, 's> {
+    pub(crate) fn shape(&self) -> [u32; 2] {
+        [self.surface.width(), self.surface.height()]
+    }
+    pub(crate) fn depth(&self) -> u16 {
+        self.surface.depth()
+    }
+    pub(crate) fn prepare_tile(
+        &self,
+        key: (u32, u32),
+        check: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<PinnedBytes, String> {
+        self.ensure(check)?;
+        let tile = self
+            .surface
+            .prepare_tile(key, &mut || {
+                self.session.check().map_err(|_| Error::Changed)?;
+                check().map_err(|_| Error::Cancelled)
+            })
+            .map_err(|e| e.to_string())?;
+        let bytes = tile
+            .copy_to_scratch(self.base.budget())
+            .map_err(|e| e.to_string())?;
+        self.ensure(check)?;
+        Ok(bytes.freeze())
+    }
+    pub(crate) fn prepare_strip(
+        &self,
+        area: [i32; 4],
+        check: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<PinnedBytes, String> {
+        self.ensure(check)?;
+        let shape = self.shape();
+        if area[0] < 0 || area[1] < 0 || area[2] > shape[0] as i32 || area[3] > shape[1] as i32 {
+            return Err("Native framed strip exceeds its captured output geometry".into());
+        }
+        let region = crate::raster::backed::Region::new(area).map_err(|e| e.to_string())?;
+        let bpp = if self.depth() == 16 { 8 } else { 4 };
+        let stride = (area[2] - area[0]) as usize * bpp;
+        let length = region.pixels() * bpp;
+        let mut bytes =
+            ScratchBytes::new(self.base.budget(), length, length).map_err(|e| e.to_string())?;
+        let view = self
+            .surface
+            .prepare_region(region, &mut || {
+                self.session.check().map_err(|_| Error::Changed)?;
+                check().map_err(|_| Error::Cancelled)
+            })
+            .map_err(|e| e.to_string())?;
+        for (index, row) in bytes.chunks_exact_mut(stride).enumerate() {
+            check()?;
+            view.copy_row(area[1] + index as i32, row)
+                .map_err(|e| e.to_string())?;
+        }
+        self.ensure(check)?;
+        Ok(bytes.freeze())
+    }
+    fn ensure(&self, check: &mut dyn FnMut() -> Result<(), String>) -> Result<(), String> {
+        if self.poisoned {
+            return Err("Native framed working output is poisoned".into());
+        }
+        self.session.check()?;
+        check()
+    }
+    pub(crate) fn replace_tile(
+        &mut self,
+        key: (u32, u32),
+        bytes: PinnedBytes,
+        check: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<(), String> {
+        let result = self.replace_inner(key, bytes, check);
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+    fn replace_inner(
+        &mut self,
+        key: (u32, u32),
+        bytes: PinnedBytes,
+        check: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.ensure(check)?;
+        let spec =
+            TileSpec::new(TILE as u16, TILE as u16, self.depth()).map_err(|e| e.to_string())?;
+        let shape = self.shape();
+        if !bytes.uses_budget(self.base.budget())
+            || bytes.len() != spec.bytes()
+            || key.0 >= shape[0].div_ceil(TILE)
+            || key.1 >= shape[1].div_ceil(TILE)
+        {
+            return Err("Native framed tile differs from its admitted shape or owner".into());
+        }
+        let before = self.prepare_tile(key, check)?;
+        let mut same = true;
+        let mut zero = true;
+        for (old, new) in before.chunks(64 * 1024).zip(bytes.chunks(64 * 1024)) {
+            self.ensure(check)?;
+            same &= old == new;
+            zero &= new.iter().all(|v| *v == 0);
+        }
+        if same {
+            return Ok(());
+        }
+        let patch = if zero {
+            TilePatch::zero(key, spec, &bytes, self.base.budget()).map_err(|e| e.to_string())?
+        } else {
+            if self.fragments.is_empty() {
+                if self.fragments.capacity() == 0 {
+                    self.fragments
+                        .try_reserve_exact(1)
+                        .map_err(|_| "Native framed fragment owner allocation failed")?;
+                    if self.fragments.capacity() != 1 {
+                        return Err("Native framed owner exceeded admission".into());
+                    }
+                }
+                self.fragments.push(self.session.fresh_fragment()?);
+            }
+            let store = self.fragments[0].store();
+            let reference = store
+                .put(spec, &bytes, &mut || {
+                    self.session.check().map_err(|_| Error::Changed)?;
+                    check().map_err(|_| Error::Cancelled)
+                })
+                .map_err(|e| e.to_string())?;
+            TilePatch::stored(key, store.clone(), reference)
+        };
+        let candidate = self
+            .surface
+            .with_tile_patches(&[patch], self.base.budget(), self.base.disk_budget())
+            .map_err(|e| e.to_string())?;
+        self.ensure(check)?;
+        self.surface = candidate;
+        Ok(())
+    }
+    pub(crate) fn abort(self) -> Result<(), String> {
+        let Self {
+            surface,
+            fragments,
+            session,
+            _charge,
+            ..
+        } = self;
+        drop(surface);
+        let mut error = None;
+        for fragment in fragments {
+            if let Err(reason) = session.abort_fragment(fragment, &mut || Ok(())) {
+                error.get_or_insert(reason);
+            }
+        }
+        drop(_charge);
+        error.map_or(Ok(()), Err)
+    }
+    pub(crate) fn finish(
+        mut self,
+        check: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<TileDraft<'d, 's>, String> {
+        let result = (|| {
+            self.ensure(check)?;
+            if self.surface.physical_tiles().next().is_none() {
+                let shape = self.shape();
+                self.surface =
+                    Surface::zero(shape[0], shape[1], self.depth()).map_err(|e| e.to_string())?;
+            }
+            let mut index = 0;
+            while index < self.fragments.len() {
+                self.ensure(check)?;
+                let identity = self.fragments[index].store().identity();
+                if self
+                    .surface
+                    .physical_tiles()
+                    .any(|tile| tile.owner().identity() == identity)
+                {
+                    index += 1;
+                } else {
+                    self.session
+                        .abort_fragment(self.fragments.remove(index), &mut || Ok(()))?;
+                }
+            }
+            self.ensure(check)
+        })();
+        if let Err(mut reason) = result {
+            if let Err(cleanup) = self.abort() {
+                reason.push_str("; native framed cleanup retained inventory: ");
+                reason.push_str(&cleanup);
+            }
+            return Err(reason);
+        }
+        let Self {
+            surface,
+            fragments,
+            base,
+            session,
+            _charge,
+            ..
+        } = self;
+        Ok(TileDraft {
+            draft: OutputDraft::new(surface, fragments),
+            base,
+            session,
+            _charge,
+        })
+    }
+}
+
+pub(crate) fn stage_frame_seed<'d, 's>(
+    input: &RasterInput<'d>,
+    plan: &InputFrame,
+    session: &'s SourceSession,
+    check: &mut dyn FnMut() -> Result<(), String>,
+    mut edit: impl FnMut(
+        (u32, u32),
+        &PinnedBytes,
+        &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<PinnedBytes, String>,
+) -> Result<FrameSeed<'d, 's>, String> {
     input.validate(plan.binding())?;
     session.check()?;
     check()?;
@@ -135,8 +362,10 @@ pub(crate) fn stage_frame_with<'d, 's>(
     if let Some(fragment) = fragment {
         fragments.push(fragment);
     }
-    Ok(TileDraft {
-        draft: OutputDraft::new(surface, fragments),
+    Ok(FrameSeed {
+        surface,
+        fragments,
+        poisoned: false,
         base,
         session,
         _charge: charge,

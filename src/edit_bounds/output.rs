@@ -12,7 +12,7 @@ use crate::{
 use std::collections::BTreeMap;
 #[path = "output/frame.rs"]
 mod frame;
-pub(crate) use frame::{stage_frame, stage_frame_with};
+pub(crate) use frame::{stage_frame, stage_frame_seed, stage_frame_with, FrameSeed};
 
 enum Replacement {
     Zero,
