@@ -161,8 +161,8 @@ impl Serialize for Metadata<'_> {
         self.0.serialize(serializer)
     }
 }
-impl Metadata<'_> {
-    pub(super) fn from_wire(wire: &Document36, key: DocumentKey) -> Metadata<'_> {
+impl<'a> Metadata<'a> {
+    pub(super) fn from_wire(wire: &'a Document36, key: DocumentKey) -> Metadata<'a> {
         Metadata(wire, key)
     }
     pub fn binding(&self) -> DocumentKey {
@@ -170,15 +170,15 @@ impl Metadata<'_> {
     }
     pub fn visit_rasters(
         &self,
-        mut visit: impl FnMut(RasterMetadata<'_>) -> Result<()>,
+        mut visit: impl FnMut(RasterMetadata<'a>) -> Result<()>,
     ) -> Result<usize> {
         self.0
             .visit_rasters(|reference| visit(RasterMetadata(reference, self.1)))
     }
-    pub fn id(&self) -> &str {
+    pub fn id(&self) -> &'a str {
         &self.0.id
     }
-    pub fn name(&self) -> &str {
+    pub fn name(&self) -> &'a str {
         &self.0.name
     }
     pub fn width(&self) -> u32 {
@@ -196,53 +196,58 @@ impl Metadata<'_> {
     pub fn read_only(&self) -> bool {
         self.0.read_only
     }
-    pub fn profile(&self) -> Option<&[u8]> {
+    pub fn profile(&self) -> Option<&'a [u8]> {
         self.0.icc_profile.as_deref().map(Vec::as_slice)
     }
     pub fn srgb_tagged(&self) -> bool {
         self.0.srgb_tagged
     }
-    pub fn global_mask(&self) -> Option<&crate::psd::GlobalMaskSettings> {
+    pub fn global_mask(&self) -> Option<&'a crate::psd::GlobalMaskSettings> {
         self.0.psd_global_mask.as_ref()
     }
-    pub fn warnings(&self) -> &[String] {
+    pub fn warnings(&self) -> &'a [String] {
         &self.0.warnings
     }
     pub fn selection(&self) -> Option<[i32; 4]> {
         self.0.selection
     }
-    pub fn selection_polygon(&self) -> Option<&[[f32; 2]]> {
+    pub fn selection_polygon(&self) -> Option<&'a [[f32; 2]]> {
         self.0.selection_polygon.as_deref()
     }
-    pub fn selection_coverage(&self) -> Option<CoverageMetadata<'_>> {
+    pub fn selection_coverage(&self) -> Option<CoverageMetadata<'a>> {
         self.0
             .selection_coverage
             .as_ref()
             .map(|c| CoverageMetadata(c, self.1))
     }
-    pub fn selection_previous(&self) -> Option<CoverageMetadata<'_>> {
+    pub fn selection_previous(&self) -> Option<CoverageMetadata<'a>> {
         self.0
             .selection_previous
             .as_ref()
             .map(|c| CoverageMetadata(c, self.1))
     }
-    pub fn layers(&self) -> impl ExactSizeIterator<Item = LayerMetadata<'_>> {
-        self.0.layers.iter().map(|l| LayerMetadata(l, self.1))
+    pub fn layers(&self) -> impl ExactSizeIterator<Item = LayerMetadata<'a>> + 'a {
+        let binding = self.1;
+        self.0.layers.iter().map(move |l| LayerMetadata(l, binding))
     }
-    pub fn filters(&self) -> impl ExactSizeIterator<Item = EffectMetadata<'_>> {
-        self.0.filters.iter().map(|e| EffectMetadata(e, self.1))
+    pub fn filters(&self) -> impl ExactSizeIterator<Item = EffectMetadata<'a>> + 'a {
+        let binding = self.1;
+        self.0
+            .filters
+            .iter()
+            .map(move |e| EffectMetadata(e, binding))
     }
 }
 #[derive(Clone, Copy)]
 pub struct LayerMetadata<'a>(&'a Layer36, DocumentKey);
-impl LayerMetadata<'_> {
-    pub fn id(&self) -> &str {
+impl<'a> LayerMetadata<'a> {
+    pub fn id(&self) -> &'a str {
         &self.0.id
     }
-    pub fn name(&self) -> &str {
+    pub fn name(&self) -> &'a str {
         &self.0.name
     }
-    pub fn kind(&self) -> &str {
+    pub fn kind(&self) -> &'a str {
         &self.0.kind
     }
     pub fn visible(&self) -> bool {
@@ -254,41 +259,45 @@ impl LayerMetadata<'_> {
     pub fn opacity(&self) -> f32 {
         self.0.opacity
     }
-    pub fn blend(&self) -> &str {
+    pub fn blend(&self) -> &'a str {
         &self.0.blend
     }
     pub fn origin(&self) -> [i32; 2] {
         [self.0.x, self.0.y]
     }
-    pub fn pixels(&self) -> RasterMetadata<'_> {
+    pub fn pixels(&self) -> RasterMetadata<'a> {
         RasterMetadata(&self.0.pixels, self.1)
     }
-    pub fn parent(&self) -> Option<&str> {
+    pub fn parent(&self) -> Option<&'a str> {
         self.0.parent.as_deref()
     }
-    pub fn clip_to(&self) -> Option<&str> {
+    pub fn clip_to(&self) -> Option<&'a str> {
         self.0.clip_to.as_deref()
     }
     pub fn color(&self) -> [u8; 4] {
         self.0.color
     }
-    pub fn mask(&self) -> Option<MaskMetadata<'_>> {
+    pub fn mask(&self) -> Option<MaskMetadata<'a>> {
         self.0.mask.as_ref().map(|m| MaskMetadata(m, self.1))
     }
-    pub fn effects(&self) -> impl ExactSizeIterator<Item = EffectMetadata<'_>> {
-        self.0.effects.iter().map(|e| EffectMetadata(e, self.1))
+    pub fn effects(&self) -> impl ExactSizeIterator<Item = EffectMetadata<'a>> + 'a {
+        let binding = self.1;
+        self.0
+            .effects
+            .iter()
+            .map(move |e| EffectMetadata(e, binding))
     }
-    pub fn psd_metadata(&self) -> &[crate::psd::LayerMetadata] {
+    pub fn psd_metadata(&self) -> &'a [crate::psd::LayerMetadata] {
         &self.0.psd_metadata
     }
-    pub fn source(&self) -> Option<&super::scene::Source36> {
+    pub fn source(&self) -> Option<&'a super::scene::Source36> {
         self.0.source.as_ref()
     }
 }
 #[derive(Clone, Copy)]
 pub struct CoverageMetadata<'a>(&'a super::scene::Coverage36, DocumentKey);
-impl CoverageMetadata<'_> {
-    pub fn mask(&self) -> RasterMetadata<'_> {
+impl<'a> CoverageMetadata<'a> {
+    pub fn mask(&self) -> RasterMetadata<'a> {
         RasterMetadata(&self.0.mask, self.1)
     }
     pub fn bounds(&self) -> [i32; 4] {
@@ -297,17 +306,17 @@ impl CoverageMetadata<'_> {
     pub fn origin(&self) -> [i32; 2] {
         self.0.origin
     }
-    pub fn contours(&self) -> &[Vec<[f32; 2]>] {
+    pub fn contours(&self) -> &'a [Vec<[f32; 2]>] {
         &self.0.contours
     }
 }
 #[derive(Clone, Copy)]
 pub struct EffectMetadata<'a>(&'a super::scene::Effect36, DocumentKey);
-impl EffectMetadata<'_> {
-    pub fn id(&self) -> &str {
+impl<'a> EffectMetadata<'a> {
+    pub fn id(&self) -> &'a str {
         &self.0.id
     }
-    pub fn kind(&self) -> &str {
+    pub fn kind(&self) -> &'a str {
         &self.0.kind
     }
     pub fn enabled(&self) -> bool {
@@ -316,36 +325,41 @@ impl EffectMetadata<'_> {
     pub fn weight(&self) -> f32 {
         self.0.weight
     }
-    pub fn settings(&self) -> &serde_json::Value {
+    pub fn settings(&self) -> &'a serde_json::Value {
         &self.0.settings
     }
-    pub fn clips(&self) -> impl ExactSizeIterator<Item = (u32, CoverageMetadata<'_>)> {
+    pub fn clips(&self) -> impl ExactSizeIterator<Item = (u32, CoverageMetadata<'a>)> + 'a {
+        let binding = self.1;
         self.0
             .clips
             .iter()
-            .map(|clip| (clip.stroke, CoverageMetadata(&clip.coverage, self.1)))
+            .map(move |clip| (clip.stroke, CoverageMetadata(&clip.coverage, binding)))
     }
 }
 #[derive(Clone, Copy)]
 pub struct MaskMetadata<'a>(&'a super::scene::Mask36, DocumentKey);
-impl MaskMetadata<'_> {
+impl<'a> MaskMetadata<'a> {
     pub fn enabled(&self) -> bool {
         self.0.enabled
     }
     pub fn linked(&self) -> bool {
         self.0.linked
     }
-    pub fn steps(&self) -> impl ExactSizeIterator<Item = MaskStepMetadata<'_>> {
-        self.0.steps.iter().map(|s| MaskStepMetadata(s, self.1))
+    pub fn steps(&self) -> impl ExactSizeIterator<Item = MaskStepMetadata<'a>> + 'a {
+        let binding = self.1;
+        self.0
+            .steps
+            .iter()
+            .map(move |s| MaskStepMetadata(s, binding))
     }
 }
 #[derive(Clone, Copy)]
 pub struct MaskStepMetadata<'a>(&'a super::scene::MaskStep36, DocumentKey);
-impl MaskStepMetadata<'_> {
-    pub fn id(&self) -> &str {
+impl<'a> MaskStepMetadata<'a> {
+    pub fn id(&self) -> &'a str {
         &self.0.id
     }
-    pub fn kind(&self) -> &str {
+    pub fn kind(&self) -> &'a str {
         &self.0.kind
     }
     pub fn enabled(&self) -> bool {
@@ -357,16 +371,16 @@ impl MaskStepMetadata<'_> {
     pub fn value(&self) -> f32 {
         self.0.value
     }
-    pub fn pixels(&self) -> RasterMetadata<'_> {
+    pub fn pixels(&self) -> RasterMetadata<'a> {
         RasterMetadata(&self.0.pixels, self.1)
     }
-    pub fn settings(&self) -> &serde_json::Value {
+    pub fn settings(&self) -> &'a serde_json::Value {
         &self.0.settings
     }
 }
 #[derive(Clone, Copy)]
 pub struct RasterMetadata<'a>(&'a RasterRef36, DocumentKey);
-impl RasterMetadata<'_> {
+impl<'a> RasterMetadata<'a> {
     pub fn ordinal(&self) -> u32 {
         self.0.id
     }
@@ -385,7 +399,7 @@ impl RasterMetadata<'_> {
             ordinal: self.0.id,
         }
     }
-    pub fn retained(&self) -> Option<RetainedMetadata<'_>> {
+    pub fn retained(&self) -> Option<RetainedMetadata<'a>> {
         self.0
             .retained
             .as_deref()
@@ -394,8 +408,8 @@ impl RasterMetadata<'_> {
 }
 #[derive(Clone, Copy)]
 pub struct RetainedMetadata<'a>(&'a super::scene::Retained36, DocumentKey);
-impl RetainedMetadata<'_> {
-    pub fn pixels(&self) -> RasterMetadata<'_> {
+impl<'a> RetainedMetadata<'a> {
+    pub fn pixels(&self) -> RasterMetadata<'a> {
         RasterMetadata(&self.0.pixels, self.1)
     }
     pub fn matrix(&self) -> [f64; 6] {
@@ -404,7 +418,7 @@ impl RetainedMetadata<'_> {
     pub fn projective(&self) -> Option<[f64; 9]> {
         self.0.projective
     }
-    pub fn warps(&self) -> &[super::scene::Warp36] {
+    pub fn warps(&self) -> &'a [super::scene::Warp36] {
         &self.0.warps
     }
 }
@@ -796,5 +810,53 @@ mod tests {
         drop(second);
         drop(document);
         assert_eq!(pool.used(), 0);
+    }
+    #[test]
+    fn borrowed_topology_outlives_function_local_projection_and_loop_copies() {
+        use crate::engine::scene::{SceneIdentity, SceneSnapshot};
+        fn layers<'a>(snapshot: &'a SceneSnapshot) -> Vec<LayerMetadata<'a>> {
+            let projection = snapshot.metadata();
+            projection.layers().collect()
+        }
+        fn labels<'a>(snapshot: &'a SceneSnapshot) -> Vec<(&'a str, &'a str)> {
+            snapshot
+                .metadata()
+                .layers()
+                .map(|layer| {
+                    let copy = layer;
+                    (copy.name(), copy.blend())
+                })
+                .collect()
+        }
+        fn profile(snapshot: &SceneSnapshot) -> Option<&[u8]> {
+            snapshot.metadata().profile()
+        }
+        fn settings<'a>(layer: LayerMetadata<'a>) -> Vec<&'a serde_json::Value> {
+            layer.effects().map(|effect| effect.settings()).collect()
+        }
+        fn contours<'a>(metadata: Metadata<'a>) -> Option<&'a [Vec<[f32; 2]>]> {
+            metadata
+                .selection_coverage()
+                .map(|coverage| coverage.contours())
+        }
+        fn warps<'a>(raster: RasterMetadata<'a>) -> Option<&'a [super::super::scene::Warp36]> {
+            raster.retained().map(|original| original.warps())
+        }
+        let pool = ResidentBudget::new(8 * 1024 * 1024).unwrap();
+        let document = document(&pool);
+        let identity = SceneIdentity {
+            project_id: "borrowed-topology".into(),
+            document_id: document.metadata().id().into(),
+            revision: 0,
+        };
+        let snapshot = SceneSnapshot::from_native(identity, document, vec![], None, None).unwrap();
+        let table = layers(&snapshot);
+        let names = labels(&snapshot);
+        assert_eq!(table[0].name(), names[0].0);
+        assert_eq!(table[0].blend(), names[0].1);
+        assert_eq!(profile(&snapshot), Some([0, 127, 128, 255].as_slice()));
+        assert!(settings(table[0]).is_empty());
+        assert!(contours(snapshot.metadata()).is_none());
+        assert!(warps(table[0].pixels()).is_none());
     }
 }
