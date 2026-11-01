@@ -360,7 +360,7 @@ fn copy_exact<R: Read, W: Write>(
     Ok(finish(hash))
 }
 
-struct HashWriter<'a, W> {
+pub(super) struct HashWriter<'a, W> {
     output: W,
     limit: u64,
     written: u64,
@@ -369,7 +369,7 @@ struct HashWriter<'a, W> {
     failed: bool,
 }
 impl<'a, W: Write> HashWriter<'a, W> {
-    fn new(output: W, limit: u64, check: &'a dyn Fn() -> Result<(), String>) -> Self {
+    pub(super) fn new(output: W, limit: u64, check: &'a dyn Fn() -> Result<(), String>) -> Self {
         Self {
             output,
             limit,
@@ -379,7 +379,7 @@ impl<'a, W: Write> HashWriter<'a, W> {
             failed: false,
         }
     }
-    fn finish(self) -> (u64, Digest) {
+    pub(super) fn finish(self) -> (u64, Digest) {
         (self.written, finish(self.sha))
     }
 }

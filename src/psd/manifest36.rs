@@ -248,12 +248,23 @@ impl StagedCore {
         bulk: BulkLimits,
         check: &dyn Fn() -> Result<(), String>,
     ) -> Result<Self, String> {
+        if !wire.metadata.is_object() {
+            return Err("Source36 typed metadata must be an object".into());
+        }
+        Self::stage(wire, metadata, bulk, check)
+    }
+}
+impl<T: Serialize> StagedCore<T> {
+    /// Writer-side borrowing avoids a second complete typed metadata graph.
+    /// Combined raw/tree/canonical admission remains the caller's obligation.
+    pub(crate) fn stage(
+        wire: Core<T>,
+        metadata: Limits,
+        bulk: BulkLimits,
+        check: &dyn Fn() -> Result<(), String>,
+    ) -> Result<Self, String> {
         check()?;
-        if wire.format != 36
-            || !source_id(&wire.source_id)
-            || !wire.metadata.is_object()
-            || wire.rasters.len() > bulk.rasters
-        {
+        if wire.format != 36 || !source_id(&wire.source_id) || wire.rasters.len() > bulk.rasters {
             return Err("Source36 core version/identity/roster differs".into());
         }
         let tile_root = digest(&wire.tile_root)?;
@@ -283,6 +294,13 @@ impl StagedCore {
         }
         .admit_core(bulk, check)?;
         let canonical = Canonical::from_serializable(&wire, metadata, check)?;
+        if !canonical
+            .value()
+            .get("metadata")
+            .is_some_and(Value::is_object)
+        {
+            return Err("Source36 typed metadata must be an object".into());
+        }
         let sha256 = canonical.core_digest();
         Ok(Self {
             wire,
@@ -318,9 +336,9 @@ pub(crate) struct Manifest<T = Value> {
     // authority or a replacement for retained whole-source/lease validation.
     origin: Option<(u64, Digest)>,
 }
-impl Manifest {
-    pub(crate) fn bind(
-        core: StagedCore,
+impl<T> Manifest<T> {
+    pub(crate) fn bind_core(
+        core: StagedCore<T>,
         layer_bytes: u64,
         composite_bytes: u64,
         standard_sha256: Digest,
@@ -344,6 +362,27 @@ impl Manifest {
         };
         result.plan().admit(limits, check)?;
         Ok(result)
+    }
+}
+impl Manifest {
+    pub(crate) fn bind(
+        core: StagedCore,
+        layer_bytes: u64,
+        composite_bytes: u64,
+        standard_sha256: Digest,
+        chunks: Vec<Descriptor>,
+        limits: BulkLimits,
+        check: &dyn Fn() -> Result<(), String>,
+    ) -> Result<Self, String> {
+        Self::bind_core(
+            core,
+            layer_bytes,
+            composite_bytes,
+            standard_sha256,
+            chunks,
+            limits,
+            check,
+        )
     }
     pub(crate) fn parse(
         bytes: &[u8],
@@ -970,5 +1009,62 @@ mod tests {
         )
         .is_err());
         assert_eq!(pool.used(), 0);
+    }
+
+    #[test]
+    fn typed_writer_borrows_metadata_without_cloning_and_retains_the_same_core_wire() {
+        #[derive(Serialize)]
+        struct Metadata {
+            id: String,
+            revision: u64,
+            native: bool,
+        }
+        let check = || Ok(());
+        let metadata = Metadata {
+            id: "61f53110-3789-4693-81d7-56136f750be2".into(),
+            revision: 7,
+            native: true,
+        };
+        let old = core();
+        let staged = StagedCore::stage(
+            Core {
+                format: old.format,
+                source_id: old.source_id,
+                revision: old.revision,
+                metadata: &metadata,
+                rasters: old.rasters,
+                tiles: old.tiles,
+                references: old.references,
+                tile_root: old.tile_root,
+                reference_root: old.reference_root,
+            },
+            metadata_limits(),
+            bulk_limits(),
+            &check,
+        )
+        .unwrap();
+        let original = fixture();
+        assert_eq!(staged.sha256(), original.core().sha256());
+        let manifest = Manifest::bind_core(
+            staged,
+            21,
+            26,
+            original.standard_sha256,
+            vec![],
+            bulk_limits(),
+            &check,
+        )
+        .unwrap();
+        assert_eq!(
+            manifest
+                .canonical(metadata_limits(), &check)
+                .unwrap()
+                .bytes(),
+            original
+                .canonical(metadata_limits(), &check)
+                .unwrap()
+                .bytes()
+        );
+        assert!(std::ptr::eq(*manifest.core().metadata(), &metadata));
     }
 }

@@ -185,3 +185,36 @@ that a styled layer or merged composite equals the current typed scene render.
 A failed source completion stays failed even if the bytes later reappear. The
 successful handoff consumes it and moves the typed metadata with its retained
 charge owner into PendingScene; it does not return a bare uncharged payload.
+
+## Captured standard save plan
+
+The new-format standard plan borrows the admitted Document36 snapshot and native
+physical references. It preserves full padded tile bytes, native low bits and
+hidden RGB. Tile/reference roots and chunk partitions are planned from bounded
+immutable metadata; emitting a tile still pins and verifies its actual bytes.
+References sort by raster ID, tile Y, tile X, independently of runtime map order.
+
+Standard native callbacks identify the exact captured scene, source layer or
+composite, channel, document-space rectangle, first row, row count and depth.
+They prepare at most 256 rows into an admitted bounded planar buffer. Sampling
+performs no file I/O. Mask serialization requests actual mask values even when
+the overall mask is disabled; the disabled flag remains standard metadata.
+The current merged composite uses native white-matte RGB plus native alpha.
+
+Ordinary supported sources keep their standard layer ordering. When filters,
+adjustments, unsupported clipping or a styled group require a visible baked
+appearance, a hidden wrapper also retains every original source layer/mask and
+its original group/visibility metadata. The original-source callback writes raw
+native source samples rather than effect-rendered replacements. This is an
+honest Photoshop fallback, not unrestricted native Photoshop compatibility.
+The editable document limit remains 200 layers. New-format standard derived
+records admit at most 403 (200 layers, up to 200 group ends, wrapper and bake);
+legacy standard/import bounds are unchanged. The strict new-format reader must
+select this explicit derived bound only after source-format admission.
+
+Reopened standard metadata and every native layer/mask/composite sample must
+equal a newly prepared plan from that same captured scene. Matching stream or
+whole-file hashes cannot replace this fidelity comparison. CompletedSave36 is
+closed to generic callbacks or digest-only constructors; publication requires
+the actual scene driver to combine complete source, native and fidelity proofs
+while retaining the exact snapshot and owned PhotoshopContainer bytes.
