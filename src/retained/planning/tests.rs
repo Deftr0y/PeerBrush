@@ -342,7 +342,8 @@ fn whole_layer_and_mask_policy_match_actual_legacy_operators_at_native_depth() {
                     }
                 }
                 drop(output);
-                std::fs::remove_dir_all(output_path).unwrap();
+                // Published file identities remain charged after Store drops.
+                // Outer cleanup keeps them named until every create completes.
             }
             assert_eq!(successful, if linked.is_none() { 5 } else { 6 });
             drop(native);
