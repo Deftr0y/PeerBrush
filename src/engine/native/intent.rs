@@ -4,6 +4,7 @@ use crate::{
     large_document::Reservation,
 };
 
+#[derive(Clone, Copy)]
 pub enum IntentKind {
     Visibility { visible: bool },
     Reorder,
@@ -24,9 +25,23 @@ impl Intent {
         source: &[Scope],
         pool: &ResidentBudget,
     ) -> Result<Self> {
-        let bytes = source.iter().try_fold(
-            source
-                .len()
+        Self::from_iter(kind, source.iter(), pool)
+    }
+    pub(super) fn combined(&self, other: &Self, pool: &ResidentBudget) -> Result<Self> {
+        Self::from_iter(
+            IntentKind::Capture,
+            self.scopes.iter().chain(other.scopes.iter()),
+            pool,
+        )
+    }
+    fn from_iter<'a>(
+        kind: IntentKind,
+        source: impl Iterator<Item = &'a Scope> + Clone,
+        pool: &ResidentBudget,
+    ) -> Result<Self> {
+        let count = source.clone().count();
+        let bytes = source.clone().try_fold(
+            count
                 .checked_mul(std::mem::size_of::<Scope>())
                 .and_then(|n| n.checked_add(128))
                 .ok_or("Native scope footprint overflow")?,
@@ -40,7 +55,7 @@ impl Intent {
             .map_err(|e| e.to_string())?;
         let mut scopes = Vec::new();
         scopes
-            .try_reserve_exact(source.len())
+            .try_reserve_exact(count)
             .map_err(|_| "Native scope allocation refused")?;
         for scope in source {
             let target = scope

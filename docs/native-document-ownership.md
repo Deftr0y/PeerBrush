@@ -75,9 +75,48 @@ The editor capture factory binds the observed generation, revision, actor and
 targets after checking the current write fence and reservations. It performs no
 source I/O. Workers retain that admission with their candidate; native history
 refuses a data-only capture without editor admission. Final publication rechecks
-the actor, targets and current leases. Generated raster batches currently use
-conservative whole-layer publication scopes; exact command footprint binding
-must preserve the legacy rectangle reservation behavior before live adoption.
+the actor, targets and current leases. The production factory accepts an immutable
+normalized command descriptor; generic caller-supplied scope capture exists only
+in tests. Descriptor construction and typed parameter normalization run outside
+the engine mutex. Capture shares its admitted scope owner and binds generation,
+revision, method classes and command tokens without copying the parameter tree.
+
+Prepared publication inherits the engine-derived command scopes after checking
+its actual targets. A command view exposes those exact scopes and checks a typed
+producer's baseline-to-proposed logical write box. Read halos remain independent.
+Producers must retain their actual changed-tile/write proof; semantic fill
+materialization is a distinct baseline proof.
+
+A native transaction derives each next command from the original immutable
+descriptor, recomputes its scopes against the current private working metadata,
+and retains every provisional output. Intermediate generations keep the original
+source revision and do not publish blocks or enter history. The final candidate
+advances once, retains the original document generation guard and the union of
+initial and working command scopes, and enters one history record. Foreign,
+duplicate, out-of-order or cancelled steps cannot advance the working state.
+An intermediate step receipt cannot enter history or publish independently, even
+when its first working generation still equals the public document generation.
+An accepted command with a proven semantic no-op still advances revision and
+records history/task information, matching the existing editor contract. Its
+token-bound unchanged receipt shares exact source owners and creates no fake
+pixel output or source I/O. A raw-pixel no-op that also changes kind, frame or
+editable source metadata must use its ordinary atomic metadata/source batch.
+History preparation admits a final physical Store reachability plan. Publication
+marks only surviving fragments and returns every intermediate output view/token
+with the retired history owners. After leaving the engine mutex, the caller uses
+its retained source session to retire unreachable provisional fragments. Every
+output view/checkpoint drops before the first unique-owner abort. Escaped previews
+refuse retirement and retain exact bytes and charged debt. Cleanup failure follows
+a committed edit; it does not roll back history. Published-source retirement and
+compaction still require their complete retained-owner/marker inventory.
+
+The normalized metadata dispatcher handles layer creation, updates, deletion,
+ordering, clipping and parenting, plus mask removal, enable and link changes.
+Canonical roster rebuilding preserves the exact immutable sources and removes
+only unreachable locations. Folder foreground fill uses a separate typed
+insertion paired with its sealed complete canvas output; it never replaces the
+folder's dummy plane. Other structural/source/effect commands and selective task
+compensation remain required before live editor migration.
 
 This is the data preparation boundary. Engine actor/reservation enforcement,
 history publication, complete source mutation/renumbering, native operators,

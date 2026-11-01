@@ -1598,3 +1598,1344 @@ fn actual_changed_pixel_boxes_include_native_low_bits_but_refuse_physical_paddin
         .is_err());
     }
 }
+
+#[test]
+fn immutable_command_projection_keeps_raw_mask_steps_and_composed_sources_distinct() {
+    let f = Fixture::new();
+    let (runtime, _connection) = f.runtime();
+    let session = runtime.begin().unwrap();
+    let mut source = source(16);
+    source.layers[0].mask = Some(crate::engine::Mask {
+        enabled: false,
+        linked: false,
+        cache_key: crate::engine::id(),
+        steps: ["first", "second"]
+            .into_iter()
+            .map(|id| crate::engine::MaskStep {
+                id: id.into(),
+                kind: "paint".into(),
+                enabled: false,
+                weight: 0.4,
+                value: 0.,
+                pixels: Raster::new_depth(3, 2, 16),
+                settings: serde_json::json!({}),
+            })
+            .collect(),
+    });
+    let document = native(&source, &session);
+    let id = &source.layers[0].id;
+    let parameters = serde_json::json!({"layer":id,"mask":true});
+    let target = RasterInput::from_parameters(&document, &parameters).unwrap();
+    let second = RasterInput::mask_step(&document, id, "second").unwrap();
+    assert_eq!(target.binding(), second.binding());
+    let first = RasterInput::from_parameters(
+        &document,
+        &serde_json::json!({"layer":id,"mask":true,"step":"first"}),
+    )
+    .unwrap();
+    assert_ne!(first.binding().slot(), second.binding().slot());
+    match target.retouch_source(&parameters).unwrap() {
+        RetouchInput::ComposedMask {
+            document: captured,
+            layer,
+        } => {
+            assert_eq!(captured.key(), document.key());
+            assert_eq!(layer.id(), id);
+        }
+        _ => panic!("Composed mask was replaced with a raw paint step"),
+    }
+    match target
+        .retouch_source(&serde_json::json!({"mask":true,"source_step":"first"}))
+        .unwrap()
+    {
+        RetouchInput::Raster(raw) => assert_eq!(raw.binding(), first.binding()),
+        _ => panic!("Explicit raw source step was not retained"),
+    }
+    let color = RasterInput::from_parameters(&document, &serde_json::json!({"layer":id})).unwrap();
+    match color
+        .retouch_source(&serde_json::json!({"sample_merged":true}))
+        .unwrap()
+    {
+        RetouchInput::Merged(captured) => assert_eq!(captured.key(), document.key()),
+        _ => panic!("Merged artwork was replaced with a raw source"),
+    }
+    assert!(
+        RasterInput::from_parameters(&document, &serde_json::json!({"layer":id,"mask":7})).is_err()
+    );
+    assert!(RasterInput::from_parameters(
+        &document,
+        &serde_json::json!({"layer":id,"mask":true,"step":"missing"})
+    )
+    .is_err());
+    assert!(color
+        .retouch_source(&serde_json::json!({"source_step":"first"}))
+        .is_err());
+    assert!(target
+        .retouch_source(&serde_json::json!({"mask":true,"sample_merged":true}))
+        .is_err());
+}
+
+#[test]
+fn captured_command_workers_use_the_same_parameters_and_preserve_native_results() {
+    use crate::{brush::input::StrokePoints, engine::native::CommandDescriptor};
+    let f = Fixture::new();
+    let (runtime, _connection) = f.runtime();
+    let session = runtime.begin().unwrap();
+    for depth in [8, 16] {
+        for operation in [
+            "paint",
+            "paint.fill",
+            "paint.clear_selection",
+            "smudge",
+            "clone",
+        ] {
+            let mut source = Document::new_depth(9, 7, depth).unwrap();
+            for y in 0..7 {
+                for x in 0..9 {
+                    source.layers[0].pixels.set16(
+                        x,
+                        y,
+                        [12347 + x as u16 * 911, 23521 + y as u16 * 617, 43217, 49153],
+                    );
+                }
+            }
+            source.selection = Some([1, 1, 8, 6]);
+            let mut coverage = Raster::new_depth(9, 7, 16);
+            for y in 0..7 {
+                for x in 0..9 {
+                    coverage.set16(x, y, [if x < 4 { 32769 } else { 49153 }, 0, 0, 0]);
+                }
+            }
+            source.selection_coverage = Some(crate::selection::Coverage {
+                mask: coverage,
+                bounds: source.selection.unwrap(),
+                origin: [0, 0],
+                contours: vec![],
+            });
+            let parameters = serde_json::json!({"op":operation,"layer":source.layers[0].id,"rect":[1,1,7,6],
+            "points":[[2.25,2.5,0.7],[5.25,3.25,0.9],[6.25,4.5,0.6]],"source":[3.5,1.25],
+            "color":[37,83,127,193],"radius":1.8,"spacing":0.8,"hardness":0.4,"flow":0.6,"opacity":0.7,
+            "load":0.3,"pickup":0.4,"wetness":0.8,"heal_radius":2});
+            let mut legacy = crate::engine::Engine::new();
+            legacy.doc = source.clone();
+            legacy
+                .edit("human", &[parameters.clone()], None, None, "Operator")
+                .unwrap();
+            let document = native(&source, &session);
+            let descriptor =
+                CommandDescriptor::from_normalized(&document, 0, &[parameters], &|| Ok(()))
+                    .unwrap();
+            let captured = document
+                .capture_descriptor(descriptor.clone(), "human", &[], 1, false, true)
+                .unwrap();
+            let command = descriptor.commands().next().unwrap();
+            let input =
+                RasterInput::from_parameters(captured.document(), command.parameters()).unwrap();
+            let points =
+                (!matches!(operation, "paint.fill" | "paint.clear_selection")).then(|| {
+                    StrokePoints::from_command(command, input.pool(), &mut || Ok(())).unwrap()
+                });
+            let frame = if operation == "paint.fill" {
+                input.fill_frame(command).unwrap()
+            } else if let Some(points) = &points {
+                input.stroke_frame(command, points, &mut || Ok(())).unwrap()
+            } else {
+                None
+            };
+            let stroke = points.as_ref().map(|points| {
+                points
+                    .local(&input, frame.as_ref(), &mut || Ok(()))
+                    .unwrap()
+            });
+            let guard = WriteGuard::new(&captured, command, &input, frame.as_ref()).unwrap();
+            let before = runtime.disk().used().unwrap();
+            let result = match operation {
+                "paint" => crate::brush::input::stage_guarded(
+                    &input,
+                    stroke.as_ref().unwrap(),
+                    frame.as_ref(),
+                    &guard,
+                    &session,
+                    &mut || Ok(()),
+                )
+                .unwrap(),
+                "paint.fill" => {
+                    crate::fill::input::stage_fill_guarded(
+                        &input,
+                        frame.as_ref(),
+                        &guard,
+                        &session,
+                        &mut || Ok(()),
+                    )
+                    .unwrap()
+                    .into_parts()
+                    .0
+                }
+                "paint.clear_selection" => {
+                    crate::fill::input::stage_clear_guarded(
+                        &input,
+                        &guard,
+                        &session,
+                        &mut || Ok(()),
+                    )
+                    .unwrap()
+                    .into_parts()
+                    .0
+                }
+                "smudge" => crate::smudge::input::stage_guarded(
+                    &input,
+                    stroke.as_ref().unwrap(),
+                    frame.as_ref(),
+                    &guard,
+                    &session,
+                    &mut || Ok(()),
+                )
+                .unwrap(),
+                "clone" => crate::retouch::input::stage_guarded(
+                    &input,
+                    &input,
+                    stroke.as_ref().unwrap(),
+                    frame.as_ref(),
+                    &guard,
+                    &session,
+                    &mut || Ok(()),
+                )
+                .unwrap(),
+                _ => unreachable!(),
+            };
+            let BuiltTiles::Draft(draft) = result else {
+                panic!("No output for {operation}")
+            };
+            let output = draft.seal(&|| Ok(())).ok().unwrap();
+            let region = output
+                .surface()
+                .prepare_region(Region::new([0, 0, 9, 7]).unwrap(), &mut || Ok(()))
+                .unwrap();
+            for y in 0..7 {
+                for x in 0..9 {
+                    assert_eq!(
+                        region.pixel16(x, y).unwrap(),
+                        legacy.doc.layers[0].pixels.get16(x, y),
+                        "{operation} depth{depth} at{x},{y}"
+                    );
+                }
+            }
+            drop(region);
+            output.abort(&session, &|| Ok(())).unwrap();
+            assert_eq!(runtime.disk().used().unwrap(), before);
+            assert_eq!(document.metadata().revision(), 0);
+        }
+    }
+}
+
+#[test]
+fn command_guards_refuse_foreign_descriptors_unbound_frames_outside_writes_and_cancellation() {
+    use crate::{brush::input::StrokePoints, engine::native::CommandDescriptor};
+    let f = Fixture::new();
+    let (runtime, _connection) = f.runtime();
+    let session = runtime.begin().unwrap();
+    let mut source = Document::new_depth(9, 7, 16).unwrap();
+    source.layers[0].pixels = Raster::new_depth(4, 3, 16);
+    source.layers[0].x = 4;
+    source.layers[0].y = 3;
+    let document = native(&source, &session);
+    let body = serde_json::json!({"op":"paint","layer":source.layers[0].id,"points":[[1,1],[5,4]],"radius":1.8,"color":[37,83,127,193]});
+    let descriptor =
+        CommandDescriptor::from_normalized(&document, 0, &[body.clone()], &|| Ok(())).unwrap();
+    let captured = document
+        .capture_descriptor(descriptor.clone(), "human", &[], 1, false, true)
+        .unwrap();
+    let command = descriptor.commands().next().unwrap();
+    let input = RasterInput::from_parameters(captured.document(), command.parameters()).unwrap();
+    let points = StrokePoints::from_command(command, input.pool(), &mut || Ok(())).unwrap();
+    let frame = input
+        .stroke_frame(command, &points, &mut || Ok(()))
+        .unwrap()
+        .unwrap();
+    let guard = WriteGuard::new(&captured, command, &input, Some(&frame)).unwrap();
+    let unrelated = CommandDescriptor::from_normalized(&document, 0, &[body], &|| Ok(())).unwrap();
+    assert!(WriteGuard::new(
+        &captured,
+        unrelated.commands().next().unwrap(),
+        &input,
+        Some(&frame)
+    )
+    .is_err());
+    let unbound = input.project_frame([0, 0, 9, 7]).unwrap().unwrap();
+    assert!(WriteGuard::new(&captured, command, &input, Some(&unbound)).is_err());
+    let unbound_stroke = LocalStroke::for_frame(
+        &input,
+        &frame,
+        points.points(),
+        points.pressures(),
+        &mut || Ok(()),
+    )
+    .unwrap();
+    let before = runtime.disk().used().unwrap();
+    assert!(crate::brush::input::stage_guarded(
+        &input,
+        &unbound_stroke,
+        Some(&frame),
+        &guard,
+        &session,
+        &mut || Ok(())
+    )
+    .is_err());
+    assert_eq!(runtime.disk().used().unwrap(), before);
+    captured.cancellation().cancel();
+    assert!(guard.validate(&input, Some(&frame), &["paint"]).is_err());
+    assert_eq!(runtime.disk().used().unwrap(), before);
+
+    let source = Document::new_depth(9, 7, 16).unwrap();
+    let document = native(&source, &session);
+    let descriptor=CommandDescriptor::from_normalized(&document,0,&[serde_json::json!({"op":"paint.fill","layer":source.layers[0].id,"rect":[1,1,3,3],"color":[37,83,127,193]})],&||Ok(())).unwrap();
+    let captured = document
+        .capture_descriptor(descriptor.clone(), "human", &[], 1, false, true)
+        .unwrap();
+    let command = descriptor.commands().next().unwrap();
+    let input = RasterInput::from_parameters(captured.document(), command.parameters()).unwrap();
+    let guard = WriteGuard::new(&captured, command, &input, None).unwrap();
+    let original = input.prepare_tile((0, 0), &mut || Ok(())).unwrap();
+    let mut proposed =
+        ScratchBytes::new(input.pool(), original.bytes().len(), original.bytes().len()).unwrap();
+    proposed.copy_from_slice(original.bytes());
+    proposed[(5 * 256 + 7) * 8 + 1] = 1;
+    let before = runtime.disk().used().unwrap();
+    assert!(guard
+        .check_tile(
+            &input,
+            None,
+            (0, 0),
+            original.bytes(),
+            &proposed.freeze(),
+            &mut || Ok(())
+        )
+        .is_err());
+    assert_eq!(runtime.disk().used().unwrap(), before);
+}
+
+#[test]
+fn folder_fill_prepares_a_new_zero_baseline_canvas_without_replacing_the_folder_plane() {
+    use crate::engine::native::CommandDescriptor;
+    let f = Fixture::new();
+    let (runtime, _connection) = f.runtime();
+    let session = runtime.begin().unwrap();
+    for depth in [8, 16] {
+        for alpha in [0, 193] {
+            for empty in [false, true] {
+                let mut source = Document::new_depth(12, 10, depth).unwrap();
+                source.layers[0].kind = "group".into();
+                source.layers[0].pixels = Raster::new_depth(2, 2, 8);
+                source.layers[0].x = 3;
+                source.layers[0].y = -2;
+                let mut existing = crate::engine::Layer::new("Existing", "paint", 12, 10);
+                existing.parent = Some(source.layers[0].id.clone());
+                existing.pixels = Raster::new_depth(12, 10, depth);
+                existing.pixels.set16(4, 3, [12347, 23521, 43217, 49153]);
+                source.layers.push(existing);
+                source.selection = Some([1, 1, 10, 8]);
+                let mut coverage = Raster::new_depth(12, 10, 16);
+                for y in 0..10 {
+                    for x in 0..12 {
+                        coverage.set16(x, y, [if x < 6 { 32769 } else { 49153 }, 0, 0, 0]);
+                    }
+                }
+                source.selection_coverage = Some(crate::selection::Coverage {
+                    mask: coverage,
+                    bounds: source.selection.unwrap(),
+                    origin: [0, 0],
+                    contours: vec![],
+                });
+                let parameters = serde_json::json!({"op":"paint.fill","layer":source.layers[0].id,
+            "rect":if empty {[20,20,22,22]}else{[2,2,8,7]},"color":[37,83,127,alpha]});
+                let mut legacy = crate::engine::Engine::new();
+                legacy.doc = source.clone();
+                legacy
+                    .edit("human", &[parameters.clone()], None, None, "Fill")
+                    .unwrap();
+                let document = native(&source, &session);
+                let descriptor =
+                    CommandDescriptor::from_normalized(&document, 0, &[parameters], &|| Ok(()))
+                        .unwrap();
+                let captured = document
+                    .capture_descriptor(descriptor.clone(), "human", &[], 1, false, true)
+                    .unwrap();
+                let command = descriptor.commands().next().unwrap();
+                let input = RasterInput::from_parameters(captured.document(), command.parameters())
+                    .unwrap();
+                let parent_key = input.binding().source();
+                let guard = WriteGuard::new(&captured, command, &input, None).unwrap();
+                let before = runtime.disk().used().unwrap();
+                let output =
+                    crate::fill::input::stage_child_fill(&input, &guard, &session, &mut || Ok(()))
+                        .unwrap();
+                if empty {
+                    assert!(matches!(output, BuiltTiles::Unchanged));
+                    assert_eq!(legacy.doc.layers.len(), 2);
+                } else {
+                    assert_eq!(legacy.doc.layers.len(), 3);
+                    let BuiltTiles::Draft(draft) = output else {
+                        panic!("A nonempty folder fill must insert a real child")
+                    };
+                    let output = draft.seal(&|| Ok(())).ok().unwrap();
+                    assert_eq!(
+                        [
+                            output.surface().width(),
+                            output.surface().height(),
+                            u32::from(output.surface().depth())
+                        ],
+                        [12, 10, u32::from(depth)]
+                    );
+                    let region = output
+                        .surface()
+                        .prepare_region(Region::new([0, 0, 12, 10]).unwrap(), &mut || Ok(()))
+                        .unwrap();
+                    for y in 0..10 {
+                        for x in 0..12 {
+                            assert_eq!(
+                                region.pixel16(x, y).unwrap(),
+                                legacy.doc.layers[1].pixels.get16(x, y),
+                                "depth{depth} alpha{alpha} at{x},{y}"
+                            );
+                        }
+                    }
+                    drop(region);
+                    output.abort(&session, &|| Ok(())).unwrap();
+                }
+                assert_eq!(runtime.disk().used().unwrap(), before);
+                assert_eq!(input.binding().source(), parent_key);
+                assert_eq!(input.shape(), [2, 2]);
+                assert_eq!(input.depth(), 8);
+                assert_eq!(document.metadata().layers().count(), 2);
+                assert_eq!(document.metadata().revision(), 0);
+            }
+        }
+    }
+}
+
+#[test]
+fn editable_definitions_keep_legacy_explicit_rasterize_refusal_and_allow_mask_paint() {
+    use crate::{brush::input::StrokePoints, engine::native::CommandDescriptor};
+    let f = Fixture::new();
+    let (runtime, _connection) = f.runtime();
+    let session = runtime.begin().unwrap();
+    let mut source = Document::new_depth(9, 7, 16).unwrap();
+    source.layers[0].source = Some(Arc::new(crate::source::Source {
+        width: 9,
+        height: 7,
+        matrix: [1., 0., 0., 1., 0., 0.],
+        content: crate::source::Content::Shape {
+            shape: "rectangle".into(),
+            bounds: [0., 0., 9., 7.],
+            points: vec![],
+            closed: true,
+            fill: [12347, 23521, 43217, 49153],
+            stroke: [0; 4],
+            stroke_width: 0.,
+        },
+    }));
+    source.layers[0]
+        .source
+        .as_ref()
+        .unwrap()
+        .validate_structure()
+        .unwrap();
+    source.layers[0].mask = Some(crate::engine::Mask {
+        enabled: true,
+        linked: false,
+        cache_key: crate::engine::id(),
+        steps: vec![crate::engine::MaskStep {
+            id: "paint-mask".into(),
+            kind: "paint".into(),
+            enabled: true,
+            weight: 1.,
+            value: 0.,
+            pixels: Raster::new_depth(9, 7, 16),
+            settings: serde_json::json!({}),
+        }],
+    });
+    source.selection = Some([0, 0, 9, 7]);
+    let document = native(&source, &session);
+    for operation in [
+        "paint",
+        "paint.fill",
+        "paint.clear_selection",
+        "smudge",
+        "clone",
+        "heal",
+    ] {
+        let body = serde_json::json!({"op":operation,"layer":source.layers[0].id,"rect":[1,1,7,6],
+            "points":[[2,2],[6,4]],"source":[3,1],"color":[37,83,127,193],"radius":1.8});
+        let mut legacy = crate::engine::Engine::new();
+        legacy.doc = source.clone();
+        assert!(legacy
+            .edit("human", &[body.clone()], None, None, "Pixels")
+            .unwrap_err()
+            .contains("explicitly rasterize"));
+        assert!(legacy.undo.is_empty());
+        assert!(legacy.doc.layers[0].source.is_some());
+        let descriptor =
+            CommandDescriptor::from_normalized(&document, 0, &[body], &|| Ok(())).unwrap();
+        let captured = document
+            .capture_descriptor(descriptor.clone(), "human", &[], 1, false, true)
+            .unwrap();
+        let command = descriptor.commands().next().unwrap();
+        let input =
+            RasterInput::from_parameters(captured.document(), command.parameters()).unwrap();
+        let before = runtime.disk().used().unwrap();
+        assert!(WriteGuard::new(&captured, command, &input, None).is_err());
+        assert_eq!(runtime.disk().used().unwrap(), before);
+    }
+    let body = serde_json::json!({"op":"paint","layer":source.layers[0].id,"mask":true,"points":[[2,2],[6,4]],"radius":1.8,"color":[200,10,20,255]});
+    let mut legacy = crate::engine::Engine::new();
+    legacy.doc = source.clone();
+    legacy
+        .edit("human", &[body.clone()], None, None, "Mask")
+        .unwrap();
+    assert!(legacy.doc.layers[0].source.is_some());
+    let descriptor = CommandDescriptor::from_normalized(&document, 0, &[body], &|| Ok(())).unwrap();
+    let captured = document
+        .capture_descriptor(descriptor.clone(), "human", &[], 1, false, true)
+        .unwrap();
+    let command = descriptor.commands().next().unwrap();
+    let input = RasterInput::from_parameters(captured.document(), command.parameters()).unwrap();
+    let points = StrokePoints::from_command(command, input.pool(), &mut || Ok(())).unwrap();
+    let frame = input
+        .stroke_frame(command, &points, &mut || Ok(()))
+        .unwrap();
+    assert!(frame.is_none());
+    let stroke = points.local(&input, None, &mut || Ok(())).unwrap();
+    let guard = WriteGuard::new(&captured, command, &input, None).unwrap();
+    let BuiltTiles::Draft(draft) =
+        crate::brush::input::stage_guarded(&input, &stroke, None, &guard, &session, &mut || Ok(()))
+            .unwrap()
+    else {
+        panic!("Mask paint was unexpectedly refused")
+    };
+    let output = draft.seal(&|| Ok(())).ok().unwrap();
+    let region = output
+        .surface()
+        .prepare_region(Region::new([0, 0, 9, 7]).unwrap(), &mut || Ok(()))
+        .unwrap();
+    for y in 0..7 {
+        for x in 0..9 {
+            assert_eq!(
+                region.pixel16(x, y).unwrap(),
+                legacy.doc.layers[0].mask.as_ref().unwrap().steps[0]
+                    .pixels
+                    .get16(x, y)
+            );
+        }
+    }
+    drop(region);
+    output.abort(&session, &|| Ok(())).unwrap();
+    assert!(document.metadata().layer(0).unwrap().source().is_some());
+}
+
+#[test]
+fn real_child_producer_typed_insertion_and_native_history_keep_one_undo_redo() {
+    use crate::engine::native::{
+        CommandDescriptor, Direction, HistoryRequest, NativeHistory, Publication,
+    };
+    let f = Fixture::new();
+    let (runtime, _connection) = f.runtime();
+    let session = runtime.begin().unwrap();
+    for depth in [8, 16] {
+        let mut source = Document::new_depth(12, 10, depth).unwrap();
+        source.layers[0].kind = "group".into();
+        source.layers[0].pixels = Raster::new_depth(2, 2, 8);
+        source.layers[0].x = 3;
+        source.layers[0].y = -2;
+        let mut existing = crate::engine::Layer::new("Existing", "paint", 12, 10);
+        existing.parent = Some(source.layers[0].id.clone());
+        existing.pixels = Raster::new_depth(12, 10, depth);
+        existing.pixels.set16(4, 3, [12347, 23521, 43217, 49153]);
+        source.layers.push(existing);
+        let body = serde_json::json!({"op":"paint.fill","layer":source.layers[0].id,"rect":[2,2,8,7],"color":[37,83,127,193]});
+        let mut legacy = crate::engine::Engine::new();
+        legacy.doc = source.clone();
+        legacy
+            .edit("human", &[body.clone()], None, None, "Fill")
+            .unwrap();
+        let mut document = native(&source, &session);
+        let parent_key = document
+            .source(document.metadata().layer(0).unwrap().pixels().slot())
+            .unwrap()
+            .key();
+        let existing_key = document
+            .source(document.metadata().layer(1).unwrap().pixels().slot())
+            .unwrap()
+            .key();
+        let descriptor =
+            CommandDescriptor::from_normalized(&document, 0, &[body], &|| Ok(())).unwrap();
+        let captured = document
+            .capture_descriptor(descriptor.clone(), "human", &[], 1, false, true)
+            .unwrap();
+        let (sealed, token) = {
+            let command = descriptor.commands().next().unwrap();
+            let input =
+                RasterInput::from_parameters(captured.document(), command.parameters()).unwrap();
+            let guard = WriteGuard::new(&captured, command, &input, None).unwrap();
+            let BuiltTiles::Draft(draft) =
+                crate::fill::input::stage_child_fill(&input, &guard, &session, &mut || Ok(()))
+                    .unwrap()
+            else {
+                panic!("No child pixels")
+            };
+            (draft.seal(&|| Ok(())).ok().unwrap(), guard.token())
+        };
+        let delta = captured
+            .insert_fill_child(token, sealed, &|| Ok(()))
+            .unwrap();
+        let mut history = NativeHistory::new(&runtime.resident(), 20).unwrap();
+        let commit = history
+            .snapshot()
+            .prepare_commit(
+                &document,
+                delta,
+                HistoryRequest {
+                    actor: "human",
+                    label: "Fill child",
+                    task: None,
+                    gesture: None,
+                },
+                &|| Ok(()),
+            )
+            .unwrap();
+        drop(
+            history
+                .commit(
+                    &mut document,
+                    Publication {
+                        actor: "human",
+                        leases: &[],
+                        now: 1,
+                        closed: false,
+                        write_available: true,
+                    },
+                    commit,
+                )
+                .unwrap(),
+        );
+        assert_eq!(history.undo_len(), 1);
+        assert_eq!(document.metadata().revision(), 1);
+        assert_eq!(document.metadata().layers().count(), 3);
+        let child = document.metadata().layer(1).unwrap();
+        let child_id = child.id().to_owned();
+        assert_eq!(child.name(), "Foreground fill");
+        assert_eq!(child.parent(), Some(source.layers[0].id.as_str()));
+        assert_eq!(child.origin(), [0, 0]);
+        assert_eq!(child.pixels().depth(), depth);
+        let region = document
+            .source(child.pixels().slot())
+            .unwrap()
+            .prepare_region(Region::new([0, 0, 12, 10]).unwrap(), &mut || Ok(()))
+            .unwrap();
+        for y in 0..10 {
+            for x in 0..12 {
+                assert_eq!(
+                    region.pixel16(x, y).unwrap(),
+                    legacy.doc.layers[1].pixels.get16(x, y)
+                );
+            }
+        }
+        drop(region);
+        assert_eq!(
+            document
+                .source(document.metadata().layer(0).unwrap().pixels().slot())
+                .unwrap()
+                .key(),
+            parent_key
+        );
+        assert_eq!(
+            document
+                .source(document.metadata().layer(2).unwrap().pixels().slot())
+                .unwrap()
+                .key(),
+            existing_key
+        );
+        let undo = history
+            .snapshot()
+            .prepare_move(&document, Direction::Undo, "human", &|| Ok(()))
+            .unwrap();
+        drop(
+            history
+                .move_cursor(
+                    &mut document,
+                    Publication {
+                        actor: "human",
+                        leases: &[],
+                        now: 1,
+                        closed: false,
+                        write_available: true,
+                    },
+                    undo,
+                )
+                .unwrap(),
+        );
+        assert_eq!(document.metadata().layers().count(), 2);
+        assert_eq!(history.redo_len(), 1);
+        assert_eq!(
+            document
+                .source(document.metadata().layer(0).unwrap().pixels().slot())
+                .unwrap()
+                .key(),
+            parent_key
+        );
+        let redo = history
+            .snapshot()
+            .prepare_move(&document, Direction::Redo, "human", &|| Ok(()))
+            .unwrap();
+        drop(
+            history
+                .move_cursor(
+                    &mut document,
+                    Publication {
+                        actor: "human",
+                        leases: &[],
+                        now: 1,
+                        closed: false,
+                        write_available: true,
+                    },
+                    redo,
+                )
+                .unwrap(),
+        );
+        assert_eq!(document.metadata().layers().count(), 3);
+        assert_eq!(document.metadata().layer(1).unwrap().id(), child_id);
+        assert_eq!(history.undo_len(), 1);
+        assert_eq!(history.redo_len(), 0);
+    }
+}
+
+#[test]
+fn command_mask_frames_use_primary_color_extent_before_projecting_small_steps() {
+    use crate::{brush::input::StrokePoints, engine::native::CommandDescriptor};
+    let f = Fixture::new();
+    let (runtime, _connection) = f.runtime();
+    let session = runtime.begin().unwrap();
+    let mut source = source(16);
+    source.width = 20;
+    source.height = 14;
+    source.layers[0].mask = Some(crate::engine::Mask {
+        enabled: false,
+        linked: false,
+        cache_key: crate::engine::id(),
+        steps: vec![crate::engine::MaskStep {
+            id: "small".into(),
+            kind: "paint".into(),
+            enabled: false,
+            weight: 1.,
+            value: 0.,
+            pixels: Raster::new_depth(5, 4, 16),
+            settings: serde_json::json!({}),
+        }],
+    });
+    let document = native(&source, &session);
+    for (points, expands) in [
+        (serde_json::json!([[1., 4.]]), false),
+        (serde_json::json!([[18., 10.]]), true),
+    ] {
+        let body = serde_json::json!({"op":"paint","layer":source.layers[0].id,"mask":true,"points":points,"radius":0.5,"color":[200,10,20,255]});
+        let descriptor =
+            CommandDescriptor::from_normalized(&document, 0, &[body.clone()], &|| Ok(())).unwrap();
+        let captured = document
+            .capture_descriptor(descriptor.clone(), "human", &[], 1, false, true)
+            .unwrap();
+        let command = descriptor.commands().next().unwrap();
+        let input =
+            RasterInput::from_parameters(captured.document(), command.parameters()).unwrap();
+        let points = StrokePoints::from_command(command, input.pool(), &mut || Ok(())).unwrap();
+        let frame = input
+            .stroke_frame(command, &points, &mut || Ok(()))
+            .unwrap();
+        assert_eq!(frame.is_some(), expands);
+        let mut expected = source.clone();
+        crate::edit_bounds::prepare(&mut expected, &body).unwrap();
+        if let Some(frame) = frame {
+            assert_eq!(frame.geometry().new_shape(), [23, 14]);
+            assert_eq!(frame.geometry().old_shape(), [5, 4]);
+            assert_eq!(frame.geometry().shift(), [0, 2]);
+            assert_eq!(
+                [
+                    expected.layers[0].mask.as_ref().unwrap().steps[0]
+                        .pixels
+                        .width,
+                    expected.layers[0].mask.as_ref().unwrap().steps[0]
+                        .pixels
+                        .height
+                ],
+                [23, 14]
+            );
+            WriteGuard::new(&captured, command, &input, Some(&frame)).unwrap();
+        } else {
+            assert_eq!(
+                [
+                    expected.layers[0].mask.as_ref().unwrap().steps[0]
+                        .pixels
+                        .width,
+                    expected.layers[0].mask.as_ref().unwrap().steps[0]
+                        .pixels
+                        .height
+                ],
+                [5, 4]
+            );
+        }
+    }
+}
+
+#[test]
+fn expanded_fill_mask_preserves_old_visible_color_and_pairs_one_native_history_entry() {
+    use crate::{
+        brush::input::StrokePoints,
+        engine::native::{
+            CommandDescriptor, Direction, HistoryRequest, LayerPatch, NativeHistory, Publication,
+            RasterBatch, RasterPatch, RetainedUpdate, SourceUpdate,
+        },
+    };
+    let f = Fixture::new();
+    let (runtime, _connection) = f.runtime();
+    let session = runtime.begin().unwrap();
+    for depth in [8, 16] {
+        let mut source = Document::new_depth(12, 10, depth).unwrap();
+        source.layers[0].kind = "fill".into();
+        source.layers[0].color = [32, 96, 160, 128];
+        source.layers[0].x = 5;
+        source.layers[0].y = 4;
+        source.layers[0].pixels = Raster::new_depth(4, 3, depth);
+        source.layers[0]
+            .pixels
+            .set16(0, 0, [12347, 23521, 43217, 49153]);
+        source.layers[0].mask = Some(crate::engine::Mask {
+            enabled: false,
+            linked: false,
+            cache_key: crate::engine::id(),
+            steps: vec![crate::engine::MaskStep {
+                id: "paint-mask".into(),
+                kind: "paint".into(),
+                enabled: true,
+                weight: 1.,
+                value: 0.,
+                pixels: Raster::new_depth(4, 3, depth),
+                settings: serde_json::json!({}),
+            }],
+        });
+        // Former ordering expanded the kindfill's logical extent while copying
+        // its unused raw plane, introducing literal color in new empty space.
+        let mut former = source.clone();
+        former.layers[0].pixels =
+            crate::transform::copy_shift(&former.layers[0].pixels, 12, 10, 5, 4);
+        former.layers[0].x = 0;
+        former.layers[0].y = 0;
+        let (_, _, former_pixels, _) = former.preview(None, 12, None, false).unwrap();
+        assert_eq!(
+            &former_pixels[(12 + 1) * 4..(12 + 1) * 4 + 4],
+            &[32, 96, 160, 128]
+        );
+        let body = serde_json::json!({"op":"paint","layer":source.layers[0].id,"mask":true,"points":[[1.,1.],[2.,2.]],
+            "radius":1.5,"opacity":0.7,"flow":0.6,"color":[200,10,20,255]});
+        let mut legacy = crate::engine::Engine::new();
+        legacy.doc = source.clone();
+        legacy
+            .edit("human", &[body.clone()], None, None, "Mask")
+            .unwrap();
+        assert_eq!(legacy.undo.len(), 1);
+        assert_eq!(legacy.doc.layers[0].kind, "paint");
+        assert_eq!(legacy.doc.layers[0].pixels.get16(1, 1), [0; 4]);
+        assert_eq!(
+            legacy.doc.layers[0].pixels.get16(6, 5),
+            [32, 96, 160, 128].map(|v| v * 257)
+        );
+        let (_, _, fixed_pixels, _) = legacy.doc.preview(None, 12, None, false).unwrap();
+        assert_eq!(&fixed_pixels[(12 + 1) * 4..(12 + 1) * 4 + 4], &[0; 4]);
+        let mut document = native(&source, &session);
+        let descriptor =
+            CommandDescriptor::from_normalized(&document, 0, &[body], &|| Ok(())).unwrap();
+        let captured = document
+            .capture_descriptor(descriptor.clone(), "human", &[], 1, false, true)
+            .unwrap();
+        let batch = {
+            let command = descriptor.commands().next().unwrap();
+            let mask =
+                RasterInput::from_parameters(captured.document(), command.parameters()).unwrap();
+            let color = RasterInput::layer(captured.document(), &source.layers[0].id).unwrap();
+            let points = StrokePoints::from_command(command, mask.pool(), &mut || Ok(())).unwrap();
+            let frame = mask
+                .stroke_frame(command, &points, &mut || Ok(()))
+                .unwrap()
+                .unwrap();
+            let color_frame = frame.for_plane(&color).unwrap();
+            let stroke = points.local(&mask, Some(&frame), &mut || Ok(())).unwrap();
+            let guard = WriteGuard::new(&captured, command, &mask, Some(&frame)).unwrap();
+            let BuiltTiles::Draft(mask_draft) = crate::brush::input::stage_guarded(
+                &mask,
+                &stroke,
+                Some(&frame),
+                &guard,
+                &session,
+                &mut || Ok(()),
+            )
+            .unwrap() else {
+                panic!("No mask output")
+            };
+            let color_stage = crate::fill::input::stage_visual_frame(
+                &color,
+                &color_frame,
+                &guard,
+                &session,
+                &mut || Ok(()),
+            )
+            .unwrap();
+            assert!(color_stage.materializes_fill());
+            let (BuiltTiles::Draft(color_draft), proof) = color_stage.into_parts() else {
+                panic!("No fill prebaseline")
+            };
+            assert_eq!(proof.unwrap().logical_shape(), [4, 3]);
+            RasterBatch {
+                rasters: vec![
+                    RasterPatch {
+                        target: color.binding().slot(),
+                        output: color_draft.seal(&|| Ok(())).ok().unwrap(),
+                        retained: RetainedUpdate::Clear,
+                        layer_origin: None,
+                    },
+                    RasterPatch {
+                        target: mask.binding().slot(),
+                        output: mask_draft.seal(&|| Ok(())).ok().unwrap(),
+                        retained: RetainedUpdate::Clear,
+                        layer_origin: None,
+                    },
+                ],
+                layers: vec![LayerPatch {
+                    target: color.binding().slot(),
+                    origin: Some(color_frame.geometry().new_origin()),
+                    source: SourceUpdate::Keep,
+                    materialize_fill: true,
+                }],
+                effects: vec![],
+                selection: None,
+            }
+        };
+        let delta = captured.batch(batch, &|| Ok(())).unwrap_or_else(|refused| {
+            let reason = refused.reason().to_owned();
+            refused.abort(&session, &|| Ok(())).unwrap();
+            panic!("Native fill-mask batch refused: {reason}")
+        });
+        let mut history = NativeHistory::new(&runtime.resident(), 20).unwrap();
+        let commit = history
+            .snapshot()
+            .prepare_commit(
+                &document,
+                delta,
+                HistoryRequest {
+                    actor: "human",
+                    label: "Mask frame",
+                    task: None,
+                    gesture: None,
+                },
+                &|| Ok(()),
+            )
+            .unwrap();
+        drop(
+            history
+                .commit(
+                    &mut document,
+                    Publication {
+                        actor: "human",
+                        leases: &[],
+                        now: 1,
+                        closed: false,
+                        write_available: true,
+                    },
+                    commit,
+                )
+                .unwrap(),
+        );
+        assert_eq!(history.undo_len(), 1);
+        assert_eq!(document.metadata().layer(0).unwrap().kind(), "paint");
+        let color_slot = document.metadata().layer(0).unwrap().pixels().slot();
+        let mask_slot = document
+            .metadata()
+            .layer(0)
+            .unwrap()
+            .mask()
+            .unwrap()
+            .steps()
+            .next()
+            .unwrap()
+            .pixels()
+            .slot();
+        for (slot, expected) in [
+            (color_slot, &legacy.doc.layers[0].pixels),
+            (
+                mask_slot,
+                &legacy.doc.layers[0].mask.as_ref().unwrap().steps[0].pixels,
+            ),
+        ] {
+            let region = document
+                .source(slot)
+                .unwrap()
+                .prepare_region(Region::new([0, 0, 12, 10]).unwrap(), &mut || Ok(()))
+                .unwrap();
+            for y in 0..10 {
+                for x in 0..12 {
+                    assert_eq!(region.pixel16(x, y).unwrap(), expected.get16(x, y));
+                }
+            }
+        }
+        let undo = history
+            .snapshot()
+            .prepare_move(&document, Direction::Undo, "human", &|| Ok(()))
+            .unwrap();
+        drop(
+            history
+                .move_cursor(
+                    &mut document,
+                    Publication {
+                        actor: "human",
+                        leases: &[],
+                        now: 1,
+                        closed: false,
+                        write_available: true,
+                    },
+                    undo,
+                )
+                .unwrap(),
+        );
+        assert_eq!(document.metadata().layer(0).unwrap().kind(), "fill");
+        assert_eq!(document.metadata().layer(0).unwrap().origin(), [5, 4]);
+        assert_eq!(document.metadata().layer(0).unwrap().pixels().width(), 4);
+    }
+}
+
+#[test]
+fn guarded_brush_transaction_replans_working_sources_and_publishes_one_history_entry() {
+    use crate::{
+        brush::input::StrokePoints,
+        engine::native::{
+            CommandDescriptor, Direction, HistoryRequest, NativeHistory, Publication, RasterPatch,
+            RetainedUpdate,
+        },
+    };
+    let f = Fixture::new();
+    let (runtime, _connection) = f.runtime();
+    let session = runtime.begin().unwrap();
+    for depth in [8, 16] {
+        let mut source = Document::new_depth(9, 7, depth).unwrap();
+        for y in 0..7 {
+            for x in 0..9 {
+                source.layers[0].pixels.set16(
+                    x,
+                    y,
+                    [12347 + x as u16 * 911, 23521 + y as u16 * 617, 43217, 49153],
+                );
+            }
+        }
+        let commands = [
+            serde_json::json!({"op":"paint","layer":source.layers[0].id,"points":[[3,3],[4,3]],"radius":1.0,"color":[211,17,71,193],"source_revision":0}),
+            serde_json::json!({"op":"paint","layer":source.layers[0].id,"points":[[4,3],[5,3]],"radius":1.0,"color":[37,83,219,127],"source_revision":0}),
+        ];
+        let mut legacy = crate::engine::Engine::new();
+        legacy.doc = source.clone();
+        legacy
+            .edit("human", &commands, None, None, "Two strokes")
+            .unwrap();
+        assert_eq!(legacy.undo.len(), 1);
+        let mut document = native(&source, &session);
+        let original_key = document.key();
+        let source_bytes = session.disk().used().unwrap();
+        let descriptor =
+            CommandDescriptor::from_normalized(&document, 0, &commands, &|| Ok(())).unwrap();
+        let capture = document
+            .capture_descriptor(descriptor.clone(), "human", &[], 1, false, true)
+            .unwrap();
+        let mut transaction = capture.transaction().unwrap();
+        for index in 0..commands.len() {
+            let step = transaction.next(&|| Ok(())).unwrap();
+            let (output, slot) = {
+                let command = step.descriptor().unwrap().commands().next().unwrap();
+                assert_eq!(
+                    command.token(),
+                    descriptor.commands().nth(index).unwrap().token()
+                );
+                assert_eq!(command.parameters()["source_revision"], 0);
+                let input =
+                    RasterInput::from_parameters(step.document(), command.parameters()).unwrap();
+                assert_eq!(input.binding().generation(), transaction.working().key());
+                let points =
+                    StrokePoints::from_command(command, input.pool(), &mut || Ok(())).unwrap();
+                let frame = input
+                    .stroke_frame(command, &points, &mut || Ok(()))
+                    .unwrap();
+                assert!(frame.is_none());
+                let stroke = points.local(&input, None, &mut || Ok(())).unwrap();
+                let guard = WriteGuard::new(&step, command, &input, None).unwrap();
+                let BuiltTiles::Draft(draft) = crate::brush::input::stage_guarded(
+                    &input,
+                    &stroke,
+                    None,
+                    &guard,
+                    &session,
+                    &mut || Ok(()),
+                )
+                .unwrap() else {
+                    panic!("No transaction stroke output")
+                };
+                (draft.seal(&|| Ok(())).ok().unwrap(), input.binding().slot())
+            };
+            let delta = step
+                .raster_patch(
+                    RasterPatch {
+                        target: slot,
+                        output,
+                        retained: RetainedUpdate::Clear,
+                        layer_origin: None,
+                    },
+                    &|| Ok(()),
+                )
+                .unwrap_or_else(|refused| {
+                    let reason = refused.reason().to_owned();
+                    refused.abort(&session, &|| Ok(())).unwrap();
+                    panic!("Native stroke step refused: {reason}")
+                });
+            transaction.complete(delta, &|| Ok(())).unwrap();
+            assert_eq!(transaction.completed(), index + 1);
+            assert_eq!(document.key(), original_key);
+            assert_eq!(document.metadata().revision(), 0);
+        }
+        let delta = transaction.finish(&|| Ok(())).unwrap();
+        let mut history = NativeHistory::new(&runtime.resident(), 20).unwrap();
+        let commit = history
+            .snapshot()
+            .prepare_commit(
+                &document,
+                delta,
+                HistoryRequest {
+                    actor: "human",
+                    label: "Two strokes",
+                    task: None,
+                    gesture: None,
+                },
+                &|| Ok(()),
+            )
+            .unwrap();
+        let retained_bytes = session.disk().used().unwrap();
+        let retired = history
+            .commit(
+                &mut document,
+                Publication {
+                    actor: "human",
+                    leases: &[],
+                    now: 1,
+                    closed: false,
+                    write_available: true,
+                },
+                commit,
+            )
+            .unwrap();
+        assert!(retired.has_provisional_sources());
+        assert_eq!(session.disk().used().unwrap(), retained_bytes);
+        // This is outside publication. Only the superseded first stroke Store
+        // can retire; final pixels remain owned by the document and history.
+        retired.retire(&session, &|| Ok(())).unwrap();
+        let published_bytes = session.disk().used().unwrap();
+        assert!(published_bytes < retained_bytes);
+        assert!(published_bytes > source_bytes);
+        assert_eq!(history.undo_len(), 1);
+        assert_eq!(document.metadata().revision(), 1);
+        let region = document
+            .source(document.metadata().layer(0).unwrap().pixels().slot())
+            .unwrap()
+            .prepare_region(Region::new([0, 0, 9, 7]).unwrap(), &mut || Ok(()))
+            .unwrap();
+        for y in 0..7 {
+            for x in 0..9 {
+                assert_eq!(
+                    region.pixel16(x, y).unwrap(),
+                    legacy.doc.layers[0].pixels.get16(x, y)
+                );
+            }
+        }
+        drop(region);
+        let undo = history
+            .snapshot()
+            .prepare_move(&document, Direction::Undo, "human", &|| Ok(()))
+            .unwrap();
+        drop(
+            history
+                .move_cursor(
+                    &mut document,
+                    Publication {
+                        actor: "human",
+                        leases: &[],
+                        now: 1,
+                        closed: false,
+                        write_available: true,
+                    },
+                    undo,
+                )
+                .unwrap(),
+        );
+        let region = document
+            .source(document.metadata().layer(0).unwrap().pixels().slot())
+            .unwrap()
+            .prepare_region(Region::new([0, 0, 9, 7]).unwrap(), &mut || Ok(()))
+            .unwrap();
+        for y in 0..7 {
+            for x in 0..9 {
+                assert_eq!(
+                    region.pixel16(x, y).unwrap(),
+                    source.layers[0].pixels.get16(x, y)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn guarded_unchanged_heal_preserves_physical_sources_and_records_command_history() {
+    use crate::{
+        brush::input::StrokePoints,
+        engine::native::{
+            CommandDescriptor, Direction, HistoryRequest, NativeHistory, Publication,
+        },
+    };
+    let f = Fixture::new();
+    let (runtime, _connection) = f.runtime();
+    let session = runtime.begin().unwrap();
+    for depth in [8, 16] {
+        let mut source = Document::new_depth(9, 7, depth).unwrap();
+        for y in 0..7 {
+            for x in 0..9 {
+                source.layers[0]
+                    .pixels
+                    .set16(x, y, [23521, 36791, 51237, 65535]);
+            }
+        }
+        let command = serde_json::json!({"op":"heal","layer":source.layers[0].id,
+            "points":[[4.,3.]],"source":[4.,3.],"radius":1.,"heal_radius":2});
+        let mut legacy = crate::engine::Engine::new();
+        legacy.doc = source.clone();
+        legacy
+            .edit("human", &[command.clone()], None, None, "Unchanged heal")
+            .unwrap();
+        assert_eq!(legacy.undo.len(), 1);
+        assert_eq!(legacy.doc.revision, 1);
+        let mut document = native(&source, &session);
+        let original_slot = document.metadata().layer(0).unwrap().pixels().slot();
+        let source_key = document.source(original_slot).unwrap().key();
+        let disk_before = session.disk().used().unwrap();
+        let descriptor =
+            CommandDescriptor::from_normalized(&document, 0, &[command], &|| Ok(())).unwrap();
+        let captured = document
+            .capture_descriptor(descriptor, "human", &[], 1, false, true)
+            .unwrap();
+        let token = {
+            let command = captured.descriptor().unwrap().commands().next().unwrap();
+            let input =
+                RasterInput::from_parameters(captured.document(), command.parameters()).unwrap();
+            let points = StrokePoints::from_command(command, input.pool(), &mut || Ok(())).unwrap();
+            let frame = input
+                .stroke_frame(command, &points, &mut || Ok(()))
+                .unwrap();
+            assert!(frame.is_none());
+            let stroke = points.local(&input, None, &mut || Ok(())).unwrap();
+            let guard = WriteGuard::new(&captured, command, &input, None).unwrap();
+            let built = crate::retouch::input::stage_guarded(
+                &input,
+                &input,
+                &stroke,
+                None,
+                &guard,
+                &session,
+                &mut || Ok(()),
+            )
+            .unwrap();
+            assert!(matches!(built, BuiltTiles::Unchanged));
+            // The actual full command is validated above, and its native output
+            // is byte-identical. No frame/kind/source metadata transition exists.
+            command.token()
+        };
+        let delta = captured.unchanged(token, &|| Ok(())).unwrap();
+        let mut history = NativeHistory::new(&runtime.resident(), 20).unwrap();
+        let commit = history
+            .snapshot()
+            .prepare_commit(
+                &document,
+                delta,
+                HistoryRequest {
+                    actor: "human",
+                    label: "Unchanged heal",
+                    task: None,
+                    gesture: None,
+                },
+                &|| Ok(()),
+            )
+            .unwrap();
+        let retired = history
+            .commit(
+                &mut document,
+                Publication {
+                    actor: "human",
+                    leases: &[],
+                    now: 1,
+                    closed: false,
+                    write_available: true,
+                },
+                commit,
+            )
+            .unwrap();
+        retired.retire(&session, &|| Ok(())).unwrap();
+        assert_eq!(history.undo_len(), 1);
+        assert_eq!(document.metadata().revision(), 1);
+        assert_eq!(session.disk().used().unwrap(), disk_before);
+        assert_eq!(
+            document
+                .source(document.metadata().layer(0).unwrap().pixels().slot())
+                .unwrap()
+                .key(),
+            source_key
+        );
+        for direction in [None, Some(Direction::Undo), Some(Direction::Redo)] {
+            if let Some(direction) = direction {
+                let movement = history
+                    .snapshot()
+                    .prepare_move(&document, direction, "human", &|| Ok(()))
+                    .unwrap();
+                drop(
+                    history
+                        .move_cursor(
+                            &mut document,
+                            Publication {
+                                actor: "human",
+                                leases: &[],
+                                now: 1,
+                                closed: false,
+                                write_available: true,
+                            },
+                            movement,
+                        )
+                        .unwrap(),
+                );
+            }
+            let pixels = document
+                .source(document.metadata().layer(0).unwrap().pixels().slot())
+                .unwrap()
+                .prepare_region(Region::new([0, 0, 9, 7]).unwrap(), &mut || Ok(()))
+                .unwrap();
+            for y in 0..7 {
+                for x in 0..9 {
+                    assert_eq!(
+                        pixels.pixel16(x, y).unwrap(),
+                        source.layers[0].pixels.get16(x, y)
+                    );
+                    assert_eq!(
+                        pixels.pixel16(x, y).unwrap(),
+                        legacy.doc.layers[0].pixels.get16(x, y)
+                    );
+                }
+            }
+            assert_eq!(session.disk().used().unwrap(), disk_before);
+        }
+    }
+}

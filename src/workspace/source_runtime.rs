@@ -15,11 +15,17 @@ use std::{
         Arc, Mutex,
     },
 };
+#[path = "source_runtime/segments.rs"]
+mod segments;
 #[path = "source_runtime/staging.rs"]
 mod staging;
+pub(crate) use segments::{SessionJxlOutput, SessionSegmentLog, SessionSegments};
 pub(crate) use staging::{SessionBytes, SessionTemporary};
+#[path = "source_runtime/checkpoints.rs"]
+mod checkpoints;
 #[path = "source_runtime/recovery_marker.rs"]
 mod recovery_marker;
+pub(crate) use checkpoints::CheckpointCensus;
 pub(crate) use recovery_marker::{NativeMarker, NativeMarkerIds};
 
 pub(crate) struct Limits {
@@ -99,6 +105,7 @@ struct Inventory {
     locations: BTreeMap<[u8; 16], Location>,
     lineages: BTreeMap<[u8; 16], [u8; 16]>,
     staging: BTreeMap<[u8; 16], staging::Location>,
+    checkpoints: checkpoints::Registry,
     directories: usize,
     // Payload/index/path allocations above must drop before their accounting.
     _charges: Vec<Reservation>,
@@ -149,7 +156,7 @@ impl SourceRuntime {
         drop(state);
         let session = SourceSession {
             runtime: self.clone(),
-            operation,
+            operation: Arc::new(operation),
             directory,
         };
         session.check()?;
@@ -183,6 +190,7 @@ impl SourceRuntime {
             );
             remaining -= count;
         }
+        let checkpoints = checkpoints::Registry::new(self.limits.max_files)?;
         let owner_path = directory.path().join("owner.pbr");
         let mut owner = match fs::symlink_metadata(&owner_path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -263,6 +271,7 @@ impl SourceRuntime {
             locations: BTreeMap::new(),
             lineages: BTreeMap::new(),
             staging: BTreeMap::new(),
+            checkpoints,
             directories: 0,
             _charges: charges,
         };
@@ -285,7 +294,7 @@ impl SourceRuntime {
                 let (_, uuid) = name
                     .split_once('-')
                     .ok_or("Unknown source directory retained")?;
-                if !["source", "planar", "scalar", "bytes"]
+                if !["source", "planar", "scalar", "bytes", "segments"]
                     .iter()
                     .any(|prefix| name.starts_with(&format!("{prefix}-")))
                     || uuid::Uuid::parse_str(uuid).is_err()
@@ -308,6 +317,7 @@ impl SourceRuntime {
                         "planar" => "planes.pbp",
                         "scalar" => "field.pbf",
                         "bytes" => "bytes.pbb",
+                        "segments" => "segments.pbj",
                         _ => unreachable!(),
                     };
                     if file_name != expected {
@@ -374,10 +384,26 @@ impl SourceRuntime {
 
 pub(crate) struct SourceSession {
     runtime: Arc<SourceRuntime>,
-    operation: RootOperation,
+    operation: Arc<RootOperation>,
     directory: PathBuf,
 }
+/// Nominal lifetime only. The worker owner parks this with an uncertain child
+/// until known exit; it grants no source I/O or publication capability.
+#[must_use]
+pub(crate) struct SessionRetention {
+    // Close retained inventory handles before the final operation/profile owner.
+    _runtime: Arc<SourceRuntime>,
+    _operation: Arc<RootOperation>,
+}
 impl SourceSession {
+    pub(crate) fn retain_for_child(&self) -> Result<SessionRetention, String> {
+        self.check()?;
+        Ok(SessionRetention {
+            _runtime: self.runtime.clone(),
+            _operation: self.operation.clone(),
+        })
+    }
+
     pub(crate) fn check(&self) -> Result<(), String> {
         self.operation.check()?;
         self.check_inventory()
@@ -1720,5 +1746,412 @@ mod tests {
         drop(runtime);
         drop(context);
         drop(connection);
+    }
+    #[test]
+    fn compatible_jxl_log_keeps_actual_session_and_canonical_inventory_until_retirement() {
+        use crate::large_document::{
+            segments::{SegmentEvent, SegmentLimits},
+            ScratchBytes,
+        };
+        let f = Fixture::new();
+        let (_shared, connection) = f.connection();
+        let context = PersistentRootContext::from_explicit_state(&connection).unwrap();
+        let runtime = SourceRuntime::new(context, limits()).unwrap();
+        let session = runtime.begin().unwrap();
+        let spec = SegmentLimits {
+            output_bytes: 1024,
+            protocol_log_bytes: 65536,
+            records: 32,
+            events: 128,
+        };
+        let directories = runtime
+            .inventory
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .directories;
+        assert!(session.segment_log(spec, [0; 16], [8; 32]).is_err());
+        assert_eq!(
+            runtime
+                .inventory
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .directories,
+            directories
+        );
+        let mut log = session.segment_log(spec, [7; 16], [8; 32]).unwrap();
+        log.append(
+            0,
+            SegmentEvent::Observed { wire_kind: 2 },
+            None,
+            &mut || Ok(()),
+        )
+        .unwrap();
+        let mut bytes = ScratchBytes::new(&session.resident(), 8, 65536).unwrap();
+        bytes.copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        let sha = ring::digest::digest(&SHA256, &bytes)
+            .as_ref()
+            .try_into()
+            .unwrap();
+        log.append(
+            1,
+            SegmentEvent::Data {
+                offset: 0,
+                sha256: sha,
+            },
+            Some((&bytes, bytes.len())),
+            &mut || Ok(()),
+        )
+        .unwrap();
+        log.append(
+            2,
+            SegmentEvent::Finalized { position: 8 },
+            None,
+            &mut || Ok(()),
+        )
+        .unwrap();
+        log.append(
+            3,
+            SegmentEvent::Done {
+                bytes: 8,
+                records: 1,
+            },
+            None,
+            &mut || Ok(()),
+        )
+        .unwrap();
+        let log = log.finish(&mut || Ok(())).unwrap();
+        let canonical = log.canonical(&mut || Ok(())).unwrap();
+        assert_eq!(
+            canonical.bytes().role(),
+            crate::large_document::ByteRole::CompatibleJxlMode1
+        );
+        assert_eq!(canonical.bytes().payload_sha256(), sha);
+        assert_eq!(
+            runtime
+                .inventory
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .staging
+                .len(),
+            2
+        );
+        canonical.check_session(&session).unwrap();
+        let foreign = runtime.begin().unwrap();
+        assert!(canonical.check_session(&foreign).is_err());
+        drop(foreign);
+        canonical.retire(&mut || session.cleanup_check()).unwrap();
+        assert_eq!(
+            runtime
+                .inventory
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .staging
+                .len(),
+            0
+        );
+        assert_eq!(
+            runtime
+                .inventory
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .directories,
+            0
+        );
+        assert_eq!(runtime.disk().used().unwrap(), 56);
+        drop(bytes);
+        drop(session);
+        drop(runtime);
+        drop(connection);
+    }
+    #[test]
+    fn unsealed_jxl_log_restart_accounts_actual_bytes_without_resuming_encoder() {
+        use crate::large_document::segments::{SegmentEvent, SegmentLimits};
+        let f = Fixture::new();
+        let (_shared, connection) = f.connection();
+        let context = PersistentRootContext::from_explicit_state(&connection).unwrap();
+        let runtime = SourceRuntime::new(context.clone(), limits()).unwrap();
+        let session = runtime.begin().unwrap();
+        let mut log = session
+            .segment_log(
+                SegmentLimits {
+                    output_bytes: 1024,
+                    protocol_log_bytes: 65536,
+                    records: 32,
+                    events: 128,
+                },
+                [7; 16],
+                [8; 32],
+            )
+            .unwrap();
+        log.append(
+            0,
+            SegmentEvent::Observed { wire_kind: 2 },
+            None,
+            &mut || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(runtime.disk().used().unwrap(), 56 + 256 + 96);
+        drop(log);
+        drop(session);
+        drop(runtime);
+        let runtime = SourceRuntime::new(context, limits()).unwrap();
+        let session = runtime.begin().unwrap();
+        assert_eq!(runtime.disk().used().unwrap(), 56 + 128 + 96);
+        {
+            let state = runtime.inventory.lock().unwrap();
+            let inventory = state.as_ref().unwrap();
+            assert_eq!(inventory.directories, 1);
+            assert_eq!(inventory.files.len(), 2);
+            assert!(inventory.locations.is_empty());
+            assert!(inventory.staging.is_empty());
+        }
+        drop(session);
+        drop(runtime);
+        drop(connection);
+    }
+    #[test]
+    fn connection_drop_waits_for_jxl_abort_without_authorizing_new_output_after_stop() {
+        use crate::large_document::segments::{SegmentEvent, SegmentLimits};
+        use std::{
+            sync::mpsc,
+            thread,
+            time::{Duration, Instant},
+        };
+        let f = Fixture::new();
+        let (_shared, connection) = f.connection();
+        let context = PersistentRootContext::from_explicit_state(&connection).unwrap();
+        let runtime = SourceRuntime::new(context, limits()).unwrap();
+        let session = runtime.begin().unwrap();
+        let spec = SegmentLimits {
+            output_bytes: 1024,
+            protocol_log_bytes: 65536,
+            records: 32,
+            events: 128,
+        };
+        let mut log = session.segment_log(spec, [7; 16], [8; 32]).unwrap();
+        log.append(
+            0,
+            SegmentEvent::Observed { wire_kind: 2 },
+            None,
+            &mut || Ok(()),
+        )
+        .unwrap();
+        let (finished, done) = mpsc::channel();
+        let closer = thread::spawn(move || {
+            drop(connection);
+            finished.send(()).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while session.check().is_ok() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(session.check().is_err());
+        assert!(done.try_recv().is_err());
+        assert!(session.segment_log(spec, [7; 16], [8; 32]).is_err());
+        log.abort(&mut || session.cleanup_check()).unwrap();
+        assert_eq!(runtime.disk().used().unwrap(), 56);
+        assert!(done.try_recv().is_err());
+        drop(session);
+        done.recv_timeout(Duration::from_secs(2)).unwrap();
+        closer.join().unwrap();
+        drop(runtime);
+    }
+    #[test]
+    fn nominal_child_retention_is_owned_send_static_without_granting_io() {
+        fn owned_send<T: Send + 'static>() {}
+        owned_send::<SessionRetention>();
+    }
+    #[test]
+    fn uncertain_child_retention_preserves_profile_instance_and_file_operation_until_drop() {
+        use std::{
+            sync::mpsc,
+            thread,
+            time::{Duration, Instant},
+        };
+        let f = Fixture::new();
+        let profile =
+            crate::settings::Profile::open(f.locations(), &f.base.join("legacy")).unwrap();
+        let (shared, connection) = f.connection();
+        let state_dir = connection.state_dir.clone();
+        let context =
+            PersistentRootContext::from_profile(&connection, profile.source_profile().unwrap())
+                .unwrap();
+        let runtime = SourceRuntime::new(context.clone(), limits()).unwrap();
+        let session = runtime.begin().unwrap();
+        let workspace = crate::workspace::attach(&shared);
+        let before = workspace
+            .lock()
+            .unwrap()
+            .file_operations
+            .load(Ordering::Acquire);
+        assert_eq!(before, 1);
+        let retained = session.retain_for_child().unwrap();
+        assert_eq!(
+            workspace
+                .lock()
+                .unwrap()
+                .file_operations
+                .load(Ordering::Acquire),
+            before
+        );
+        drop(profile);
+        drop(context);
+        let (finished, done) = mpsc::channel();
+        let closer = thread::spawn(move || {
+            drop(connection);
+            finished.send(()).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while session.check().is_ok() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(session.check().is_err());
+        assert!(session.retain_for_child().is_err());
+        drop(session);
+        drop(runtime);
+        assert_eq!(
+            workspace
+                .lock()
+                .unwrap()
+                .file_operations
+                .load(Ordering::Acquire),
+            before
+        );
+        assert!(crate::settings::Profile::open(f.locations(), &f.base.join("legacy")).is_err());
+        let instance = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(state_dir.join("instance.lock"))
+            .unwrap();
+        assert!(instance.try_lock().is_err());
+        assert!(matches!(
+            done.recv_timeout(Duration::from_millis(20)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(retained);
+        done.recv_timeout(Duration::from_secs(5)).unwrap();
+        closer.join().unwrap();
+        assert_eq!(
+            workspace
+                .lock()
+                .unwrap()
+                .file_operations
+                .load(Ordering::Acquire),
+            0
+        );
+        instance.try_lock().unwrap();
+        assert!(crate::settings::Profile::open(f.locations(), &f.base.join("legacy")).is_ok());
+    }
+    #[test]
+    #[ignore = "Internal bounded pipe-wait child, launched only by the retained-worker lifecycle test"]
+    fn retained_codec_pipe_child_waits_for_owned_stdin_close() {
+        use std::io::Read;
+        let mut byte = [0];
+        let result = std::io::stdin().read_exact(&mut byte);
+        assert!(matches!(result,Err(error) if error.kind()==std::io::ErrorKind::UnexpectedEof));
+    }
+    #[test]
+    fn autonomous_retained_codec_reaper_releases_actual_profile_and_instance_without_future_request(
+    ) {
+        use std::{
+            process::Command,
+            sync::mpsc,
+            thread,
+            time::{Duration, Instant},
+        };
+        crate::jpeg_xl::prepare_retained_test_reaper().unwrap();
+        let f = Fixture::new();
+        let profile =
+            crate::settings::Profile::open(f.locations(), &f.base.join("legacy")).unwrap();
+        let (shared, connection) = f.connection();
+        let state_dir = connection.state_dir.clone();
+        let context =
+            PersistentRootContext::from_profile(&connection, profile.source_profile().unwrap())
+                .unwrap();
+        let runtime = SourceRuntime::new(context.clone(), limits()).unwrap();
+        let session = runtime.begin().unwrap();
+        let workspace = crate::workspace::attach(&shared);
+        let baseline = workspace
+            .lock()
+            .unwrap()
+            .file_operations
+            .load(Ordering::Acquire);
+        assert_eq!(baseline, 1);
+        let retained = session.retain_for_child().unwrap();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.args([
+            "--ignored",
+            "--exact",
+            "workspace::source_runtime::tests::retained_codec_pipe_child_waits_for_owned_stdin_close",
+            "--nocapture",
+            "--test-threads=1",
+        ]);
+        let mut child = crate::jpeg_xl::park_retained_test_child(command, retained).unwrap();
+        assert!(!child.reaped());
+        drop(profile);
+        drop(context);
+        let (finished, done) = mpsc::channel();
+        let closer = thread::spawn(move || {
+            drop(connection);
+            finished.send(()).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while session.check().is_ok() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(session.check().is_err());
+        assert!(session.retain_for_child().is_err());
+        drop(session);
+        drop(runtime);
+        assert!(!child.reaped());
+        assert_eq!(
+            workspace
+                .lock()
+                .unwrap()
+                .file_operations
+                .load(Ordering::Acquire),
+            baseline
+        );
+        assert!(crate::settings::Profile::open(f.locations(), &f.base.join("legacy")).is_err());
+        let instance = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(state_dir.join("instance.lock"))
+            .unwrap();
+        assert!(instance.try_lock().is_err());
+        assert!(matches!(
+            done.recv_timeout(Duration::from_millis(20)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        // No codec request follows this close. The autonomous reaper must perform
+        // actual child/job/source-owner drops and wake the waiting Connection.
+        child.close_child();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !child.reaped() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(child.reaped());
+        done.recv_timeout(Duration::from_secs(5)).unwrap();
+        closer.join().unwrap();
+        assert_eq!(
+            workspace
+                .lock()
+                .unwrap()
+                .file_operations
+                .load(Ordering::Acquire),
+            0
+        );
+        instance.try_lock().unwrap();
+        assert!(crate::settings::Profile::open(f.locations(), &f.base.join("legacy")).is_ok());
     }
 }

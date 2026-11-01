@@ -13,6 +13,9 @@ type Digest = [u8; 32];
 const STRIP_PIXELS: u32 = 128 * 1024;
 const MAX_ENCODED: u64 = 64 * 1024 * 1024 * 1024;
 const CHUNK_BYTES: usize = 64 * 1024;
+pub(super) fn stripe_rows(width: u32, height: u32) -> u32 {
+    (STRIP_PIXELS / width.max(1)).max(1).min(256).min(height)
+}
 
 pub(crate) struct RowRequest<'a> {
     pub output: &'a Output,
@@ -228,10 +231,7 @@ pub(crate) fn write_to<'scene, 'output>(
         return Err("Native PNG output rectangle, target or scale differs".into());
     }
     let provenance = binding(scene, output, settings.resampling, check)?;
-    let stripe = STRIP_PIXELS
-        .div_ceil(output.width)
-        .min(256)
-        .min(output.height);
+    let stripe = stripe_rows(output.width, output.height);
     let capacity = row_bytes
         .checked_mul(stripe as usize)
         .ok_or("Native PNG stripe footprint overflow")?;
@@ -408,6 +408,53 @@ mod tests {
         raster::{Raster, Surface},
     };
     use std::{io::Cursor, sync::Arc};
+    #[test]
+    fn nondivisor_width_is_admitted_before_raw_provider_within_shared_pixel_limit() {
+        let scene = fixture_scene(16, 0);
+        let mut output = output(&scene);
+        output.width = 16000;
+        output.height = 17;
+        struct Inspect<'a> {
+            scene: &'a SceneSnapshot,
+            calls: usize,
+        }
+        impl CapturedExportRows for Inspect<'_> {
+            fn scene(&self) -> &SceneSnapshot {
+                self.scene
+            }
+            fn fill(
+                &mut self,
+                request: RowRequest<'_>,
+                _: &mut [u8],
+                _: &dyn Fn() -> Result<(), String>,
+            ) -> Result<(), String> {
+                self.calls += 1;
+                assert_eq!(request.rows, 8);
+                assert!(request.output.width * request.rows <= STRIP_PIXELS);
+                Err("metadata stripe admission observed before samples".into())
+            }
+        }
+        let mut provider = Inspect {
+            scene: &scene,
+            calls: 0,
+        };
+        let mut bytes = vec![];
+        assert!(write_to(
+            &scene,
+            &output,
+            &Settings::default(),
+            &mut provider,
+            &mut bytes,
+            1024 * 1024,
+            &|| Ok(())
+        )
+        .is_err());
+        assert_eq!(provider.calls, 1);
+        for width in [1, 3, 513, 8191, 16000] {
+            let rows = stripe_rows(width, 10000);
+            assert!(rows >= 1 && rows <= 256 && width * rows <= STRIP_PIXELS);
+        }
+    }
     // Transport-only source. Pixel generation is deliberately independent of
     // the compositor, whose current-scene semantic qualification is separate.
     struct Collect(Vec<Surface>);

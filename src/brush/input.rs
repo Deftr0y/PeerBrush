@@ -12,6 +12,7 @@ use crate::{
 pub(crate) struct StrokePoints {
     points: Vec<[f32; 2]>,
     pressures: Option<Vec<f32>>,
+    command: Option<crate::engine::native::CommandToken>,
     _charge: Reservation,
 }
 impl StrokePoints {
@@ -52,8 +53,21 @@ impl StrokePoints {
         Ok(Self {
             points,
             pressures,
+            command: None,
             _charge: charge,
         })
+    }
+    pub(crate) fn from_command(
+        command: crate::engine::native::Command<'_>,
+        pool: &ResidentBudget,
+        check: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<Self, String> {
+        let mut points = Self::from_parameters(command.parameters(), pool, check)?;
+        points.command = Some(command.token());
+        Ok(points)
+    }
+    pub(crate) fn matches_command(&self, token: crate::engine::native::CommandToken) -> bool {
+        self.command == Some(token)
     }
     pub(crate) fn points(&self) -> &[[f32; 2]] {
         &self.points
@@ -67,11 +81,13 @@ impl StrokePoints {
         frame: Option<&InputFrame>,
         check: &mut dyn FnMut() -> Result<(), String>,
     ) -> Result<LocalStroke, String> {
-        if let Some(frame) = frame {
+        let mut stroke = if let Some(frame) = frame {
             LocalStroke::for_frame(input, frame, self.points(), self.pressures(), check)
         } else {
             LocalStroke::new(input, self.points(), self.pressures(), check)
-        }
+        }?;
+        stroke.command = self.command;
+        Ok(stroke)
     }
 }
 
@@ -81,6 +97,8 @@ pub(crate) struct LocalStroke {
     origin: [i32; 2],
     points: Vec<[f32; 2]>,
     pressures: Option<Vec<f32>>,
+    command: Option<crate::engine::native::CommandToken>,
+    first_document: [f32; 2],
     polygon: Option<Vec<[f32; 2]>>,
     clip: Option<[i32; 4]>,
     // Keep admission until the actual Vec capacities above have been released.
@@ -89,6 +107,7 @@ pub(crate) struct LocalStroke {
 
 /// Worker-only preparation. Output remains unpublished; the common dispatcher
 /// must retain the capture/session and atomically adopt every related plane.
+#[cfg(test)]
 pub(crate) fn stage<'d, 's>(
     input: &RasterInput<'d>,
     stroke: &LocalStroke,
@@ -99,14 +118,60 @@ pub(crate) fn stage<'d, 's>(
     session: &'s crate::workspace::source_runtime::SourceSession,
     check: &mut dyn FnMut() -> Result<(), String>,
 ) -> Result<crate::edit_bounds::output::BuiltTiles<'d, 's>, String> {
+    stage_impl(
+        input, stroke, settings, color, erase, frame, None, session, check,
+    )
+}
+pub(crate) fn stage_guarded<'d, 's>(
+    input: &RasterInput<'d>,
+    stroke: &LocalStroke,
+    frame: Option<&InputFrame>,
+    guard: &crate::edit_bounds::input::WriteGuard<'_>,
+    session: &'s crate::workspace::source_runtime::SourceSession,
+    check: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<crate::edit_bounds::output::BuiltTiles<'d, 's>, String> {
+    guard.validate(input, frame, &["paint"])?;
+    stroke.validate_command(guard.token())?;
+    let parameters = guard.parameters();
+    let settings = Settings::from_command(parameters)?;
+    let color = crate::engine::color(parameters);
+    let erase = parameters["erase"] == true;
+    let mut checked = || {
+        guard.check_active()?;
+        check()?;
+        guard.check_active()
+    };
+    stage_impl(
+        input,
+        stroke,
+        settings,
+        color,
+        erase,
+        frame,
+        Some(guard),
+        session,
+        &mut checked,
+    )
+}
+fn stage_impl<'d, 's>(
+    input: &RasterInput<'d>,
+    stroke: &LocalStroke,
+    settings: Settings,
+    color: [u8; 4],
+    erase: bool,
+    frame: Option<&InputFrame>,
+    guard: Option<&crate::edit_bounds::input::WriteGuard<'_>>,
+    session: &'s crate::workspace::source_runtime::SourceSession,
+    check: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<crate::edit_bounds::output::BuiltTiles<'d, 's>, String> {
     use crate::edit_bounds::{
         input::{restrict_frame_tile, restrict_tile},
         output::{stage_frame_with, BuiltTiles, TileOutput},
     };
     session.check()?;
     check()?;
-    if input.document().metadata().read_only() {
-        return Err("Native document is read-only".into());
+    if input.document().metadata().read_only() || input.layer_metadata().locked() {
+        return Err("Native paint requires an editable unlocked plane".into());
     }
     stroke.validate_frame(input, frame)?;
     if !input.is_mask()
@@ -132,12 +197,22 @@ pub(crate) fn stage<'d, 's>(
                 return Ok(before.clone());
             }
             let after = plan.render_tile(key, before, check)?;
-            if selection.has_coverage() {
+            let after = if selection.has_coverage() {
                 let coverage = selection.prepare(frame.tile_document_rect(key)?, check)?;
                 restrict_frame_tile(input, frame, key, before, &after, &coverage, check)
             } else {
                 Ok(after)
-            }
+            }?;
+            crate::edit_bounds::input::check_proposal(
+                guard,
+                input,
+                Some(frame),
+                key,
+                before,
+                &after,
+                check,
+            )?;
+            Ok(after)
         })?;
         return Ok(BuiltTiles::Draft(draft));
     }
@@ -151,6 +226,15 @@ pub(crate) fn stage<'d, 's>(
                 let coverage = selection.prepare(input.tile_document_rect(key)?, check)?;
                 after = restrict_tile(input, key, before.bytes(), &after, &coverage, check)?;
             }
+            crate::edit_bounds::input::check_proposal(
+                guard,
+                input,
+                None,
+                key,
+                before.bytes(),
+                &after,
+                check,
+            )?;
             output.replace_tile(&before, after, check)?;
         }
         check()
@@ -287,6 +371,8 @@ impl LocalStroke {
             origin,
             points,
             pressures,
+            command: None,
+            first_document: points_document[0],
             polygon,
             clip: selection
                 .bounds()
@@ -305,6 +391,18 @@ impl LocalStroke {
     }
     pub(crate) fn binding(&self) -> InputBinding {
         self.binding
+    }
+    pub(crate) fn validate_command(
+        &self,
+        token: crate::engine::native::CommandToken,
+    ) -> Result<(), String> {
+        if self.command != Some(token) {
+            return Err("Native stroke was not parsed from this immutable command".into());
+        }
+        Ok(())
+    }
+    pub(crate) fn first_document(&self) -> [f32; 2] {
+        self.first_document
     }
     pub(crate) fn validate_frame(
         &self,

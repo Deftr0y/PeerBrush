@@ -3,16 +3,30 @@
 mod admission;
 #[path = "native/batch.rs"]
 mod batch;
+#[path = "native/descriptor.rs"]
+mod descriptor;
 #[path = "native/effect_patch.rs"]
 mod effect_patch;
 #[path = "native/history.rs"]
 mod history;
+#[path = "native/insertion.rs"]
+mod insertion;
 #[path = "native/intent.rs"]
 mod intent;
+#[path = "native/metadata.rs"]
+mod metadata;
 #[path = "native/output.rs"]
 mod output;
 #[path = "native/patch.rs"]
 mod patch;
+#[path = "native/pixel_inverse.rs"]
+mod pixel_inverse;
+#[path = "native/publication.rs"]
+mod publication;
+#[path = "native/scopes.rs"]
+mod scopes;
+#[path = "native/transaction.rs"]
+mod transaction;
 use super::scene::{Document36, Layer36, PendingScene, RasterRef36, RasterRoster, Result};
 use crate::{
     large_document::{DiskBudget, ResidentBudget, ScratchBytes},
@@ -26,11 +40,13 @@ pub(crate) use batch::{
     CoveragePatch, CoveragePixels, LayerPatch, RasterBatch, RefusedBatch, SelectionPatch,
     SourceUpdate,
 };
+pub(crate) use descriptor::{Command, CommandDescriptor, CommandToken, Method};
 pub(crate) use effect_patch::{EffectClipPatch, EffectPatch};
 pub(crate) use history::{
     Direction, HistoryRequest, HistorySnapshot, NativeHistory, PreparedCommit, PreparedMove,
-    Publication, RefusedCommit, RefusedMove, RetiredHistory,
+    Publication, RefusedCommit, RefusedMove, RetiredHistory, TaskCapture, TaskEntry, TaskRequest,
 };
+pub(crate) use insertion::RefusedInsertion;
 pub use intent::{Intent, IntentKind};
 pub use output::{OutputDraft, RefusedOutput, StagedOutput};
 pub use patch::{RasterPatch, RefusedPatch, RetainedUpdate};
@@ -42,6 +58,7 @@ use std::{
         Arc, OnceLock,
     },
 };
+pub(crate) use transaction::{NativeTransaction, RefusedTransaction};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct DocumentKey([u8; 16]);
@@ -119,6 +136,36 @@ impl NativeDocument {
     pub fn disk_budget(&self) -> &DiskBudget {
         &self.core.disk
     }
+    /// Metadata-only producer copies retain a fresh shared-pool charge. These
+    /// helpers grant no source staging or editor publication authority.
+    pub(crate) fn copy_value_metadata(
+        &self,
+        value: &serde_json::Value,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<Admitted<serde_json::Value>> {
+        copy_admitted(value, self.budget(), true, check)
+    }
+    pub(crate) fn copy_contour_metadata(
+        &self,
+        contours: &[Vec<[f32; 2]>],
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<Admitted<Vec<Vec<[f32; 2]>>>> {
+        if contours.len() > 500_000 {
+            return Err("Native contour array count exceeds its bound".into());
+        }
+        let mut vertices = 0usize;
+        for contour in contours {
+            check()?;
+            vertices = vertices
+                .checked_add(contour.len())
+                .filter(|count| *count <= 500_000)
+                .ok_or("Native contour vertex count exceeds its bound")?;
+            if contour.iter().flatten().any(|v| !v.is_finite()) {
+                return Err("Native contour coordinates must be finite".into());
+            }
+        }
+        copy_admitted(&contours, self.budget(), true, check)
+    }
     pub(super) fn roster(&self) -> &RasterRoster {
         &self.core.roster.roster
     }
@@ -169,6 +216,7 @@ impl NativeDocument {
         })
     }
     /// No callbacks, file access or history duplication occurs here.
+    #[cfg(test)]
     pub fn adopt(
         &self,
         prepared: PreparedDelta,
@@ -181,6 +229,7 @@ impl NativeDocument {
         }
         self.finish(prepared)
     }
+    #[cfg(test)]
     pub(crate) fn publish(
         &self,
         actor: &str,
@@ -189,6 +238,20 @@ impl NativeDocument {
         closed: bool,
         prepared: PreparedDelta,
     ) -> std::result::Result<NativeDocument, RefusedDelta> {
+        let (candidate, outputs) = self.publish_deferred(actor, leases, now, closed, prepared)?;
+        for output in outputs {
+            output.mark_published();
+        }
+        Ok(candidate)
+    }
+    fn publish_deferred(
+        &self,
+        actor: &str,
+        leases: &[super::Lease],
+        now: u64,
+        closed: bool,
+        prepared: PreparedDelta,
+    ) -> std::result::Result<(NativeDocument, Vec<StagedOutput>), RefusedDelta> {
         if closed {
             return Err(RefusedDelta {
                 reason: "Project is closed".into(),
@@ -199,13 +262,34 @@ impl NativeDocument {
             return Err(RefusedDelta { reason, prepared });
         }
         if let Some(admission) = &prepared.admission {
-            if let Err(reason) = admission.check(self, actor, &prepared.intent) {
+            if let Err(reason) = admission.check_publication(self, actor, &prepared.intent) {
                 return Err(RefusedDelta { reason, prepared });
             }
         }
-        self.finish(prepared)
+        self.finish_deferred(prepared)
     }
+    #[cfg(test)]
     fn finish(&self, prepared: PreparedDelta) -> std::result::Result<NativeDocument, RefusedDelta> {
+        let (candidate, outputs) = self.finish_deferred(prepared)?;
+        for output in outputs {
+            output.mark_published();
+        }
+        Ok(candidate)
+    }
+    fn finish_deferred(
+        &self,
+        prepared: PreparedDelta,
+    ) -> std::result::Result<(NativeDocument, Vec<StagedOutput>), RefusedDelta> {
+        if prepared
+            .admission
+            .as_ref()
+            .is_some_and(|a| a.is_transaction_step())
+        {
+            return Err(RefusedDelta {
+                reason: "Native transaction steps cannot publish independently".into(),
+                prepared,
+            });
+        }
         if let Err(reason) = prepared.cancellation.check() {
             return Err(RefusedDelta { reason, prepared });
         }
@@ -220,10 +304,7 @@ impl NativeDocument {
                 prepared,
             });
         }
-        for output in prepared.outputs {
-            output.mark_published();
-        }
-        Ok(prepared.candidate)
+        Ok((prepared.candidate, prepared.outputs))
     }
 }
 pub(super) fn key() -> DocumentKey {
@@ -567,10 +648,15 @@ impl RefusedDelta {
         cleanup: &dyn Fn() -> Result<()>,
     ) -> Result<()> {
         let PreparedDelta {
-            candidate, outputs, ..
+            candidate,
+            outputs,
+            admission,
+            ..
         } = self.prepared;
         drop(candidate);
-        output::abort_outputs(outputs, session, cleanup)
+        let result = output::abort_outputs(outputs, session, cleanup);
+        drop(admission);
+        result
     }
 }
 impl PreparedDelta {
@@ -585,6 +671,17 @@ impl PreparedDelta {
     }
 }
 impl CapturedEdit {
+    pub(crate) fn descriptor(&self) -> Option<&CommandDescriptor> {
+        self.admission
+            .as_ref()
+            .and_then(|admission| admission.descriptor())
+    }
+    fn planned_intent(&self, intent: Intent) -> Result<Intent> {
+        match self.admission.as_ref() {
+            Some(admission) => admission.planned_intent(&self.base, intent),
+            None => Ok(intent),
+        }
+    }
     pub fn base_key(&self) -> DocumentKey {
         self.base.key()
     }
@@ -617,7 +714,26 @@ impl CapturedEdit {
             .iter()
             .position(|l| l.id == layer)
             .ok_or("Unknown native layer")?;
-        let intent = Intent::visibility(layer, visible, self.base.budget())?;
+        if let Some(descriptor) = self.descriptor() {
+            let command = descriptor
+                .commands()
+                .next()
+                .ok_or("Missing normalized visibility command")?;
+            if descriptor.commands().len() != 1
+                || command.parameters()["op"] != "layer.update"
+                || command.parameters()["layer"] != layer
+                || command.parameters()["visible"] != visible
+                || !command.parameters().as_object().is_some_and(|object| {
+                    object
+                        .keys()
+                        .all(|key| ["op", "layer", "visible"].contains(&key.as_str()))
+                })
+            {
+                return Err("Visibility preparation differs from its normalized command".into());
+            }
+        }
+        let intent =
+            self.planned_intent(Intent::visibility(layer, visible, self.base.budget())?)?;
         // The shared engine permits visibility-only changes on locked layers.
         let copied = copy_metadata(&self.base.core.metadata, self.base.budget(), check)?;
         let roster = self.base.core.roster.clone();
@@ -664,6 +780,11 @@ impl CapturedEdit {
         };
         let check = &checked;
         check()?;
+        if self.descriptor().is_some() {
+            return Err(
+                "Use the normalized native metadata dispatcher for reorder commands".into(),
+            );
+        }
         if order.len() != self.base.core.metadata.layers.len()
             || self
                 .base
@@ -873,6 +994,46 @@ fn copy_admitted<T: Serialize, U: serde::de::DeserializeOwned + Serialize>(
 mod tests {
     use super::*;
     use crate::engine::{scene::RasterCollector, Document};
+    #[test]
+    fn producer_metadata_copies_preserve_unknown_fields_and_own_their_fresh_charge() {
+        let pool = ResidentBudget::new(8 * 1024 * 1024).unwrap();
+        let document = document(&pool);
+        let value =
+            serde_json::json!({"future":{"enabled":true,"exact":[-0.0,1.23456789]},"strokes":[]});
+        let copied = document.copy_value_metadata(&value, &|| Ok(())).unwrap();
+        assert_eq!(*copied, value);
+        let copied = copied
+            .map_unique(|mut value, _| {
+                value["future"]["enabled"] = serde_json::json!(false);
+                Ok(value)
+            })
+            .unwrap();
+        assert_eq!(value["future"]["enabled"], true);
+        let contours = vec![vec![[1., 2.], [3., 4.]], vec![]];
+        let copied_contours = document
+            .copy_contour_metadata(&contours, &|| Ok(()))
+            .unwrap();
+        let copied_contours = copied_contours
+            .map_unique(|mut values, _| {
+                values[0][0][0] += 4.;
+                Ok(values)
+            })
+            .unwrap();
+        assert_eq!(copied_contours[0][0], [5., 2.]);
+        assert_eq!(contours[0][0], [1., 2.]);
+        assert!(document
+            .copy_contour_metadata(&[vec![[f32::NAN, 0.]]], &|| Ok(()))
+            .is_err());
+        assert!(document
+            .copy_value_metadata(&value, &|| Err("cancelled".into()))
+            .is_err());
+        drop(document);
+        assert!(pool.used() > 0);
+        assert_eq!(copied["future"]["exact"], value["future"]["exact"]);
+        drop(copied);
+        drop(copied_contours);
+        assert_eq!(pool.used(), 0);
+    }
     struct Collector {
         rasters: Vec<Surface>,
     }

@@ -113,6 +113,40 @@ physical padding sample is refused. These boxes must pass the captured engine
 command's write guard before the same immutable proposal is staged; they grant
 no independent write permission and exclude read halos.
 
+Production worker entry points require `WriteGuard`, bound to an actual captured
+descriptor member, target/raw mask step, source generation and proposed frame.
+They consume that guard's immutable parameters; charged point owners and frame
+plans retain the same opaque command token. Each logical proposal passes the
+engine's actual write check before those immutable bytes append. Captured
+cancellation is checked throughout preparation/staging; cleanup still uses the
+registered session's independent retirement checks. Unguarded differential
+entry points exist only in test builds. Final atomic adoption/history, resolved
+folder insertion and shared composed-source providers remain separate gates.
+
+Folder foreground fill prepares a genuinely new zero-baseline document canvas
+through the same session-owned seed. It uses document depth/origin and current
+selection, independently of the folder's unused dummy raster frame/depth.
+The existing folder slot identifies only the captured authorization target;
+its plane is never replaced. Empty requested areas produce no operation, while
+transparent color over a nonempty area still produces the empty child required
+by legacy insertion semantics. The engine's typed child insertion must bind the
+same command token, construct hierarchy/metadata and commit one history record.
+
+Color edits on an editable text/vector definition preserve the shared engine's
+explicit-rasterize refusal. `source.rasterize` is a separate operation; paint,
+fill, clear, smudge and clone/heal never silently remove the definition. Raw
+paint mask steps remain editable. Ordinary paint/smudge retain the legacy
+raster fallback kind policy when no editable definition is present.
+
+Mask command frame planning starts from the primary color extent and projects
+its translation onto each mask's own original shape/depth. If it expands a
+procedural fill, the old literal color extent is materialized before expansion;
+new space remains zero. The native auxiliary color producer carries a nominal
+fill-baseline proof alongside the mask output for one atomic kind/frame batch.
+It does not turn the mask command into a color draw. A small reproducer records
+the former new-space color leak and compares corrected native8/16 color/mask
+planes plus the shared one-entry undo path; native execution is still required.
+
 `edit_bounds::output::TileOutput` stages one plane through the actual
 `SourceSession` and the engine's `OutputDraft`. It compares full original padded
 tiles, keeps mutable proposal/index allocations charged, creates a fragment only

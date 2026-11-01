@@ -5,6 +5,9 @@ use crate::{
     large_document::Reservation,
 };
 use serde::Deserialize;
+#[path = "history/task_capture.rs"]
+mod task_capture;
+pub(crate) use task_capture::{TaskCapture, TaskEntry, TaskRequest};
 
 pub(crate) struct NativeHistory {
     identity: DocumentKey,
@@ -12,6 +15,9 @@ pub(crate) struct NativeHistory {
     limit: usize,
     undo: Vec<Arc<Record>>,
     redo: Vec<Arc<Record>>,
+    pool: ResidentBudget,
+    current: Option<DocumentKey>,
+    truncated: Arc<task_capture::TruncatedTasks>,
     _capacity: Reservation,
 }
 pub(crate) struct HistorySnapshot {
@@ -20,6 +26,11 @@ pub(crate) struct HistorySnapshot {
     limit: usize,
     undo: Option<Arc<Record>>,
     redo: Option<Arc<Record>>,
+    oldest: Option<Arc<Record>>,
+    undo_len: usize,
+    pool: ResidentBudget,
+    current: Option<DocumentKey>,
+    truncated: Arc<task_capture::TruncatedTasks>,
 }
 struct Record {
     identity: DocumentKey,
@@ -36,6 +47,8 @@ struct Info {
     task: Option<String>,
     gesture: Option<String>,
     scopes: Vec<Scope>,
+    #[serde(default)]
+    reverted: Vec<[u8; 16]>,
 }
 pub(crate) struct HistoryRequest<'a> {
     pub actor: &'a str,
@@ -58,6 +71,8 @@ pub(crate) struct PreparedCommit {
     record: Arc<Record>,
     coalesce: bool,
     retired: Vec<Arc<Record>>,
+    sources: Option<super::publication::SourcePublication>,
+    truncated: Arc<task_capture::TruncatedTasks>,
     _retirement_charge: Reservation,
 }
 #[must_use]
@@ -113,7 +128,37 @@ impl RefusedCommit {
 pub(crate) struct RetiredHistory {
     _previous: NativeDocument,
     _records: Vec<Arc<Record>>,
+    sources: Option<(super::publication::SourcePublication, Vec<StagedOutput>)>,
+    _truncated: Arc<task_capture::TruncatedTasks>,
     _charge: Reservation,
+}
+impl RetiredHistory {
+    pub fn has_provisional_sources(&self) -> bool {
+        self.sources.is_some()
+    }
+    /// Run after releasing the Engine mutex, retaining the original SourceSession.
+    pub fn retire(
+        self,
+        session: &impl super::super::scene::StageSession,
+        cleanup: &dyn Fn() -> Result<()>,
+    ) -> Result<()> {
+        let Self {
+            _previous,
+            _records,
+            sources,
+            _truncated,
+            _charge,
+        } = self;
+        drop(_previous);
+        drop(_records);
+        drop(_truncated);
+        let result = match sources {
+            Some((plan, outputs)) => plan.retire(outputs, session, cleanup),
+            None => Ok(()),
+        };
+        drop(_charge);
+        result
+    }
 }
 impl std::fmt::Debug for RetiredHistory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -180,6 +225,9 @@ impl NativeHistory {
             limit,
             undo,
             redo,
+            pool: pool.clone(),
+            current: None,
+            truncated: task_capture::TruncatedTasks::empty(pool)?,
             _capacity: charge,
         })
     }
@@ -191,6 +239,11 @@ impl NativeHistory {
             limit: self.limit,
             undo: self.undo.last().cloned(),
             redo: self.redo.last().cloned(),
+            oldest: self.undo.first().cloned(),
+            undo_len: self.undo.len(),
+            pool: self.pool.clone(),
+            current: self.current,
+            truncated: self.truncated.clone(),
         }
     }
     pub fn undo_len(&self) -> usize {
@@ -206,6 +259,27 @@ impl NativeHistory {
         gate: Publication<'_>,
         prepared: PreparedCommit,
     ) -> std::result::Result<RetiredHistory, RefusedCommit> {
+        if !self.pool.same_pool(current.budget())
+            || self.current.is_some_and(|key| key != current.key())
+        {
+            return Err(RefusedCommit {
+                reason: "Native history belongs to another current document or admission".into(),
+                prepared,
+            });
+        }
+        if prepared.sources.is_none() && !prepared.delta.outputs.is_empty() {
+            return Err(RefusedCommit {
+                reason: "Native source publication plan is missing".into(),
+                prepared,
+            });
+        }
+        if let Some(sources) = &prepared.sources {
+            if let Err(reason) =
+                sources.validate(&prepared.delta.candidate, &prepared.delta.outputs)
+            {
+                return Err(RefusedCommit { reason, prepared });
+            }
+        }
         let reason = if self.identity != prepared.identity || self.epoch != prepared.epoch {
             Some("Prepared native history cursor is stale")
         } else if self.epoch == u64::MAX {
@@ -230,26 +304,33 @@ impl NativeHistory {
             record,
             coalesce,
             mut retired,
+            sources,
+            truncated,
             _retirement_charge,
         } = prepared;
-        let candidate = match current.publish(gate.actor, gate.leases, gate.now, gate.closed, delta)
-        {
-            Ok(candidate) => candidate,
-            Err(refused) => {
-                return Err(RefusedCommit {
-                    reason: refused.reason,
-                    prepared: PreparedCommit {
-                        identity,
-                        epoch,
-                        delta: refused.prepared,
-                        record,
-                        coalesce,
-                        retired,
-                        _retirement_charge,
-                    },
-                })
-            }
-        };
+        let (candidate, outputs) =
+            match current.publish_deferred(gate.actor, gate.leases, gate.now, gate.closed, delta) {
+                Ok(result) => result,
+                Err(refused) => {
+                    return Err(RefusedCommit {
+                        reason: refused.reason,
+                        prepared: PreparedCommit {
+                            identity,
+                            epoch,
+                            delta: refused.prepared,
+                            record,
+                            coalesce,
+                            retired,
+                            sources,
+                            truncated,
+                            _retirement_charge,
+                        },
+                    })
+                }
+            };
+        if let Some(sources) = &sources {
+            sources.mark(&outputs);
+        }
         if coalesce {
             if let Some(old) = self.undo.pop() {
                 retired.push(old);
@@ -262,10 +343,14 @@ impl NativeHistory {
             retired.push(old);
         }
         self.epoch += 1;
+        self.current = Some(candidate.key());
+        let old_truncated = std::mem::replace(&mut self.truncated, truncated);
         let previous = std::mem::replace(current, candidate);
         Ok(RetiredHistory {
             _previous: previous,
             _records: retired,
+            sources: sources.map(|plan| (plan, outputs)),
+            _truncated: old_truncated,
             _charge: _retirement_charge,
         })
     }
@@ -275,6 +360,14 @@ impl NativeHistory {
         gate: Publication<'_>,
         prepared: PreparedMove,
     ) -> std::result::Result<NativeDocument, RefusedMove> {
+        if !self.pool.same_pool(current.budget())
+            || self.current.is_some_and(|key| key != current.key())
+        {
+            return Err(RefusedMove {
+                reason: "Native history belongs to another current document or admission".into(),
+                prepared,
+            });
+        }
         let selected = match prepared.direction {
             Direction::Undo => self.undo.last(),
             Direction::Redo => self.redo.last(),
@@ -307,23 +400,26 @@ impl NativeHistory {
             actor,
             delta,
         } = prepared;
-        let candidate = match current.publish(gate.actor, gate.leases, gate.now, gate.closed, delta)
-        {
-            Ok(candidate) => candidate,
-            Err(refused) => {
-                return Err(RefusedMove {
-                    reason: refused.reason,
-                    prepared: PreparedMove {
-                        identity,
-                        epoch,
-                        record,
-                        direction,
-                        actor,
-                        delta: refused.prepared,
-                    },
-                })
-            }
-        };
+        let candidate =
+            match current.publish_deferred(gate.actor, gate.leases, gate.now, gate.closed, delta) {
+                Ok((candidate, outputs)) => {
+                    debug_assert!(outputs.is_empty());
+                    candidate
+                }
+                Err(refused) => {
+                    return Err(RefusedMove {
+                        reason: refused.reason,
+                        prepared: PreparedMove {
+                            identity,
+                            epoch,
+                            record,
+                            direction,
+                            actor,
+                            delta: refused.prepared,
+                        },
+                    })
+                }
+            };
         match direction {
             Direction::Undo => {
                 if let Some(record) = self.undo.pop() {
@@ -337,6 +433,7 @@ impl NativeHistory {
             }
         }
         self.epoch += 1;
+        self.current = Some(candidate.key());
         Ok(std::mem::replace(current, candidate))
     }
 }
@@ -349,17 +446,20 @@ impl HistorySnapshot {
         request: HistoryRequest<'_>,
         check: &dyn Fn() -> Result<()>,
     ) -> std::result::Result<PreparedCommit, RefusedDelta> {
-        let build = || -> Result<(Arc<Record>, bool, Vec<Arc<Record>>, Reservation)> {
+        let build = || -> Result<(Arc<Record>, bool, Vec<Arc<Record>>, Reservation,Option<super::publication::SourcePublication>,Arc<task_capture::TruncatedTasks>)> {
             delta.cancellation.check()?;
             check()?;
             if delta.base != current.key() {
                 return Err("Prepared native edit is stale".into());
             }
+            if !self.pool.same_pool(current.budget())||self.current.is_some_and(|key|key!=current.key()){
+                return Err("Native history snapshot belongs to another document or admission".into());
+            }
             delta
                 .admission
                 .as_ref()
                 .ok_or("Native editor capture admission is missing")?
-                .check(current, request.actor, &delta.intent)?;
+                .check_publication(current, request.actor, &delta.intent)?;
             let coalesce = request.gesture.is_some()
                 && self.undo.as_ref().is_some_and(|record| {
                     record.info.actor == request.actor
@@ -395,6 +495,7 @@ impl HistorySnapshot {
                 task: Option<&'a str>,
                 gesture: Option<&'a str>,
                 scopes: Vec<&'a Scope>,
+                reverted:&'a [[u8;16]],
             }
             let borrowed = Borrowed {
                 actor: request.actor,
@@ -402,6 +503,7 @@ impl HistorySnapshot {
                 task: request.task,
                 gesture: request.gesture,
                 scopes,
+                reverted:&[],
             };
             let info: Admitted<Info> = copy_admitted(&borrowed, current.budget(), true, check)?;
             drop(borrowed);
@@ -435,16 +537,20 @@ impl HistorySnapshot {
             }
             delta.cancellation.check()?;
             check()?;
-            Ok((record, coalesce, retired, retirement_charge))
+            let sources=if delta.outputs.is_empty(){None}else{Some(super::publication::SourcePublication::prepare(&delta.candidate,&delta.outputs,check)?)};
+            let truncated=if !coalesce&&self.undo_len==self.limit {self.truncated.retaining_evicted(self.oldest.as_deref(),current.budget(),check)?}else{self.truncated.clone()};
+            Ok((record, coalesce, retired, retirement_charge,sources,truncated))
         };
         match build() {
-            Ok((record, coalesce, retired, charge)) => Ok(PreparedCommit {
+            Ok((record, coalesce, retired, charge, sources, truncated)) => Ok(PreparedCommit {
                 identity: self.identity,
                 epoch: self.epoch,
                 delta,
                 record,
                 coalesce,
                 retired,
+                sources,
+                truncated,
                 _retirement_charge: charge,
             }),
             Err(reason) => Err(RefusedDelta {
@@ -461,6 +567,11 @@ impl HistorySnapshot {
         check: &dyn Fn() -> Result<()>,
     ) -> Result<PreparedMove> {
         check()?;
+        if !self.pool.same_pool(current.budget())
+            || self.current.is_some_and(|key| key != current.key())
+        {
+            return Err("Native history snapshot belongs to another document or admission".into());
+        }
         let record = match direction {
             Direction::Undo => self.undo.as_ref(),
             Direction::Redo => self.redo.as_ref(),

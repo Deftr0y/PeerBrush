@@ -8,14 +8,68 @@ pub(super) struct Location {
     directory: (u64, u64),
     file: (u64, u64),
 }
-struct Namespace<'a> {
-    session: &'a SourceSession,
+impl Location {
+    pub(super) fn filesystem_identity(&self) -> ((u64, u64), (u64, u64)) {
+        (self.directory, self.file)
+    }
+}
+pub(super) struct Namespace<'a> {
+    pub(super) session: &'a SourceSession,
     id: [u8; 16],
     directory: Directory,
     file: (u64, u64),
+    filename: &'static str,
 }
-impl Namespace<'_> {
-    fn io_check(
+impl<'a> Namespace<'a> {
+    pub(super) fn register(
+        session: &'a SourceSession,
+        id: [u8; 16],
+        path: PathBuf,
+        expected: ((u64, u64), (u64, u64)),
+        filename: &'static str,
+    ) -> Result<Self, String> {
+        let directory = Directory::open(&path)?;
+        let file = crate::file_safety::open_native_identity(&path.join(filename))
+            .map_err(|_| "New operation spool unavailable; inventory retained")?;
+        let file_id = crate::file_safety::identity(&file)?;
+        if expected != (directory.identity(), file_id)
+            || crate::file_safety::link_count(&file)? != 1
+        {
+            return Err("New operation spool has an alias; inventory retained".into());
+        }
+        // Do not retain another file handle: verified retirement must close the
+        // last physical owner before its persistent file charge can be released.
+        drop(file);
+        let mut state = session
+            .runtime
+            .inventory
+            .try_lock()
+            .map_err(|_| "Source inventory is busy")?;
+        let inventory = state.as_mut().ok_or("Source inventory unavailable")?;
+        if inventory.staging.contains_key(&id) {
+            return Err("Duplicate operation spool identity retained".into());
+        }
+        inventory.staging.insert(
+            id,
+            Location {
+                path,
+                directory: directory.identity(),
+                file: file_id,
+            },
+        );
+        drop(state);
+        let namespace = Namespace {
+            session,
+            id,
+            directory,
+            file: file_id,
+            filename,
+        };
+        namespace.check()?;
+        Ok(namespace)
+    }
+
+    pub(super) fn io_check(
         &self,
         check: &mut dyn FnMut() -> Result<(), String>,
         failure: &mut Option<String>,
@@ -27,7 +81,7 @@ impl Namespace<'_> {
         }
         Ok(())
     }
-    fn check(&self) -> Result<(), String> {
+    pub(super) fn check(&self) -> Result<(), String> {
         self.check_with(false)
     }
     fn check_with(&self, retiring: bool) -> Result<(), String> {
@@ -37,7 +91,7 @@ impl Namespace<'_> {
             self.session.check()?;
         }
         self.directory.check()?;
-        let path = self.directory.path().join("bytes.pbb");
+        let path = self.directory.path().join(self.filename);
         let named = crate::file_safety::open_native_identity(&path)
             .map_err(|_| "Operation spool name unavailable; inventory retained")?;
         let metadata = std::fs::symlink_metadata(&path)
@@ -67,12 +121,16 @@ impl Namespace<'_> {
         }
         Ok(())
     }
-    fn retire(self, cleanup: &mut dyn FnMut() -> Result<(), String>) -> Result<(), String> {
+    pub(super) fn retire(
+        self,
+        cleanup: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<(), String> {
         let Self {
             session,
             id,
             directory,
             file,
+            ..
         } = self;
         let path = directory.path().to_owned();
         let directory_id = directory.identity();
@@ -112,8 +170,8 @@ impl Namespace<'_> {
 /// The borrowed session retains both profile/instance and WorkspaceFileOperation
 /// admission through every read, write, publication and explicit cleanup.
 pub(crate) struct SessionTemporary<'a> {
-    temporary: LargeSourceTemporary,
-    namespace: Namespace<'a>,
+    pub(super) temporary: LargeSourceTemporary,
+    pub(super) namespace: Namespace<'a>,
 }
 pub(crate) struct SessionBytes<'a> {
     bytes: CompletedBytes,
@@ -136,43 +194,8 @@ impl SourceSession {
         let temporary =
             LargeSourceTemporary::create(&path, length, role, self.resident(), self.disk())
                 .map_err(|e| e.to_string())?;
-        let directory = Directory::open(&path)?;
-        let file = crate::file_safety::open_native_identity(&path.join("bytes.pbb"))
-            .map_err(|_| "New operation spool unavailable; inventory retained")?;
-        let file_id = crate::file_safety::identity(&file)?;
-        if temporary.filesystem_identity() != (directory.identity(), file_id)
-            || crate::file_safety::link_count(&file)? != 1
-        {
-            return Err("New operation spool has an alias; inventory retained".into());
-        }
-        // Do not retain another file handle: verified retirement must close the
-        // last physical owner before its persistent file charge can be released.
-        drop(file);
-        let mut state = self
-            .runtime
-            .inventory
-            .try_lock()
-            .map_err(|_| "Source inventory is busy")?;
-        let inventory = state.as_mut().ok_or("Source inventory unavailable")?;
-        if inventory.staging.contains_key(&id) {
-            return Err("Duplicate operation spool identity retained".into());
-        }
-        inventory.staging.insert(
-            id,
-            Location {
-                path,
-                directory: directory.identity(),
-                file: file_id,
-            },
-        );
-        drop(state);
-        let namespace = Namespace {
-            session: self,
-            id,
-            directory,
-            file: file_id,
-        };
-        namespace.check()?;
+        let namespace =
+            Namespace::register(self, id, path, temporary.filesystem_identity(), "bytes.pbb")?;
         Ok(SessionTemporary {
             temporary,
             namespace,
@@ -222,12 +245,20 @@ impl<'a> SessionTemporary<'a> {
     }
 }
 impl SessionBytes<'_> {
+    pub(crate) fn check_session(&self, session: &SourceSession) -> Result<(), String> {
+        if !std::ptr::eq(self.namespace.session, session) {
+            return Err("Operation spool belongs to another source operation".into());
+        }
+        self.check()
+    }
+
     /// Retain this guard until the last cursor/read and final publication check.
     pub(crate) fn bytes(&self) -> &CompletedBytes {
         &self.bytes
     }
     pub(crate) fn check(&self) -> Result<(), String> {
-        self.namespace.check()
+        self.namespace.check()?;
+        self.bytes.check_owner().map_err(|e| e.to_string())
     }
     pub(crate) fn retire(
         self,

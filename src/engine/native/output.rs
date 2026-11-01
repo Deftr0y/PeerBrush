@@ -15,7 +15,7 @@ pub struct OutputDraft {
 pub struct StagedOutput {
     draft: OutputDraft,
 }
-struct Retirement {
+pub(super) struct Retirement {
     fragments: Vec<FreshFragment>,
     _charge: Option<Reservation>,
 }
@@ -152,6 +152,35 @@ impl OutputDraft {
     }
 }
 impl Retirement {
+    pub(super) fn retire_selected(
+        self,
+        flags: &mut std::slice::Iter<'_, bool>,
+        session: &impl StageSession,
+        cleanup: &dyn Fn() -> Result<()>,
+    ) -> Result<()> {
+        let mut error = None;
+        for fragment in self.fragments {
+            match flags.next() {
+                Some(true) => drop(fragment),
+                Some(false) => {
+                    if let Err(reason) = session
+                        .cleanup_check()
+                        .and_then(|_| cleanup())
+                        .and_then(|_| session.abort_fragment(fragment, cleanup))
+                    {
+                        error.get_or_insert(reason);
+                    }
+                }
+                None => {
+                    drop(fragment);
+                    error.get_or_insert(
+                        "Native retirement flags are incomplete; bytes remain charged".into(),
+                    );
+                }
+            }
+        }
+        error.map_or(Ok(()), Err)
+    }
     fn abort(self, session: &impl StageSession, cleanup: &dyn Fn() -> Result<()>) -> Result<()> {
         let mut error = None;
         for fragment in self.fragments {
@@ -189,6 +218,12 @@ pub(super) fn abort_outputs(
     error.map_or(Ok(()), Err)
 }
 impl StagedOutput {
+    pub(super) fn fragments(&self) -> impl ExactSizeIterator<Item = &FreshFragment> {
+        self.draft.fragments.iter()
+    }
+    pub(super) fn into_retirement(self) -> Retirement {
+        self.draft.into_retirement()
+    }
     pub fn surface(&self) -> &Surface {
         &self.draft.surface
     }

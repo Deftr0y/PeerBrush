@@ -355,8 +355,11 @@ impl FreshFragment {
     }
     /// Mark before any engine, history, clipboard or marker visibility. A late
     /// refused publication deliberately cannot undo this conservative mark.
-    pub fn publish(self) -> Store {
+    pub(crate) fn mark_published(&self) {
         self.store.0.may_be_published.store(true, Ordering::Release);
+    }
+    pub fn publish(self) -> Store {
+        self.mark_published();
         self.store
     }
     pub fn abort(self, check: Check<'_>) -> Result<()> {
@@ -454,6 +457,11 @@ impl Store {
             .admitted_bytes();
         blocks.checked_add(cache).ok_or(Error::Budget)
     }
+    /// Conservative one-way visibility mark, not document/checkpoint authority.
+    pub(crate) fn publication_marked(&self) -> bool {
+        self.0.may_be_published.load(Ordering::Acquire)
+    }
+
     pub(crate) fn downgrade(&self) -> WeakStore {
         WeakStore(Arc::downgrade(&self.0))
     }

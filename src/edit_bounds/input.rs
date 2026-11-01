@@ -2,7 +2,10 @@
 //! grants edit permission, source publication, or an Engine history operation.
 use super::native::FrameExpansion;
 use crate::{
-    engine::native::{DocumentKey, LayerMetadata, NativeDocument, RasterMetadata, RasterSlot},
+    engine::native::{
+        CapturedEdit, Command, CommandToken, DocumentKey, LayerMetadata, Method, NativeDocument,
+        RasterMetadata, RasterSlot,
+    },
     large_document::{Error, PinnedBytes, ResidentBudget, ScratchBytes},
     raster::{backed::Region, project16, Surface, SurfaceKey, SurfaceRegion, TILE},
 };
@@ -15,6 +18,235 @@ pub(crate) struct InputBinding {
     shape: [u32; 2],
     depth: u16,
     origin: [i32; 2],
+}
+/// Producer guard for one exact immutable command in the captured descriptor.
+/// It cannot replace scopes or authorize a different source/frame.
+pub(crate) struct WriteGuard<'c> {
+    _capture: &'c CapturedEdit,
+    cancellation: crate::engine::native::Cancellation,
+    command: Command<'c>,
+    binding: InputBinding,
+    shape: [u32; 2],
+    origin: [i32; 2],
+}
+impl<'c> WriteGuard<'c> {
+    pub(crate) fn new(
+        captured: &'c CapturedEdit,
+        command: Command<'c>,
+        input: &RasterInput<'_>,
+        frame: Option<&InputFrame>,
+    ) -> Result<Self, String> {
+        let cancellation = captured.cancellation();
+        cancellation.check()?;
+        if captured.base_key() != input.binding.generation
+            || !captured
+                .descriptor()
+                .is_some_and(|d| d.commands().any(|c| c.token() == command.token()))
+        {
+            return Err("Native paint command is not owned by its captured descriptor".into());
+        }
+        let parameters = command.parameters();
+        let operation = parameters["op"]
+            .as_str()
+            .ok_or("Native paint command has no operation")?;
+        let method = match operation {
+            "paint" => Method::Paint,
+            "paint.fill" => Method::Fill,
+            "paint.clear_selection" => Method::Clear,
+            "smudge" => Method::Smudge,
+            "clone" | "heal" => Method::Retouch,
+            _ => return Err("Native paint guard requires a paint operator".into()),
+        };
+        if command.method() != method {
+            return Err("Native paint method differs from its descriptor".into());
+        }
+        let target = parameters["layer"]
+            .as_str()
+            .ok_or("Native paint command has no target")?;
+        let mask = parameters
+            .get("mask")
+            .map_or(Ok(false), |v| v.as_bool().ok_or("mask must be boolean"))?;
+        if mask != input.is_mask() {
+            return Err("Native paint command targets a different color or mask plane".into());
+        }
+        if !mask && input.layer_metadata().source().is_some() {
+            return Err("Edit this layer's text/vector properties, paint its mask, or explicitly rasterize it first".into());
+        }
+        if target != input.layer_metadata().id() {
+            if method != Method::Clear || mask {
+                return Err("Native paint command targets another layer".into());
+            }
+            let document = captured.document();
+            let parent = document
+                .metadata()
+                .layers()
+                .find(|layer| layer.id() == target)
+                .ok_or("Unknown native clear folder")?;
+            if parent.kind() != "group" {
+                return Err("Resolved native clear target is not a folder child".into());
+            }
+            let mut current = input.layer_metadata().parent();
+            let mut found = false;
+            for _ in 0..=16 {
+                let Some(id) = current else {
+                    break;
+                };
+                if id == target {
+                    found = true;
+                    break;
+                }
+                current = document
+                    .metadata()
+                    .layers()
+                    .find(|layer| layer.id() == id)
+                    .and_then(|layer| layer.parent());
+            }
+            if !found {
+                return Err("Resolved native clear target is not a folder child".into());
+            }
+        }
+        if mask
+            && RasterInput::from_parameters(captured.document(), parameters)?.binding()
+                != input.binding()
+        {
+            return Err("Native paint command targets another raw mask step".into());
+        }
+        let (shape, origin) = if let Some(frame) = frame {
+            input.validate(frame.binding())?;
+            if frame.command != Some(command.token()) {
+                return Err("Native frame was not planned from this immutable command".into());
+            }
+            (frame.geometry().new_shape(), frame.geometry().new_origin())
+        } else {
+            (input.shape(), input.origin())
+        };
+        Ok(Self {
+            _capture: captured,
+            cancellation,
+            command,
+            binding: input.binding,
+            shape,
+            origin,
+        })
+    }
+    pub(crate) fn parameters(&self) -> &'c serde_json::Value {
+        self.command.parameters()
+    }
+    pub(crate) fn check_active(&self) -> Result<(), String> {
+        self.cancellation.check()
+    }
+    pub(crate) fn token(&self) -> CommandToken {
+        self.command.token()
+    }
+    pub(crate) fn validate(
+        &self,
+        input: &RasterInput<'_>,
+        frame: Option<&InputFrame>,
+        operations: &[&str],
+    ) -> Result<(), String> {
+        self.check_active()?;
+        input.validate(self.binding)?;
+        let (shape, origin) = if let Some(frame) = frame {
+            input.validate(frame.binding())?;
+            (frame.geometry().new_shape(), frame.geometry().new_origin())
+        } else {
+            (input.shape(), input.origin())
+        };
+        if shape != self.shape
+            || origin != self.origin
+            || !self.parameters()["op"]
+                .as_str()
+                .is_some_and(|operation| operations.contains(&operation))
+        {
+            return Err("Native paint guard belongs to another operator or proposed frame".into());
+        }
+        Ok(())
+    }
+    pub(crate) fn check_tile(
+        &self,
+        input: &RasterInput<'_>,
+        frame: Option<&InputFrame>,
+        key: (u32, u32),
+        before: &PinnedBytes,
+        after: &PinnedBytes,
+        check: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.validate(
+            input,
+            frame,
+            &[
+                "paint",
+                "paint.fill",
+                "paint.clear_selection",
+                "smudge",
+                "clone",
+                "heal",
+            ],
+        )?;
+        if let Some(bounds) = changed_bounds(input, frame, key, before, after, check)? {
+            self.command
+                .check_write(input.document(), input.binding.slot, bounds)?;
+        }
+        self.check_active()
+    }
+    pub(crate) fn check_child_tile(
+        &self,
+        input: &RasterInput<'_>,
+        key: (u32, u32),
+        before: &PinnedBytes,
+        after: &PinnedBytes,
+        check: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.validate(input, None, &["paint.fill"])?;
+        if input.is_mask() || input.layer_metadata().kind() != "group" {
+            return Err("Native child fill requires its captured folder target".into());
+        }
+        let metadata = input.document().metadata();
+        if let Some(bounds) = changed_geometry(
+            input.pool(),
+            metadata.depth(),
+            [metadata.width(), metadata.height()],
+            [0, 0],
+            key,
+            before,
+            after,
+            check,
+        )? {
+            // The existing folder slot is only the authorization target. Its
+            // unused plane is never replaced; the engine inserts a new child.
+            self.command
+                .check_write(input.document(), input.binding.slot, bounds)?;
+        }
+        self.check_active()
+    }
+    pub(crate) fn validate_fill_frame(
+        &self,
+        input: &RasterInput<'_>,
+        frame: &InputFrame,
+    ) -> Result<(), String> {
+        self.check_active()?;
+        input.validate(frame.binding())?;
+        if self._capture.base_key() != input.binding.generation
+            || input.is_mask()
+            || input.layer_metadata().kind() != "fill"
+            || input.layer_metadata().source().is_some()
+            || self.parameters()["mask"] != true
+            || self.parameters()["layer"].as_str() != Some(input.layer_metadata().id())
+            || !matches!(
+                self.parameters()["op"].as_str(),
+                Some("paint" | "smudge" | "clone" | "heal" | "paint.fill")
+            )
+            || frame.command != Some(self.token())
+            || frame.geometry().new_shape() != self.shape
+            || frame.geometry().new_origin() != self.origin
+        {
+            return Err(
+                "Native fill baseline is not an ancillary frame of this captured mask command"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
 }
 impl InputBinding {
     pub(crate) fn generation(self) -> DocumentKey {
@@ -45,7 +277,98 @@ pub(crate) struct RasterInput<'a> {
     binding: InputBinding,
     mask: bool,
 }
+pub(crate) enum RetouchInput<'a> {
+    Raster(RasterInput<'a>),
+    Merged(&'a NativeDocument),
+    ComposedMask {
+        document: &'a NativeDocument,
+        layer: LayerMetadata<'a>,
+    },
+}
 impl<'a> RasterInput<'a> {
+    /// Resolve only immutable captured metadata. Disabled paint steps remain
+    /// editable; a missing target step never falls back to a different plane.
+    pub(crate) fn from_parameters(
+        document: &'a NativeDocument,
+        parameters: &serde_json::Value,
+    ) -> Result<Self, String> {
+        let target = parameters["layer"]
+            .as_str()
+            .ok_or("Choose a target layer")?;
+        let mask = parameters
+            .get("mask")
+            .map_or(Ok(false), |v| v.as_bool().ok_or("mask must be boolean"))?;
+        if !mask {
+            return Self::layer(document, target);
+        }
+        let layer = document
+            .metadata()
+            .layers()
+            .find(|l| l.id() == target)
+            .ok_or("Unknown native paint layer")?;
+        let mask = layer.mask().ok_or("Layer has no mask")?;
+        let step = if let Some(step) = parameters.get("step") {
+            step.as_str().ok_or("Mask step must be an ID")?
+        } else {
+            mask.steps()
+                .filter(|step| step.kind() == "paint")
+                .last()
+                .ok_or("Add a paint step to the mask")?
+                .id()
+        };
+        Self::mask_step(document, target, step)
+    }
+    pub(crate) fn retouch_source(
+        &self,
+        parameters: &serde_json::Value,
+    ) -> Result<RetouchInput<'a>, String> {
+        let boolean = |key: &str| {
+            parameters.get(key).map_or(Ok(false), |v| {
+                v.as_bool().ok_or_else(|| format!("{key} must be boolean"))
+            })
+        };
+        let mask = boolean("mask")?;
+        let merged = boolean("sample_merged")?;
+        if parameters.get("source_step").is_some() && (!mask || merged) {
+            return Err("Source steps require layer mask sampling".into());
+        }
+        if merged {
+            if mask {
+                return Err("Mask retouching samples a layer mask, not merged artwork".into());
+            }
+            return Ok(RetouchInput::Merged(self.document));
+        }
+        let target = parameters
+            .get("source_layer")
+            .map(|v| v.as_str().ok_or("Source layer must be an ID"))
+            .transpose()?
+            .unwrap_or(self.layer.id());
+        let layer = self
+            .document
+            .metadata()
+            .layers()
+            .find(|l| l.id() == target)
+            .ok_or("Unknown retouch source layer")?;
+        if mask {
+            if let Some(step) = parameters.get("source_step") {
+                return Self::mask_step(
+                    self.document,
+                    target,
+                    step.as_str().ok_or("Source step must be an ID")?,
+                )
+                .map(RetouchInput::Raster);
+            }
+            layer.mask().ok_or("Source layer has no mask")?;
+            return Ok(RetouchInput::ComposedMask {
+                document: self.document,
+                layer,
+            });
+        }
+        if layer.kind() != "paint" {
+            return Err("Choose a paint source layer or sample merged artwork".into());
+        }
+        Self::layer(self.document, target).map(RetouchInput::Raster)
+    }
     pub(crate) fn layer(document: &'a NativeDocument, layer: &str) -> Result<Self, String> {
         Self::resolve(document, layer, None)
     }
@@ -341,8 +664,84 @@ impl<'a> RasterInput<'a> {
                 binding: self.binding,
                 layer: self.layer.pixels().slot(),
                 geometry,
+                command: None,
             })
         })
+    }
+    pub(crate) fn fill_frame(&self, command: Command<'_>) -> Result<Option<InputFrame>, String> {
+        if command.parameters()["op"] != "paint.fill" {
+            return Err("Native fill frame requires its foreground-fill command".into());
+        }
+        let metadata = self.document.metadata();
+        let requested = command
+            .parameters()
+            .get("rect")
+            .and_then(crate::engine::rect)
+            .or(metadata.selection())
+            .unwrap_or([0, 0, metadata.width() as i32, metadata.height() as i32]);
+        let mut frame = self.command_frame(requested)?;
+        if let Some(frame) = &mut frame {
+            frame.command = Some(command.token());
+        }
+        Ok(frame)
+    }
+    pub(crate) fn stroke_frame(
+        &self,
+        command: Command<'_>,
+        points: &crate::brush::input::StrokePoints,
+        check: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<Option<InputFrame>, String> {
+        check()?;
+        let parameters = command.parameters();
+        if !matches!(
+            parameters["op"].as_str(),
+            Some("paint" | "smudge" | "clone" | "heal")
+        ) || !points.matches_command(command.token())
+        {
+            return Err("Native stroke frame requires its same admitted command points".into());
+        }
+        let settings = crate::brush::Settings::from_command(parameters)?;
+        if settings.opacity == 0.
+            || settings.flow == 0.
+            || (parameters["op"] == "paint" && crate::engine::color(parameters)[3] == 0)
+        {
+            return Ok(None);
+        }
+        let radius = settings.radius + 1.;
+        let values = points.points();
+        let requested = [
+            (values.iter().map(|p| p[0]).fold(f32::INFINITY, f32::min) - radius).floor() as i32,
+            (values.iter().map(|p| p[1]).fold(f32::INFINITY, f32::min) - radius).floor() as i32,
+            (values
+                .iter()
+                .map(|p| p[0])
+                .fold(f32::NEG_INFINITY, f32::max)
+                + radius)
+                .ceil() as i32,
+            (values
+                .iter()
+                .map(|p| p[1])
+                .fold(f32::NEG_INFINITY, f32::max)
+                + radius)
+                .ceil() as i32,
+        ];
+        let mut frame = self.command_frame(requested)?;
+        if let Some(frame) = &mut frame {
+            frame.command = Some(command.token());
+        }
+        check()?;
+        Ok(frame)
+    }
+    fn command_frame(&self, requested: [i32; 4]) -> Result<Option<InputFrame>, String> {
+        if self.is_mask() {
+            let color = Self::layer(self.document, self.layer.id())?;
+            color
+                .project_frame(requested)?
+                .map(|frame| frame.for_plane(self))
+                .transpose()
+        } else {
+            self.project_frame(requested)
+        }
     }
     pub(crate) fn selection(&self) -> Result<SelectionInput<'a>, String> {
         SelectionInput::new(self.document)
@@ -352,6 +751,7 @@ pub(crate) struct InputFrame {
     binding: InputBinding,
     layer: RasterSlot,
     geometry: FrameExpansion,
+    command: Option<CommandToken>,
 }
 impl InputFrame {
     pub(crate) fn binding(&self) -> InputBinding {
@@ -380,6 +780,7 @@ impl InputFrame {
             geometry: self
                 .geometry
                 .for_plane(input.shape(), input.depth(), input.pool())?,
+            command: self.command,
         })
     }
 }
@@ -418,12 +819,34 @@ pub(crate) fn changed_bounds(
     } else {
         (input.shape(), input.origin())
     };
-    let bpp = if input.depth() == 16 { 8 } else { 4 };
+    changed_geometry(
+        input.pool(),
+        input.depth(),
+        shape,
+        origin,
+        key,
+        before,
+        after,
+        check,
+    )
+}
+fn changed_geometry(
+    pool: &ResidentBudget,
+    depth: u16,
+    shape: [u32; 2],
+    origin: [i32; 2],
+    key: (u32, u32),
+    before: &PinnedBytes,
+    after: &PinnedBytes,
+    check: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<Option<[i32; 4]>, String> {
+    check()?;
+    let bpp = if depth == 16 { 8 } else { 4 };
     let length = (TILE * TILE) as usize * bpp;
     if key.0 >= shape[0].div_ceil(TILE)
         || key.1 >= shape[1].div_ceil(TILE)
-        || !before.uses_budget(input.pool())
-        || !after.uses_budget(input.pool())
+        || !before.uses_budget(pool)
+        || !after.uses_budget(pool)
         || before.len() != length
         || after.len() != length
     {
@@ -472,6 +895,27 @@ pub(crate) fn changed_bounds(
     }
     check()?;
     Ok(bounds)
+}
+pub(crate) fn check_proposal(
+    guard: Option<&WriteGuard<'_>>,
+    input: &RasterInput<'_>,
+    frame: Option<&InputFrame>,
+    key: (u32, u32),
+    before: &PinnedBytes,
+    after: &PinnedBytes,
+    check: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<(), String> {
+    if let Some(guard) = guard {
+        return guard.check_tile(input, frame, key, before, after, check);
+    }
+    #[cfg(test)]
+    {
+        Ok(())
+    }
+    #[cfg(not(test))]
+    {
+        Err("Native paint output requires its captured command write guard".into())
+    }
 }
 pub(crate) struct PreparedPixels<'a> {
     binding: InputBinding,
@@ -771,11 +1215,58 @@ fn restrict_geometry(
     selection: &PreparedSelection<'_>,
     check: &mut dyn FnMut() -> Result<(), String>,
 ) -> Result<PinnedBytes, String> {
+    restrict_document_geometry(
+        input.document(),
+        input.depth(),
+        shape,
+        origin,
+        key,
+        before,
+        after,
+        selection,
+        check,
+    )
+}
+pub(crate) fn restrict_child_tile(
+    input: &RasterInput<'_>,
+    key: (u32, u32),
+    before: &PinnedBytes,
+    after: &PinnedBytes,
+    selection: &PreparedSelection<'_>,
+    check: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<PinnedBytes, String> {
+    if input.is_mask() || input.layer_metadata().kind() != "group" {
+        return Err("Native child coverage requires its folder target".into());
+    }
+    let metadata = input.document().metadata();
+    restrict_document_geometry(
+        input.document(),
+        metadata.depth(),
+        [metadata.width(), metadata.height()],
+        [0, 0],
+        key,
+        before,
+        after,
+        selection,
+        check,
+    )
+}
+fn restrict_document_geometry(
+    document: &NativeDocument,
+    depth: u16,
+    shape: [u32; 2],
+    origin: [i32; 2],
+    key: (u32, u32),
+    before: &PinnedBytes,
+    after: &PinnedBytes,
+    selection: &PreparedSelection<'_>,
+    check: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<PinnedBytes, String> {
     check()?;
-    let bpp = if input.depth() == 16 { 8 } else { 4 };
+    let bpp = if depth == 16 { 8 } else { 4 };
     let length = (TILE * TILE) as usize * bpp;
-    if !before.uses_budget(input.pool())
-        || !after.uses_budget(input.pool())
+    if !before.uses_budget(document.budget())
+        || !after.uses_budget(document.budget())
         || before.len() != length
         || after.len() != length
         || key.0 >= shape[0].div_ceil(TILE)
@@ -783,13 +1274,14 @@ fn restrict_geometry(
     {
         return Err("Soft-selection tile input differs from its admitted native frame".into());
     }
-    if selection._document.key() != input.binding.generation {
+    if selection._document.key() != document.key() {
         return Err("Soft selection belongs to another native generation".into());
     }
     if selection.coverage.is_none() {
         return Ok(after.clone());
     }
-    let mut output = ScratchBytes::new(input.pool(), length, length).map_err(|e| e.to_string())?;
+    let mut output =
+        ScratchBytes::new(document.budget(), length, length).map_err(|e| e.to_string())?;
     output.copy_from_slice(after);
     for y in key.1 * TILE..((key.1 + 1) * TILE).min(shape[1]) {
         check()?;
@@ -801,7 +1293,7 @@ fn restrict_geometry(
             let at = ((y % TILE) * TILE + x % TILE) as usize * bpp;
             let read = |bytes: &[u8]| -> [u16; 4] {
                 std::array::from_fn(|c| {
-                    if input.depth() == 16 {
+                    if depth == 16 {
                         u16::from_be_bytes([bytes[at + c * 2], bytes[at + c * 2 + 1]])
                     } else {
                         u16::from(bytes[at + c]) * 257
@@ -827,7 +1319,7 @@ fn restrict_geometry(
                 };
             }
             for c in 0..4 {
-                if input.depth() == 16 {
+                if depth == 16 {
                     output[at + c * 2..at + c * 2 + 2].copy_from_slice(&result[c].to_be_bytes());
                 } else {
                     output[at + c] = project16(result[c]);

@@ -234,6 +234,58 @@ impl CoverageSource {
     pub fn metadata_bytes(&self) -> usize {
         self.contours.charge.bytes()
     }
+    /// Move a newly completed, uniquely owned contour payload without cloning
+    /// its retained capacity or separating it from its original reservation.
+    pub(crate) fn translate_unique(mut self, delta: [i32; 2]) -> Result<Self> {
+        let add = |value: i32, by: i32| {
+            value
+                .checked_add(by)
+                .ok_or(Error::Invalid("Selection translation overflow"))
+        };
+        let bounds = [
+            add(self.bounds[0], delta[0])?,
+            add(self.bounds[1], delta[1])?,
+            add(self.bounds[2], delta[0])?,
+            add(self.bounds[3], delta[1])?,
+        ];
+        let origin = [
+            add(self.origin[0], delta[0])?,
+            add(self.origin[1], delta[1])?,
+        ];
+        if bounds
+            .iter()
+            .chain(&origin)
+            .any(|v| v.unsigned_abs() > 100000)
+            || delta.iter().any(|v| v.unsigned_abs() > 100000)
+        {
+            return Err(Error::Invalid(
+                "Selection translation exceeds coordinate limits",
+            ));
+        }
+        let owner = Arc::get_mut(&mut self.contours).ok_or(Error::Busy)?;
+        for line in &owner.values {
+            for point in line {
+                for axis in 0..2 {
+                    let next = point[axis] - (-delta[axis]) as f32;
+                    if !next.is_finite() || next.abs() > 100000. {
+                        return Err(Error::Invalid(
+                            "Selection contour translation exceeds coordinate limits",
+                        ));
+                    }
+                }
+            }
+        }
+        for line in &mut owner.values {
+            for point in line {
+                for axis in 0..2 {
+                    point[axis] -= (-delta[axis]) as f32;
+                }
+            }
+        }
+        self.bounds = bounds;
+        self.origin = origin;
+        Ok(self)
+    }
     pub fn uses_budget(&self, budget: &ResidentBudget) -> bool {
         self.mask.uses_budget(budget) && self.contours.pool.same_pool(budget)
     }
