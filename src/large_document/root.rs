@@ -265,6 +265,29 @@ impl PersistentRootContext {
         held.check()?;
         Ok(held)
     }
+
+    /// Observation of known in-memory pixels must not initialize the data root.
+    /// This permit has no base/source-directory or mutation methods.
+    pub(crate) fn begin_observation(self: &Arc<Self>) -> Result<RootReadOperation, String> {
+        let operation = self.admission.begin()?;
+        operation.check()?;
+        self.validate()?;
+        Ok(RootReadOperation {
+            context: self.clone(),
+            operation,
+        })
+    }
+}
+
+pub(crate) struct RootReadOperation {
+    context: Arc<PersistentRootContext>,
+    operation: server::SourceOperation,
+}
+impl RootReadOperation {
+    pub(crate) fn check(&self) -> Result<(), String> {
+        self.operation.check()?;
+        self.context.validate()
+    }
 }
 
 pub(crate) struct RootOperation {
