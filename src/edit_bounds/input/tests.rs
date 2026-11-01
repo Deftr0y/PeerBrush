@@ -1988,3 +1988,179 @@ fn editable_definitions_keep_legacy_explicit_rasterize_refusal_and_allow_mask_pa
     output.abort(&session, &|| Ok(())).unwrap();
     assert!(document.metadata().layer(0).unwrap().source().is_some());
 }
+
+#[test]
+fn real_child_producer_typed_insertion_and_native_history_keep_one_undo_redo() {
+    use crate::engine::native::{
+        CommandDescriptor, Direction, HistoryRequest, NativeHistory, Publication,
+    };
+    let f = Fixture::new();
+    let (runtime, _connection) = f.runtime();
+    let session = runtime.begin().unwrap();
+    for depth in [8, 16] {
+        let mut source = Document::new_depth(12, 10, depth).unwrap();
+        source.layers[0].kind = "group".into();
+        source.layers[0].pixels = Raster::new_depth(2, 2, 8);
+        source.layers[0].x = 3;
+        source.layers[0].y = -2;
+        let mut existing = crate::engine::Layer::new("Existing", "paint", 12, 10);
+        existing.parent = Some(source.layers[0].id.clone());
+        existing.pixels = Raster::new_depth(12, 10, depth);
+        existing.pixels.set16(4, 3, [12347, 23521, 43217, 49153]);
+        source.layers.push(existing);
+        let body = serde_json::json!({"op":"paint.fill","layer":source.layers[0].id,"rect":[2,2,8,7],"color":[37,83,127,193]});
+        let mut legacy = crate::engine::Engine::new();
+        legacy.doc = source.clone();
+        legacy
+            .edit("human", &[body.clone()], None, None, "Fill")
+            .unwrap();
+        let mut document = native(&source, &session);
+        let parent_key = document
+            .source(document.metadata().layer(0).unwrap().pixels().slot())
+            .unwrap()
+            .key();
+        let existing_key = document
+            .source(document.metadata().layer(1).unwrap().pixels().slot())
+            .unwrap()
+            .key();
+        let descriptor =
+            CommandDescriptor::from_normalized(&document, 0, &[body], &|| Ok(())).unwrap();
+        let captured = document
+            .capture_descriptor(descriptor.clone(), "human", &[], 1, false, true)
+            .unwrap();
+        let (sealed, token) = {
+            let command = descriptor.commands().next().unwrap();
+            let input =
+                RasterInput::from_parameters(captured.document(), command.parameters()).unwrap();
+            let guard = WriteGuard::new(&captured, command, &input, None).unwrap();
+            let BuiltTiles::Draft(draft) =
+                crate::fill::input::stage_child_fill(&input, &guard, &session, &mut || Ok(()))
+                    .unwrap()
+            else {
+                panic!("No child pixels")
+            };
+            (draft.seal(&|| Ok(())).ok().unwrap(), guard.token())
+        };
+        let delta = captured
+            .insert_fill_child(token, sealed, &|| Ok(()))
+            .unwrap();
+        let mut history = NativeHistory::new(&runtime.resident(), 20).unwrap();
+        let commit = history
+            .snapshot()
+            .prepare_commit(
+                &document,
+                delta,
+                HistoryRequest {
+                    actor: "human",
+                    label: "Fill child",
+                    task: None,
+                    gesture: None,
+                },
+                &|| Ok(()),
+            )
+            .unwrap();
+        drop(
+            history
+                .commit(
+                    &mut document,
+                    Publication {
+                        actor: "human",
+                        leases: &[],
+                        now: 1,
+                        closed: false,
+                        write_available: true,
+                    },
+                    commit,
+                )
+                .unwrap(),
+        );
+        assert_eq!(history.undo_len(), 1);
+        assert_eq!(document.metadata().revision(), 1);
+        assert_eq!(document.metadata().layers().count(), 3);
+        let child = document.metadata().layer(1).unwrap();
+        let child_id = child.id().to_owned();
+        assert_eq!(child.name(), "Foreground fill");
+        assert_eq!(child.parent(), Some(source.layers[0].id.as_str()));
+        assert_eq!(child.origin(), [0, 0]);
+        assert_eq!(child.pixels().depth(), depth);
+        let region = document
+            .source(child.pixels().slot())
+            .unwrap()
+            .prepare_region(Region::new([0, 0, 12, 10]).unwrap(), &mut || Ok(()))
+            .unwrap();
+        for y in 0..10 {
+            for x in 0..12 {
+                assert_eq!(
+                    region.pixel16(x, y).unwrap(),
+                    legacy.doc.layers[1].pixels.get16(x, y)
+                );
+            }
+        }
+        drop(region);
+        assert_eq!(
+            document
+                .source(document.metadata().layer(0).unwrap().pixels().slot())
+                .unwrap()
+                .key(),
+            parent_key
+        );
+        assert_eq!(
+            document
+                .source(document.metadata().layer(2).unwrap().pixels().slot())
+                .unwrap()
+                .key(),
+            existing_key
+        );
+        let undo = history
+            .snapshot()
+            .prepare_move(&document, Direction::Undo, "human", &|| Ok(()))
+            .unwrap();
+        drop(
+            history
+                .move_cursor(
+                    &mut document,
+                    Publication {
+                        actor: "human",
+                        leases: &[],
+                        now: 1,
+                        closed: false,
+                        write_available: true,
+                    },
+                    undo,
+                )
+                .unwrap(),
+        );
+        assert_eq!(document.metadata().layers().count(), 2);
+        assert_eq!(history.redo_len(), 1);
+        assert_eq!(
+            document
+                .source(document.metadata().layer(0).unwrap().pixels().slot())
+                .unwrap()
+                .key(),
+            parent_key
+        );
+        let redo = history
+            .snapshot()
+            .prepare_move(&document, Direction::Redo, "human", &|| Ok(()))
+            .unwrap();
+        drop(
+            history
+                .move_cursor(
+                    &mut document,
+                    Publication {
+                        actor: "human",
+                        leases: &[],
+                        now: 1,
+                        closed: false,
+                        write_available: true,
+                    },
+                    redo,
+                )
+                .unwrap(),
+        );
+        assert_eq!(document.metadata().layers().count(), 3);
+        assert_eq!(document.metadata().layer(1).unwrap().id(), child_id);
+        assert_eq!(history.undo_len(), 1);
+        assert_eq!(history.redo_len(), 0);
+    }
+}
