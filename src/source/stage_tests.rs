@@ -15,10 +15,43 @@ use crate::{
     workspace::source_runtime::{Limits, SourceRuntime},
 };
 use std::{
+    cell::{Cell, RefCell},
     fs,
     path::PathBuf,
+    rc::Rc,
     sync::{Arc, Mutex},
 };
+// Observation only: production builds contain no hook or control interface.
+// Each test's worker thread retains its own counter, restored even on unwind.
+thread_local! {
+    static COMPLETED_TILES: RefCell<Option<Rc<Cell<usize>>>> = const { RefCell::new(None) };
+}
+struct CompletedTiles {
+    count: Rc<Cell<usize>>,
+    previous: Option<Rc<Cell<usize>>>,
+}
+impl CompletedTiles {
+    fn observe() -> Self {
+        let count = Rc::new(Cell::new(0));
+        let previous = COMPLETED_TILES.with(|slot| slot.replace(Some(count.clone())));
+        Self { count, previous }
+    }
+    fn count(&self) -> usize {
+        self.count.get()
+    }
+}
+impl Drop for CompletedTiles {
+    fn drop(&mut self) {
+        COMPLETED_TILES.with(|slot| *slot.borrow_mut() = self.previous.take());
+    }
+}
+pub(super) fn observe_completed_tile() {
+    COMPLETED_TILES.with(|slot| {
+        if let Some(count) = slot.borrow().as_ref() {
+            count.set(count.get().checked_add(1).unwrap());
+        }
+    });
+}
 struct Fixture {
     path: PathBuf,
     held: Option<Directory>,
@@ -54,6 +87,38 @@ impl Fixture {
         )
         .unwrap();
         (runtime, connection)
+    }
+    fn block_files(&self) -> Vec<(PathBuf, Vec<u8>)> {
+        // Inspect only this exact private fixture, with finite depth, entry and
+        // byte bounds. No symlink or other-file contents are followed/read.
+        self.held.as_ref().unwrap().check().unwrap();
+        let mut pending = vec![(self.path.clone(), 0usize)];
+        let mut files = Vec::new();
+        let mut entries = 0;
+        while let Some((directory, depth)) = pending.pop() {
+            assert!(depth <= 8);
+            for entry in fs::read_dir(directory).unwrap() {
+                entries += 1;
+                assert!(entries <= 128);
+                let entry = entry.unwrap();
+                let metadata = fs::symlink_metadata(entry.path()).unwrap();
+                assert!(!metadata.file_type().is_symlink());
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::MetadataExt;
+                    assert_eq!(metadata.file_attributes() & 0x400, 0);
+                }
+                if metadata.is_dir() {
+                    pending.push((entry.path(), depth + 1));
+                } else if entry.file_name() == "blocks.pbt" {
+                    assert!(metadata.is_file() && metadata.len() <= 1024 * 1024);
+                    files.push((entry.path(), fs::read(entry.path()).unwrap()));
+                }
+            }
+        }
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+        self.held.as_ref().unwrap().check().unwrap();
+        files
     }
 }
 impl Drop for Fixture {
@@ -162,19 +227,94 @@ fn actual_session_vector_refusal_reclaims_only_owned_provisional_files() {
     let source = definition();
     let p = PreparedSource::new(&source, None, &session.resident(), &mut || Ok(())).unwrap();
     let before = session.disk().used().unwrap();
+    let before_files = fixture.block_files();
+    let original = base.key();
+    let completed = CompletedTiles::observe();
+    let foreign_path = fixture.path.join("unrelated.bin");
+    fs::write(&foreign_path, b"preserve unrelated bytes").unwrap();
     let error = render(&p, [280, 19], 16, &base, &session, &mut || {
-        if session.disk().used().map_err(|e| e.to_string())? > before + 4096 {
-            Err("vector canceled after provisional admission".into())
+        // Store::put has returned only after the complete tile record, seal,
+        // identity/stamp and SHA rechecks. A reservation alone proves none of
+        // these facts and can fire during an unverified partial append.
+        if completed.count() != 0 {
+            Err("vector canceled after completed provisional tile".into())
         } else {
             Ok(())
         }
     })
     .err()
     .unwrap();
-    assert!(error.contains("vector canceled"), "{error}");
+    assert!(
+        error.contains("vector canceled"),
+        "VECTOR_REFUSAL_STATUS completed={} canceled={} retained={}",
+        completed.count(),
+        error.contains("vector canceled"),
+        error.contains("cleanup retained inventory")
+    );
+    assert_eq!(completed.count(), 1);
     assert_eq!(session.disk().used().unwrap(), before);
+    assert_eq!(fixture.block_files(), before_files);
+    assert_eq!(base.key(), original);
+    assert_eq!(
+        fs::read(&foreign_path).unwrap(),
+        b"preserve unrelated bytes"
+    );
     let foreign = ResidentBudget::new(256 * 1024 * 1024).unwrap();
     let p = PreparedSource::new(&source, None, &foreign, &mut || Ok(())).unwrap();
     assert!(render(&p, [280, 19], 16, &base, &session, &mut || Ok(())).is_err());
     assert_eq!(session.disk().used().unwrap(), before);
+}
+
+#[test]
+fn actual_session_vector_mid_record_refusal_retains_unverified_bytes_and_quota() {
+    let fixture = Fixture::new();
+    let (runtime, _connection) = fixture.runtime(16 * 1024 * 1024);
+    let session = runtime.begin().unwrap();
+    let base = base(&session, 16);
+    let original = base.key();
+    let source = definition();
+    let prepared = PreparedSource::new(&source, None, &session.resident(), &mut || Ok(())).unwrap();
+    let before = session.disk().used().unwrap();
+    let before_files = fixture.block_files();
+    let completed = CompletedTiles::observe();
+    let error = render(&prepared, [280, 19], 16, &base, &session, &mut || {
+        if session.disk().used().map_err(|e| e.to_string())? > before + 4096 {
+            Err("vector canceled during unverified append".into())
+        } else {
+            Ok(())
+        }
+    })
+    .err()
+    .unwrap();
+    assert!(
+        error.contains("vector canceled"),
+        "VECTOR_REFUSAL_STATUS completed={} canceled={} retained={}",
+        completed.count(),
+        error.contains("vector canceled"),
+        error.contains("cleanup retained inventory")
+    );
+    assert!(error.contains("cleanup retained inventory"));
+    assert_eq!(completed.count(), 0);
+    let retained = session.disk().used().unwrap();
+    assert!(retained > before + 4096);
+    let retained_files = fixture.block_files();
+    assert_eq!(retained_files.len(), before_files.len() + 1);
+    let new = retained_files
+        .iter()
+        .filter(|(name, _)| !before_files.iter().any(|(old, _)| old == name))
+        .collect::<Vec<_>>();
+    assert_eq!(new.len(), 1);
+    assert!(new[0].1.starts_with(b"PBTILES1") && new[0].1.len() > 24);
+    for (name, bytes) in &before_files {
+        assert!(retained_files.contains(&(name.clone(), bytes.clone())));
+    }
+    assert_eq!(base.key(), original);
+    // A separate admission refusal cannot opportunistically retire this
+    // unknown prefix or refund its charge.
+    let foreign = ResidentBudget::new(256 * 1024 * 1024).unwrap();
+    let prepared = PreparedSource::new(&source, None, &foreign, &mut || Ok(())).unwrap();
+    assert!(render(&prepared, [280, 19], 16, &base, &session, &mut || Ok(())).is_err());
+    assert_eq!(session.disk().used().unwrap(), retained);
+    assert_eq!(fixture.block_files(), retained_files);
+    assert_eq!(base.key(), original);
 }
