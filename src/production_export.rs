@@ -1,6 +1,8 @@
 //! Flattened production exports. Plans and renders never mutate editable sources.
 pub mod jobs;
 pub mod library;
+pub(crate) mod native_png;
+pub(crate) mod native_webp;
 mod png;
 use crate::engine::Document;
 use serde::{Deserialize, Serialize};

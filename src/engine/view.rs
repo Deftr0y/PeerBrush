@@ -115,7 +115,7 @@ impl<'a> DocumentView<'a> {
     pub(crate) fn layer(self, index: usize) -> Option<LayerView<'a>> {
         match self {
             Self::Resident(doc) => doc.layers.get(index).map(LayerView::Resident),
-            Self::Native(doc) => doc.metadata().layers().nth(index).map(LayerView::Native),
+            Self::Native(doc) => doc.metadata().layer(index).map(LayerView::Native),
         }
     }
     pub(crate) fn layers(self) -> Layers<'a> {
