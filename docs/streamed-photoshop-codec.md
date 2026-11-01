@@ -24,6 +24,20 @@ mask retain 32-bit lengths in PSB; layer-info and channel lengths widen. Tagged
 lengths follow the existing codec's key-specific policy, including when the
 signature is 8B64. Unknown ordinary tags remain opaque indexed spans.
 
+The decoder scan retains only semantic image resources (including the markers
+needed to protect duplicate sources/profiles) and raw layer-record spans. It
+does not impose the full index's resource/cumulative layer-tag collection limits
+on records the previous parser ignored or protected. Unsupported adjustment
+records can contain undefined channel data; that data remains provisional and
+cannot authorize a private restore or editable native decode. Global tag limits
+and all existing file, layer, tile and native mask admission remain.
+
+Raw 8-bit layer rows accept both the existing writer's packed rows and explicitly
+declared even-byte row padding. Layer-info alignment can contain one arbitrary
+padding byte. Merged composite rows retain their exact unpadded representation.
+ZIP checksum/termination and exact encoded/decoded consumption remain required;
+arbitrary encoded tails are not treated as meaningful pixels.
+
 Layer descriptors retain raw record, mask, name, blending-range and tag spans,
 alongside blend/opacity/clipping/flag fields and channel geometry. The selected
 primary or depth-specific layer-info set follows the existing selection policy;
