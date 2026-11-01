@@ -206,6 +206,7 @@ mod windows {
         dacl: *mut c_void,
         protected: bool,
         present: bool,
+        control: u16,
     }
     impl Drop for Rules {
         fn drop(&mut self) {
@@ -223,6 +224,7 @@ mod windows {
                 dacl: ptr::null_mut(),
                 protected: false,
                 present: false,
+                control: 0,
             };
             // OWNER|GROUP|DACL only. SACL access would require an unapproved
             // privilege change and is deliberately neither requested nor claimed.
@@ -251,6 +253,7 @@ mod windows {
             {
                 return Err("Native access descriptor control unavailable".into());
             }
+            r.control = control;
             r.protected = control & 0x1000 != 0;
             r.present = control & 4 != 0;
             if !r.present && !r.dacl.is_null() {
@@ -341,6 +344,7 @@ mod windows {
         }
         fn equal(&self, other: &Self) -> Result<bool, String> {
             Ok(self.owners_equal(other)?
+                && self.control == other.control
                 && self.protected == other.protected
                 && self.acl_equal(other, false)?)
         }
@@ -385,11 +389,15 @@ mod windows {
                 dacl,
                 protected: true,
                 present,
+                control: 0x1000 | if present { 4 } else { 0 },
             };
             let original = rules(e, e, ptr::null_mut(), true);
             assert!(original
                 .owners_equal(&rules(e, e, ptr::null_mut(), true))
                 .unwrap());
+            let mut changed_control = rules(e, e, ptr::null_mut(), true);
+            changed_control.control ^= 0x400;
+            assert!(!original.equal(&changed_control).unwrap());
             assert!(!original
                 .owners_equal(&rules(y, e, ptr::null_mut(), true))
                 .unwrap());
