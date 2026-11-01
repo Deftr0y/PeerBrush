@@ -401,3 +401,176 @@ fn prepared_soft_restriction_matches_the_real_legacy_native_rounding_and_origin(
         assert!(result[9 * bpp..256 * bpp].iter().all(|b| *b == 0));
     }
 }
+
+#[test]
+fn projected_frame_and_brush_share_one_complete_output_with_the_legacy_soft_baseline() {
+    let f = Fixture::new();
+    let (runtime, _connection) = f.runtime();
+    let session = runtime.begin().unwrap();
+    for depth in [8, 16] {
+        let mut source = source(depth);
+        source.width = 20;
+        source.height = 14;
+        source.selection = Some([0, 0, 20, 14]);
+        let mut mask = Raster::new_depth(20, 14, 16);
+        for y in 0..14 {
+            for x in 0..20 {
+                mask.set16(x, y, [32769, 0, 0, 0]);
+            }
+        }
+        let coverage = crate::selection::Coverage {
+            mask,
+            bounds: source.selection.unwrap(),
+            origin: [0, 0],
+            contours: vec![],
+        };
+        source.selection_coverage = Some(coverage.clone());
+        let document = native(&source, &session);
+        let input = RasterInput::layer(&document, &source.layers[0].id).unwrap();
+        let frame = input.project_frame([15, 7, 20, 13]).unwrap().unwrap();
+        assert_eq!(frame.geometry().new_shape(), [23, 14]);
+        assert_eq!(frame.geometry().new_origin(), [-3, 0]);
+        let settings = crate::brush::Settings::from_command(
+            &serde_json::json!({"radius":2.,"opacity":0.7,"flow":0.6}),
+        )
+        .unwrap();
+        let stroke =
+            LocalStroke::for_frame(&input, &frame, &[[18., 10.]], None, &mut || Ok(())).unwrap();
+        let baseline = runtime.disk().used().unwrap();
+        let BuiltTiles::Draft(draft) = crate::brush::input::stage(
+            &input,
+            &stroke,
+            settings,
+            [17, 83, 219, 127],
+            false,
+            Some(&frame),
+            &session,
+            &mut || Ok(()),
+        )
+        .unwrap() else {
+            panic!("Frame was not staged")
+        };
+        let staged = draft.seal(&|| Ok(())).ok().unwrap();
+        let mut expected = source.clone();
+        crate::edit_bounds::prepare(
+            &mut expected,
+            &serde_json::json!({"op":"paint","layer":source.layers[0].id,
+            "points":[[18.,10.]],"radius":2.,"opacity":0.7,"flow":0.6,"color":[17,83,219,127]}),
+        )
+        .unwrap();
+        let before = expected.layers[0].pixels.clone();
+        let origin = [expected.layers[0].x, expected.layers[0].y];
+        let mut settings = settings;
+        settings.texture_origin = origin;
+        let point = [[18. - origin[0] as f32, 10. - origin[1] as f32]];
+        let clip = source.selection.map(|r| {
+            [
+                r[0] - origin[0],
+                r[1] - origin[1],
+                r[2] - origin[0],
+                r[3] - origin[1],
+            ]
+        });
+        crate::brush::paint_with_pressure(
+            &mut expected.layers[0].pixels,
+            &point,
+            None,
+            settings,
+            [17, 83, 219, 127],
+            false,
+            clip,
+            None,
+        )
+        .unwrap();
+        crate::selection::restrict_raster(
+            &mut expected.layers[0].pixels,
+            &before,
+            &coverage,
+            origin,
+        );
+        let region = staged
+            .surface()
+            .prepare_region(Region::new([0, 0, 23, 14]).unwrap(), &mut || Ok(()))
+            .unwrap();
+        for y in 0..14 {
+            for x in 0..23 {
+                assert_eq!(
+                    region.pixel16(x, y).unwrap(),
+                    expected.layers[0].pixels.get16(x, y)
+                );
+            }
+        }
+        drop(region);
+        staged.abort(&session, &|| Ok(())).unwrap();
+        assert_eq!(runtime.disk().used().unwrap(), baseline);
+        assert!(
+            crate::edit_bounds::output::stage_frame(&input, &frame, &session, &mut || {
+                if runtime.disk().used().unwrap() > baseline + 4096 {
+                    Err("cancelled after native frame staging".into())
+                } else {
+                    Ok(())
+                }
+            })
+            .is_err()
+        );
+        assert_eq!(runtime.disk().used().unwrap(), baseline);
+    }
+}
+
+#[test]
+fn projected_mask_frames_keep_the_color_translation_with_their_own_native_shape() {
+    let f = Fixture::new();
+    let (runtime, _connection) = f.runtime();
+    let session = runtime.begin().unwrap();
+    let mut source = source(16);
+    source.width = 20;
+    source.height = 14;
+    let mut pixels = Raster::new_depth(5, 4, 16);
+    pixels.set16(1, 2, [35731, 35731, 35731, 49153]);
+    source.layers[0].mask = Some(crate::engine::Mask {
+        enabled: false,
+        linked: false,
+        cache_key: crate::engine::id(),
+        steps: vec![crate::engine::MaskStep {
+            id: "mask-paint".into(),
+            kind: "paint".into(),
+            enabled: false,
+            weight: 0.4,
+            value: 0.,
+            pixels: pixels.clone(),
+            settings: serde_json::json!({}),
+        }],
+    });
+    let document = native(&source, &session);
+    let color = RasterInput::layer(&document, &source.layers[0].id).unwrap();
+    let mask = RasterInput::mask_step(&document, &source.layers[0].id, "mask-paint").unwrap();
+    assert_eq!(mask.color([7, 19, 31, 127]), [7, 7, 7, 127]);
+    assert_eq!(mask.shape(), [5, 4]);
+    let frame = color.project_frame([15, 7, 20, 13]).unwrap().unwrap();
+    let mask_frame = frame.for_plane(&mask).unwrap();
+    assert_eq!(
+        mask_frame.geometry().new_shape(),
+        frame.geometry().new_shape()
+    );
+    assert_eq!(mask_frame.geometry().shift(), [0, 2]);
+    let baseline = runtime.disk().used().unwrap();
+    let staged =
+        crate::edit_bounds::output::stage_frame(&mask, &mask_frame, &session, &mut || Ok(()))
+            .unwrap()
+            .seal(&|| Ok(()))
+            .ok()
+            .unwrap();
+    let expected = crate::transform::copy_shift(&pixels, 23, 14, 0, 2);
+    let region = staged
+        .surface()
+        .prepare_region(Region::new([0, 0, 23, 14]).unwrap(), &mut || Ok(()))
+        .unwrap();
+    for y in 0..14 {
+        for x in 0..23 {
+            assert_eq!(region.pixel16(x, y).unwrap(), expected.get16(x, y));
+        }
+    }
+    drop(region);
+    staged.abort(&session, &|| Ok(())).unwrap();
+    assert_eq!(runtime.disk().used().unwrap(), baseline);
+}

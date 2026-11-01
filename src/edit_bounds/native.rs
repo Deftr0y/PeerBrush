@@ -29,6 +29,27 @@ impl FrameExpansion {
     pub(crate) fn shift(&self) -> [i32; 2] {
         self.shift
     }
+    /// A layer-frame change shifts every mask plane by the color frame's exact
+    /// translation, even when a mask's original logical extent differs.
+    pub(crate) fn for_plane(
+        &self,
+        old_shape: [u32; 2],
+        depth: u16,
+        pool: &ResidentBudget,
+    ) -> Result<Self, String> {
+        if old_shape.iter().any(|v| *v == 0 || *v > 16000) || ![8, 16].contains(&depth) {
+            return Err("Invalid native frame-plane projection".into());
+        }
+        Ok(Self {
+            old_shape,
+            old_origin: self.old_origin,
+            new_shape: self.new_shape,
+            new_origin: self.new_origin,
+            shift: self.shift,
+            depth,
+            pool: pool.clone(),
+        })
+    }
     /// Matches the resident edit-bound union after command geometry has been
     /// resolved in document coordinates. Live admission remains the engine's
     /// responsibility; this internal shape limit does not admit a16K document.
