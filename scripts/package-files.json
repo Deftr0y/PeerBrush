@@ -245,6 +245,8 @@
     "src/collaboration.rs",
     "src/color_profile.rs",
     "src/color_profile/prepared.rs",
+    "src/color_profile/prepared/display.rs",
+    "src/color_profile/prepared/display/tests.rs",
     "src/compatibility.rs",
     "src/compositor.rs",
     "src/compositor/native.rs",

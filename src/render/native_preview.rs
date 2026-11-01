@@ -1,6 +1,7 @@
 //! Captured, source-backed preview rows. Display bytes own their admission;
 //! completed frames retain no source handle or profile operation.
 use crate::{
+    color_profile::prepared::{profile_binding, ChargedWords, DisplayPlan, DisplayStatus},
     compositor::native::{Native16, Native8, Plan, RawLayers, Topology},
     engine::{
         native::DocumentKey,
@@ -36,7 +37,14 @@ impl Request {
         {
             return Err("Preview scene and source session have different admission".into());
         }
-        let prepared = Arc::new(Prepared::capture(&scene, rect, edge, target, mask)?);
+        let prepared = Arc::new(Prepared::capture(
+            &scene,
+            rect,
+            edge,
+            target,
+            mask,
+            &mut || session.check(),
+        )?);
         session.check()?;
         Ok(Self {
             scene,
@@ -96,6 +104,7 @@ struct Prepared {
     target: Option<usize>,
     grid: Grid,
     pool: ResidentBudget,
+    profile: Option<[u8; 32]>,
     _tags: Reservation,
 }
 /// Reply tracking shares the exact admitted tags instead of cloning strings.
@@ -113,7 +122,9 @@ impl Prepared {
         edge: u32,
         target: Option<&str>,
         mask: bool,
+        check: &mut dyn FnMut() -> Result<()>,
     ) -> Result<Self> {
+        check()?;
         let doc = scene.metadata();
         if doc.width() == 0
             || doc.height() == 0
@@ -125,9 +136,6 @@ impl Prepared {
         }
         if doc.read_only() {
             return Err("Native preview requires its prepared protected-document provider".into());
-        }
-        if doc.profile().is_some() {
-            return Err("Native preview requires its exact prepared ICC provider".into());
         }
         if doc.filters().any(|e| e.enabled() && e.weight() > 0.) {
             return Err("Native preview requires prepared document filters".into());
@@ -187,6 +195,8 @@ impl Prepared {
             .budget()
             .reserve_bytes(bytes, 4 * 1024 * 1024)
             .map_err(|e| e.to_string())?;
+        let profile = profile_binding(doc.profile(), check)?;
+        check()?;
         Ok(Self {
             key: Key {
                 source: scene.key(),
@@ -200,6 +210,7 @@ impl Prepared {
             target: index,
             grid,
             pool: scene.budget().clone(),
+            profile,
             _tags: tags,
         })
     }
@@ -239,6 +250,13 @@ impl Prepared {
             || !scene.budget().same_pool(&self.pool)
         {
             return Err("Preview capture belongs to another source generation".into());
+        }
+        // Only the active worker creates CMS executors. Queued requests and
+        // completed presentation tags retain no128MiB transform reservation.
+        let display =
+            DisplayPlan::prepare(scene.metadata().profile(), self.key.mask, &self.pool, check)?;
+        if display.profile_binding() != self.profile {
+            return Err("Preview profile differs from the captured source".into());
         }
         // Preview's target is raw. Export's isolated topology rejects clipped
         // roots and would reinterpret the legacy target preview contract.
@@ -282,6 +300,17 @@ impl Prepared {
                 .map_err(|e| e.to_string())?;
             if scene.metadata().depth() == 8 {
                 let plan = Plan::<Native8, _>::with_topology(topology.clone(), &prepared, region)?;
+                let row_length = self.key.width as usize * 4;
+                let mut rows = if display.status() == DisplayStatus::Converted {
+                    Some((
+                        ScratchBytes::new(&self.pool, row_length, 16000 * 4)
+                            .map_err(|e| e.to_string())?,
+                        ScratchBytes::new(&self.pool, row_length, 16000 * 4)
+                            .map_err(|e| e.to_string())?,
+                    ))
+                } else {
+                    None
+                };
                 for oy in y..end {
                     check()?;
                     for x in 0..self.key.width {
@@ -297,12 +326,31 @@ impl Prepared {
                         } else {
                             plan.pixel(sx, sy)?
                         };
-                        let at = (((oy - y) * self.key.width + x) * 4) as usize;
-                        output[at..at + 4].copy_from_slice(&pixel);
+                        let at = (x * 4) as usize;
+                        if let Some((raw, _)) = &mut rows {
+                            raw[at..at + 4].copy_from_slice(&pixel);
+                        } else {
+                            let at = (oy - y) as usize * row_length + at;
+                            output[at..at + 4].copy_from_slice(&pixel);
+                        }
+                    }
+                    if let Some((raw, converted)) = &mut rows {
+                        display.convert8(raw, converted, check)?;
+                        let at = (oy - y) as usize * row_length;
+                        output[at..at + row_length].copy_from_slice(converted);
                     }
                 }
             } else {
                 let plan = Plan::<Native16, _>::with_topology(topology.clone(), &prepared, region)?;
+                let row_length = self.key.width as usize * 4;
+                let mut rows = if display.status() == DisplayStatus::Converted {
+                    Some((
+                        ChargedWords::new(row_length, &self.pool)?,
+                        ChargedWords::new(row_length, &self.pool)?,
+                    ))
+                } else {
+                    None
+                };
                 for oy in y..end {
                     check()?;
                     for x in 0..self.key.width {
@@ -319,8 +367,23 @@ impl Prepared {
                         } else {
                             plan.pixel(sx, sy)?
                         };
-                        let at = (((oy - y) * self.key.width + x) * 4) as usize;
-                        output[at..at + 4].copy_from_slice(&crate::depth16::display_pixel(pixel));
+                        let at = (x * 4) as usize;
+                        if let Some((raw, _)) = &mut rows {
+                            raw[at..at + 4].copy_from_slice(&pixel);
+                        } else {
+                            let at = (oy - y) as usize * row_length + at;
+                            output[at..at + 4]
+                                .copy_from_slice(&crate::depth16::display_pixel(pixel));
+                        }
+                    }
+                    if let Some((raw, converted)) = &mut rows {
+                        display.convert16(raw, converted, check)?;
+                        for (x, pixel) in converted.chunks_exact(4).enumerate() {
+                            let at = (oy - y) as usize * row_length + x * 4;
+                            output[at..at + 4].copy_from_slice(&crate::depth16::display_pixel(
+                                pixel.try_into().unwrap(),
+                            ));
+                        }
                     }
                 }
             }
@@ -335,6 +398,7 @@ impl Prepared {
         Ok(Frame {
             stripes,
             prepared: self.clone(),
+            display_status: display.status(),
             _index: index,
         })
     }
@@ -354,9 +418,16 @@ impl Stripe {
 pub(crate) struct Frame {
     stripes: Vec<Stripe>,
     prepared: Arc<Prepared>,
+    display_status: DisplayStatus,
     _index: Reservation,
 }
 impl Frame {
+    pub(crate) fn display_status(&self) -> DisplayStatus {
+        self.display_status
+    }
+    pub(crate) fn profile_warning(&self) -> Option<&'static str> {
+        self.display_status.warning()
+    }
     pub(crate) fn key(&self) -> &Key {
         &self.prepared.key
     }
@@ -433,7 +504,7 @@ mod tests {
         target: Option<&str>,
         mask: bool,
     ) -> Arc<Prepared> {
-        Arc::new(Prepared::capture(scene, rect, edge, target, mask).unwrap())
+        Arc::new(Prepared::capture(scene, rect, edge, target, mask, &mut || Ok(())).unwrap())
     }
     #[test]
     fn native_preview_matches_legacy_raw_targets_hidden_rgb_clipping_and_rect_grids() {
@@ -649,13 +720,10 @@ mod tests {
     }
     #[test]
     fn unsupported_derived_providers_are_explicit_refusals_not_blank_frames() {
-        for variant in 0..3 {
+        for variant in 0..2 {
             let mut doc = document(16, 9, 7);
             match variant {
                 0 => {
-                    doc.icc_profile = Some(Arc::new(crate::color_profile::srgb_profile().to_vec()))
-                }
-                1 => {
                     doc.layers[0].mask = Some(crate::engine::Mask {
                         enabled: false,
                         linked: true,
@@ -672,9 +740,146 @@ mod tests {
                 }),
             }
             let (scene, path) = capture(&doc);
-            assert!(Prepared::capture(&scene, None, 48, Some(&doc.layers[0].id), true).is_err());
+            assert!(Prepared::capture(
+                &scene,
+                None,
+                48,
+                Some(&doc.layers[0].id),
+                true,
+                &mut || Ok(())
+            )
+            .is_err());
             drop(scene);
             crate::compositor::native::tests::cleanup(&path);
         }
+    }
+
+    fn profile_scene(doc: &Document) -> (Arc<SceneSnapshot>, std::path::PathBuf) {
+        let (scene, path) = crate::compositor::native::tests::capture_kind_with_budget(
+            doc,
+            true,
+            ResidentBudget::new(192 * 1024 * 1024).unwrap(),
+        );
+        (Arc::new(scene), path)
+    }
+    #[test]
+    fn icc_preview_matches_legacy_rows_before_projection_with_raw_warning_and_mask_bypass() {
+        let mut unsupported = moxcms::ColorProfile::new_display_p3().encode().unwrap();
+        unsupported[16..20].copy_from_slice(b"CMYK");
+        for depth in [8, 16] {
+            for (profile, supported) in [
+                (crate::color_profile::srgb_profile().to_vec(), true),
+                (
+                    moxcms::ColorProfile::new_display_p3().encode().unwrap(),
+                    true,
+                ),
+                (unsupported.clone(), false),
+                (vec![0; 132], false),
+            ] {
+                let mut doc = document(depth, 29, 23);
+                doc.icc_profile = Some(Arc::new(profile));
+                let before = doc.icc_profile.clone();
+                let (scene, path) = profile_scene(&doc);
+                for mask in [false, true] {
+                    for target in [None, Some(doc.layers[0].id.as_str())] {
+                        let prepared = prepare(&scene, Some([2, 3, 27, 22]), 13, target, mask);
+                        let frame = prepared.render(&scene, &mut || Ok(())).unwrap();
+                        let expected = doc.preview(Some([2, 3, 27, 22]), 13, target, mask).unwrap();
+                        assert_eq!(
+                            &*frame.copy_rgba8(&mut || Ok(())).unwrap(),
+                            &expected.2,
+                            "ICC depth{depth} mask{mask} supported{supported}"
+                        );
+                        assert_eq!(
+                            frame.display_status(),
+                            if mask {
+                                DisplayStatus::Mask
+                            } else if supported {
+                                DisplayStatus::Converted
+                            } else {
+                                DisplayStatus::Unsupported
+                            }
+                        );
+                        assert_eq!(frame.profile_warning().is_some(), !mask && !supported);
+                        assert_eq!(
+                            scene.metadata().profile(),
+                            before.as_deref().map(Vec::as_slice)
+                        );
+                        assert_eq!(doc.icc_profile, before);
+                    }
+                }
+                drop(scene);
+                crate::compositor::native::tests::cleanup(&path);
+            }
+        }
+    }
+    #[test]
+    fn cms_executor_ends_before_completed_frame_and_tag_allow_the_next_request() {
+        let mut doc = document(16, 29, 23);
+        doc.icc_profile = Some(Arc::new(
+            moxcms::ColorProfile::new_display_p3().encode().unwrap(),
+        ));
+        let (scene, path) = profile_scene(&doc);
+        let pool = scene.budget().clone();
+        let prepared = prepare(&scene, None, 48, None, false);
+        drop(prepared.render(&scene, &mut || Ok(())).unwrap());
+        let baseline = pool.used();
+        let frame = prepared.render(&scene, &mut || Ok(())).unwrap();
+        let retained = frame._index.bytes()
+            + frame
+                .stripes
+                .iter()
+                .map(|stripe| stripe.bytes.allocated_bytes())
+                .sum::<usize>();
+        assert_eq!(pool.used(), baseline + retained);
+        let tag = frame.tag();
+        let next = prepare(&scene, None, 48, None, false);
+        let next_frame = next.render(&scene, &mut || Ok(())).unwrap();
+        assert!(frame.matches(&tag));
+        assert_eq!(frame.key(), next_frame.key());
+        drop(next_frame);
+        drop(next);
+        assert_eq!(pool.used(), baseline + retained);
+        drop(scene);
+        crate::compositor::native::tests::cleanup(&path);
+        assert_eq!(frame.copy_rgba8(&mut || Ok(())).unwrap().len(), 29 * 23 * 4);
+        drop(frame);
+        drop(tag);
+        drop(prepared);
+        assert_eq!(pool.used(), 0);
+    }
+    #[test]
+    fn icc_cancel_owner_mismatch_and_insufficient_admission_return_no_fallback_frame() {
+        let mut doc = document(16, 29, 23);
+        doc.icc_profile = Some(Arc::new(
+            moxcms::ColorProfile::new_display_p3().encode().unwrap(),
+        ));
+        let (scene, path) = profile_scene(&doc);
+        let prepared = prepare(&scene, None, 48, None, false);
+        let baseline = scene.budget().used();
+        let remaining = scene.budget().limit() - baseline - 127 * 1024 * 1024;
+        let owner = scene
+            .budget()
+            .reserve_bytes(remaining, 64 * 1024 * 1024)
+            .unwrap();
+        assert!(prepared.render(&scene, &mut || Ok(())).is_err());
+        assert_eq!(scene.budget().used(), baseline + remaining);
+        drop(owner);
+        let reason = prepared
+            .render(&scene, &mut || Err("profile source lease ended".into()))
+            .err()
+            .unwrap();
+        assert_eq!(reason, "profile source lease ended");
+        assert_eq!(scene.budget().used(), baseline);
+        let mut wrong = Prepared::capture(&scene, None, 48, None, false, &mut || Ok(())).unwrap();
+        wrong.profile.as_mut().unwrap()[0] ^= 1;
+        let wrong = Arc::new(wrong);
+        let with_tag = scene.budget().used();
+        assert!(wrong.render(&scene, &mut || Ok(())).is_err());
+        assert_eq!(scene.budget().used(), with_tag);
+        drop(wrong);
+        drop(prepared);
+        drop(scene);
+        crate::compositor::native::tests::cleanup(&path);
     }
 }
