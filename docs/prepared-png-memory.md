@@ -180,3 +180,26 @@ their corresponding charges. A failed decoder, sink, cancellation check or final
 checksum returns no completion owner. Callers must discard every provisional
 durable row/block after such a failure and independently validate scene revision,
 source, lease, selection and slot identity before engine adoption.
+
+`png_admission::stage` uses the actual `SourceSession` provider rather than
+creating generic Store paths. Ordinary rows stage final physical tiles directly.
+Adam7 rows first append compact sample planes to one unpublished fragment; a
+separate fragment receives complete physical tiles. The partial fragment is
+retired through the session only after its maps, Store clones and pins drop.
+This avoids seven padded full-image generations and performs no random writes.
+For dense16000-square native16 input, the logical compact payload and padded
+final payload can coexist at roughly4 GiB before record/manifest overhead. This
+is an architectural payload estimate, not a measured disk or RAM result.
+
+The final checkpoint binds exact encoded-source/transport hashes, color policy,
+dimensions/depth, alpha/grayscale/orientation/cICP facts, retained ICC bytes and
+every tile coordinate/reference fingerprint. The temporary reference vector and
+metadata bytes share resident admission. The provisional map remains charged
+until `Surface::from_plane` acquires its permanent immutable index charge.
+`StagedPng` retains the final fragment and seal until explicit publication or
+abort. Publication marks the fragment in memory before returning any authority;
+the engine still owns all final scene guards and atomic history adoption.
+Unexpected drops retain private files/inventory. Failed, busy, foreign or
+uncertain retirement reports retained inventory and never falls back to generic
+deletion. These mechanisms do not raise the application's current canvas limits
+or establish dense16K editing/recovery qualification.
