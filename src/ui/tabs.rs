@@ -476,7 +476,7 @@ impl PeerBrush {
                         &drag.source_order,
                         &drag.order,
                     ) {
-                        self.message = error;
+                        self.message = error.into();
                     }
                 }
             } else if !ctx.input(|i| i.pointer.button_down(egui::PointerButton::Primary)) {

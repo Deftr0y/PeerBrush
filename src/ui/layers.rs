@@ -291,7 +291,7 @@ impl PeerBrush {
                 )
             }
         };
-        self.message = result.map(|_| "Renamed layer".into()).unwrap_or_else(|e| e);
+        self.message = result.map(|_| "Renamed layer".into()).unwrap_or_else(|e| e).into();
         self.last_preview = None;
     }
     fn inline_rename(&mut self, ui: &mut egui::Ui, width: f32) {
@@ -853,7 +853,7 @@ impl PeerBrush {
                         } else {format!("{} · at end",destination)});
                         drag.target=p.indices().iter().position(|&i|view.layer(i).unwrap().id()==drag.id).unwrap_or(0);drag.commands=commands;preview=p;
                     }
-                    Err(e)=>{drag.commands.clear();self.message=e;}
+                    Err(e)=>{drag.commands.clear();self.message=e.into();}
                 }
             }
             let visibility=self.eye_sweep.as_ref().map(|sweep|(sweep.visible,sweep.ids.clone()));
@@ -942,14 +942,14 @@ impl PeerBrush {
                 if let Some(drag)=self.layer_drag.take() {
                     if pointer.is_some_and(|p|ui.clip_rect().contains(p)) && !drag.commands.is_empty() {
                         let result=self.shared.lock().unwrap().edit("human",&drag.commands,Some(drag.revision),None,"Move layers");
-                        self.message=result.map(|_|"Move layers".into()).unwrap_or_else(|e|e);self.last_preview=None;
+                        self.message=result.map(|_|"Move layers".into()).unwrap_or_else(|e|e).into();self.last_preview=None;
                         if let Some(id)=drop_folder {self.collapsed.remove(&id);}
                     }
                 }
                 if let Some(sweep)=self.eye_sweep.take() {
                     let commands=sweep.ids.iter().map(|id|json!({"op":"layer.update","layer":id,"visible":sweep.visible})).collect::<Vec<_>>();
                     let result=self.shared.lock().unwrap().edit("human",&commands,Some(sweep.revision),None,"Layer visibility sweep");
-                    self.message=result.map(|_|"Layer visibility".into()).unwrap_or_else(|e|e);self.last_preview=None;
+                    self.message=result.map(|_|"Layer visibility".into()).unwrap_or_else(|e|e).into();self.last_preview=None;
                 }
             }
             ui.advance_cursor_after_rect(Rect::from_min_size(base,Vec2::new(width,ordered.len() as f32*46.0)));

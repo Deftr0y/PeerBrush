@@ -86,7 +86,7 @@ impl PeerBrush {
                 .lock()
                 .unwrap()
                 .edit("human", &commands, Some(doc.revision), None, label);
-        self.message = result.map(|_| label.into()).unwrap_or_else(|e| e);
+        self.message = result.map(|_| label.into()).unwrap_or_else(|e| e).into();
         self.last_preview = None;
     }
 }

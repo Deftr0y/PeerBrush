@@ -12,8 +12,8 @@ impl PeerBrush {
             .iter()
             .filter(|l| l.expires > crate::engine::now())
             .any(|l| {
-                self.message == format!("Reserved by {}: {}", l.owner, l.description)
-                    || self.message
+                self.message.as_str() == format!("Reserved by {}: {}", l.owner, l.description)
+                    || self.message.as_str()
                         == format!(
                             "Reserved by {}: {}. Release the reservation or edit elsewhere.",
                             l.owner, l.description
@@ -125,7 +125,7 @@ impl PeerBrush {
                             result["label"] = task["label"].clone();
                             self.task_undo_review = Some(result);
                         }
-                        Err(error) => self.message = error,
+                        Err(error) => self.message = error.into(),
                     }
                     ui.close_menu();
                 }
@@ -335,7 +335,8 @@ impl PeerBrush {
                         let result = self.shared.lock().unwrap().reject_proposal("human", &id);
                         self.message = result
                             .map(|_| "Proposal discarded · current work preserved".into())
-                            .unwrap_or_else(|e| e);
+                            .unwrap_or_else(|e| e)
+                            .into();
                         close = true;
                     }
                     if ui.button("Close").clicked() {

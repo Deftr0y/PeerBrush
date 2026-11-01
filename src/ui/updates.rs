@@ -516,7 +516,7 @@ impl PeerBrush {
                     let (profile, _) = self.updates.install.take().unwrap();
                     match result {
                         Ok(owner) => self.updates.ready_owner = Some((profile, owner)),
-                        Err(error) => self.message = error,
+                        Err(error) => self.message = error.into(),
                     }
                 }
                 Some(Err(mpsc::TryRecvError::Disconnected)) => {
@@ -545,7 +545,7 @@ impl PeerBrush {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         return;
                     }
-                    Err(error) => self.message = error,
+                    Err(error) => self.message = error.into(),
                 }
             }
         }

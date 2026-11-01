@@ -740,7 +740,7 @@ struct Entry {
 pub(super) struct Review {
     intent: Intent,
     entries: Vec<Entry>,
-    error: Option<String>,
+    error: Option<RuntimeValue<String>>,
     saving: Option<mpsc::Receiver<SaveReply>>,
     pub(super) buttons: [Option<Rect>; 3],
 }
@@ -890,7 +890,7 @@ impl PeerBrush {
                     buttons: [None; 3],
                 })
             }
-            Err(error) => self.message = error,
+            Err(error) => self.message = error.into(),
         }
     }
 
@@ -920,7 +920,7 @@ impl PeerBrush {
         let shared = match crate::workspace::get_in(&self.workspace, &row.source.project) {
             Ok(shared) => shared,
             Err(error) => {
-                self.lifecycle.as_mut().unwrap().error = Some(error);
+                self.lifecycle.as_mut().unwrap().error = Some(error.into());
                 return;
             }
         };
@@ -932,7 +932,7 @@ impl PeerBrush {
         let report = match report {
             Ok(report) => report,
             Err(error) => {
-                self.lifecycle.as_mut().unwrap().error = Some(error);
+                self.lifecycle.as_mut().unwrap().error = Some(error.into());
                 return;
             }
         };
@@ -1007,7 +1007,7 @@ impl PeerBrush {
                 review.saving = Some(rx);
                 review.error = None;
             }
-            Err(error) => review.error = Some(format!("Could not start saving: {error}")),
+            Err(error) => review.error = Some(format!("Could not start saving: {error}").into()),
         }
     }
 
@@ -1025,7 +1025,7 @@ impl PeerBrush {
                 if let Some(result) = request {
                     match result {
                         Ok(()) => self.request_close(Intent::Close(project)),
-                        Err(error) => self.message = error,
+                        Err(error) => self.message = error.into(),
                     }
                     break;
                 }
@@ -1087,7 +1087,7 @@ impl PeerBrush {
                     Ok(false) => {
                         review.error = Some("Save canceled. The project remains open.".into())
                     }
-                    Err(error) => review.error = Some(error),
+                    Err(error) => review.error = Some(error.into()),
                 }
             }
         }
@@ -1095,7 +1095,7 @@ impl PeerBrush {
             let refreshed = match review.refresh(&self.workspace) {
                 Ok(()) => true,
                 Err(error) => {
-                    review.error = Some(error);
+                    review.error = Some(error.into());
                     false
                 }
             };
@@ -1132,6 +1132,7 @@ impl PeerBrush {
                             )
                         }
                     }
+                    .map_err(RuntimeValue::from)
                 };
                 match result {
                     Ok(()) => {
@@ -1149,7 +1150,7 @@ impl PeerBrush {
                         }
                         return;
                     }
-                    Err(error) => review.error = Some(error),
+                    Err(error) => review.error = Some(error.into()),
                 }
             }
         }
@@ -1189,7 +1190,7 @@ impl PeerBrush {
                 }
             }
             if let Some(error) = &review.error {
-                ui.label(RichText::new(error).color(ACCENT));
+                ui.label(RichText::new(error.as_str()).color(ACCENT));
             }
             if saving {
                 if let Some(control) = &save_control {

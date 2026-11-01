@@ -195,7 +195,7 @@ impl super::PeerBrush {
         if let Some(warning) = warning {
             self.message = warning.into();
         } else if previous_warning.is_some_and(|warning| self.message == warning) {
-            self.message.clear();
+            self.message = "".into();
         }
         self.canvas_generation = self.canvas_generation.wrapping_add(1);
         Ok(true)

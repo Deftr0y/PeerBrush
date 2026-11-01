@@ -218,7 +218,7 @@ impl PeerBrush {
         {
             Ok(value) => value,
             Err(error) => {
-                self.message = error;
+                self.message = error.into();
                 return;
             }
         };
@@ -247,7 +247,7 @@ impl PeerBrush {
                         Ok(Some(source)) => source,
                         Ok(None) => return,
                         Err(error) => {
-                            self.message = error;
+                            self.message = error.into();
                             return;
                         }
                     },
@@ -324,7 +324,7 @@ impl PeerBrush {
         let mut font_search = String::new();
         if native.is_some() {
             if let Err(error) = native::prepare_buffers(&mut source, &mut font_search) {
-                self.message = error;
+                self.message = error.into();
                 return;
             }
         }
@@ -469,7 +469,7 @@ impl PeerBrush {
             let anchor = self.view.document(press, rect, scale);
             if let Some(id) = text_hit(doc, anchor) {
                 if let Err(error) = unlocked(doc, &id) {
-                    self.message = error;
+                    self.message = error.into();
                     return;
                 }
                 self.select_content(&id);
