@@ -1701,8 +1701,11 @@ Status PrepareResampledPatch(
   // Normal builds contain no full-image oracle, and qualification refuses more
   // than 1 MiB raw even when the actual streaming producer could accept it.
   JXL_ENSURE(data.xsize * data.ysize <= 1024 * 1024 / 8);
-  JXL_ASSIGN_OR_RETURN(Image3F reference,
-                       Image3F::Create(manager, data.xsize, data.ysize));
+  JXL_ASSIGN_OR_RETURN(
+      Image3F reference,
+      Image3F::Create(manager, RoundUpToBlockDim(data.xsize),
+                      RoundUpToBlockDim(data.ysize)));
+  JXL_RETURN_IF_ERROR(reference.ShrinkTo(data.xsize, data.ysize));
   JXL_ASSIGN_OR_RETURN(Image3F reference_piece,
                        Image3F::Create(manager, resampled_rows::kNativeEdge,
                                        resampled_rows::kBand));
