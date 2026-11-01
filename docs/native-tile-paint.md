@@ -49,3 +49,15 @@ physical padding untouched. Invalid confidence, an undeclared coverage sample,
 cancellation or a foreign pool returns no partial tile. The caller must bind
 the prepared coverage and original color/mask slot to the captured scene before
 the common engine transaction can adopt the result.
+
+`retouch::native::PreparedRetouch` preserves the resident clone/heal coverage,
+bilinear sampling, premultiplied means and native-depth blend arithmetic. Its
+explicit read plan declares source sampling queries and the destination healing
+halo. Prepared samplers are memory-only and fallible; a missing sample cannot
+be replaced with transparent pixels. Known exterior zeros must be established
+by the prepared source's geometry. A radius-64 halo spans at most 384x384 pixels,
+so its source preparation must be split into bounded strips. The two integral
+fields use charged byte storage, including their padded rows and columns.
+The output preserves complete physical tile padding and stays provisional until
+the common captured-scene transaction adopts it. Merged artwork/mask sampling
+must use the shared prepared compositor; this kernel adds no full-frame fallback.

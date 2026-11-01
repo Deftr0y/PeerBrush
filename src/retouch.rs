@@ -1,4 +1,6 @@
 //! Snapshot-based clone and locally color-adapted healing, at the original channel depth.
+#[path = "retouch/native.rs"]
+pub(crate) mod native;
 use crate::{
     brush::{self, Settings},
     engine::{self, Document},

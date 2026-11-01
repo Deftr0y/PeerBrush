@@ -51,6 +51,9 @@ pub(crate) struct PreparedBrush<'a> {
 }
 
 impl<'a> PreparedBrush<'a> {
+    pub(crate) fn dabs(&self) -> &[Dab] {
+        &self.dabs
+    }
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         width: u32,
@@ -145,6 +148,49 @@ impl<'a> PreparedBrush<'a> {
 
     pub(crate) fn tiles(&self) -> &[(u32, u32)] {
         &self.tiles
+    }
+
+    /// Clone/heal use the existing 16-bit dab coverage at both source depths.
+    /// Opacity is applied by their native sampling kernel after this quantization.
+    pub(crate) fn coverage16_tile(
+        &self,
+        coordinate: (u32, u32),
+        check: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<PinnedBytes, String> {
+        check()?;
+        if self
+            .tiles
+            .binary_search_by_key(&(coordinate.1, coordinate.0), |&(x, y)| (y, x))
+            .is_err()
+        {
+            return Err("Native coverage tile is outside its prepared footprint".into());
+        }
+        let length = (TILE * TILE * 2) as usize;
+        let mut coverage =
+            ScratchBytes::new(&self.budget, length, length).map_err(|e| e.to_string())?;
+        let origin = [(coordinate.0 * TILE) as i32, (coordinate.1 * TILE) as i32];
+        let tip = Tip::new(self.settings);
+        for &dab in &self.dabs {
+            check()?;
+            if dab.radius <= 0.001 || dab.opacity == 0.0 {
+                continue;
+            }
+            visit_tile_dab(
+                dab,
+                tip.with_radius(dab.radius),
+                self.clip,
+                origin,
+                self.polygon,
+                |at, amount| {
+                    let at = at * 2;
+                    let old = u16::from_be_bytes([coverage[at], coverage[at + 1]]);
+                    let value = accumulated16(old, amount, self.settings.flow, dab.opacity);
+                    coverage[at..at + 2].copy_from_slice(&value.to_be_bytes());
+                },
+            );
+        }
+        check()?;
+        Ok(coverage.freeze())
     }
 
     pub(crate) fn changed_tiles(&self, previous: &Self) -> Result<TileChanges, String> {
