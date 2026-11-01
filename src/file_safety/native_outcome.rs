@@ -17,7 +17,7 @@ pub(crate) trait ExternalCreationProof: sealed::RootOutcome {
     fn validate(&self, intent: [u8; 32], target: [u8; 32], growth: u64) -> Result<(), String>;
     fn fact(&self) -> NativeExternalFile;
     fn role(&self) -> ExternalCreationRole;
-    fn name(&self) -> &OsStr;
+    fn name(&self) -> &std::ffi::OsStr;
     fn parent_identity(&self) -> (u64, u64);
 }
 /// Implemented by the native destination writer's held publication/abort
@@ -88,7 +88,7 @@ impl ExternalOutcomeProof for AccountingOutcome {
 #[cfg(test)]
 pub(crate) struct AccountingCreation {
     intent: [u8;32], target: [u8;32], growth:u64,
-    fact:NativeExternalFile, role:ExternalCreationRole, name:OsString,
+    fact:NativeExternalFile, role:ExternalCreationRole, name:std::ffi::OsString,
     parent:(u64,u64), accepted:bool,
 }
 #[cfg(test)]
@@ -96,7 +96,7 @@ impl AccountingCreation {
     /// Journal admission fixture only; absent from production, no file authority.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(intent:[u8;32],target:[u8;32],growth:u64,fact:NativeExternalFile,
-        role:ExternalCreationRole,name:OsString,parent:(u64,u64))->Self {
+        role:ExternalCreationRole,name:std::ffi::OsString,parent:(u64,u64))->Self {
         Self {intent,target,growth,fact,role,name,parent,accepted:true}
     }
     pub(crate) fn refuse(mut self)->Self {self.accepted=false;self}
@@ -111,6 +111,6 @@ impl ExternalCreationProof for AccountingCreation {
     }
     fn fact(&self)->NativeExternalFile {self.fact}
     fn role(&self)->ExternalCreationRole {self.role}
-    fn name(&self)->&OsStr {&self.name}
+    fn name(&self)->&std::ffi::OsStr {&self.name}
     fn parent_identity(&self)->(u64,u64) {self.parent}
 }
