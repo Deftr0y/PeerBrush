@@ -10,6 +10,9 @@ use crate::{
     transform::native::Work,
 };
 use serde_json::Value;
+#[path = "planning/folder.rs"]
+mod folder;
+pub(super) use folder::folder;
 #[cfg(test)]
 #[path = "planning/tests.rs"]
 pub(super) mod tests;
@@ -46,6 +49,21 @@ pub(crate) struct LayerPlan<'a> {
     pub materialize_fill: bool,
     // Keep all Vec payloads above inseparable from their provisional charge.
     _charge: Reservation,
+}
+pub(super) fn unchanged<'a>(
+    document: &'a NativeDocument,
+    layer: LayerMetadata<'a>,
+) -> Result<LayerPlan<'a>, String> {
+    let (masks, charge) = charged_planes(document, 0)?;
+    Ok(LayerPlan {
+        layer,
+        frame: [layer.pixels().width(), layer.pixels().height()],
+        origin: layer.origin(),
+        color: None,
+        masks,
+        materialize_fill: false,
+        _charge: charge,
+    })
 }
 fn lookup<'a>(document: &'a NativeDocument, id: &str) -> Result<LayerMetadata<'a>, String> {
     document
@@ -145,6 +163,17 @@ pub(crate) fn layer<'a>(
     work: &mut Work,
     check: &dyn Fn() -> SourceResult<()>,
 ) -> Result<Option<LayerPlan<'a>>, String> {
+    layer_with_pivot(document, id, command, None, work, check)
+}
+
+fn layer_with_pivot<'a>(
+    document: &'a NativeDocument,
+    id: &str,
+    command: &Value,
+    default_pivot: Option<[f64; 2]>,
+    work: &mut Work,
+    check: &dyn Fn() -> SourceResult<()>,
+) -> Result<Option<LayerPlan<'a>>, String> {
     check().map_err(|e| e.to_string())?;
     let layer = lookup(document, id)?;
     if layer.source().is_some() {
@@ -212,8 +241,12 @@ pub(crate) fn layer<'a>(
     let (sx, sy) = crate::transform::scales(command)?;
     let angle = command["angle"].as_f64().unwrap_or(0.);
     let [dx, dy] = crate::transform::translation(command)?;
-    let px = command["pivot"][0].as_f64().unwrap_or(center[0]);
-    let py = command["pivot"][1].as_f64().unwrap_or(center[1]);
+    let px = command["pivot"][0]
+        .as_f64()
+        .unwrap_or(default_pivot.unwrap_or(center)[0]);
+    let py = command["pivot"][1]
+        .as_f64()
+        .unwrap_or(default_pivot.unwrap_or(center)[1]);
     if ![angle, px, py, dx, dy]
         .iter()
         .all(|v| v.is_finite() && v.abs() <= 100000.)
@@ -437,12 +470,13 @@ pub(crate) fn layer<'a>(
             target: pixels.slot(),
             pixels: Pixels::Editable {
                 source,
-                matrix: super::policy::source_matrix(
+                matrix: super::policy::source_matrix_with_pivot(
                     [x, y],
                     current_frame,
                     origin,
                     source.matrix,
                     command,
+                    default_pivot,
                 )?,
                 depth: pixels.depth(),
             },

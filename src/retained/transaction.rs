@@ -3,7 +3,7 @@ use super::planning::{LayerPlan, Pixels, Plane};
 use crate::{
     engine::{
         native::{
-            CapturedEdit, CommandToken, LayerPatch, Method, NativeDocument, OutputDraft,
+            CapturedEdit, Command, CommandToken, LayerPatch, Method, NativeDocument, OutputDraft,
             PreparedDelta, RasterBatch, RasterPatch, RetainedUpdate, SourceUpdate, StagedOutput,
         },
         scene::{Grid36, StageSession, Warp36},
@@ -68,9 +68,6 @@ pub(crate) fn prepare_command(
         .layers()
         .find(|layer| layer.id() == id)
         .ok_or("Unknown native transform layer")?;
-    if layer.kind() == "group" {
-        return Err("Native folder transform transaction is not prepared".into());
-    }
     let cancellation = captured.cancellation();
     let failure = RefCell::new(None);
     let checked = || match cancellation
@@ -84,12 +81,32 @@ pub(crate) fn prepare_command(
             Err(Error::Cancelled)
         }
     };
+    if layer.kind() == "group" {
+        let planned = super::planning::folder(&base, id, command.parameters(), work, &checked);
+        let plans = match planned {
+            Ok(plans) => plans,
+            Err(reason) => return Err(failure.into_inner().unwrap_or(reason)),
+        };
+        for plan in &plans.layers {
+            check_write(&base, command, plan)?;
+        }
+        return prepare(captured, &plans.layers, session, work, check);
+    }
     let planned = super::planning::layer(&base, id, command.parameters(), work, &checked);
     let plan = match planned {
         Ok(Some(plan)) => plan,
-        Ok(None) => return Err("Native transform has no layer or mask target".into()),
+        Ok(None) => super::planning::unchanged(&base, layer)?,
         Err(reason) => return Err(failure.into_inner().unwrap_or(reason)),
     };
+    check_write(&base, command, &plan)?;
+    prepare(captured, &[plan], session, work, check)
+}
+
+fn check_write(
+    base: &NativeDocument,
+    command: Command<'_>,
+    plan: &LayerPlan<'_>,
+) -> Result<(), String> {
     let [x, y] = plan.origin;
     let bounds = [
         x,
@@ -101,11 +118,11 @@ pub(crate) fn prepare_command(
     ];
     // Whole-layer and independent-mask transforms replace this complete logical
     // frame. Input halos and retained-original support remain read footprints.
-    command.check_write(&base, plan.layer.pixels().slot(), bounds)?;
+    command.check_write(base, plan.layer.pixels().slot(), bounds)?;
     for plane in plan.color.iter().chain(&plan.masks) {
-        command.check_write(&base, plane.target, bounds)?;
+        command.check_write(base, plane.target, bounds)?;
     }
-    prepare(captured, &[plan], session, work, check)
+    Ok(())
 }
 
 /// All linked planes and layers enter one nominal packet. A caller must keep
