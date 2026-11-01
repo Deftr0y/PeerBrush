@@ -6,6 +6,9 @@ use serde::{
 };
 use serde_json::{Number, Value};
 use std::{cell::Cell, fmt, io::Write};
+#[path = "canonical36_stats.rs"]
+mod stats;
+pub(crate) use stats::Stats;
 
 pub(crate) const MAX_BYTES: usize = 64 * 1024 * 1024;
 
@@ -20,7 +23,7 @@ impl Limits {
         if self.bytes == 0
             || self.bytes > MAX_BYTES
             || self.nodes == 0
-            || self.nodes > 1_048_576
+            || self.nodes > 8_388_608
             || self.depth == 0
             || self.depth > 128
         {
