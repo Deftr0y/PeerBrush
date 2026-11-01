@@ -10,6 +10,7 @@ pub mod masks;
 pub mod refine;
 mod rows;
 mod source;
+pub mod worker;
 pub use source::{PreparedSelection, SelectionSource};
 mod system;
 #[cfg(test)]
