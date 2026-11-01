@@ -93,6 +93,124 @@ fn owned_bytes(store: &Store) -> Vec<u8> {
 }
 
 #[test]
+fn index_capacity_stays_charged_through_shared_versions_until_the_last_source_owner() {
+    let fixture = Fixture::new();
+    let budget = ResidentBudget::new(4096).unwrap();
+    let store = fixture.store(&budget);
+    let block = store
+        .put(TileSpec::new(1, 1, 8).unwrap(), &[7; 4], &mut okay)
+        .unwrap();
+    let after_block = budget.used();
+    assert!(after_block > 0);
+    assert_eq!(budget.payload_used(), 0);
+    let snapshot = store
+        .commit([9; 16], 1, None, b"source", &[block], &mut okay)
+        .unwrap();
+    let version = snapshot.clone();
+    assert_eq!(budget.used(), after_block);
+    let pin = snapshot.metadata(&mut okay).unwrap();
+    assert_eq!(budget.payload_used(), 6);
+    drop(pin);
+    let index_bytes = budget.used();
+    assert!(index_bytes > after_block);
+    assert_eq!(budget.payload_used(), 0);
+    drop(store);
+    drop(snapshot);
+    assert_eq!(budget.used(), index_bytes);
+    drop(version);
+    assert_eq!(budget.used(), 0);
+}
+
+#[test]
+fn index_growth_refusal_precedes_source_append_and_preserves_all_old_bytes() {
+    let fixture = Fixture::new();
+    let one_index = 2 * std::mem::size_of::<(Digest, BlockRef)>();
+    let budget = ResidentBudget::new(one_index).unwrap();
+    let store = fixture.store(&budget);
+    let spec = TileSpec::new(1, 1, 8).unwrap();
+    let first = store.put(spec, &[7; 4], &mut okay).unwrap();
+    let before = owned_bytes(&store);
+    assert!(matches!(
+        store.put(spec, &[8; 4], &mut okay),
+        Err(Error::Budget)
+    ));
+    assert_eq!(owned_bytes(&store), before);
+    assert_eq!(
+        store.state().unwrap().blocks.get(&first.digest),
+        Some(&first)
+    );
+    assert_eq!(budget.used(), one_index);
+    assert_eq!(budget.payload_used(), 0);
+    drop(store);
+    assert_eq!(budget.used(), 0);
+}
+
+#[test]
+fn recovered_prefix_index_admission_precedes_payload_ingestion_and_releases_on_refusal() {
+    let fixture = Fixture::new();
+    let original = ResidentBudget::new(4096).unwrap();
+    let store = fixture.store(&original);
+    let spec = TileSpec::new(1, 1, 8).unwrap();
+    let mut blocks = Vec::new();
+    for byte in 0..3 {
+        blocks.push(store.put(spec, &[byte; 4], &mut okay).unwrap());
+    }
+    let snapshot = store
+        .commit([3; 16], 1, None, b"selected", &blocks, &mut okay)
+        .unwrap();
+    let selected = snapshot.reference();
+    // Invalid payload cannot become authority; low metadata capacity refuses
+    // before the subsequent mandatory full integrity pass attempts ingestion.
+    write_all_at(&store.0.file, blocks[0].offset + RECORD_HEADER + 8, &[99]).unwrap();
+    drop(snapshot);
+    drop(store);
+    assert_eq!(original.used(), 0);
+    let minimum = 2 * 3 * std::mem::size_of::<(Digest, BlockRef)>();
+    let budget = ResidentBudget::new(minimum - 1).unwrap();
+    assert!(matches!(
+        Store::recover(
+            &fixture.root(),
+            selected,
+            budget.clone(),
+            limits(),
+            &mut okay
+        ),
+        Err(Error::Budget)
+    ));
+    assert_eq!(budget.used(), 0);
+    let enough = ResidentBudget::new(4096).unwrap();
+    assert!(matches!(
+        Store::recover(
+            &fixture.root(),
+            selected,
+            enough.clone(),
+            limits(),
+            &mut okay
+        ),
+        Err(Error::Corrupt)
+    ));
+    assert_eq!(enough.used(), 0);
+}
+
+#[test]
+fn cache_index_refusal_returns_candidate_payload_capacity_without_freeing_source_metadata() {
+    let fixture = Fixture::new();
+    let metadata = 2 * std::mem::size_of::<(Digest, BlockRef)>();
+    let budget = ResidentBudget::new(metadata + 256).unwrap();
+    let store = fixture.store(&budget);
+    let block = store
+        .put(TileSpec::new(8, 8, 8).unwrap(), &[9; 256], &mut okay)
+        .unwrap();
+    let before = owned_bytes(&store);
+    assert!(matches!(store.pin(block, &mut okay), Err(Error::Budget)));
+    assert_eq!(budget.payload_used(), 0);
+    assert_eq!(budget.used(), metadata);
+    assert_eq!(owned_bytes(&store), before);
+    drop(store);
+    assert_eq!(budget.used(), 0);
+}
+
+#[test]
 fn unpublished_fragment_abort_verifies_all_records_then_releases_only_its_charge() {
     for depth in [8, 16] {
         let fixture = Fixture::new();
@@ -321,11 +439,11 @@ fn native_depth_blocks_deduplicate_share_capacity_and_recover_exact_checkpoint()
         assert_eq!(first.bytes(), source);
         assert_eq!(first.spec(), spec);
         assert!(Arc::ptr_eq(&first.bytes.0, &second.bytes.0));
-        assert_eq!(budget.used(), first.allocated_bytes());
+        assert_eq!(budget.payload_used(), first.allocated_bytes());
         drop(first);
-        assert_eq!(budget.used(), second.allocated_bytes());
+        assert_eq!(budget.payload_used(), second.allocated_bytes());
         drop(second);
-        assert_eq!(budget.used(), 0);
+        assert_eq!(budget.payload_used(), 0);
         let snapshot = store
             .commit(
                 [7; 16],
@@ -340,9 +458,9 @@ fn native_depth_blocks_deduplicate_share_capacity_and_recover_exact_checkpoint()
         assert_eq!(CommitRef::decode(&selected.encode()).unwrap(), selected);
         let metadata = snapshot.metadata(&mut okay).unwrap();
         assert_eq!(&*metadata, b"opaque source metadata");
-        assert_eq!(budget.used(), metadata.allocated_bytes());
+        assert_eq!(budget.payload_used(), metadata.allocated_bytes());
         drop(metadata);
-        assert_eq!(budget.used(), 0);
+        assert_eq!(budget.payload_used(), 0);
         let mut refs = Vec::new();
         snapshot
             .visit_blocks(&mut okay, |reference| {
@@ -401,7 +519,7 @@ fn depth_dimensions_store_identity_and_encoded_lengths_are_bound() {
     let mut serialized = [0; 96];
     serialized[..8].copy_from_slice(b"PBREF001");
     assert!(CommitRef::decode(&serialized).is_err());
-    assert_eq!(budget.used(), 0);
+    assert_eq!(budget.payload_used(), 0);
 }
 
 #[test]
@@ -447,7 +565,7 @@ fn failed_and_cancelled_loads_restore_the_shared_capacity() {
         .unwrap();
     super::super::budget::refuse_next_allocation();
     assert!(matches!(store.pin(block, &mut okay), Err(Error::Budget)));
-    assert_eq!(budget.used(), 0);
+    assert_eq!(budget.payload_used(), 0);
     let mut calls = 0;
     let result = store.pin(block, &mut || {
         calls += 1;
@@ -458,40 +576,40 @@ fn failed_and_cancelled_loads_restore_the_shared_capacity() {
         }
     });
     assert!(matches!(result, Err(Error::Cancelled)));
-    assert_eq!(budget.used(), 0);
+    assert_eq!(budget.payload_used(), 0);
     let result = store.load((3, [7; 32]), 256, &mut okay, |_, _| {
         Err(Error::Io(std::io::ErrorKind::Other.into()))
     });
     assert!(matches!(result, Err(Error::Io(_))));
-    assert_eq!(budget.used(), 0);
+    assert_eq!(budget.payload_used(), 0);
     assert_eq!(store.pin(block, &mut okay).unwrap().bytes(), [19; 256]);
-    assert_eq!(budget.used(), 0);
+    assert_eq!(budget.payload_used(), 0);
 }
 
 #[test]
 fn no_weak_entry_can_keep_an_uncharged_live_payload() {
     let fixture = Fixture::new();
-    let budget = ResidentBudget::new(256).unwrap();
+    let budget = ResidentBudget::new(256 + 288).unwrap();
     let store = fixture.store(&budget);
     let block = store
         .put(TileSpec::new(8, 8, 8).unwrap(), &[23; 256], &mut okay)
         .unwrap();
     let pin = store.pin(block, &mut okay).unwrap();
     let clone = pin.clone();
-    assert_eq!(budget.used(), 256);
+    assert_eq!(budget.payload_used(), 256);
     drop(pin);
-    assert_eq!(budget.used(), 256);
+    assert_eq!(budget.payload_used(), 256);
     drop(clone);
-    assert_eq!(budget.used(), 0);
+    assert_eq!(budget.payload_used(), 0);
     assert_eq!(store.0.cache.lock().unwrap().len(), 1);
     assert_eq!(store.pin(block, &mut okay).unwrap().bytes(), [23; 256]);
-    assert_eq!(budget.used(), 0);
+    assert_eq!(budget.payload_used(), 0);
 }
 
 #[test]
 fn slot_and_byte_admission_preserve_other_pins() {
     let fixture = Fixture::new();
-    let budget = ResidentBudget::new(512).unwrap();
+    let budget = ResidentBudget::new(512 + 480).unwrap();
     let mut admitted = limits();
     admitted.max_resident_blocks = 1;
     let store = Store::create(&fixture.root(), budget.clone(), admitted).unwrap();
@@ -501,18 +619,18 @@ fn slot_and_byte_admission_preserve_other_pins() {
     let first = store.pin(a, &mut okay).unwrap();
     assert!(matches!(store.pin(b, &mut okay), Err(Error::Budget)));
     assert_eq!(first.bytes(), [1; 256]);
-    assert_eq!(budget.used(), 256);
+    assert_eq!(budget.payload_used(), 256);
     drop(first);
-    assert_eq!(budget.used(), 0);
+    assert_eq!(budget.payload_used(), 0);
     assert_eq!(store.pin(b, &mut okay).unwrap().bytes(), [2; 256]);
-    assert_eq!(budget.used(), 0);
+    assert_eq!(budget.payload_used(), 0);
 }
 
 #[test]
 fn mutable_scratch_freezes_without_copy_and_keeps_one_live_charge() {
     let budget = ResidentBudget::new(1024).unwrap();
     let mut scratch = ScratchBytes::new(&budget, 512, 512).unwrap();
-    assert_eq!(budget.used(), 512);
+    assert_eq!(budget.payload_used(), 512);
     assert!(scratch.iter().all(|value| *value == 0));
     scratch[..2].copy_from_slice(&12347u16.to_be_bytes());
     let pointer = scratch.as_ptr();
@@ -522,11 +640,11 @@ fn mutable_scratch_freezes_without_copy_and_keeps_one_live_charge() {
     assert_eq!(pointer, pinned.as_ptr());
     assert_eq!(&pinned[..2], &12347u16.to_be_bytes());
     let clone = pinned.clone();
-    assert_eq!(budget.used(), 512);
+    assert_eq!(budget.payload_used(), 512);
     drop(pinned);
-    assert_eq!(budget.used(), 512);
+    assert_eq!(budget.payload_used(), 512);
     drop(clone);
-    assert_eq!(budget.used(), 0);
+    assert_eq!(budget.payload_used(), 0);
     assert!(matches!(
         ScratchBytes::new(&budget, 513, 512),
         Err(Error::Budget)
@@ -535,34 +653,34 @@ fn mutable_scratch_freezes_without_copy_and_keeps_one_live_charge() {
         ScratchBytes::new(&budget, 0, 64 * 1024 * 1024 + 1),
         Err(Error::Budget)
     ));
-    assert_eq!(budget.used(), 0);
+    assert_eq!(budget.payload_used(), 0);
     super::super::budget::refuse_next_allocation();
     assert!(matches!(
         ScratchBytes::new(&budget, 512, 512),
         Err(Error::Budget)
     ));
-    assert_eq!(budget.used(), 0);
+    assert_eq!(budget.payload_used(), 0);
 }
 
 #[test]
 fn external_reservations_and_store_pins_use_the_same_pool() {
     let fixture = Fixture::new();
-    let budget = ResidentBudget::new(512).unwrap();
+    let budget = ResidentBudget::new(512 + 288).unwrap();
     let store = fixture.store(&budget);
     let pool = store.resident_budget();
     let reserved = pool.reserve_bytes(256, 256).unwrap();
     assert_eq!(reserved.bytes(), 256);
-    assert_eq!(budget.used(), 256);
+    assert_eq!(budget.payload_used(), 256);
     let block = store
         .put(TileSpec::new(8, 8, 8).unwrap(), &[21; 256], &mut okay)
         .unwrap();
     let pin = store.pin(block, &mut okay).unwrap();
-    assert_eq!(budget.used(), 512);
+    assert_eq!(budget.payload_used(), 512);
     assert!(matches!(pool.reserve_bytes(1, 1), Err(Error::Budget)));
     drop(reserved);
-    assert_eq!(budget.used(), 256);
+    assert_eq!(budget.payload_used(), 256);
     drop(pin);
-    assert_eq!(budget.used(), 0);
+    assert_eq!(budget.payload_used(), 0);
     assert!(matches!(pool.reserve_bytes(257, 256), Err(Error::Budget)));
     assert!(matches!(
         pool.reserve_bytes(0, 64 * 1024 * 1024 + 1),
@@ -580,7 +698,7 @@ fn concurrent_different_loads_keep_both_allocations_charged() {
 }
 fn concurrent_pins(duplicate: bool) {
     let fixture = Fixture::new();
-    let budget = ResidentBudget::new(32768).unwrap();
+    let budget = ResidentBudget::new(32768 + 1024).unwrap();
     let store = fixture.store(&budget);
     let spec = TileSpec::new(64, 64, 8).unwrap();
     let a = store.put(spec, &[3; 16384], &mut okay).unwrap();
@@ -618,7 +736,7 @@ fn concurrent_pins(duplicate: bool) {
         assert!(std::time::Instant::now() < deadline);
         std::thread::yield_now();
     }
-    assert_eq!(budget.used(), 32768);
+    assert_eq!(budget.payload_used(), 32768);
     barrier.wait();
     let first = workers.remove(0).join().unwrap();
     let second = workers.remove(0).join().unwrap();
@@ -628,11 +746,11 @@ fn concurrent_pins(duplicate: bool) {
         if duplicate { [3; 16384] } else { [4; 16384] }
     );
     assert_eq!(Arc::ptr_eq(&first.bytes.0, &second.bytes.0), duplicate);
-    assert_eq!(budget.used(), if duplicate { 16384 } else { 32768 });
+    assert_eq!(budget.payload_used(), if duplicate { 16384 } else { 32768 });
     drop(first);
-    assert_eq!(budget.used(), 16384);
+    assert_eq!(budget.payload_used(), 16384);
     drop(second);
-    assert_eq!(budget.used(), 0);
+    assert_eq!(budget.payload_used(), 0);
 }
 
 #[test]
@@ -707,7 +825,7 @@ fn cancelled_append_keeps_checkpoint_and_marks_unknown_tail_readonly_on_recovery
         ),
         Err(Error::Interrupted)
     ));
-    assert_eq!(budget.used(), 0);
+    assert_eq!(budget.payload_used(), 0);
 }
 
 #[test]
@@ -762,7 +880,7 @@ fn corrupt_and_truncated_payloads_return_errors_without_a_resident_leak() {
         // Simulate corruption without relying on a timestamp change to catch it.
         store.state().unwrap().expected = stamp(&store.0.file).unwrap();
         assert!(matches!(store.pin(block, &mut okay), Err(Error::Corrupt)));
-        assert_eq!(budget.used(), 0);
+        assert_eq!(budget.payload_used(), 0);
     }
 }
 
@@ -780,7 +898,7 @@ fn metadata_and_reference_bytes_keep_their_original_sha_binding() {
     write_all_at(&store.0.file, snapshot.metadata.0, &[0]).unwrap();
     store.state().unwrap().expected = stamp(&store.0.file).unwrap();
     assert!(matches!(snapshot.metadata(&mut okay), Err(Error::Corrupt)));
-    assert_eq!(budget.used(), 0);
+    assert_eq!(budget.payload_used(), 0);
     write_all_at(&store.0.file, snapshot.blocks.0, &b.encode()).unwrap();
     store.state().unwrap().expected = stamp(&store.0.file).unwrap();
     assert!(matches!(
@@ -878,7 +996,7 @@ fn actual_partial_io_failure_preserves_confirmed_prefix_and_forbids_retry() {
 #[test]
 fn insufficient_concurrent_capacity_never_allocates_an_uncharged_duplicate() {
     let fixture = Fixture::new();
-    let budget = ResidentBudget::new(256).unwrap();
+    let budget = ResidentBudget::new(256 + 288).unwrap();
     let store = fixture.store(&budget);
     let block = store
         .put(TileSpec::new(8, 8, 8).unwrap(), &[31; 256], &mut okay)
@@ -906,16 +1024,16 @@ fn insufficient_concurrent_capacity_never_allocates_an_uncharged_duplicate() {
         assert!(std::time::Instant::now() < deadline);
         std::thread::yield_now();
     }
-    assert_eq!(budget.used(), 256);
+    assert_eq!(budget.payload_used(), 256);
     assert!(matches!(store.pin(block, &mut okay), Err(Error::Budget)));
     barrier.wait();
     let first = worker.join().unwrap();
     let second = store.pin(block, &mut okay).unwrap();
     assert!(Arc::ptr_eq(&first.bytes.0, &second.bytes.0));
-    assert_eq!(budget.used(), 256);
+    assert_eq!(budget.payload_used(), 256);
     drop(first);
     drop(second);
-    assert_eq!(budget.used(), 0);
+    assert_eq!(budget.payload_used(), 0);
 }
 
 #[test]
@@ -930,9 +1048,9 @@ fn missing_backing_is_an_error_even_when_an_existing_pin_remains_valid() {
     fs::rename(&store.0.path, fixture.base.join("retained-pack")).unwrap();
     assert!(store.pin(block, &mut okay).is_err());
     assert_eq!(pin.bytes(), [71; 256]);
-    assert_eq!(budget.used(), 256);
+    assert_eq!(budget.payload_used(), 256);
     drop(pin);
-    assert_eq!(budget.used(), 0);
+    assert_eq!(budget.payload_used(), 0);
 }
 
 #[test]
@@ -1055,7 +1173,7 @@ fn held_owner_selects_old_checkpoint_without_advancing_head_or_bypassing_guards(
     assert!(matches!(store.snapshot(old, &mut okay), Err(Error::Busy)));
     drop(writer);
     assert_eq!(store.state().unwrap().head, Some(current));
-    assert_eq!(budget.used(), 0);
+    assert_eq!(budget.payload_used(), 0);
 }
 
 #[test]
@@ -1275,7 +1393,7 @@ fn held_checkpoint_selection_rechecks_late_source_changes() {
 fn dense_three_layer_native16_backing_crosses_four_gib_with_bounded_pins() {
     let started = std::time::Instant::now();
     let fixture = Fixture::new();
-    let budget = ResidentBudget::new(1024 * 1024).unwrap();
+    let budget = ResidentBudget::new(8 * 1024 * 1024).unwrap();
     let mut admitted = limits();
     admitted.disk_bytes = 8 * 1024 * 1024 * 1024;
     admitted.max_blocks = 16384;
@@ -1300,16 +1418,16 @@ fn dense_three_layer_native16_backing_crosses_four_gib_with_bounded_pins() {
         let reference = store.put(spec, &source, &mut okay).unwrap();
         let pin = store.pin(reference, &mut okay).unwrap();
         assert_eq!(pin.bytes(), source);
-        assert_eq!(budget.used(), spec.bytes());
+        assert_eq!(budget.payload_used(), spec.bytes());
         drop(pin);
-        assert_eq!(budget.used(), 0);
+        assert_eq!(budget.payload_used(), 0);
         refs.push(reference);
         if (tile + 1) % (63 * 63) == 0 {
             println!(
                 "dense backing component layer={} encoded_bytes={} resident_pin_bytes={}",
                 (tile + 1) / (63 * 63),
                 store.0.file.metadata().unwrap().len(),
-                budget.used()
+                budget.payload_used()
             );
         }
     }
@@ -1369,10 +1487,10 @@ fn dense_three_layer_native16_backing_crosses_four_gib_with_bounded_pins() {
         fill(&mut source, tile);
         let pin = recovered.store.pin(refs[tile], &mut okay).unwrap();
         assert_eq!(pin.bytes(), source);
-        assert_eq!(budget.used(), spec.bytes());
+        assert_eq!(budget.payload_used(), spec.bytes());
         drop(pin);
     }
-    assert_eq!(budget.used(), 0);
+    assert_eq!(budget.payload_used(), 0);
     let checkpoint_sha256 = selected
         .digest
         .iter()

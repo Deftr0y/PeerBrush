@@ -1,5 +1,4 @@
 use std::{
-    collections::BTreeMap,
     fs::{self, File, OpenOptions},
     ops::{Deref, DerefMut},
     path::{Path, PathBuf},
@@ -13,7 +12,8 @@ use std::{
 use ring::digest::{Context, SHA256};
 
 use super::{
-    access::Access, budget::Charge, DiskBudget, DiskReservation, Error, ResidentBudget, Result,
+    access::Access, budget::Charge, index::Index, DiskBudget, DiskReservation, Error,
+    ResidentBudget, Result,
 };
 
 const FILE_MAGIC: &[u8; 8] = b"PBTILES1";
@@ -297,7 +297,7 @@ impl PinnedTile {
 
 struct State {
     expected: Stamp,
-    blocks: BTreeMap<Digest, BlockRef>,
+    blocks: Index<Digest, BlockRef>,
     head: Option<CommitRef>,
     readonly: bool,
     poisoned: bool,
@@ -316,7 +316,7 @@ struct Inner {
     disk: Option<DiskReservation>,
     access: Access,
     state: Mutex<State>,
-    cache: Mutex<BTreeMap<(u8, Digest), Weak<Resident>>>,
+    cache: Mutex<Index<(u8, Digest), Weak<Resident>>>,
     may_be_published: AtomicBool,
 }
 
@@ -664,13 +664,13 @@ impl Store {
             access: Access::default(),
             state: Mutex::new(State {
                 expected: stamp(&file)?,
-                blocks: BTreeMap::new(),
+                blocks: Index::new(),
                 head: None,
                 readonly: false,
                 poisoned: false,
             }),
             file,
-            cache: Mutex::new(BTreeMap::new()),
+            cache: Mutex::new(Index::new()),
             may_be_published: AtomicBool::new(may_be_published),
         }));
         let expected = store.state()?.expected;
@@ -733,6 +733,9 @@ impl Store {
         if &header[..8] != FILE_MAGIC || header[8..] != selected.store {
             return Err(Error::Corrupt);
         }
+        let count = preflight_index(&file, selected.end, limits, check)?;
+        let mut blocks = Index::new();
+        blocks.reserve_to(count, &budget, limits.max_blocks)?;
         let store = Self(Arc::new(Inner {
             root: root.into(),
             directory,
@@ -747,12 +750,12 @@ impl Store {
             access: Access::default(),
             state: Mutex::new(State {
                 expected,
-                blocks: BTreeMap::new(),
+                blocks,
                 head: None,
                 readonly: expected.bytes != selected.end,
                 poisoned: false,
             }),
-            cache: Mutex::new(BTreeMap::new()),
+            cache: Mutex::new(Index::new()),
             may_be_published: AtomicBool::new(true),
         }));
         store.check_source(expected)?;
@@ -765,7 +768,7 @@ impl Store {
                 let block = store.block_record(&record)?;
                 let mut state = store.state()?;
                 if state.blocks.len() >= limits.max_blocks
-                    || state.blocks.insert(block.digest, block).is_some()
+                    || state.blocks.insert_reserved(block.digest, block)?.is_some()
                 {
                     return Err(Error::Corrupt);
                 }
@@ -805,6 +808,9 @@ impl Store {
         if self.state()?.blocks.len() >= self.0.limits.max_blocks {
             return Err(Error::Budget);
         }
+        self.state()?
+            .blocks
+            .reserve_one(&self.0.budget, self.0.limits.max_blocks)?;
         let record = self.append(b"TILE", [&spec_bytes[..], bytes], digest, check)?;
         let reference = BlockRef {
             store: self.0.id,
@@ -812,7 +818,7 @@ impl Store {
             offset: record.offset,
             spec,
         };
-        self.state()?.blocks.insert(digest, reference);
+        self.state()?.blocks.insert_reserved(digest, reference)?;
         Ok(reference)
     }
 
@@ -1017,7 +1023,8 @@ impl Store {
                 if cache.len() >= self.0.limits.max_resident_blocks {
                     return Err(Error::Budget);
                 }
-                cache.insert(key, Arc::downgrade(&candidate));
+                cache.reserve_one(&self.0.budget, self.0.limits.max_resident_blocks)?;
+                cache.insert_reserved(key, Arc::downgrade(&candidate))?;
                 candidate.clone()
             }
         };
@@ -1229,6 +1236,49 @@ struct Record {
     manifest: Option<[u8; MANIFEST_HEADER]>,
     metadata_digest: Digest,
     refs_digest: Digest,
+}
+
+/// Admission only: headers cannot grant source authority. The following pass
+/// still rehashes every complete record, reference and checkpoint chain.
+fn preflight_index(file: &File, boundary: u64, limits: Limits, check: Check<'_>) -> Result<usize> {
+    let mut at = FILE_HEADER;
+    let mut count = 0usize;
+    let mut header = [0; RECORD_HEADER as usize];
+    while at < boundary {
+        check()?;
+        read_exact_at(file, at, &mut header)?;
+        let length = u64_at(&header, 4);
+        let maximum = match &header[..4] {
+            b"TILE" => {
+                count = count
+                    .checked_add(1)
+                    .filter(|n| *n <= limits.max_blocks)
+                    .ok_or(Error::Budget)?;
+                8 + 256 * 256 * 8
+            }
+            b"CMIT" => limits.manifest_bytes,
+            _ => return Err(Error::Corrupt),
+        };
+        if length > maximum as u64 {
+            return Err(Error::Corrupt);
+        }
+        at = at
+            .checked_add(RECORD_HEADER)
+            .and_then(|n| n.checked_add(length))
+            .and_then(|n| n.checked_add(SEAL.len() as u64))
+            .filter(|n| *n <= boundary)
+            .ok_or(Error::Corrupt)?;
+        let mut footer = [0; 8];
+        read_exact_at(file, at - SEAL.len() as u64, &mut footer)?;
+        if &footer != SEAL {
+            return Err(Error::Corrupt);
+        }
+    }
+    if at != boundary {
+        return Err(Error::Corrupt);
+    }
+    check()?;
+    Ok(count)
 }
 
 fn read_record(

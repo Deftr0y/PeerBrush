@@ -13,6 +13,7 @@ pub struct ResidentBudget(Arc<Budget>);
 struct Budget {
     limit: usize,
     used: AtomicUsize,
+    index: AtomicUsize,
 }
 
 /// A reservation for an external buffer; retain it until that allocation is
@@ -20,6 +21,7 @@ struct Budget {
 pub struct Reservation {
     budget: ResidentBudget,
     bytes: usize,
+    index: bool,
 }
 pub(super) type Charge = Reservation;
 
@@ -41,6 +43,9 @@ impl Reservation {
             })
             .map_err(|_| Error::Corrupt)?;
         self.bytes = bytes;
+        if self.index {
+            self.budget.0.index.fetch_sub(release, Ordering::AcqRel);
+        }
         Ok(())
     }
     pub(crate) fn uses_budget(&self, budget: &ResidentBudget) -> bool {
@@ -56,11 +61,24 @@ impl ResidentBudget {
         Ok(Self(Arc::new(Budget {
             limit,
             used: AtomicUsize::new(0),
+            index: AtomicUsize::new(0),
         })))
     }
 
     pub fn used(&self) -> usize {
         self.0.used.load(Ordering::Acquire)
+    }
+    #[cfg(test)]
+    pub(super) fn payload_used(&self) -> usize {
+        self.used()
+            .checked_sub(self.0.index.load(Ordering::Acquire))
+            .expect("Index charges exceed all admission")
+    }
+    pub(super) fn reserve_index(&self, bytes: usize) -> Result<Reservation> {
+        let mut reservation = self.reserve(bytes)?;
+        reservation.index = true;
+        self.0.index.fetch_add(bytes, Ordering::AcqRel);
+        Ok(reservation)
     }
 
     pub fn limit(&self) -> usize {
@@ -88,6 +106,7 @@ impl ResidentBudget {
         Ok(Reservation {
             budget: self.clone(),
             bytes,
+            index: false,
         })
     }
 }
@@ -121,6 +140,9 @@ pub(super) fn refuse_next_allocation() {
 
 impl Drop for Reservation {
     fn drop(&mut self) {
+        if self.index {
+            self.budget.0.index.fetch_sub(self.bytes, Ordering::AcqRel);
+        }
         self.budget.0.used.fetch_sub(self.bytes, Ordering::AcqRel);
     }
 }
