@@ -1,4 +1,6 @@
 //! Tile-wise foreground fills, clipped in document coordinates and committed by Engine.edit.
+#[path = "fill/native.rs"]
+pub(crate) mod native;
 use crate::{
     engine::{Document, Layer},
     raster::{blend, check_size, Pixel, Raster, TILE},
