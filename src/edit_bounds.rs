@@ -120,6 +120,7 @@ pub(crate) fn prepare(doc: &mut Document, c: &Value) -> Result<(), String> {
         }
         pixels
     };
+    crate::fill::materialize_visual_layer(&mut doc.layers[index])?;
     let layer = &mut doc.layers[index];
     layer.pixels = shift(&layer.pixels);
     if let Some(mask) = &mut layer.mask {

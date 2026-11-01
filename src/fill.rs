@@ -227,19 +227,29 @@ pub(crate) fn prepare_visual_baseline(doc: &mut Document, command: &Value) -> Re
         if layer.kind != "fill" || !ids.contains(&layer.id) {
             continue;
         }
-        if layer.locked {
-            return Err("A selected layer or folder child is locked".into());
-        }
-        if layer.source.is_some() {
-            return Err("Rasterize the editable source before modifying fill color pixels".into());
-        }
-        let mut pixels =
-            Raster::new_depth(layer.pixels.width, layer.pixels.height, layer.pixels.depth);
-        let area = [0, 0, pixels.width as i32, pixels.height as i32];
-        fill_tiles_mode(&mut pixels, area, layer.color, [0, 0], None, true);
-        layer.pixels = pixels;
-        layer.kind = "paint".into();
+        materialize_visual_layer(layer)?;
     }
+    Ok(())
+}
+
+/// Preserve the procedural OLD logical extent before any storage expansion.
+/// This is also needed for mask edits: a larger kindfill frame would otherwise
+/// introduce visible color in space that was previously transparent.
+pub(crate) fn materialize_visual_layer(layer: &mut Layer) -> Result<(), String> {
+    if layer.kind != "fill" {
+        return Ok(());
+    }
+    if layer.locked {
+        return Err("A selected layer or folder child is locked".into());
+    }
+    if layer.source.is_some() {
+        return Err("Rasterize the editable source before modifying fill color pixels".into());
+    }
+    let mut pixels = Raster::new_depth(layer.pixels.width, layer.pixels.height, layer.pixels.depth);
+    let area = [0, 0, pixels.width as i32, pixels.height as i32];
+    fill_tiles_mode(&mut pixels, area, layer.color, [0, 0], None, true);
+    layer.pixels = pixels;
+    layer.kind = "paint".into();
     Ok(())
 }
 
