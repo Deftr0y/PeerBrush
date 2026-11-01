@@ -1284,6 +1284,11 @@ mod native_metadata_tests {
             app.begin_rename(view, &child);
             assert_eq!(app.rename_edit.as_ref().unwrap().original, "Native child");
             app.rename_edit = None;
+            app.selection_gesture_source = Some(app.selection_source(view));
+            assert!(!app.selection_gesture_stale(view));
+            let foreign = Document::new_depth(9, 7, depth).unwrap();
+            assert!(app.selection_gesture_stale(&foreign));
+            app.selection_gesture_source = None;
             app.tool = Tool::Clone;
             app.retouch_source = Some(super::super::retouch::Anchor {
                 project: view.id().to_owned(),
