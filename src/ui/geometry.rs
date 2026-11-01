@@ -27,7 +27,12 @@ impl Editor {
     }
 }
 impl PeerBrush {
-    pub(super) fn open_geometry(&mut self, doc: &Document, mode: &'static str) {
+    pub(super) fn open_geometry<'a>(
+        &mut self,
+        doc: impl Into<DocumentView<'a>>,
+        mode: &'static str,
+    ) {
+        let doc = doc.into();
         self.cancel_filters();
         self.cancel_source();
         self.cancel_refinement();
@@ -38,18 +43,18 @@ impl PeerBrush {
         self.animation.cancel();
         self.isolate = false;
         self.geometry = Some(Editor {
-            document: doc.id.clone(),
-            revision: doc.revision,
+            document: doc.id().to_owned(),
+            revision: doc.revision(),
             mode,
-            width: doc.width,
-            height: doc.height,
+            width: doc.width(),
+            height: doc.height(),
             rect: doc
-                .selection
+                .selection()
                 .filter(|b| b[0] < b[2] && b[1] < b[3])
-                .unwrap_or([0, 0, doc.width as i32, doc.height as i32]),
+                .unwrap_or([0, 0, doc.width() as i32, doc.height() as i32]),
             anchor: "center".into(),
             proportional: true,
-            original: [doc.width, doc.height],
+            original: [doc.width(), doc.height()],
             error: None,
         });
         self.last_preview = None;
@@ -64,11 +69,16 @@ impl PeerBrush {
         });
         self.last_preview = None;
     }
-    pub(super) fn geometry_window(&mut self, ctx: &egui::Context, doc: &Document) {
+    pub(super) fn geometry_window<'a>(
+        &mut self,
+        ctx: &egui::Context,
+        doc: impl Into<DocumentView<'a>>,
+    ) {
+        let doc = doc.into();
         let Some(mut editor) = self.geometry.take() else {
             return;
         };
-        if editor.document != doc.id || editor.revision != doc.revision {
+        if editor.document != doc.id() || editor.revision != doc.revision() {
             self.cancel_geometry();
             return;
         }
@@ -96,12 +106,12 @@ impl PeerBrush {
                 }
                 if ui
                     .add_enabled(
-                        doc.selection.is_some(),
+                        doc.selection().is_some(),
                         egui::Button::new("Use selection bounds"),
                     )
                     .clicked()
                 {
-                    editor.rect = doc.selection.unwrap();
+                    editor.rect = doc.selection().unwrap();
                 }
                 ui.label("Artwork outside the crop is retained.");
             } else {
@@ -200,7 +210,7 @@ impl PeerBrush {
                 }
             }
             let [w, h] = editor.size();
-            ui.label(format!("Result {w} × {h} · {} bit", doc.bit_depth));
+            ui.label(format!("Result {w} × {h} · {} bit", doc.depth()));
             let invalid = crate::raster::check_size(w, h).err().or_else(|| {
                 (editor.mode == "crop"
                     && (editor.rect[0] >= editor.rect[2] || editor.rect[1] >= editor.rect[3]))
