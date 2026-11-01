@@ -16,7 +16,10 @@ Use explicit typed mirrors of Document, Layer, MaskStep, selection Coverage and
 retained-original definitions. Every native raster has a deterministic traversal
 ID 1..N and a descriptor containing width, height and depth. Retained original
 pixels, layer pixels, every native mask step, selection_coverage and
-selection_previous are included. IDs are independent of runtime store UUIDs,
+selection_previous are included. Every effect location also maps historical
+Liquify `settings.strokes[*].coverage` masks to typed coverage/raster references;
+these cannot remain opaque inline pixel JSON. Retained warp stages are geometry,
+not historical Liquify coverage. IDs are independent of runtime store UUIDs,
 pack offsets and SurfaceKey values. No runtime path belongs in the saved source.
 
 Current Bezier/Text/Shape/Svg source definitions retain their exact values.
@@ -36,6 +39,23 @@ buffers, typed metadata, tile transfer and index scratch need combined RAM
 admission in one shared pool. Raster count, reference count, unique tile count,
 chunk count and metadata/index allocation require explicit operation admission.
 These are additional internal bounds, not a promise of arbitrary document size.
+
+Canonical metadata has separate operation-selected node and depth bounds, with
+format implementation ceilings of 8,388,608 nodes and 128 levels. A no-DOM pass
+counts empty arrays, values, object fields and decoded strings before allocating
+the parsed tree. Its source fingerprint prevents reusing admission for different
+bytes. The accounting envelope covers tree/container growth, string/parser and
+sorting scratch plus simultaneous raw/core/manifest/typed data and tile/index
+scratch. It is a conservative application accounting bound, not total process or
+allocator RAM evidence.
+
+The raw input must already have a retained charge before decompression. Shared
+reservations are acquired with rollback before parsing. Immutable `Admitted<T>`
+owners share both one payload allocation and a separate charge-only Arc. Moved
+large fields retain that owner; new deep copies require separate admission.
+Temporary accounting can be reduced only after the corresponding buffers drop
+and all surviving capacities remain covered. Transitioning legacy document
+clones retains its separate bounds and does not establish a total RAM claim.
 
 ## Manifest and hash bindings
 
