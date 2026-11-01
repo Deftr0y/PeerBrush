@@ -88,3 +88,28 @@ cancellation fail the tile. Color, mask steps, retained placement, vector source
 placement and effect coordinates must all be staged together before the common
 engine transaction changes a layer's frame. This component does not replace
 those metadata guards or widen live source admission.
+
+`edit_bounds::input::RasterInput` borrows an admitted `NativeDocument` and binds
+layer or mask-step reads to its generation, raster slot, source key and frame.
+Full-tile tokens preserve physical padding. Regional and healing-halo preparation
+performs explicit worker I/O before returning fallible memory-only samplers.
+Healing halos use bounded region strips and a separately charged linear owner.
+Selection geometry and contours stay borrowed; matching coverage takes priority
+and samples its physical origin/extent using legacy red-channel projection.
+The post-edit soft-selection kernel preserves the existing premultiplied native
+rounding and must not be applied a second time to selected clear.
+
+`brush::input::LocalStroke` admits its shifted point, pressure and polygon
+capacities before allocation. It creates the actual brush, clone/heal and smudge
+plans with the captured storage origin; another generation/frame cannot reuse
+that geometry accidentally.
+
+`edit_bounds::output::TileOutput` stages one plane through the actual
+`SourceSession` and the engine's `OutputDraft`. It compares full original padded
+tiles, keeps mutable proposal/index allocations charged, creates a fragment only
+for changed nonzero bytes, and poisons failed replacements. Unchanged operations
+produce no output draft. Explicit zero and unused-fragment retirement precede
+sealing. Refusals retain ownership and admission until proven cleanup; dropping
+an owner never silently deletes files or refunds disk. These source adapters do
+not replace the coordinator's atomic group, mask, frame, retained-source, actor,
+lease, revision, selection or history decisions, and do not raise canvas limits.

@@ -1,6 +1,8 @@
 //! Shared, bounded brush rasterization. Opacity caps a stroke; flow accumulates per dab.
 #[path = "brush/native.rs"]
 pub(crate) mod native;
+#[path = "brush/input.rs"]
+pub(crate) mod input;
 use crate::raster::{blend, Pixel, Raster, TILE};
 use serde_json::Value;
 use std::{
