@@ -57,6 +57,21 @@ before and after reopening, including a final named-file observation. A copied
 same-byte/header replacement does not inherit the old live owner's authority.
 Ownership uncertainty closes further source admission until a fresh inventory.
 
+External save staging uses a distinct coexistence admission ticket. Persistent
+source reservations and growth also count retained external debt; observing only
+`DiskBudget::used()` is insufficient for operation admission. `admitted()` counts
+both domains. A ticket can be reserved only after the caller durably records its
+orphan intent. Drop or a failed receipt keeps the debt. Authenticated startup
+journal recovery can restore the exact intent/byte count idempotently; conflicting
+counts refuse admission.
+
+Settlement requires the destination owner's checked held-identity receipt,
+validated outside the meter lock. It removes operation admission after verified
+temporary retirement or transfer to the external saved-file domain. It does not
+report physical disk space freed and never relaxes persistent source reservations'
+unlink-only retirement rule. The publication caller still owns durable intent,
+destination/backup inventory, uncertain-result reconciliation and crash recovery.
+
 ## Exclusive marker publication
 
 `file_safety::owned_rename` verifies the expected complete SHA256 through a held
