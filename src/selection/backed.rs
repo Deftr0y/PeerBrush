@@ -17,6 +17,22 @@ pub struct CoverageSource {
     contours: Arc<ContourOwner>,
 }
 
+impl crate::engine::scene::CaptureCoverage for CoverageSource {
+    type Pixels = Surface;
+    fn mask(&self) -> &Surface {
+        CoverageSource::mask(self)
+    }
+    fn bounds(&self) -> [i32; 4] {
+        CoverageSource::bounds(self)
+    }
+    fn origin(&self) -> [i32; 2] {
+        CoverageSource::origin(self)
+    }
+    fn contours(&self) -> &[Vec<[f32; 2]>] {
+        CoverageSource::contours(self)
+    }
+}
+
 pub(super) struct ContourOwner {
     // Payload must be destroyed before its reservation can be released.
     values: Vec<Vec<[f32; 2]>>,
@@ -480,5 +496,48 @@ mod tests {
             Err(Error::Budget)
         ));
         assert_eq!(small.used(), 0);
+    }
+
+    #[test]
+    fn source36_capture_uses_borrowed_metadata_and_typed_native_surface_reference() {
+        use crate::engine::scene::{Coverage36, RasterCollector, RasterRef36};
+        struct Collector(usize);
+        impl RasterCollector for Collector {
+            fn resident(&mut self, _: &Raster) -> std::result::Result<RasterRef36, String> {
+                Err("Unexpected resident serialization".into())
+            }
+            fn surface(&mut self, source: &Surface) -> std::result::Result<RasterRef36, String> {
+                self.0 += 1;
+                Ok(RasterRef36 {
+                    id: 7,
+                    width: source.width(),
+                    height: source.height(),
+                    depth: source.depth(),
+                    retained: None,
+                })
+            }
+        }
+        let pool = ResidentBudget::new(1024).unwrap();
+        let values = vec![vec![[1., 2.], [5., 2.], [5., 6.], [1., 6.]]];
+        let source = CoverageSource::new(
+            Surface::zero(8, 8, 8).unwrap(),
+            [1, 2, 5, 6],
+            [1, 2],
+            &values,
+            &pool,
+        )
+        .unwrap();
+        let charge = pool.used();
+        let mut collector = Collector(0);
+        let dto = Coverage36::from_capture(&source, &mut collector).unwrap();
+        assert_eq!(collector.0, 1);
+        assert_eq!(dto.mask.id, 7);
+        assert_eq!(dto.mask.depth, 8);
+        assert_eq!(dto.bounds, source.bounds());
+        assert_eq!(dto.origin, source.origin());
+        assert_eq!(dto.contours, values);
+        assert_eq!(pool.used(), charge);
+        drop(source);
+        assert_eq!(pool.used(), 0);
     }
 }
