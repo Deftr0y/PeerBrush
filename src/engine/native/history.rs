@@ -58,6 +58,7 @@ pub(crate) struct PreparedCommit {
     record: Arc<Record>,
     coalesce: bool,
     retired: Vec<Arc<Record>>,
+    sources: Option<super::publication::SourcePublication>,
     _retirement_charge: Reservation,
 }
 #[must_use]
@@ -113,7 +114,34 @@ impl RefusedCommit {
 pub(crate) struct RetiredHistory {
     _previous: NativeDocument,
     _records: Vec<Arc<Record>>,
+    sources: Option<(super::publication::SourcePublication, Vec<StagedOutput>)>,
     _charge: Reservation,
+}
+impl RetiredHistory {
+    pub fn has_provisional_sources(&self) -> bool {
+        self.sources.is_some()
+    }
+    /// Run after releasing the Engine mutex, retaining the original SourceSession.
+    pub fn retire(
+        self,
+        session: &impl super::super::scene::StageSession,
+        cleanup: &dyn Fn() -> Result<()>,
+    ) -> Result<()> {
+        let Self {
+            _previous,
+            _records,
+            sources,
+            _charge,
+        } = self;
+        drop(_previous);
+        drop(_records);
+        let result = match sources {
+            Some((plan, outputs)) => plan.retire(outputs, session, cleanup),
+            None => Ok(()),
+        };
+        drop(_charge);
+        result
+    }
 }
 impl std::fmt::Debug for RetiredHistory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -206,6 +234,19 @@ impl NativeHistory {
         gate: Publication<'_>,
         prepared: PreparedCommit,
     ) -> std::result::Result<RetiredHistory, RefusedCommit> {
+        if prepared.sources.is_none() && !prepared.delta.outputs.is_empty() {
+            return Err(RefusedCommit {
+                reason: "Native source publication plan is missing".into(),
+                prepared,
+            });
+        }
+        if let Some(sources) = &prepared.sources {
+            if let Err(reason) =
+                sources.validate(&prepared.delta.candidate, &prepared.delta.outputs)
+            {
+                return Err(RefusedCommit { reason, prepared });
+            }
+        }
         let reason = if self.identity != prepared.identity || self.epoch != prepared.epoch {
             Some("Prepared native history cursor is stale")
         } else if self.epoch == u64::MAX {
@@ -230,26 +271,31 @@ impl NativeHistory {
             record,
             coalesce,
             mut retired,
+            sources,
             _retirement_charge,
         } = prepared;
-        let candidate = match current.publish(gate.actor, gate.leases, gate.now, gate.closed, delta)
-        {
-            Ok(candidate) => candidate,
-            Err(refused) => {
-                return Err(RefusedCommit {
-                    reason: refused.reason,
-                    prepared: PreparedCommit {
-                        identity,
-                        epoch,
-                        delta: refused.prepared,
-                        record,
-                        coalesce,
-                        retired,
-                        _retirement_charge,
-                    },
-                })
-            }
-        };
+        let (candidate, outputs) =
+            match current.publish_deferred(gate.actor, gate.leases, gate.now, gate.closed, delta) {
+                Ok(result) => result,
+                Err(refused) => {
+                    return Err(RefusedCommit {
+                        reason: refused.reason,
+                        prepared: PreparedCommit {
+                            identity,
+                            epoch,
+                            delta: refused.prepared,
+                            record,
+                            coalesce,
+                            retired,
+                            sources,
+                            _retirement_charge,
+                        },
+                    })
+                }
+            };
+        if let Some(sources) = &sources {
+            sources.mark(&outputs);
+        }
         if coalesce {
             if let Some(old) = self.undo.pop() {
                 retired.push(old);
@@ -266,6 +312,7 @@ impl NativeHistory {
         Ok(RetiredHistory {
             _previous: previous,
             _records: retired,
+            sources: sources.map(|plan| (plan, outputs)),
             _charge: _retirement_charge,
         })
     }
@@ -307,23 +354,26 @@ impl NativeHistory {
             actor,
             delta,
         } = prepared;
-        let candidate = match current.publish(gate.actor, gate.leases, gate.now, gate.closed, delta)
-        {
-            Ok(candidate) => candidate,
-            Err(refused) => {
-                return Err(RefusedMove {
-                    reason: refused.reason,
-                    prepared: PreparedMove {
-                        identity,
-                        epoch,
-                        record,
-                        direction,
-                        actor,
-                        delta: refused.prepared,
-                    },
-                })
-            }
-        };
+        let candidate =
+            match current.publish_deferred(gate.actor, gate.leases, gate.now, gate.closed, delta) {
+                Ok((candidate, outputs)) => {
+                    debug_assert!(outputs.is_empty());
+                    candidate
+                }
+                Err(refused) => {
+                    return Err(RefusedMove {
+                        reason: refused.reason,
+                        prepared: PreparedMove {
+                            identity,
+                            epoch,
+                            record,
+                            direction,
+                            actor,
+                            delta: refused.prepared,
+                        },
+                    })
+                }
+            };
         match direction {
             Direction::Undo => {
                 if let Some(record) = self.undo.pop() {
@@ -349,7 +399,7 @@ impl HistorySnapshot {
         request: HistoryRequest<'_>,
         check: &dyn Fn() -> Result<()>,
     ) -> std::result::Result<PreparedCommit, RefusedDelta> {
-        let build = || -> Result<(Arc<Record>, bool, Vec<Arc<Record>>, Reservation)> {
+        let build = || -> Result<(Arc<Record>, bool, Vec<Arc<Record>>, Reservation,Option<super::publication::SourcePublication>)> {
             delta.cancellation.check()?;
             check()?;
             if delta.base != current.key() {
@@ -435,16 +485,18 @@ impl HistorySnapshot {
             }
             delta.cancellation.check()?;
             check()?;
-            Ok((record, coalesce, retired, retirement_charge))
+            let sources=if delta.outputs.is_empty(){None}else{Some(super::publication::SourcePublication::prepare(&delta.candidate,&delta.outputs,check)?)};
+            Ok((record, coalesce, retired, retirement_charge,sources))
         };
         match build() {
-            Ok((record, coalesce, retired, charge)) => Ok(PreparedCommit {
+            Ok((record, coalesce, retired, charge, sources)) => Ok(PreparedCommit {
                 identity: self.identity,
                 epoch: self.epoch,
                 delta,
                 record,
                 coalesce,
                 retired,
+                sources,
                 _retirement_charge: charge,
             }),
             Err(reason) => Err(RefusedDelta {
