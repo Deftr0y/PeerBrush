@@ -12,6 +12,7 @@ use crate::{
 use serde_json::Value;
 #[path = "planning/folder.rs"]
 mod folder;
+pub(super) use folder::belongs;
 pub(super) use folder::folder;
 #[cfg(test)]
 #[path = "planning/tests.rs"]

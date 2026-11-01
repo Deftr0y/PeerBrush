@@ -21,6 +21,7 @@ pub(crate) fn write(
     selection: &Selection<'_>,
     placement: &Placement,
     origin: [i32; 2],
+    layer_frame: [u32; 2],
     fill: Option<Pixel>,
     store: &Store,
     work: &mut Work,
@@ -33,6 +34,7 @@ pub(crate) fn write(
         || !store
             .resident_budget()
             .same_pool(selection.document().budget())
+        || layer_frame.iter().any(|n| *n == 0 || *n > 16000)
         || store
             .disk_budget()
             .is_none_or(|d| !d.same_pool(selection.document().disk_budget()))
@@ -48,8 +50,8 @@ pub(crate) fn write(
     let [l, t, r, b] = placement.bounds;
     let next = [origin[0].min(l), origin[1].min(t)];
     let frame = [
-        (origin[0] + source.width() as i32).max(r) - next[0],
-        (origin[1] + source.height() as i32).max(b) - next[1],
+        (origin[0] + layer_frame[0] as i32).max(r) - next[0],
+        (origin[1] + layer_frame[1] as i32).max(b) - next[1],
     ];
     if frame.iter().any(|n| *n <= 0 || *n > 16000) {
         return Err("Selected transform exceeds native frame admission".into());

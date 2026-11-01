@@ -4,6 +4,7 @@ pub(crate) mod planning;
 pub(crate) mod policy;
 pub(crate) mod pose;
 pub(crate) mod projection;
+pub(crate) mod selected;
 pub(crate) mod stage;
 pub(crate) mod transaction;
 use crate::{

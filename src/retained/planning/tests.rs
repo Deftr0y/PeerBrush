@@ -58,6 +58,39 @@ impl RasterCollector for Collector {
     fn surface(&mut self, _: &Surface) -> Result<RasterRef36, String> {
         Err("Unexpected fixture source".into())
     }
+    fn embedded_coverage(
+        &mut self,
+        value: &serde_json::Value,
+    ) -> Result<crate::engine::scene::Coverage36, String> {
+        // Only the tiny current/original clip fixtures use this decoder. Admit
+        // their two native tiles before serde allocates either payload.
+        for raster in [
+            Some(&value["mask"]),
+            value["mask"]
+                .get("retained")
+                .filter(|v| !v.is_null())
+                .map(|o| &o["pixels"]),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if raster["width"].as_u64().is_none_or(|v| v > 256)
+                || raster["height"].as_u64().is_none_or(|v| v > 256)
+                || raster["depth"].as_u64().is_some_and(|v| v != 8)
+                || raster["tiles"].as_array().is_none_or(|v| v.len() > 1)
+            {
+                return Err("Fixture clip exceeds its admitted two-tile envelope".into());
+            }
+        }
+        let owner = MetadataCharge::reserve(&self.pool, 2 * 1024 * 1024, &|| Ok(()))?;
+        let coverage: crate::selection::Coverage =
+            serde::Deserialize::deserialize(value).map_err(|_| "Invalid fixture clip")?;
+        coverage.validate()?;
+        let result = crate::engine::scene::Coverage36::from_capture(&coverage, self);
+        drop(coverage);
+        drop(owner);
+        result
+    }
 }
 pub(in crate::retained) fn fixture(depth: u16, kind: &str, linked: Option<bool>) -> Document {
     let mut doc = Document::new_depth(17, 19, depth).unwrap();

@@ -8,7 +8,10 @@ mod geometry;
 mod input;
 #[path = "selected/render.rs"]
 mod render;
+#[path = "selected/shift.rs"]
+mod shift;
 pub(crate) use coverage::write_coverage;
 pub(crate) use geometry::Placement;
 pub(crate) use input::Selection;
 pub(crate) use render::{write, Written};
+pub(crate) use shift::shift;

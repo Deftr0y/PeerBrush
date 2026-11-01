@@ -47,8 +47,8 @@ Retained layer planning reads borrowed native metadata and keeps its placement
 arrays charged. It includes linked mask support, independent mask reframing,
 mask-only paint-step selection and complete editable-source frame placement.
 Planning does not publish pixels. The ordinary size and work checks still apply;
-selected-pixel transactions and the concrete regional editable-source
-evaluator are separate integration requirements.
+the concrete regional editable-source evaluator remains a separate integration
+requirement.
 
 The final consumer must use the common captured edit, generation-bound source
 slots, sealed source-session output, retained-source action and guarded
@@ -84,9 +84,7 @@ and nested groups, reject locked children, and keep linked and independent mask
 placement. Their default affine pivot uses current native alpha support; hidden
 RGB and padding cannot move that pivot. Hierarchy visits and alpha scans consume
 the same work allowance. A shared default-pivot argument preserves the original
-normalized command without allocating modified JSON per child. Selected-pixel
-commands remain closed until their complete policies and outputs use the same
-transaction.
+normalized command without allocating modified JSON per child.
 
 Selected-pixel sampling evaluates a virtual native cut and remainder directly
 from explicitly prepared current-source and coverage footprints. It keeps the
@@ -103,9 +101,26 @@ geometry into a canvas-clipped scalar mask first. Matching raw coverage remains
 a separate source; its physical exterior, rather than its bounds hint, determines
 known zero during scalar resampling. The scalar writer retains the existing
 f32 expression, ordered-row completion proof and bounded contour extraction.
-These source producers do not yet constitute complete selected command adoption.
+The selected command producer consumes the same captured descriptor token and
+prepares color, every linked or independently selected paint-mask step, expanded
+untouched mask planes, selection geometry and scalar coverage in one native
+batch. A private working plane retains current and original output tokens until
+the whole candidate is prepared or retired. Final linked-mask reframing reads
+the retained original, while expansion of untouched planes copies their current
+pixels and translates the retained placement. Current and previous raw coverage
+keep their complete native source metadata.
+The final resident reconciliation rule also applies: an equal original
+descriptor is cleared if the completed current plane changed. A retained-mask
+reframe compares bounded pairs of prepared native footprints in document
+coordinates and checks its actual changed bounds against that same command's
+planned write scope, including samples restored outside the selection.
 
-Linked and unlinked mask/selection command integration,
-cancellation/history acceptance and
-full dense16K qualification are separate gates. Existing live limits remain
-unchanged.
+Expansion also translates local Liquify controls and typed clip placement using
+admitted metadata copies. Clip pixels and their retained originals keep their
+generation-bound source slots. Unknown settings survive. No inline pixel JSON,
+separate intermediate adoption or resident cut/remainder is introduced.
+
+The producer still requires final guarded publication through the shared Engine
+or working transaction. Concrete profile/source-session lifetime, one-history
+undo/redo, native editor acceptance and full dense16K qualification remain
+separate gates. Existing live limits remain unchanged.
