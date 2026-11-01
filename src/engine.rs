@@ -1,3 +1,4 @@
+pub(crate) mod authority;
 pub mod backed;
 pub mod native;
 pub(crate) mod reframe_scope;
@@ -490,6 +491,20 @@ pub struct Engine {
     pub(crate) code_jobs: Vec<crate::code::Job>,
 }
 impl Engine {
+    /// An explicit resident-only route. Native callers must use a captured
+    /// source/metadata view and a prepared worker instead of materializing pixels.
+    pub(crate) fn resident(&self) -> Result<&Document, String> {
+        Ok(&self.doc)
+    }
+    pub(crate) fn doc_snapshot(&self) -> view::DocumentSnapshot {
+        self.doc.clone().into()
+    }
+    pub(crate) fn history_lengths(&self) -> [usize; 2] {
+        [self.undo.len(), self.redo.len()]
+    }
+    pub(crate) fn history_entries(&self) -> authority::HistoryEntries<'_> {
+        authority::HistoryEntries::Resident(self.undo.iter())
+    }
     /// Capture strong immutable owners under the engine lock; staging and source
     /// I/O must happen only after releasing that lock and the root/registry locks.
     pub fn capture_scene(

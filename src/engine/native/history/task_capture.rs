@@ -413,6 +413,7 @@ mod tests {
             gesture: None,
             scopes: vec![],
             reverted: vec![reverted],
+            reverted_revisions: vec![1],
         };
         let info = copy_admitted(&info, &pool, true, &|| Ok(())).unwrap();
         Arc::get_mut(history.undo.last_mut().unwrap()).unwrap().info = info;

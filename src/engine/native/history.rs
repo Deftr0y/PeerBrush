@@ -46,6 +46,53 @@ struct Record {
     info: Admitted<Info>,
     _charge: Reservation,
 }
+#[derive(Clone, Copy)]
+pub(crate) struct HistoryEntry<'a> {
+    record: &'a Record,
+}
+pub(crate) struct HistoryEntries<'a> {
+    records: std::slice::Iter<'a, Arc<Record>>,
+}
+impl<'a> HistoryEntry<'a> {
+    pub(crate) fn actor(self) -> &'a str {
+        &self.record.info.actor
+    }
+    pub(crate) fn label(self) -> &'a str {
+        &self.record.info.label
+    }
+    pub(crate) fn task(self) -> Option<&'a str> {
+        self.record.info.task.as_deref()
+    }
+    pub(crate) fn gesture(self) -> Option<&'a str> {
+        self.record.info.gesture.as_deref()
+    }
+    pub(crate) fn revision(self) -> u64 {
+        self.record.after.metadata().revision()
+    }
+    pub(crate) fn scopes(self) -> &'a [Scope] {
+        &self.record.info.scopes
+    }
+    pub(crate) fn reverted_batches(self) -> &'a [u64] {
+        &self.record.info.reverted_revisions
+    }
+}
+impl<'a> Iterator for HistoryEntries<'a> {
+    type Item = HistoryEntry<'a>;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.records.next().map(|record| HistoryEntry { record })
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.records.size_hint()
+    }
+}
+impl DoubleEndedIterator for HistoryEntries<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.records
+            .next_back()
+            .map(|record| HistoryEntry { record })
+    }
+}
+impl ExactSizeIterator for HistoryEntries<'_> {}
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Info {
@@ -56,6 +103,8 @@ struct Info {
     scopes: Vec<Scope>,
     #[serde(default)]
     reverted: Vec<[u8; 16]>,
+    #[serde(default)]
+    reverted_revisions: Vec<u64>,
 }
 pub(crate) struct HistoryRequest<'a> {
     pub actor: &'a str,
@@ -81,6 +130,14 @@ pub(crate) struct PreparedCommit {
     sources: Option<super::publication::SourcePublication>,
     truncated: Arc<task_capture::TruncatedTasks>,
     _retirement_charge: Reservation,
+}
+impl PreparedCommit {
+    pub(crate) fn refused(self, reason: &str) -> RefusedCommit {
+        RefusedCommit {
+            reason: reason.into(),
+            prepared: self,
+        }
+    }
 }
 #[must_use]
 pub(crate) struct RefusedCommit {
@@ -187,6 +244,14 @@ pub(crate) struct PreparedMove {
     actor: Admitted<String>,
     delta: PreparedDelta,
 }
+impl PreparedMove {
+    pub(crate) fn refused(self, reason: &str) -> RefusedMove {
+        RefusedMove {
+            reason: reason.into(),
+            prepared: self,
+        }
+    }
+}
 #[must_use]
 pub(crate) struct RefusedMove {
     reason: String,
@@ -206,6 +271,11 @@ impl RefusedMove {
     }
 }
 impl NativeHistory {
+    pub(crate) fn entries(&self) -> HistoryEntries<'_> {
+        HistoryEntries {
+            records: self.undo.iter(),
+        }
+    }
     pub fn new(pool: &ResidentBudget, limit: usize) -> Result<Self> {
         if !(1..=200).contains(&limit) {
             return Err("Native history limit must be between 1 and 200".into());
@@ -503,6 +573,7 @@ impl HistorySnapshot {
                 gesture: Option<&'a str>,
                 scopes: Vec<&'a Scope>,
                 reverted:&'a [[u8;16]],
+                reverted_revisions: &'a [u64],
             }
             let borrowed = Borrowed {
                 actor: request.actor,
@@ -511,6 +582,7 @@ impl HistorySnapshot {
                 gesture: request.gesture,
                 scopes,
                 reverted:&[],
+                reverted_revisions: &[],
             };
             let info: Admitted<Info> = copy_admitted(&borrowed, current.budget(), true, check)?;
             drop(borrowed);
