@@ -347,8 +347,14 @@ pub fn points_from_command(c: &Value) -> Result<(Vec<[f32; 2]>, Option<Vec<f32>>
         .as_array()
         .filter(|p| !p.is_empty() && p.len() <= 10000)
         .ok_or("Stroke needs 1–10000 points")?;
-    let mut points = Vec::with_capacity(values.len());
-    let mut pressures = Vec::with_capacity(values.len());
+    let mut points = Vec::new();
+    points
+        .try_reserve_exact(values.len())
+        .map_err(|_| "Stroke point allocation failed")?;
+    let mut pressures = Vec::new();
+    pressures
+        .try_reserve_exact(values.len())
+        .map_err(|_| "Stroke pressure allocation failed")?;
     let mut explicit = false;
     for value in values {
         let point = value
@@ -378,7 +384,10 @@ pub fn points_from_command(c: &Value) -> Result<(Vec<[f32; 2]>, Option<Vec<f32>>
             .as_array()
             .filter(|p| p.len() == points.len())
             .ok_or("Pressures must match the point count")?;
-        pressures = values.iter().map(pressure).collect::<Result<Vec<_>, _>>()?;
+        pressures.clear();
+        for value in values {
+            pressures.push(pressure(value)?);
+        }
         explicit = true;
     }
     if let Some(axis) = c.get("stroke_axis") {
