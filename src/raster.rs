@@ -1,6 +1,8 @@
 pub mod backed;
+pub mod surface;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, sync::Arc};
+pub use surface::{Surface, SurfaceKey, SurfaceRegion};
 
 pub const TILE: u32 = 256;
 pub const MAX_EDGE: u32 = 8192;
