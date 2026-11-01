@@ -104,6 +104,19 @@ fn hair_line_rgn(points: &[Point], clip: Option<&ScreenIntRect>, blitter: &mut d
                 i32::MAX
             };
 
+            #[cfg(feature = "std")]
+            if blitter.hairline_kernel(super::hairline_plan::Kernel::Aliased(
+                super::hairline_plan::AliasedKernel {
+                    horizontal: true,
+                    first: ix0,
+                    stop: ix1,
+                    ordinate: start_y,
+                    slope,
+                    maximum_y: max_y,
+                },
+            )) {
+                continue;
+            }
             debug_assert!(ix0 < ix1);
             loop {
                 tiny_skia_path::allocation::checkpoint();
@@ -137,6 +150,19 @@ fn hair_line_rgn(points: &[Point], clip: Option<&ScreenIntRect>, blitter: &mut d
             #[allow(clippy::precedence)]
             let mut start_x = fdot6::to_fdot16(x0) + (slope * ((32 - y0) & 63) >> 6);
 
+            #[cfg(feature = "std")]
+            if blitter.hairline_kernel(super::hairline_plan::Kernel::Aliased(
+                super::hairline_plan::AliasedKernel {
+                    horizontal: false,
+                    first: iy0,
+                    stop: iy1,
+                    ordinate: start_x,
+                    slope,
+                    maximum_y: i32::MAX,
+                },
+            )) {
+                continue;
+            }
             debug_assert!(iy0 < iy1);
             loop {
                 tiny_skia_path::allocation::checkpoint();

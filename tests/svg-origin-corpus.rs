@@ -35,6 +35,9 @@ pub fn cases() -> Vec<Case> {
     for matrix in matrices {
         result.push(Case{name:"reused-identical-clip-sites",frame:[113,79],matrix,rows:(0..79).collect(),svg:"<svg xmlns='http://www.w3.org/2000/svg' width='113' height='79'><defs><clipPath id='shared'><rect x='7.375' y='5.125' width='96.25' height='66.375' rx='11.625'/></clipPath></defs><g opacity='.43' clip-path='url(#shared)'><rect x='1.125' y='2.375' width='107.625' height='72.25' fill='#d24731'/></g><g opacity='.61' clip-path='url(#shared)'><rect x='1.125' y='2.375' width='107.625' height='72.25' fill='#296bc1'/></g></svg>".into()});
     }
+    for matrix in matrices {
+        result.push(Case{name:"hairline-fractional-caps-dashes",frame:[113,79],matrix,rows:(0..79).collect(),svg:"<svg xmlns='http://www.w3.org/2000/svg' width='113' height='79'><defs><linearGradient id='hair' x1='0' y1='0' x2='113' y2='79' gradientUnits='userSpaceOnUse'><stop stop-color='#de5239' stop-opacity='.43'/><stop offset='1' stop-color='#296bc1' stop-opacity='.81'/></linearGradient></defs><g opacity='.73'><path d='M2.125 .25 L109.375 76.125 L4.25 72.875 L108.125 1.375 M56.25 1.125 L55.375 76.625' fill='none' stroke='url(#hair)' stroke-width='.625' stroke-linecap='round'/><path d='M4.25 68.75 C26.125 1.375 81.625 78.25 106.375 6.125 Q47.625 34.25 8.375 4.625' fill='none' stroke='#51ad7b' stroke-opacity='.61' stroke-width='.875' stroke-linecap='square' stroke-dasharray='3.125 1.375 2.625 4.25' stroke-dashoffset='.625'/></g></svg>".into()});
+    }
     // The original renderer tiles at8191; preserve its f32 round trips, not
     // just a crop translated into a fresh local-coordinate canvas.
     for (name, frame, rows) in [
@@ -55,6 +58,14 @@ pub fn cases() -> Vec<Case> {
                 "<svg xmlns='http://www.w3.org/2000/svg' width='{w}' height='{h}'>{body}</svg>"
             ),
             rows,
+        });
+        let hair = format!("<g opacity='.73'><path d='M.125 1.375 L{} {} M2.375 {} L{} .25' fill='none' stroke='url(#l)' stroke-width='.625' stroke-linecap='round'/><path d='M.375 .625 L{} {}' fill='none' stroke='#51ad7b' stroke-opacity='.61' stroke-width='.875' stroke-linecap='square' stroke-dasharray='3.125 1.375 2.625 4.25' stroke-dashoffset='.625'/></g>",w as f32-0.625,h as f32-1.125,h as f32-0.375,w as f32-1.125,w as f32-1.25,h as f32-1.375);
+        result.push(Case {
+            name: if w > h { "hairline-horizontal-tiler" } else { "hairline-vertical-tiler" },
+            frame,
+            matrix: [1., 0., 0., 1., 0.125, -0.125],
+            svg: format!("<svg xmlns='http://www.w3.org/2000/svg' width='{w}' height='{h}'>{body}{hair}</svg>"),
+            rows: if w > h { vec![0,1,8,9,17,18] } else { vec![0,1,8189,8190,8191,8192,8208] },
         });
     }
     for width in [1, 7, 8, 9, 15, 16, 17, 31, 32, 33] {

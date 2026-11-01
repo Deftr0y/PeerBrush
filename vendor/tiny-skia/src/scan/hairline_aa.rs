@@ -313,11 +313,70 @@ fn anti_hair_line_rgn(points: &[Point], clip: Option<&ScreenIntRect>, blitter: &
 }
 
 #[derive(Copy, Clone, Debug)]
-enum BlitterKind {
+pub(crate) enum BlitterKind {
     HLine,
     Horish,
     VLine,
     Vertish,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AntiKernel {
+    kind: BlitterKind,
+    first: i32,
+    stop: i32,
+    ordinate: FDot16,
+    slope: FDot16,
+    scale_start: i32,
+    scale_stop: i32,
+    clip: Option<ScreenIntRect>,
+}
+#[cfg(feature = "std")]
+impl AntiKernel {
+    pub(crate) fn valid(self) -> bool {
+        if self.first < 0
+            || self.stop <= self.first
+            || !(0..=64).contains(&self.scale_start)
+            || !(0..=64).contains(&self.scale_stop)
+            || self.slope < -fdot16::ONE
+            || self.slope > fdot16::ONE
+        {
+            return false;
+        }
+        let Some(start) = self.ordinate.checked_add(fdot16::HALF).map(|n| n.max(0)) else {
+            return false;
+        };
+        let step = if matches!(self.kind, BlitterKind::Horish | BlitterKind::Vertish) {
+            self.slope
+        } else {
+            0
+        };
+        let Some(next) = start
+            .checked_add(step)
+            .and_then(|n| n.checked_sub(fdot16::HALF))
+        else {
+            return false;
+        };
+        let length = self.stop - self.first - 1 - (self.scale_stop > 0) as i32;
+        if length < 0 {
+            return false;
+        }
+        let Some(initial) = next.checked_add(fdot16::HALF) else {
+            return false;
+        };
+        let Some(end) = super::hairline_plan::advance_clamped(initial, step, length as u32)
+            .and_then(|n| n.checked_sub(fdot16::HALF))
+        else {
+            return false;
+        };
+        self.scale_stop == 0
+            || end
+                .checked_add(fdot16::HALF)
+                .map(|n| n.max(0))
+                .and_then(|n| n.checked_add(step))
+                .and_then(|n| n.checked_sub(fdot16::HALF))
+                .is_some()
+    }
 }
 
 fn do_anti_hairline(
@@ -543,17 +602,42 @@ fn do_anti_hairline(
         }
     }
 
+    let Some(kind) = blitter_kind else {
+        return;
+    };
+    let kernel = AntiKernel {
+        kind,
+        first: istart,
+        stop: istop,
+        ordinate: fstart,
+        slope,
+        scale_start,
+        scale_stop,
+        clip: clip_opt,
+    };
+    #[cfg(feature = "std")]
+    if blitter.hairline_kernel(super::hairline_plan::Kernel::Anti(kernel)) {
+        return;
+    }
+    emit_kernel(kernel, blitter);
+}
+pub(crate) fn emit_kernel(kernel: AntiKernel, blitter: &mut dyn Blitter) {
+    let AntiKernel {
+        kind: blitter_kind,
+        first: istart,
+        stop: istop,
+        ordinate: mut fstart,
+        slope,
+        scale_start,
+        scale_stop,
+        clip: clip_opt,
+    } = kernel;
     let mut clip_blitter;
     let blitter = if let Some(clip) = clip_opt {
         clip_blitter = RectClipBlitter { blitter, clip };
         &mut clip_blitter
     } else {
         blitter
-    };
-
-    let blitter_kind = match blitter_kind {
-        Some(v) => v,
-        None => return,
     };
 
     // A bit ugly, but looks like this is the only way to have stack allocated object trait.
@@ -691,6 +775,10 @@ impl AntiHairBlitter for HorishAntiHairBlitter<'_> {
     }
 
     fn draw_line(&mut self, mut x: u32, stop_x: u32, mut fy: FDot16, dy: FDot16) -> FDot16 {
+        #[cfg(feature = "std")]
+        if let Some(band) = self.0.hairline_band() {
+            return super::hairline_plan::horish(self.0, x, stop_x, fy, dy, band);
+        }
         debug_assert!(x < stop_x);
 
         fy += fdot16::ONE / 2;
@@ -782,6 +870,10 @@ impl AntiHairBlitter for VertishAntiHairBlitter<'_> {
     }
 
     fn draw_line(&mut self, mut y: u32, stop_y: u32, mut fx: FDot16, dx: FDot16) -> FDot16 {
+        #[cfg(feature = "std")]
+        if let Some(band) = self.0.hairline_band() {
+            return super::hairline_plan::vertish(self.0, y, stop_y, fx, dx, band);
+        }
         debug_assert!(y < stop_y);
 
         fx += fdot16::ONE / 2;
@@ -803,7 +895,7 @@ impl AntiHairBlitter for VertishAntiHairBlitter<'_> {
     }
 }
 
-fn i32_to_alpha(a: i32) -> u8 {
+pub(crate) fn i32_to_alpha(a: i32) -> u8 {
     (a & 0xFF) as u8
 }
 
@@ -813,6 +905,15 @@ struct RectClipBlitter<'a> {
 }
 
 impl Blitter for RectClipBlitter<'_> {
+    #[cfg(feature = "std")]
+    fn hairline_band(&self) -> Option<[u32; 2]> {
+        self.blitter.hairline_band()
+    }
+    #[cfg(feature = "std")]
+    fn refuse_hairline(&mut self, message: &'static str) {
+        self.blitter.refuse_hairline(message);
+    }
+
     fn blit_anti_h(
         &mut self,
         x: u32,

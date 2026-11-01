@@ -6,6 +6,8 @@
 
 pub mod hairline;
 pub mod hairline_aa;
+#[cfg(feature = "std")]
+pub(crate) mod hairline_plan;
 pub mod path;
 pub mod path_aa;
 

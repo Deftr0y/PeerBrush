@@ -326,12 +326,16 @@ impl PixmapMut<'_> {
                     // We're ignoring "errors" here, because `fill_path` will return `None`
                     // when rendering a tile that doesn't have a path on it.
                     // Which is not an error in this case.
+                    let tile_context = tile_prepared(prepared, &tile);
+                    if prepared.is_some() && tile_context.is_none() {
+                        return;
+                    }
                     fill_scan(
                         &path,
                         paint.anti_alias,
                         fill_rule,
                         &clip_rect,
-                        tile_prepared(prepared, &tile),
+                        tile_context,
                         band,
                         &mut blitter,
                     );
@@ -463,12 +467,6 @@ impl PixmapMut<'_> {
         };
 
         if let Some(coverage) = treat_as_hairline(paint, stroke, transform) {
-            #[cfg(feature = "std")]
-            if let Some((cache, _)) = prepared {
-                cache.refuse("SVG retained hairline continuation is not yet qualified");
-                return;
-            }
-
             let mut paint = paint.clone();
             if coverage == 1.0 {
                 // No changes to the `paint`.
@@ -518,7 +516,18 @@ impl PixmapMut<'_> {
                     // We're ignoring "errors" here, because `stroke_hairline` will return `None`
                     // when rendering a tile that doesn't have a path on it.
                     // Which is not an error in this case.
-                    Self::stroke_hairline(&path, &paint, stroke.line_cap, submask, &mut subpix);
+                    let tile_context = tile_prepared(prepared, &tile);
+                    if prepared.is_some() && tile_context.is_none() {
+                        return;
+                    }
+                    Self::stroke_hairline(
+                        &path,
+                        &paint,
+                        stroke.line_cap,
+                        submask,
+                        &mut subpix,
+                        tile_context,
+                    );
 
                     let ts = Transform::from_translate(tile.x() as f32, tile.y() as f32);
                     path = match path.transform(ts) {
@@ -543,9 +552,16 @@ impl PixmapMut<'_> {
                         }
                     };
 
-                    Self::stroke_hairline(&path, &paint, stroke.line_cap, submask, subpix);
+                    Self::stroke_hairline(
+                        &path,
+                        &paint,
+                        stroke.line_cap,
+                        submask,
+                        subpix,
+                        prepared,
+                    );
                 } else {
-                    Self::stroke_hairline(path, &paint, stroke.line_cap, submask, subpix);
+                    Self::stroke_hairline(path, &paint, stroke.line_cap, submask, subpix, prepared);
                 }
             }
         } else {
@@ -569,12 +585,29 @@ impl PixmapMut<'_> {
         line_cap: LineCap,
         mask: Option<SubMaskRef>,
         pixmap: &mut SubPixmapMut,
+        prepared: Option<PreparedDraw<'_>>,
     ) {
         let clip = pixmap.size.to_screen_int_rect(0, 0);
+        let band = [pixmap.rows.start, pixmap.rows.end()];
         let mut blitter = match RasterPipelineBlitter::new(paint, mask, pixmap) {
             Some(v) => v,
             None => return, // nothing to do, all good
         };
+        #[cfg(feature = "std")]
+        if let Some((cache, key)) = prepared {
+            if band[0] != band[1] {
+                cache.draw_hairline(
+                    key,
+                    path,
+                    line_cap,
+                    &clip,
+                    paint.anti_alias,
+                    band,
+                    &mut blitter,
+                );
+            }
+            return;
+        }
         if paint.anti_alias {
             scan::hairline_aa::stroke_path(path, line_cap, &clip, &mut blitter);
         } else {

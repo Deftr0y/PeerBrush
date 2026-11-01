@@ -545,6 +545,68 @@ mod tests {
         assert_eq!(budget.live.load(Ordering::SeqCst), 0);
     }
     #[test]
+    fn retained_hairline_cancellation_cannot_resume_or_release_live_cache_owner() {
+        let tree = tree("<path d='M2.125 1.375 L110.625 76.125 L3.25 73.75 C92.5 68.25 8.125 7.75 107.375 3.125' fill='none' stroke='#8935d3' stroke-opacity='.67' stroke-width='.625' stroke-linecap='round'/>");
+        let budget = Budget::new(256 * 1024 * 1024, usize::MAX);
+        let mut plan = RowPlan::new(
+            &tree,
+            tiny_skia::Transform::identity(),
+            [113, 79],
+            plan_limits(1_000_000),
+            &budget,
+        )
+        .unwrap();
+        assert!(plan.maximum_rows() >= 1);
+        let first = plan.next(7).unwrap();
+        assert_eq!(
+            budget.live.load(Ordering::SeqCst),
+            192 * 1024 * 1024 + 113 * 7 * 4 + 256
+        );
+        drop(first);
+        assert_eq!(budget.live.load(Ordering::SeqCst), 64 * 1024 * 1024);
+        budget.control.calls.store(usize::MAX, Ordering::SeqCst);
+        assert!(plan.next(7).is_err());
+        budget.control.calls.store(0, Ordering::SeqCst);
+        assert!(plan.next(7).is_err());
+        assert_eq!(plan.next_y(), 7);
+        assert!(!plan.is_complete());
+        assert_eq!(budget.live.load(Ordering::SeqCst), 64 * 1024 * 1024);
+        drop(plan);
+        assert_eq!(budget.live.load(Ordering::SeqCst), 0);
+        // Refuse partway through actual second-band work, not just at its
+        // entry check. Work admission and retained owners span the operation.
+        let mut probe = RowPlan::new(
+            &tree,
+            tiny_skia::Transform::identity(),
+            [113, 79],
+            plan_limits(1_000_000),
+            &budget,
+        )
+        .unwrap();
+        drop(probe.next(7).unwrap());
+        let first = probe.work_used();
+        drop(probe.next(7).unwrap());
+        let second = probe.work_used();
+        drop(probe);
+        assert!(second > first + 2);
+        let mut limited = RowPlan::new(
+            &tree,
+            tiny_skia::Transform::identity(),
+            [113, 79],
+            plan_limits(first + (second - first) / 2),
+            &budget,
+        )
+        .unwrap();
+        drop(limited.next(7).unwrap());
+        assert!(limited.next(7).is_err());
+        assert!(limited.work_used() > first);
+        assert_eq!(limited.next_y(), 7);
+        assert!(limited.next(7).is_err());
+        assert_eq!(budget.live.load(Ordering::SeqCst), 64 * 1024 * 1024);
+        drop(limited);
+        assert_eq!(budget.live.load(Ordering::SeqCst), 0);
+    }
+    #[test]
     fn prepared_resource_and_nested_scope_refusals_preserve_all_owner_charges() {
         let tree = tree(BODY);
         let budget = Budget::new(256 * 1024 * 1024, usize::MAX);
