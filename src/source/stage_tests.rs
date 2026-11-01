@@ -52,6 +52,116 @@ pub(super) fn observe_completed_tile() {
         }
     });
 }
+
+fn svg_source(matrix: [f32; 6]) -> Source36 {
+    Source36{
+        width:529,height:273,matrix,
+        content:Content36::Svg{svg:"<svg xmlns='http://www.w3.org/2000/svg' width='529' height='273'><defs><linearGradient id='g' x1='1.375' y1='2.625' x2='527.125' y2='271.375' gradientUnits='userSpaceOnUse'><stop stop-color='#c74129' stop-opacity='.43'/><stop offset='.37' stop-color='#387ac1' stop-opacity='.81'/><stop offset='1' stop-color='#54b87e' stop-opacity='.61'/></linearGradient><clipPath id='c'><rect x='3.125' y='2.375' width='522.625' height='267.25' rx='17.375'/></clipPath></defs><g opacity='.73' clip-path='url(#c)'><rect x='1.375' y='2.625' width='526.125' height='268.375' fill='url(#g)'/><path d='M2.125 1.375 C519.375 2.625 4.375 270.125 527.625 269.375' fill='none' stroke='#df5329' stroke-width='.625' stroke-linecap='round' stroke-dasharray='3.125 1.375 2.625 4.25'/></g></svg>".into()}.into(),
+    }
+}
+
+#[test]
+fn actual_session_svg_bands_match_direct_full_origin_native8_and16_across_output_tiles() {
+    let fixture = Fixture::new();
+    let (runtime, _connection) = fixture.runtime(32 * 1024 * 1024);
+    let session = runtime.begin().unwrap();
+    for depth in [8, 16] {
+        let base = base(&session, depth);
+        for matrix in [
+            [1., 0., 0., 1., 0., 0.],
+            [0.9375, 0.125, -0.0625, 1.125, 7.25, 0.625],
+            [-0.875, 0.0625, 0.125, 1.0625, 521.125, -2.25],
+        ] {
+            let source = svg_source(matrix);
+            let prepared =
+                PreparedSource::new(&source, None, &session.resident(), &mut || Ok(())).unwrap();
+            let cancellation = base.capture_edit().unwrap().cancellation();
+            let before = session.disk().used().unwrap();
+            let staged = render_captured(
+                &prepared,
+                [529, 273],
+                depth,
+                &base,
+                &session,
+                &cancellation,
+                &mut || Ok(()),
+            )
+            .unwrap();
+            let legacy: crate::source::Source =
+                serde_json::from_value(serde_json::to_value(&source).unwrap()).unwrap();
+            let expected = legacy.render(529, 273, depth).unwrap();
+            for top in (0..273).step_by(32) {
+                let end = (top + 32).min(273);
+                let pixels = staged
+                    .surface()
+                    .prepare_region(Region::new([0, top, 529, end]).unwrap(), &mut || Ok(()))
+                    .unwrap();
+                for y in top..end {
+                    for x in 0..529 {
+                        assert_eq!(
+                            pixels.pixel16(x, y).unwrap(),
+                            expected.get16(x, y),
+                            "depth{depth} pixel{x},{y}"
+                        );
+                    }
+                }
+            }
+            staged.abort(&session, &|| Ok(())).unwrap();
+            assert_eq!(session.disk().used().unwrap(), before);
+        }
+    }
+}
+
+#[test]
+fn actual_session_svg_requires_captured_token_and_cancellation_preserves_inventory() {
+    let fixture = Fixture::new();
+    let (runtime, _connection) = fixture.runtime(16 * 1024 * 1024);
+    let session = runtime.begin().unwrap();
+    let base = base(&session, 16);
+    let key = base.key();
+    let source = svg_source([1., 0., 0., 1., 0., 0.]);
+    let prepared = PreparedSource::new(&source, None, &session.resident(), &mut || Ok(())).unwrap();
+    let before = session.disk().used().unwrap();
+    let files = fixture.block_files();
+    assert!(render(&prepared, [529, 273], 16, &base, &session, &mut || Ok(())).is_err());
+    let canceled = base.capture_edit().unwrap().cancellation();
+    canceled.cancel();
+    assert!(render_captured(
+        &prepared,
+        [529, 273],
+        16,
+        &base,
+        &session,
+        &canceled,
+        &mut || Ok(())
+    )
+    .is_err());
+    assert_eq!(session.disk().used().unwrap(), before);
+    assert_eq!(fixture.block_files(), files);
+    let completed = CompletedTiles::observe();
+    let cancellation = base.capture_edit().unwrap().cancellation();
+    let result = render_captured(
+        &prepared,
+        [529, 273],
+        16,
+        &base,
+        &session,
+        &cancellation,
+        &mut || {
+            if completed.count() != 0 {
+                cancellation.cancel();
+                Err("SVG canceled after completed provisional tile".into())
+            } else {
+                Ok(())
+            }
+        },
+    );
+    assert!(result.is_err());
+    assert_ne!(completed.count(), 0);
+    assert_eq!(session.disk().used().unwrap(), before);
+    assert_eq!(fixture.block_files(), files);
+    assert_eq!(base.key(), key);
+}
 struct Fixture {
     path: PathBuf,
     held: Option<Directory>,

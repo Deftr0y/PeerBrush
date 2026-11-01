@@ -41,6 +41,12 @@ pub(crate) struct PreparedSource<'a> {
     _charge: Reservation,
 }
 impl<'a> PreparedSource<'a> {
+    pub(super) fn svg_plan(&self) -> Option<(&crate::svg::prepared::PreparedSvg, [f32; 6])> {
+        match &self.kind {
+            Kind::Svg(svg) => Some((svg, self.matrix)),
+            _ => None,
+        }
+    }
     pub(crate) fn uses_budget(&self, pool: &ResidentBudget) -> bool {
         self.pool.same_pool(pool)
     }

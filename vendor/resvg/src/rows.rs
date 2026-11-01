@@ -42,6 +42,10 @@ pub struct RowImage {
     image: tiny_skia::allocation::Bounded<OwnedPixmap>,
 }
 impl RowImage {
+    /// Borrowed original premultiplied pixels, retaining the complete row owner.
+    pub fn pixels(&self) -> &[tiny_skia::PremultipliedColorU8] {
+        self.image.get().pixels()
+    }
     /// Logical canvas width.
     pub fn width(&self) -> u32 {
         self.image.get().width()
