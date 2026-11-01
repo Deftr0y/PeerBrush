@@ -47,5 +47,17 @@ fn main() {
         &RefuseCallbacks,
     );
     assert!(matches!(result,Err(ref error)if error.contains("unwind-capable")));
+    let plan = resvg::rows::RowPlan::new(
+        &tree,
+        resvg::tiny_skia::Transform::identity(),
+        [3, 3],
+        resvg::rows::PlanLimits {
+            retained_bytes: 4096,
+            maximum_invocations: 1,
+            work: 100,
+        },
+        &RefuseCallbacks,
+    );
+    assert!(matches!(plan,Err(ref error)if error.contains("unwind-capable")));
     println!("abort-profile entry refused before operation, callbacks or allocation");
 }

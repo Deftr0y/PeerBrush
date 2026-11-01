@@ -202,8 +202,17 @@ struct Entry {
     program: Option<PreparedEdges>,
     next_band: u32,
 }
+struct HairEntry {
+    key: InvocationKey,
+    binding: Binding,
+    program: crate::scan::hairline_plan::PreparedHairline,
+    next_band: u32,
+    cap: crate::LineCap,
+    aa: bool,
+}
 struct State {
     entries: Vec<Entry>,
+    hairlines: Vec<HairEntry>,
     charged: usize,
     error: Option<String>,
 }
@@ -232,6 +241,7 @@ impl ScanCache {
         Ok(Self {
             state: Mutex::new(State {
                 entries: Vec::new(),
+                hairlines: Vec::new(),
                 charged: 4096,
                 error: None,
             }),
@@ -305,6 +315,17 @@ impl ScanCache {
             state.error = Some("SVG retained scan band is invalid".into());
             return false;
         }
+        if state
+            .hairlines
+            .binary_search_by(|entry| {
+                tiny_skia_path::allocation::checkpoint();
+                entry.key.cmp(&key)
+            })
+            .is_ok()
+        {
+            state.error = Some("SVG prepared invocation kind changed".into());
+            return false;
+        }
         let index = match state.entries.binary_search_by(|entry| {
             tiny_skia_path::allocation::checkpoint();
             entry.key.cmp(&key)
@@ -322,7 +343,7 @@ impl ScanCache {
                 index
             }
             Err(index) => {
-                if state.entries.len() == self.maximum {
+                if state.entries.len() + state.hairlines.len() == self.maximum {
                     state.error = Some("SVG retained scan invocation admission exceeded".into());
                     return false;
                 }
@@ -397,6 +418,150 @@ impl ScanCache {
         let entry = &mut state.entries[index];
         if let Some(program) = entry.program.as_mut() {
             program.advance(band[1] << shift, blitter);
+        }
+        entry.next_band = band[1];
+        true
+    }
+    pub(crate) fn draw_hairline(
+        &self,
+        key: InvocationKey,
+        path: &Path,
+        cap: crate::LineCap,
+        clip: &ScreenIntRect,
+        aa: bool,
+        band: [u32; 2],
+        blitter: &mut dyn Blitter,
+    ) -> bool {
+        if !tiny_skia_path::allocation::is_active() {
+            self.refuse("SVG retained hairline requires an admitted Rust scope");
+            return false;
+        }
+        let Ok(mut state) = self.state.try_lock() else {
+            self.failed.store(true, Ordering::Release);
+            return false;
+        };
+        if state.error.is_some() || self.failed.load(Ordering::Acquire) {
+            return false;
+        }
+        if band[0] >= band[1] {
+            state.error = Some("SVG retained hairline band is invalid".into());
+            return false;
+        }
+        if state
+            .entries
+            .binary_search_by(|entry| {
+                tiny_skia_path::allocation::checkpoint();
+                entry.key.cmp(&key)
+            })
+            .is_ok()
+        {
+            state.error = Some("SVG prepared invocation kind changed".into());
+            return false;
+        }
+        let index = match state.hairlines.binary_search_by(|entry| {
+            tiny_skia_path::allocation::checkpoint();
+            entry.key.cmp(&key)
+        }) {
+            Ok(index) => {
+                let entry = &state.hairlines[index];
+                if entry.next_band != band[0]
+                    || entry.cap != cap
+                    || entry.aa != aa
+                    || !entry
+                        .binding
+                        .matches(path, clip, 0, 0, 0, false, FillRule::Winding)
+                {
+                    state.error =
+                        Some("SVG retained hairline source or ascending band changed".into());
+                    return false;
+                }
+                index
+            }
+            Err(index) => {
+                if state.entries.len() + state.hairlines.len() == self.maximum {
+                    state.error = Some("SVG retained scan invocation admission exceeded".into());
+                    return false;
+                }
+                let program =
+                    match crate::scan::hairline_plan::PreparedHairline::new(path, cap, clip, aa) {
+                        Ok(program) => program,
+                        Err(error) => {
+                            state.error = Some(error);
+                            return false;
+                        }
+                    };
+                let bytes = path
+                    .verbs()
+                    .len()
+                    .checked_mul(core::mem::size_of::<tiny_skia_path::PathVerb>())
+                    .and_then(|n| {
+                        n.checked_add(
+                            path.points()
+                                .len()
+                                .checked_mul(core::mem::size_of::<crate::Point>())?,
+                        )
+                    })
+                    .and_then(|n| n.checked_add(program.allocation_bytes()?));
+                let Some(bytes) = bytes else {
+                    state.error = Some("SVG retained hairline size overflow".into());
+                    return false;
+                };
+                if !self.charge(&mut state, bytes) {
+                    return false;
+                }
+                if state.hairlines.len() == state.hairlines.capacity() {
+                    let capacity = state
+                        .hairlines
+                        .capacity()
+                        .saturating_mul(2)
+                        .max(4)
+                        .min(self.maximum);
+                    let Some(bytes) = capacity.checked_mul(core::mem::size_of::<HairEntry>())
+                    else {
+                        state.error = Some("SVG retained hairline metadata overflow".into());
+                        return false;
+                    };
+                    if !self.charge(&mut state, bytes) {
+                        return false;
+                    }
+                    let additional = capacity - state.hairlines.len();
+                    if state.hairlines.try_reserve_exact(additional).is_err()
+                        || state.hairlines.capacity() > capacity
+                    {
+                        state.error = Some("SVG retained hairline allocation failed".into());
+                        return false;
+                    }
+                }
+                let binding = Binding {
+                    path: path.clone(),
+                    clip: [clip.x(), clip.y(), clip.width(), clip.height()],
+                    start: 0,
+                    stop: 0,
+                    shift: 0,
+                    contained: false,
+                    rule: FillRule::Winding,
+                };
+                for _ in index..state.hairlines.len() {
+                    tiny_skia_path::allocation::checkpoint();
+                }
+                state.hairlines.insert(
+                    index,
+                    HairEntry {
+                        key,
+                        binding,
+                        program,
+                        next_band: band[0],
+                        cap,
+                        aa,
+                    },
+                );
+                index
+            }
+        };
+        let entry = &mut state.hairlines[index];
+        if let Err(error) = entry.program.render(band, blitter) {
+            state.error = Some(error);
+            return false;
         }
         entry.next_band = band[1];
         true

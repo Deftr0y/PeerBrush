@@ -5,7 +5,9 @@ fn main() {
     let baseline = std::env::args().any(|argument| argument == "--baseline");
     let mut out = io::BufWriter::new(io::stdout().lock());
     for case in corpus::cases() {
-        if baseline && case.name == "reused-identical-clip-sites" {
+        if baseline
+            && (case.name == "reused-identical-clip-sites" || case.name.starts_with("hairline"))
+        {
             continue;
         }
 

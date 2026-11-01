@@ -264,6 +264,7 @@ impl Transform {
 
     /// Transforms a slice of points using the current transform.
     pub fn map_points(&self, points: &mut [Point]) {
+        crate::allocation::work(if self.is_identity() { 0 } else { points.len() });
         if points.is_empty() {
             return;
         }

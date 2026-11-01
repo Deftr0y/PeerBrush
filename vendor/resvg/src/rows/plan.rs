@@ -19,14 +19,19 @@ struct WholeControl {
 }
 impl tiny_skia::allocation::Cancellation for WholeControl {
     fn check(&self) -> Result<(), String> {
+        self.work(1)
+    }
+    fn work(&self, units: usize) -> Result<(), String> {
+        let units = u64::try_from(units).map_err(|_| "SVG total operation work overflow")?;
         self.calls
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
-                old.checked_add(1).filter(|next| *next <= self.maximum)
+                old.checked_add(units).filter(|next| *next <= self.maximum)
             })
             .map_err(|_| "SVG total operation work admission exceeded")?;
-        self.cancellation.check()
+        self.cancellation.work(units as usize)
     }
 }
+
 struct Budget<'a> {
     outer: &'a dyn RowBudget,
     control: Arc<WholeControl>,
@@ -131,6 +136,14 @@ impl<'a> RowPlan<'a> {
             cache,
             budget,
         })
+    }
+    /// Guaranteed band height under the original isolated-group width bound.
+    /// This does not crop/translate geometry or guess an interpolation halo.
+    pub fn maximum_rows(&self) -> u32 {
+        let bound = crate::max_filter_bbox(self.frame[0], self.frame[1])
+            .width()
+            .max(self.frame[0]);
+        ((128 * 1024) / bound).max(1)
     }
     pub fn next_y(&self) -> u32 {
         self.next
