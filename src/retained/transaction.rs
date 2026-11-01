@@ -58,7 +58,7 @@ pub(crate) fn prepare_command(
         return Err("Native retained transform requires a move or transform command".into());
     }
     if base.metadata().selection().is_some() && command.parameters()["selection_only"] != false {
-        return Err("Native selected-pixel transaction is not prepared".into());
+        return super::selected::prepare(captured, token, session, work, check);
     }
     let id = command.parameters()["layer"]
         .as_str()
@@ -68,6 +68,9 @@ pub(crate) fn prepare_command(
         .layers()
         .find(|layer| layer.id() == id)
         .ok_or("Unknown native transform layer")?;
+    if layer.kind() == "adjustment" {
+        return Err("Edit the adjustment effect settings or paint on its mask".into());
+    }
     let cancellation = captured.cancellation();
     let failure = RefCell::new(None);
     let checked = || match cancellation
@@ -341,7 +344,7 @@ fn stage_plane(
     }
 }
 
-fn stage(
+pub(super) fn stage(
     base: &NativeDocument,
     session: &impl Session,
     check: &dyn Fn() -> Result<(), String>,

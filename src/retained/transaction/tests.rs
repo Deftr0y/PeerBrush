@@ -62,7 +62,9 @@ impl Session for TestSession {
         let next = self.created.get() + 1;
         self.created.set(next);
         FreshFragment::create(
-            &self.parent.join(format!("fragment-{next}")),
+            &self
+                .parent
+                .join(format!("fragment-{next}-{}", crate::engine::id())),
             self.pool.clone(),
             self.disk.clone(),
             limits(),
@@ -687,6 +689,7 @@ fn virtual_selected_cut_remainder_and_blend_match_actual_legacy_native_pixels() 
                         &selection,
                         &placement,
                         layer.origin(),
+                        [layer.pixels().width(), layer.pixels().height()],
                         (kind == "fill").then_some(layer.color()),
                         fragment.store(),
                         &mut Work::new(20_000_000).unwrap(),
@@ -820,6 +823,692 @@ fn selected_folder_geometry_scalar_preserves_canvas_clipping_and_contour_edges()
             session.abort_fragment(fragment, &|| Ok(())).unwrap();
             drop(session);
             fixture.finish();
+        }
+    }
+}
+
+fn assert_raster_metadata(
+    native: &NativeDocument,
+    metadata: crate::engine::native::RasterMetadata<'_>,
+    expected: &crate::raster::Raster,
+    pool: &ResidentBudget,
+) {
+    planning::tests::assert_pixels(native.source(metadata.slot()).unwrap(), expected, pool);
+    match (metadata.retained(), expected.retained.as_ref()) {
+        (None, None) => (),
+        (Some(actual), Some(expected)) => {
+            assert_eq!(actual.matrix(), expected.matrix);
+            assert_eq!(actual.projective(), expected.projective);
+            assert_eq!(
+                serde_json::to_value(actual.warps()).unwrap(),
+                serde_json::to_value(&expected.warps).unwrap()
+            );
+            planning::tests::assert_pixels(
+                native.source(actual.pixels().slot()).unwrap(),
+                &expected.pixels,
+                pool,
+            );
+        }
+        _ => panic!(
+            "Native retained metadata differs: actual{} expected{} frame{}x{}",
+            metadata.retained().is_some(),
+            expected.retained.is_some(),
+            expected.width,
+            expected.height
+        ),
+    }
+}
+fn assert_coverage_metadata(
+    native: &NativeDocument,
+    metadata: crate::engine::native::CoverageMetadata<'_>,
+    expected: &crate::selection::Coverage,
+    pool: &ResidentBudget,
+) {
+    assert_eq!(metadata.bounds(), expected.bounds);
+    assert_eq!(metadata.origin(), expected.origin);
+    assert_raster_metadata(native, metadata.mask(), &expected.mask, pool);
+    let diagonal = expected.contours.iter().any(|line| {
+        line.iter().enumerate().any(|(i, p)| {
+            let q = line[(i + 1) % line.len()];
+            p[0] != q[0] && p[1] != q[1]
+        })
+    });
+    if diagonal {
+        assert_eq!(metadata.contours(), expected.contours);
+    } else {
+        assert_eq!(
+            contour_edges(metadata.contours()),
+            contour_edges(&expected.contours)
+        );
+    }
+}
+fn assert_selected_candidate(native: &NativeDocument, expected: &Document, pool: &ResidentBudget) {
+    for (layer, old) in native.metadata().layers().zip(&expected.layers) {
+        assert_eq!(layer.id(), old.id);
+        assert_eq!(layer.parent(), old.parent.as_deref());
+        assert_eq!(layer.origin(), [old.x, old.y]);
+        assert_eq!(layer.kind(), old.kind);
+        assert_raster_metadata(native, layer.pixels(), &old.pixels, pool);
+        match (layer.mask(), old.mask.as_ref()) {
+            (None, None) => (),
+            (Some(mask), Some(old)) => {
+                assert_eq!(mask.enabled(), old.enabled);
+                assert_eq!(mask.linked(), old.linked);
+                assert_eq!(mask.steps().len(), old.steps.len());
+                for (step, old) in mask.steps().zip(&old.steps) {
+                    assert_eq!(step.id(), old.id);
+                    assert_eq!(step.kind(), old.kind);
+                    assert_eq!(step.enabled(), old.enabled);
+                    assert_eq!(step.weight(), old.weight);
+                    assert_eq!(step.value(), old.value);
+                    assert_raster_metadata(native, step.pixels(), &old.pixels, pool);
+                }
+            }
+            _ => panic!("Native mask presence differs"),
+        }
+        assert_eq!(layer.effects().len(), old.effects.len());
+        for (effect, old) in layer.effects().zip(&old.effects) {
+            assert_eq!(effect.id(), old.id);
+            assert_eq!(effect.kind(), old.kind);
+            assert_eq!(effect.enabled(), old.enabled);
+            assert_eq!(effect.weight(), old.weight);
+            let mut expected = (*old.settings).clone();
+            let mut clips = 0;
+            if let Some(strokes) = expected
+                .get_mut("strokes")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                for (index, stroke) in strokes.iter_mut().enumerate() {
+                    if let Some(raw) = stroke.get("coverage").filter(|v| !v.is_null()) {
+                        let coverage: crate::selection::Coverage =
+                            serde_json::from_value(raw.clone()).unwrap();
+                        let actual = effect.clips().find(|(s, _)| *s == index as u32).unwrap().1;
+                        assert_coverage_metadata(native, actual, &coverage, pool);
+                        stroke.as_object_mut().unwrap().remove("coverage");
+                        clips += 1;
+                    }
+                }
+            }
+            assert_eq!(effect.clips().len(), clips);
+            assert_eq!(effect.settings(), &expected);
+        }
+    }
+    assert_eq!(native.metadata().selection(), expected.selection);
+    assert_eq!(
+        native.metadata().selection_polygon(),
+        expected.selection_polygon.as_deref()
+    );
+    for (actual, old) in [
+        (
+            native.metadata().selection_coverage(),
+            expected.selection_coverage.as_ref(),
+        ),
+        (
+            native.metadata().selection_previous(),
+            expected.selection_previous.as_ref(),
+        ),
+    ] {
+        match (actual, old) {
+            (None, None) => (),
+            (Some(actual), Some(old)) => assert_coverage_metadata(native, actual, old, pool),
+            _ => panic!("Native selection source presence differs"),
+        }
+    }
+}
+fn selected_document(depth: u16, kind: &str, linked: Option<bool>, raw: bool) -> Document {
+    let mut doc = planning::tests::fixture(depth, kind, linked);
+    doc.layers[0].x = 2;
+    doc.layers[0].y = 3;
+    doc.layers[0].pixels.set(8, 1, [17, 83, 211, 0]);
+    if let Some(mask) = &mut doc.layers[0].mask {
+        let mut pixels = crate::raster::Raster::new_depth(17, 19, depth);
+        pixels.set16(1, 4, [20123, 31007, 41009, 65003]);
+        mask.steps.push(crate::engine::MaskStep {
+            id: "second".into(),
+            kind: "paint".into(),
+            enabled: false,
+            weight: 0.45,
+            value: 1.,
+            pixels,
+            settings: json!({}),
+        });
+    }
+    doc.selection = Some([-4, -3, 13, 15]);
+    if raw {
+        let mut mask = crate::raster::Raster::new(17, 19);
+        for y in 0..19 {
+            for x in 0..17 {
+                let v = [0, 1, 64, 127, 128, 254, 255][(x + y * 3) as usize % 7];
+                mask.set(x, y, [v, 7, 11, 255]);
+            }
+        }
+        doc.selection_coverage = Some(crate::selection::Coverage {
+            mask,
+            bounds: doc.selection.unwrap(),
+            origin: [1, -2],
+            contours: vec![],
+        });
+    } else {
+        doc.selection_polygon = Some(vec![[-4., -3.], [13., -3.], [2., 15.]]);
+    }
+    let mut mask = crate::raster::Raster::new(3, 4);
+    mask.set(1, 2, [83; 4]);
+    let original = crate::retained::Original::from(&mask);
+    mask.retained = Some(Box::new(original));
+    doc.selection_previous = Some(crate::selection::Coverage {
+        mask,
+        bounds: [1, 1, 3, 4],
+        origin: [1, 1],
+        contours: vec![vec![[1., 1.], [3., 1.], [3., 4.], [1., 4.]]],
+    });
+    doc
+}
+
+#[test]
+fn selected_command_atomically_matches_legacy_color_masks_selection_and_originals() {
+    let mut cases = 0;
+    for depth in [8, 16] {
+        for (kind, linked) in [
+            ("paint", None),
+            ("paint", Some(true)),
+            ("paint", Some(false)),
+            ("fill", Some(true)),
+            ("fill", Some(false)),
+        ] {
+            for raw in [false, true] {
+                for mut command in [
+                    json!({"op":"transform","angle":17.5,"scale_x":0.83,"scale_y":1.07,"skew_x":11.25,"dx":3.25,"dy":-2.75,"fractional_translation":true}),
+                    json!({"op":"transform","mask":true,"step":"paint","angle":-13.25,"dx":-2}),
+                    json!({"op":"move","mask":true,"dx":-3,"dy":2}),
+                ] {
+                    if linked.is_none() && command["mask"] == true {
+                        continue;
+                    }
+                    let doc = selected_document(depth, kind, linked, raw);
+                    command["layer"] = json!(doc.layers[0].id);
+                    let expected = Engine::preview_edits(doc.clone(), &[command.clone()]).unwrap();
+                    let fixture = Fixture::from_legacy(doc);
+                    let baseline = fixture.disk.used().unwrap();
+                    let session = fixture.session();
+                    let descriptor = CommandDescriptor::from_normalized(
+                        &fixture.document,
+                        0,
+                        &[command.clone()],
+                        &|| Ok(()),
+                    )
+                    .unwrap();
+                    let token = descriptor.commands().next().unwrap().token();
+                    let captured = fixture
+                        .document
+                        .capture_descriptor(descriptor.clone(), "human", &[], 1, false, true)
+                        .unwrap();
+                    let prepared=prepare_command(captured,token,&session,&mut Work::new(50_000_000).unwrap(),&||Ok(())).unwrap_or_else(|reason|panic!("case{cases} depth{depth} {kind} {linked:?} raw{raw} {command}: {reason}"));
+                    assert_eq!(prepared.preview().metadata().revision(), 1);
+                    assert_eq!(fixture.document.metadata().revision(), 0);
+                    assert_selected_candidate(prepared.preview(), &expected, &fixture.pool);
+                    fixture
+                        .document
+                        .adopt(prepared)
+                        .err()
+                        .unwrap()
+                        .abort(&session, &|| Ok(()))
+                        .unwrap();
+                    assert_eq!(fixture.disk.used().unwrap(), baseline);
+                    drop(descriptor);
+                    drop(session);
+                    fixture.finish();
+                    cases += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(cases, 52);
+}
+
+#[test]
+fn selected_different_mask_frames_preserve_current_vs_original_and_final_linked_reframe() {
+    for depth in [8, 16] {
+        for linked in [false, true] {
+            for mut command in [
+                json!({"op":"transform","angle":0}),
+                json!({"op":"transform","angle":17.5}),
+                json!({"op":"transform","mask":true,"step":"paint","angle":17.5}),
+            ] {
+                let mut doc = selected_document(depth, "paint", Some(linked), true);
+                doc.selection = Some([4, 6, 9, 12]);
+                doc.selection_coverage = None;
+                let mask = doc.layers[0].mask.as_mut().unwrap();
+                let mut large = crate::raster::Raster::new_depth(31, 29, depth);
+                large.set16(16, 18, [10001, 20003, 30007, 65009]);
+                large.set16(30, 25, [41001, 31003, 21007, 64009]);
+                let original = crate::retained::Original::from(&large);
+                mask.steps[0].pixels = original.render(7, 9).unwrap();
+                mask.steps[1].pixels = large;
+                command["layer"] = json!(doc.layers[0].id);
+                let expected = Engine::preview_edits(doc.clone(), &[command.clone()]).unwrap();
+                let fixture = Fixture::from_legacy(doc);
+                let baseline = fixture.disk.used().unwrap();
+                let session = fixture.session();
+                let descriptor = CommandDescriptor::from_normalized(
+                    &fixture.document,
+                    0,
+                    &[command.clone()],
+                    &|| Ok(()),
+                )
+                .unwrap();
+                let token = descriptor.commands().next().unwrap().token();
+                let captured = fixture
+                    .document
+                    .capture_descriptor(descriptor.clone(), "human", &[], 1, false, true)
+                    .unwrap();
+                let cancellation = captured.cancellation();
+                let prepared = prepare_command(
+                    captured,
+                    token,
+                    &session,
+                    &mut Work::new(50_000_000).unwrap(),
+                    &|| Ok(()),
+                )
+                .unwrap_or_else(|e| panic!("depth{depth} linked{linked} {command}: {e}"));
+                assert_selected_candidate(prepared.preview(), &expected, &fixture.pool);
+                cancellation.cancel();
+                fixture
+                    .document
+                    .publish("human", &[], 1, false, prepared)
+                    .err()
+                    .unwrap()
+                    .abort(&session, &|| Ok(()))
+                    .unwrap();
+                assert_eq!(fixture.disk.used().unwrap(), baseline);
+                drop(descriptor);
+                drop(session);
+                fixture.finish();
+            }
+        }
+    }
+}
+
+#[test]
+fn selected_expansion_translates_typed_liquify_controls_clips_and_preserves_unknown_fields() {
+    for depth in [8, 16] {
+        for mask_only in [false, true] {
+            let mut doc = selected_document(depth, "paint", Some(false), true);
+            let mut clip = crate::raster::Raster::new(3, 4);
+            clip.set(0, 1, [127, 7, 11, 255]);
+            clip.set(1, 2, [255; 4]);
+            clip.retained = Some(Box::new(crate::retained::Original::from(&clip)));
+            let coverage = crate::selection::Coverage {
+                mask: clip,
+                bounds: [0, 0, 8, 10],
+                origin: [-1, 2],
+                contours: vec![vec![[0., 0.], [8., 0.], [0., 10.]]],
+            };
+            let settings = json!({"radius":4.,"strength":0.5,"future":{"untouched":[true,7,"exact"]},"strokes":[
+                {"mode":"push","points":[[2.125,3.75],[5.5,7.25]],"selection":[0,0,8,10],"polygon":[[0.,0.],[8.,0.],[0.,10.]],"coverage":coverage,"future_stroke":17},
+                {"mode":"expand","points":[[4.,5.]],"selection":[1,2,7,9]}
+            ]});
+            crate::effects::validate("liquify", &settings).unwrap();
+            doc.layers[0].effects.push(crate::effects::Effect {
+                id: "local-warp".into(),
+                kind: "liquify".into(),
+                enabled: false,
+                weight: 0.35,
+                settings: settings.into(),
+            });
+            let command = json!({"op":"move","layer":doc.layers[0].id,"mask":mask_only,"step":"paint","dx":-20,"dy":-10});
+            let expected = Engine::preview_edits(doc.clone(), &[command.clone()]).unwrap();
+            let fixture = Fixture::from_legacy(doc);
+            let baseline = fixture.disk.used().unwrap();
+            let session = fixture.session();
+            let descriptor =
+                CommandDescriptor::from_normalized(&fixture.document, 0, &[command], &|| Ok(()))
+                    .unwrap();
+            let token = descriptor.commands().next().unwrap().token();
+            let captured = fixture
+                .document
+                .capture_descriptor(descriptor.clone(), "human", &[], 1, false, true)
+                .unwrap();
+            let prepared = prepare_command(
+                captured,
+                token,
+                &session,
+                &mut Work::new(50_000_000).unwrap(),
+                &|| Ok(()),
+            )
+            .unwrap();
+            assert_selected_candidate(prepared.preview(), &expected, &fixture.pool);
+            fixture
+                .document
+                .adopt(prepared)
+                .err()
+                .unwrap()
+                .abort(&session, &|| Ok(()))
+                .unwrap();
+            assert_eq!(fixture.disk.used().unwrap(), baseline);
+            drop(descriptor);
+            drop(session);
+            fixture.finish();
+        }
+    }
+}
+
+#[test]
+fn selected_cancel_stale_generation_and_late_lease_refusal_retire_complete_packets() {
+    let fixture = Fixture::from_legacy(selected_document(16, "paint", Some(true), true));
+    let baseline = fixture.disk.used().unwrap();
+    let command = json!({"op":"move","layer":fixture.legacy.layers[0].id,"dx":-20,"dy":-10});
+    for mode in [0, 1, 2, 3] {
+        let session = fixture.session();
+        let descriptor = CommandDescriptor::from_normalized(
+            &fixture.document,
+            0,
+            &[command.clone()],
+            &|| Ok(()),
+        )
+        .unwrap();
+        let token = descriptor.commands().next().unwrap().token();
+        let captured = fixture
+            .document
+            .capture_descriptor(descriptor.clone(), "human", &[], 1, false, true)
+            .unwrap();
+        let cancellation = captured.cancellation();
+        let result = prepare_command(
+            captured,
+            token,
+            &session,
+            &mut Work::new(50_000_000).unwrap(),
+            &|| {
+                if mode == 0 && session.created.get() >= 2 {
+                    Err("cancel selected intermediate".into())
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        if mode == 0 {
+            assert_eq!(result.err().unwrap(), "cancel selected intermediate");
+            assert_eq!(session.created.get(), 2);
+        } else {
+            let prepared = result.unwrap();
+            let refused = if mode == 1 {
+                cancellation.cancel();
+                fixture
+                    .document
+                    .publish("human", &[], 1, false, prepared)
+                    .err()
+                    .unwrap()
+            } else if mode == 2 {
+                let target = fixture.document.metadata().layers().next().unwrap().id();
+                let changed = fixture
+                    .document
+                    .capture_edit()
+                    .unwrap()
+                    .visibility(target, false, &|| Ok(()))
+                    .unwrap();
+                let current = fixture.document.adopt(changed).ok().unwrap();
+                current
+                    .publish("human", &[], 1, false, prepared)
+                    .err()
+                    .unwrap()
+            } else {
+                let lease = crate::engine::Lease {
+                    id: "late-selected".into(),
+                    owner: "other".into(),
+                    description: "selected pixels".into(),
+                    scopes: vec![crate::engine::Scope::layer(&fixture.legacy.layers[0].id)],
+                    expires: 100,
+                };
+                fixture
+                    .document
+                    .publish("human", &[lease], 1, false, prepared)
+                    .err()
+                    .unwrap()
+            };
+            refused.abort(&session, &|| Ok(())).unwrap();
+        }
+        assert_eq!(fixture.disk.used().unwrap(), baseline);
+        assert_eq!(fixture.document.metadata().revision(), 0);
+        drop(descriptor);
+        drop(session);
+    }
+    fixture.finish();
+}
+
+fn selected_case(doc: Document, command: serde_json::Value) {
+    let expected = Engine::preview_edits(doc.clone(), &[command.clone()]).unwrap();
+    let fixture = Fixture::from_legacy(doc);
+    let baseline = fixture.disk.used().unwrap();
+    let session = fixture.session();
+    let descriptor =
+        CommandDescriptor::from_normalized(&fixture.document, 0, &[command.clone()], &|| Ok(()))
+            .unwrap();
+    let token = descriptor.commands().next().unwrap().token();
+    let captured = fixture
+        .document
+        .capture_descriptor(descriptor.clone(), "human", &[], 1, false, true)
+        .unwrap();
+    let cancellation = captured.cancellation();
+    let prepared = prepare_command(
+        captured,
+        token,
+        &session,
+        &mut Work::new(50_000_000).unwrap(),
+        &|| Ok(()),
+    )
+    .unwrap_or_else(|reason| panic!("{command}: {reason}"));
+    assert_selected_candidate(prepared.preview(), &expected, &fixture.pool);
+    assert_eq!(fixture.document.metadata().revision(), 0);
+    cancellation.cancel();
+    fixture
+        .document
+        .publish("human", &[], 1, false, prepared)
+        .err()
+        .unwrap()
+        .abort(&session, &|| Ok(()))
+        .unwrap();
+    assert_eq!(fixture.disk.used().unwrap(), baseline);
+    drop(descriptor);
+    drop(session);
+    fixture.finish();
+}
+
+#[test]
+fn selected_folder_complete_batch_keeps_hidden_children_container_masks_and_clipped_geometry() {
+    for depth in [8, 16] {
+        for raw in [false, true] {
+            for command in [
+                json!({"op":"transform","angle":17.5,"skew_x":11.25}),
+                json!({"op":"move","dx":-3,"dy":2}),
+            ] {
+                let mut doc = folder_document(depth);
+                doc.selection = Some([-4, -3, 13, 15]);
+                if raw {
+                    let mut mask = crate::raster::Raster::new(7, 9);
+                    for y in 0..9 {
+                        for x in 0..7 {
+                            let v = [0, 1, 83, 127, 254, 255][(x + 3 * y) as usize % 6];
+                            mask.set(x, y, [v, 7, 11, 255]);
+                        }
+                    }
+                    doc.selection_coverage = Some(crate::selection::Coverage {
+                        mask,
+                        bounds: doc.selection.unwrap(),
+                        origin: [1, -2],
+                        contours: vec![],
+                    });
+                } else {
+                    doc.selection_polygon = Some(vec![[-4., -3.], [13., -3.], [2., 15.]]);
+                }
+                let mut command = command;
+                command["layer"] = json!(doc.layers[0].id);
+                selected_case(doc, command);
+            }
+        }
+    }
+    // The folder mask route is one temporary paint target; children are untouched.
+    for depth in [8, 16] {
+        for linked in [false, true] {
+            let mut doc = selected_document(depth, "paint", Some(linked), false);
+            doc.layers[0].kind = "group".into();
+            let mut child = planning::tests::fixture(depth, "paint", None)
+                .layers
+                .remove(0);
+            child.parent = Some(doc.layers[0].id.clone());
+            doc.layers.push(child);
+            let command = json!({"op":"transform","layer":doc.layers[0].id,"mask":true,"step":"paint","angle":-13.25});
+            selected_case(doc, command);
+        }
+    }
+}
+
+#[test]
+fn selected_retained_current_and_stale_coverage_preserve_exact_legacy_source_policy() {
+    for depth in [8, 16] {
+        for mask in [false, true] {
+            for noop in [false, true] {
+                let mut doc = selected_document(depth, "paint", Some(false), false);
+                let original = crate::retained::Original::from(&doc.layers[0].pixels);
+                doc.layers[0].pixels = original.render(17, 19).unwrap();
+                let original = crate::retained::Original::from(
+                    &doc.layers[0].mask.as_ref().unwrap().steps[0].pixels,
+                );
+                doc.layers[0].mask.as_mut().unwrap().steps[0].pixels =
+                    original.render(17, 19).unwrap();
+                let mut stale = crate::raster::Raster::new(3, 4);
+                stale.set(1, 2, [123; 4]);
+                stale.retained = Some(Box::new(crate::retained::Original::from(&stale)));
+                doc.selection_coverage = Some(crate::selection::Coverage {
+                    mask: stale,
+                    bounds: [1, 1, 3, 4],
+                    origin: [-1, 2],
+                    contours: vec![vec![[1., 1.], [3., 1.], [1., 4.]]],
+                });
+                let command = json!({"op":"transform","layer":doc.layers[0].id,"mask":mask,"step":"paint","angle":if noop {0.}else{17.5}});
+                selected_case(doc, command);
+            }
+        }
+    }
+}
+
+#[test]
+fn selected_empty_raw_and_folder_geometry_and_named_noop_keep_legacy_early_return_order() {
+    for depth in [8, 16] {
+        for folder in [false, true] {
+            let mut doc = if folder {
+                folder_document(depth)
+            } else {
+                selected_document(depth, "paint", None, false)
+            };
+            doc.selection = Some([0, 0, 0, 0]);
+            doc.selection_polygon = None;
+            doc.selection_coverage = Some(crate::selection::Coverage {
+                mask: crate::raster::Raster::new(3, 4),
+                bounds: [0, 0, 0, 0],
+                origin: [-1, 2],
+                contours: vec![],
+            });
+            let command = json!({"op":"transform","layer":doc.layers[0].id,"mask":!folder,"step":"missing","angle":17.5});
+            selected_case(doc, command);
+            if folder {
+                for empty in [true, false] {
+                    let mut doc = folder_document(depth);
+                    doc.selection = Some(if empty {
+                        [0, 0, 0, 0]
+                    } else {
+                        [-20, -20, -10, -10]
+                    });
+                    let command = json!({"op":"move","layer":doc.layers[0].id,"dx":2,"dy":3});
+                    selected_case(doc, command);
+                }
+            }
+        }
+        let doc = selected_document(depth, "paint", None, false);
+        let command = json!({"op":"transform","layer":doc.layers[0].id,"mask":true,"step":"missing","angle":0.});
+        selected_case(doc, command);
+    }
+}
+
+#[test]
+fn selected_native_tile_edges_and_soft_coverage_match_complete_legacy_planes() {
+    for depth in [8, 16] {
+        for moving in [false, true] {
+            let mut doc = Document::new_depth(259, 257, depth).unwrap();
+            for (x, y, p) in [
+                (0, 0, [12345, 23003, 34007, 65535]),
+                (255, 255, [20123, 31007, 41009, 50003]),
+                (256, 255, [12001, 22003, 32009, 1]),
+                (258, 256, [17003, 23007, 43009, 0]),
+            ] {
+                doc.layers[0].pixels.set16(x, y, p);
+            }
+            doc.selection = Some([252, 250, 259, 257]);
+            let mut mask = crate::raster::Raster::new(259, 257);
+            for y in 249..257 {
+                for x in 251..259 {
+                    let v = [1, 64, 127, 128, 254, 255][(x + 3 * y) as usize % 6];
+                    mask.set(x, y, [v, 7, 11, 255]);
+                }
+            }
+            doc.selection_coverage = Some(crate::selection::Coverage {
+                mask,
+                bounds: doc.selection.unwrap(),
+                origin: [0, 0],
+                contours: vec![],
+            });
+            let command = if moving {
+                json!({"op":"move","layer":doc.layers[0].id,"dx":-3,"dy":-2})
+            } else {
+                json!({"op":"transform","layer":doc.layers[0].id,"angle":17.5,"dx":-2,"dy":-3})
+            };
+            selected_case(doc, command);
+        }
+    }
+}
+
+#[test]
+fn direct_adjustment_geometry_refuses_before_staging_like_shared_legacy_engine() {
+    for depth in [8, 16] {
+        for selected in [false, true] {
+            for mask in [false, true] {
+                for op in ["move", "transform"] {
+                    let mut doc = planning::tests::fixture(depth, "adjustment", Some(false));
+                    doc.selection = selected.then_some([0, 0, 7, 9]);
+                    let command = json!({"op":op,"layer":doc.layers[0].id,"mask":mask,"step":"paint","dx":2,"angle":17.5});
+                    let expected = Engine::preview_edits(doc.clone(), &[command.clone()])
+                        .err()
+                        .unwrap();
+                    let fixture = Fixture::from_legacy(doc);
+                    let session = fixture.session();
+                    let descriptor = CommandDescriptor::from_normalized(
+                        &fixture.document,
+                        0,
+                        &[command],
+                        &|| Ok(()),
+                    )
+                    .unwrap();
+                    let token = descriptor.commands().next().unwrap().token();
+                    let captured = fixture
+                        .document
+                        .capture_descriptor(descriptor.clone(), "human", &[], 1, false, true)
+                        .unwrap();
+                    assert_eq!(
+                        prepare_command(
+                            captured,
+                            token,
+                            &session,
+                            &mut Work::new(1_000_000).unwrap(),
+                            &|| Ok(())
+                        )
+                        .err()
+                        .unwrap(),
+                        expected
+                    );
+                    assert_eq!(session.created.get(), 0);
+                    drop(descriptor);
+                    drop(session);
+                    fixture.finish();
+                }
+            }
         }
     }
 }
