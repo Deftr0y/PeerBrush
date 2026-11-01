@@ -197,17 +197,57 @@ fn worker_preflight_late_parameter_refusal_and_cancel_preserve_live_authority() 
     let key = state.native().unwrap().key();
     let layer = state.view().layer(0).unwrap().id().to_owned();
     let disk = session.disk().used().unwrap();
-    for operation in ["source.update", "layer.update"] {
+    for (second, expected_reason) in [
+        (
+            serde_json::json!({"op":"source.update","layer":layer,"opacity":2}),
+            "Native command has no connected bounded producer",
+        ),
+        (
+            serde_json::json!({"op":"layer.update","layer":layer,"blend":"@unsupported-blend"}),
+            "Unsupported blend mode",
+        ),
+    ] {
         let commands = [
             serde_json::json!({"op":"layer.update","layer":layer,"visible":false}),
-            serde_json::json!({"op":operation,"layer":layer,"opacity":2}),
+            second,
         ];
-        assert!(prepare(capture(&state, &commands), &session, &|| Ok(())).is_err());
+        let failure = match prepare(capture(&state, &commands), &session, &|| Ok(())) {
+            Err(failure) => failure,
+            Ok(prepared) => {
+                prepared
+                    .abort(&session, &|| session.cleanup_check())
+                    .unwrap();
+                panic!("Refused command unexpectedly prepared");
+            }
+        };
+        assert_eq!(failure.reason, expected_reason);
+        assert!(failure.cleanup_error.is_none());
         assert_eq!(state.native().unwrap().key(), key);
         assert!(state.view().layer(0).unwrap().visible());
         assert_eq!(state.history_lengths(), [0, 0]);
         assert_eq!(session.disk().used().unwrap(), disk);
     }
+    // Out-of-range opacity is a supported legacy clamp, not invalid input.
+    let clamped = prepare(
+        capture(
+            &state,
+            &[
+                serde_json::json!({"op":"layer.update","layer":layer,"visible":false}),
+                serde_json::json!({"op":"layer.update","layer":layer,"opacity":2}),
+            ],
+        ),
+        &session,
+        &|| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(clamped.preview().metadata().layer(0).unwrap().opacity(), 1.);
+    assert!(!clamped.preview().metadata().layer(0).unwrap().visible());
+    assert_eq!(state.native().unwrap().key(), key);
+    assert_eq!(state.history_lengths(), [0, 0]);
+    clamped
+        .abort(&session, &|| session.cleanup_check())
+        .unwrap();
+    assert_eq!(session.disk().used().unwrap(), disk);
     let captured = capture(
         &state,
         &[serde_json::json!({"op":"layer.update","layer":layer,"visible":false})],
