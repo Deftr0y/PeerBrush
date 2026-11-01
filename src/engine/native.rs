@@ -1,4 +1,6 @@
 //! Immutable native document owners. No live Engine field is switched here.
+#[path = "native/batch.rs"]
+mod batch;
 #[path = "native/intent.rs"]
 mod intent;
 #[path = "native/output.rs"]
@@ -13,6 +15,10 @@ use crate::{
         memory36::{Admitted, MetadataCharge},
     },
     raster::Surface,
+};
+pub(crate) use batch::{
+    CoveragePatch, CoveragePixels, LayerPatch, RasterBatch, RefusedBatch, SelectionPatch,
+    SourceUpdate,
 };
 pub use intent::{Intent, IntentKind};
 pub use output::{OutputDraft, RefusedOutput, StagedOutput};
@@ -539,10 +545,13 @@ impl RefusedDelta {
             candidate, outputs, ..
         } = self.prepared;
         drop(candidate);
+        let mut error = None;
         for output in outputs {
-            output.into_draft().abort(session, cleanup)?;
+            if let Err(reason) = output.abort(session, cleanup) {
+                error.get_or_insert(reason);
+            }
         }
-        Ok(())
+        error.map_or(Ok(()), Err)
     }
 }
 impl PreparedDelta {
@@ -753,6 +762,16 @@ fn copy_metadata(
     pool: &ResidentBudget,
     check: &dyn Fn() -> Result<()>,
 ) -> Result<Admitted<Document36>> {
+    let metadata: Admitted<Document36> = copy_admitted(source, pool, true, check)?;
+    metadata.visit_rasters(|_| Ok(()))?;
+    Ok(metadata)
+}
+fn copy_admitted<T: Serialize, U: serde::de::DeserializeOwned + Serialize>(
+    source: &T,
+    pool: &ResidentBudget,
+    compare_wire: bool,
+    check: &dyn Fn() -> Result<()>,
+) -> Result<Admitted<U>> {
     struct Count<'a> {
         bytes: usize,
         check: &'a dyn Fn() -> Result<()>,
@@ -793,8 +812,7 @@ fn copy_metadata(
     drop(preflight);
     let owner = MetadataCharge::reserve(pool, stats.tree_upper_bytes()?, check)?;
     check()?;
-    let metadata: Document36 = serde_json::from_slice(&encoded).map_err(|e| e.to_string())?;
-    metadata.visit_rasters(|_| Ok(()))?;
+    let metadata: U = serde_json::from_slice(&encoded).map_err(|e| e.to_string())?;
     struct Same<'a> {
         expected: &'a [u8],
         at: usize,
@@ -820,8 +838,10 @@ fn copy_metadata(
         expected: &encoded,
         at: 0,
     };
-    serde_json::to_writer(&mut same, &metadata).map_err(|e| e.to_string())?;
-    if same.at != encoded.len() {
+    if compare_wire {
+        serde_json::to_writer(&mut same, &metadata).map_err(|e| e.to_string())?;
+    }
+    if compare_wire && same.at != encoded.len() {
         return Err("Native copied metadata length differs".into());
     }
     check()?;
