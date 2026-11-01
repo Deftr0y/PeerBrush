@@ -878,6 +878,27 @@ fn embedded_manifest_bytes_are_not_a_selected_record_boundary() {
 }
 
 #[test]
+fn derived_reference_identity_includes_store_spec_digest_and_offset() {
+    let fixture = Fixture::new();
+    let store = fixture.store(&ResidentBudget::new(1024).unwrap());
+    let block = store
+        .put(TileSpec::new(1, 1, 8).unwrap(), &[7; 4], &mut okay)
+        .unwrap();
+    assert_eq!(block.fingerprint(), block.fingerprint());
+    for field in 0..4 {
+        let mut other = block;
+        match field {
+            0 => other.store[0] ^= 1,
+            1 => other.spec.depth = 16,
+            2 => other.digest[0] ^= 1,
+            _ => other.offset += 1,
+        }
+        assert_ne!(block.fingerprint(), other.fingerprint());
+        assert!(store.pin(other, &mut okay).is_err());
+    }
+}
+
+#[test]
 fn held_checkpoint_selection_rechecks_late_source_changes() {
     let fixture = Fixture::new();
     let store = fixture.store(&ResidentBudget::new(1024).unwrap());
