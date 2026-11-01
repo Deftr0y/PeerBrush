@@ -220,7 +220,7 @@ impl<'a> Plan<'a> {
 
     /// Append exact standard records/channels and then every declared private
     /// tag. Callback payload hashes/lengths are verified against actual writes.
-    pub(crate) fn write_layers<W: Write>(
+    pub(crate) fn write_layers<W: Write + ?Sized>(
         &self,
         output: &mut W,
         provider: &mut impl NativeRows,
@@ -303,7 +303,7 @@ impl<'a> Plan<'a> {
             descriptors,
         })
     }
-    pub(crate) fn write_composite<W: Write>(
+    pub(crate) fn write_composite<W: Write + ?Sized>(
         &self,
         output: &mut W,
         provider: &mut impl NativeRows,
@@ -662,7 +662,7 @@ fn dimensions(bounds: [i32; 4]) -> Result<(u32, u32), String> {
     let [l, t, r, b] = bounds;
     let w = i64::from(r) - i64::from(l);
     let h = i64::from(b) - i64::from(t);
-    if [l, t, r, b].iter().any(|v| v.unsigned_abs() > 100000)
+    if [l, t].iter().any(|v| v.unsigned_abs() > 100000)
         || !(0..=16000).contains(&w)
         || !(0..=16000).contains(&h)
     {
@@ -901,6 +901,9 @@ mod tests {
     }
     fn value(channel: i16, x: i32, y: i32) -> u16 {
         if channel == -1 || channel == 3 {
+            if x == 0 && y == 0 {
+                return 0;
+            }
             (31337 + x * 173 + y * 109) as u16
         } else if channel == -2 {
             (27001 + x * 13 + y * 181) as u16
@@ -1214,5 +1217,57 @@ mod tests {
         explicit.layers = MAX_STANDARD_RECORDS;
         let index = structural::index(&mut Cursor::new(&bytes), explicit, || Ok(())).unwrap();
         assert_eq!(index.layers.len(), MAX_STANDARD_RECORDS);
+    }
+    #[test]
+    fn explicit_source_mask_edge_admission_keeps_valid_maximum_origins_without_legacy_change() {
+        let check = || Ok(());
+        let mut r = record();
+        r.bounds = [100000, 100000, 100003, 100257];
+        r.mask = Some(Mask {
+            bounds: r.bounds,
+            enabled: false,
+        });
+        let header = header(Format::Psb, 16);
+        let plan = Plan::new(header, [17; 32], vec![r], &[], &[], &check).unwrap();
+        let mut provider = Provider {
+            binding: [17; 32],
+            calls: 0,
+            fail: None,
+            swap: false,
+        };
+        let mut scratch = vec![0; MAX_TILE_BYTES];
+        let mut layers = vec![];
+        let mut composite = vec![];
+        plan.write_layers(
+            &mut layers,
+            &mut provider,
+            &mut scratch,
+            &check,
+            |_, _| unreachable!(),
+        )
+        .unwrap();
+        plan.write_composite(&mut composite, &mut provider, &mut scratch, &check)
+            .unwrap();
+        let bytes = assembled(header, &layers, &composite);
+        assert_eq!(structural::Limits::current().coordinate, 100000);
+        assert!(structural::index(
+            &mut Cursor::new(&bytes),
+            structural::Limits::current(),
+            || Ok(())
+        )
+        .is_err());
+        let mut explicit = structural::Limits::current();
+        explicit.coordinate = 116000;
+        let index = structural::index(&mut Cursor::new(&bytes), explicit, || Ok(())).unwrap();
+        let source = Source::new(Cursor::new(&bytes), bytes.len() as u64).unwrap();
+        plan.compare(
+            &source,
+            &index,
+            &mut provider,
+            &mut scratch,
+            &mut [0; 32000],
+            &check,
+        )
+        .unwrap();
     }
 }

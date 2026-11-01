@@ -34,7 +34,11 @@ impl<'a> ScenePlan<'a> {
     ) -> Result<Self, String> {
         check()?;
         let doc = scene.metadata();
-        if doc.read_only || doc.layers.len() > 200 || ![8, 16].contains(&doc.bit_depth) {
+        if doc.read_only
+            || doc.icc_profile.is_some()
+            || doc.layers.len() > 200
+            || ![8, 16].contains(&doc.bit_depth)
+        {
             return Err("Source36 save requires a supported editable captured scene".into());
         }
         validate_hierarchy(doc, check)?;
@@ -200,6 +204,8 @@ fn validate_hierarchy(
             || !layer.opacity.is_finite()
             || !(0.0..=1.0).contains(&layer.opacity)
             || layer.pixels.depth != doc.bit_depth
+            || layer.x.unsigned_abs() > 100000
+            || layer.y.unsigned_abs() > 100000
         {
             return Err("Source36 standard layer identity/kind/precision differs".into());
         }
