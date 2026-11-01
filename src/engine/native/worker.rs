@@ -2,6 +2,8 @@
 //! publishes sources, changes the live document, or enters history.
 use super::*;
 use crate::{engine::authority::NativeCapture, workspace::source_runtime::SourceSession};
+#[path = "worker/paint.rs"]
+mod paint;
 
 pub(crate) struct PreparedNative {
     document: NativeDocument,
@@ -36,6 +38,19 @@ impl PreparedNative {
     pub(crate) fn base_key(&self) -> DocumentKey {
         self.document.key()
     }
+    pub(crate) fn created_layers(&self) -> impl Iterator<Item = &str> + '_ {
+        self.preview()
+            .metadata()
+            .layers()
+            .filter(|layer| {
+                !self
+                    .document
+                    .metadata()
+                    .layers()
+                    .any(|old| old.id() == layer.id())
+            })
+            .map(|layer| layer.id())
+    }
     pub(crate) fn preview(&self) -> &NativeDocument {
         self.delta.preview()
     }
@@ -61,6 +76,7 @@ impl PreparedNative {
 pub(crate) enum Handler {
     Metadata,
     Retained,
+    Paint,
 }
 /// The central route and compatibility report share this exact implementation
 /// table. A missing producer never falls back to resident materialization.
@@ -69,6 +85,9 @@ pub(crate) fn handler(operation: &str) -> Option<Handler> {
         "layer.update" | "layer.add" | "layer.delete" | "layer.reorder" | "layer.clip"
         | "layer.parent" | "mask.remove" | "mask.toggle" | "mask.link" => Some(Handler::Metadata),
         "move" | "transform" => Some(Handler::Retained),
+        "paint" | "paint.fill" | "paint.clear_selection" | "smudge" | "clone" | "heal" => {
+            Some(Handler::Paint)
+        }
         _ => None,
     }
 }
@@ -164,6 +183,7 @@ fn prepare_step(
     )
     .ok_or("Native producer missing")?;
     match kind {
+        Handler::Paint => paint::prepare(edit, session, check),
         Handler::Metadata => edit.metadata_command(token, check),
         Handler::Retained => {
             // Preserve the existing operation work admission until the complete
