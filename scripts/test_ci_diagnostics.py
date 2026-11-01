@@ -70,6 +70,62 @@ class Diagnostics(unittest.TestCase):
         output = self.summarize(f"test {name} ... FAILED\n---- other::test stdout ----\nthread 'worker' panicked at src/other.rs:12:3:\n{PRIVATE}")
         self.assertNotIn('title=Regression failure location::', output)
 
+    def test_retained_source_checkpoints_are_exact_bounded_and_failure_scoped(self):
+        name = 'engine::native::output::tests::retained_noop_and_unshifted_expansion_keep_original_across_distinct_owned_stores'
+        header = f'test {name} ... FAILED\n---- {name} stdout ----\n'
+        valid = 'PB_RETAINED_DIAG step=8 width=16 resident=16777216 disk=8388608 ok=0'
+        output = self.summarize(header + valid + '\n' + PRIVATE)
+        self.assertIn('Retained source diagnostic::step=8 width=16 resident=16777216 disk=8388608 ok=0', output)
+        for record in [valid + ' ' + PRIVATE, valid.replace('width=16', 'width=32'),
+                       valid.replace('step=8', 'step=100'), valid.replace('resident=16777216', 'resident=16777217'),
+                       valid.replace('disk=8388608', 'disk=8388609'), valid.replace('ok=0', 'ok=2'),
+                       valid.replace('step=8', 'step=08'), PRIVATE + valid]:
+            with self.subTest(record=record):
+                self.assertNotIn('Retained source diagnostic::', self.summarize(header + record + '\n' + PRIVATE))
+        self.assertNotIn('Retained source diagnostic::', self.summarize('test other::case ... FAILED\n---- other::case stdout ----\n' + valid))
+        self.assertNotIn('Retained source diagnostic::', self.summarize('test result: ok. 1 passed; 0 failed; 0 ignored;\n' + valid, status=0))
+        output = self.summarize(header + valid + '\n' + valid.replace('step=8', 'step=9'))
+        self.assertEqual(output.count('Retained source diagnostic::'), 1)
+        self.assertIn('step=9', output)
+
+    def test_native_input_checkpoints_are_finite_case_bound_and_private(self):
+        cases = {
+            'edit_bounds::input::tests::projected_frame_and_brush_share_one_complete_output_with_the_legacy_soft_baseline': ('frame_brush', ['brush']),
+            'edit_bounds::input::tests::session_clone_and_heal_match_resident_source_offsets_and_soft_selection': ('retouch', ['clone', 'heal']),
+        }
+        for name, (case, modes) in cases.items():
+            header = f'test {name} ... FAILED\n---- {name} stdout ----\n'
+            for depth in [8, 16]:
+                for mode in modes:
+                    record = f'PB_NATIVE_INPUT_FAILURE case={case} phase=pixels depth={depth} mode={mode} category=pixel_count count=1048576'
+                    output = self.summarize(header + record + '\n' + PRIVATE)
+                    self.assertIn(f'Native input diagnostic::case={case} phase=pixels depth={depth} mode={mode} category=pixel_count count=1048576', output)
+                    invalid = [record + ' ' + PRIVATE, PRIVATE + record, record.replace('phase=pixels', 'phase=' + PRIVATE),
+                               record.replace('depth=' + str(depth), 'depth=32'), record.replace('category=pixel_count', 'category=' + PRIVATE),
+                               record.replace('count=1048576', 'count=1048577'), record.replace('count=1048576', 'count=01'),
+                               record.replace('case=' + case, 'case=other'), record.replace('mode=' + mode, 'mode=other')]
+                    invalid += [record.replace('mode=' + mode, 'mode=heal' if case == 'frame_brush' else 'mode=brush')]
+                    for bad in invalid:
+                        self.assertNotIn('Native input diagnostic::', self.summarize(header + bad + '\n' + PRIVATE))
+        marker = 'PB_NATIVE_INPUT_FAILURE case=retouch phase=cleanup depth=16 mode=heal category=quota_count count=0'
+        self.assertNotIn('Native input diagnostic::', self.summarize('test other::case ... FAILED\n---- other::case stdout ----\n' + marker))
+
+    def test_vector_refusal_status_is_bounded_boolean_and_failure_scoped(self):
+        names = [
+            'source::stage::tests::actual_session_vector_refusal_reclaims_only_owned_provisional_files',
+            'source::stage::tests::actual_session_vector_mid_record_refusal_retains_unverified_bytes_and_quota',
+        ]
+        valid = 'VECTOR_REFUSAL_STATUS completed=4096 canceled=true retained=false'
+        for name in names:
+            header = f'test {name} ... FAILED\n---- {name} stdout ----\n'
+            self.assertIn('Vector refusal diagnostic::completed=4096 canceled=true retained=false', self.summarize(header + valid + '\n' + PRIVATE))
+            for bad in [valid + ' ' + PRIVATE, PRIVATE + valid, valid.replace('4096', '4097'),
+                        valid.replace('4096', '04096'), valid.replace('true', '1'),
+                        valid.replace('false', PRIVATE), valid.replace('completed=', 'private=')]:
+                self.assertNotIn('Vector refusal diagnostic::', self.summarize(header + bad + '\n' + PRIVATE))
+        self.assertNotIn('Vector refusal diagnostic::', self.summarize('test other::case ... FAILED\n---- other::case stdout ----\n' + valid))
+        self.assertNotIn('Vector refusal diagnostic::', self.summarize('test result: ok. 1 passed; 0 failed; 0 ignored;\n' + valid, status=0))
+
     def test_effect_color_history_record_reports_only_exact_fixed_fields(self):
         name = 'ui::effect_color::tests::effect_color_hex_is_live_provisional_and_cancels_on_escape_invalid_input_and_source_changes'
         header = 'test ' + name + ' ... FAILED\n---- ' + name + ' stdout ----\n'
