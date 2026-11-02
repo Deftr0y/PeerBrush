@@ -243,6 +243,12 @@ def submit(store, name, package, report, execute=False, journal=None):
     current = store.call('/submissions/' + str(published))
     if version(report['version']) <= max(BASELINE, published_version(current)):
         raise SafeError('Package version is already live or older; no duplicate or downgrade submitted.')
+    packages = current['applicationPackages']
+    if len(packages) != 1:
+        raise SafeError('Multiple published packages require a reviewed replacement policy.')
+    requirements = {field: packages[0].get(field) for field in ('minimumDirectXVersion', 'minimumSystemRam')}
+    if not all(isinstance(value, str) and value for value in requirements.values()):
+        raise SafeError('Published hardware requirements are missing; review the Store baseline.')
     if not execute:
         print('Read-only Store preflight passed. No submission created.')
         return
@@ -260,15 +266,13 @@ def submit(store, name, package, report, execute=False, journal=None):
     journal.phase('created', sid)
     print('Created Store submission ' + sid + '. Any failure leaves this draft for inspection.')
     updated = copy.deepcopy(draft)
-    if not updated.get('applicationPackages'):
-        raise SafeError('New draft has no inherited packages; left untouched.')
-    for old in updated['applicationPackages']:
-        # Do not retire packages for other architectures/platforms accidentally.
-        if old.get('architecture', '').lower() != 'x64':
-            raise SafeError('Unexpected existing architecture. Review package replacement policy manually.')
-        old['fileStatus'] = 'PendingDelete'
-    updated['applicationPackages'].append({'fileName': name, 'fileStatus': 'PendingUpload',
-        'minimumDirectXVersion': 'None', 'minimumSystemRam': 'None'})
+    inherited = updated.get('applicationPackages')
+    binding = ('fileName', 'fileStatus', 'version', 'architecture', 'targetPlatform', 'targetDeviceFamilies', *requirements)
+    if (not isinstance(inherited, list) or len(inherited) != 1 or not isinstance(inherited[0], dict)
+            or any(inherited[0].get(field) != packages[0].get(field) for field in binding)):
+        raise SafeError('Inherited packages differ from the published baseline; inspect the draft.')
+    inherited[0]['fileStatus'] = 'PendingDelete'
+    inherited.append({'fileName': name, 'fileStatus': 'PendingUpload', **requirements})
     upload = draft.get('fileUploadUrl', '')
     parts = urllib.parse.urlparse(upload)
     if parts.scheme != 'https' or not (parts.hostname or '').endswith('.blob.core.windows.net') or parts.username or parts.port:

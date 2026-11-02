@@ -30,7 +30,8 @@ class FakeStore:
         self.calls = []
         self.app = dict(id=s.STORE_ID, packageIdentityName=s.IDENTITY, publisherName=s.PUBLISHER,
             packageFamilyName=s.FAMILY, lastPublishedApplicationSubmission={'id': '123'})
-        self.current = dict(applicationPackages=[dict(fileName='old.msix', fileStatus='Uploaded', version='1.25.0.0', architecture='x64')])
+        self.current = dict(applicationPackages=[dict(fileName='old.msix', fileStatus='Uploaded',
+            version='1.25.0.0', architecture='x64', minimumDirectXVersion='DirectX100', minimumSystemRam='Memory2GB')])
         self.draft = dict(self.current, id='456', listings={'en-us': {'description': 'Keep me'}},
             pricing={'priceId': 'Free'}, targetPublishMode='Manual',
             fileUploadUrl='https://example.blob.core.windows.net/upload?sig=redacted')
@@ -162,7 +163,7 @@ class Tests(unittest.TestCase):
         for key in ('listings', 'pricing', 'targetPublishMode'):
             self.assertEqual(updated[key], store.draft[key])
         self.assertEqual(updated['applicationPackages'][0]['fileStatus'], 'PendingDelete')
-        self.assertEqual(updated['applicationPackages'][1], {'fileName': fixture()[0], 'fileStatus': 'PendingUpload', 'minimumDirectXVersion': 'None', 'minimumSystemRam': 'None'})
+        self.assertEqual(updated['applicationPackages'][1], {'fileName': fixture()[0], 'fileStatus': 'PendingUpload', 'minimumDirectXVersion': 'DirectX100', 'minimumSystemRam': 'Memory2GB'})
         self.assertEqual(store.calls[-2][:2], ('/submissions/456/commit', 'POST'))
         self.assertEqual(upload.call_count, 1)
         self.assertEqual(store.draft['applicationPackages'][0]['fileStatus'], 'Uploaded')
@@ -181,6 +182,18 @@ class Tests(unittest.TestCase):
         with self.assertRaises(ValueError):
             s.submit(store, *fixture(), execute=True, journal=self.journal)
         self.assertFalse(any(method == 'PUT' for _, method, _ in store.calls))
+
+    def test_ambiguous_or_incomplete_baseline_refused_before_creating_draft(self):
+        for multiple in (True, False):
+            store = FakeStore()
+            packages = store.current['applicationPackages']
+            if multiple:
+                packages.append(dict(packages[0], fileName='other.msix'))
+            else:
+                del packages[0]['minimumSystemRam']
+            with self.subTest(multiple=multiple), self.assertRaises(s.SafeError):
+                s.submit(store, *fixture(), execute=True, journal=self.journal)
+            self.assertTrue(all(method == 'GET' for _, method, _ in store.calls))
 
 
 class PackageTests(unittest.TestCase):
