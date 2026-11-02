@@ -6,6 +6,7 @@
     ".github/workflows/final-inputs.yml",
     ".github/workflows/linux-qualification.yml",
     ".github/workflows/macos-qualification.yml",
+    ".github/workflows/sparkle-feed.yml",
     ".github/workflows/macos-release-signing.yml",
     ".github/workflows/pages.yml",
     ".github/workflows/production.yml",

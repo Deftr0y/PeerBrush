@@ -26,6 +26,7 @@ REPOSITORY = 'Deftr0y/PeerBrush'
 REPOSITORY_ID = 1407648785
 OWNER_ID = 21202494
 WORKFLOW = REPOSITORY + '/.github/workflows/macos-qualification.yml@refs/heads/main'
+FEED_WORKFLOW = REPOSITORY + '/.github/workflows/sparkle-feed.yml@refs/heads/main'
 SIGNING_WORKFLOW = '.github/workflows/macos-release-signing.yml'
 API = '/repos/' + REPOSITORY + '/actions/'
 MAX_FILE = 512 * 1024 * 1024
@@ -43,12 +44,12 @@ def identifier(value):
 
 
 def selected(root, commit, run_id, artifact_id, artifact_sha256, archive_name,
-             archive_sha256, image_name, image_sha256, team_id, environment):
+             archive_sha256, image_name, image_sha256, team_id, environment, for_feed=False):
     required = dict(GITHUB_REPOSITORY=REPOSITORY, GITHUB_REF='refs/heads/main',
-        GITHUB_EVENT_NAME='workflow_dispatch', GITHUB_WORKFLOW_REF=WORKFLOW,
+        GITHUB_EVENT_NAME='workflow_dispatch', GITHUB_WORKFLOW_REF=FEED_WORKFLOW if for_feed else WORKFLOW,
         GITHUB_SHA=commit, GITHUB_WORKFLOW_SHA=commit, GITHUB_RUN_ATTEMPT='1',
-        RUNNER_ENVIRONMENT='github-hosted', RUNNER_OS='macOS', RUNNER_ARCH='ARM64',
-        PEERBRUSH_NATIVE_QUALIFICATION_ENABLED='true')
+        RUNNER_ENVIRONMENT='github-hosted', RUNNER_OS='macOS', RUNNER_ARCH='ARM64')
+    required['PEERBRUSH_SPARKLE_FEED_ENABLED' if for_feed else 'PEERBRUSH_NATIVE_QUALIFICATION_ENABLED'] = 'true'
     if (not hexadecimal(commit, 40) or not identifier(run_id) or not identifier(artifact_id)
             or any(not hexadecimal(value, 64) for value in [artifact_sha256, archive_sha256, image_sha256])
             or type(team_id) is not str or not re.fullmatch('[A-Z0-9]{10}', team_id)
@@ -231,10 +232,10 @@ def extract(archive, output, selected_files):
 
 
 def acquire(root, output, *, commit, run_id, artifact_id, artifact_sha256, archive_name,
-            archive_sha256, image_name, image_sha256, team_id, token, environment):
+            archive_sha256, image_name, image_sha256, team_id, token, environment, for_feed=False):
     inputs = dict(commit=commit, run_id=run_id, artifact_id=artifact_id, artifact_sha256=artifact_sha256,
         archive_name=archive_name, archive_sha256=archive_sha256, image_name=image_name,
-        image_sha256=image_sha256, team_id=team_id)
+        image_sha256=image_sha256, team_id=team_id, for_feed=for_feed)
     version = selected(root, **inputs, environment=environment)
     output = private_inspection_directory(output, root, fresh=True)
     run_route, artifact_route = API + 'runs/' + run_id, API + 'artifacts/' + artifact_id

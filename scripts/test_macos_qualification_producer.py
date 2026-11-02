@@ -119,6 +119,18 @@ class NativeProducer(unittest.TestCase):
             with self.subTest(field=key), self.assertRaises(ValueError):
                 self.selected(inputs=changed)
 
+    def test_feed_and_native_qualification_require_their_own_workflow_and_enable_setting(self):
+        feed = dict(self.environment, GITHUB_WORKFLOW_REF=acquire.FEED_WORKFLOW)
+        del feed['PEERBRUSH_NATIVE_QUALIFICATION_ENABLED']
+        feed['PEERBRUSH_SPARKLE_FEED_ENABLED'] = 'true'
+        inputs = dict(self.inputs, for_feed=True)
+        self.assertEqual(self.selected(inputs=inputs, environment=feed), self.version)
+        for selection, context in [(self.inputs, feed), (inputs, self.environment),
+                                   (inputs, dict(feed, PEERBRUSH_SPARKLE_FEED_ENABLED='false')),
+                                   (inputs, dict(feed, GITHUB_RUN_ATTEMPT='2'))]:
+            with self.assertRaises(ValueError):
+                self.selected(inputs=selection, environment=context)
+
     def test_predecessor_first_success_main_and_exact_official_artifact_are_mandatory(self):
         self.assertEqual(self.metadata(), len(self.wrapper))
         self.run['path'] = acquire.SIGNING_WORKFLOW + '@main'

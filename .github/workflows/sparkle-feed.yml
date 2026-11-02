@@ -1,0 +1,110 @@
+name: Prepare signed Mac update feed
+on:
+  workflow_dispatch:
+    inputs:
+      expected_commit:
+        description: Reviewed stable production source and workflow SHA
+        type: string
+        required: true
+      signed_pair:
+        description: Reviewed signing run, artifact and ZIP/DMG selections as JSON
+        type: string
+        required: true
+      previous_version:
+        description: Previously published stable Mac application version
+        type: string
+        required: true
+      release_notes:
+        description: Reviewed plain text for display in the Mac updater
+        type: string
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  prepare:
+    if: github.repository == 'Deftr0y/PeerBrush' && github.ref == 'refs/heads/main' && github.sha == inputs.expected_commit && github.run_attempt == 1 && vars.PEERBRUSH_SPARKLE_FEED_ENABLED == 'true'
+    environment: apple-signing
+    runs-on: macos-26
+    timeout-minutes: 30
+    env:
+      SELECTED_COMMIT: ${{ inputs.expected_commit }}
+      PEERBRUSH_SPARKLE_FEED_ENABLED: ${{ vars.PEERBRUSH_SPARKLE_FEED_ENABLED }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify the independently selected signed pair and public feed configuration
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          SIGNED_PAIR: ${{ inputs.signed_pair }}
+          RELEASE_NOTES: ${{ inputs.release_notes }}
+        run: |
+          umask 077
+          python3 -B - <<'PY'
+          import json, os, sys
+          from pathlib import Path
+          sys.path.insert(0, 'scripts')
+          from acquire_macos_qualification_inputs import acquire
+          from package import source_files
+          from production_readiness import unique_fields
+          from sparkle_bundle import check_pins
+          root, temp = Path.cwd(), Path(os.environ['RUNNER_TEMP'])
+          pair = json.loads(os.environ['SIGNED_PAIR'], object_pairs_hook=unique_fields)
+          if set(pair) != {'run_id','artifact_id','artifact_sha256','archive_name','archive_sha256','image_name','image_sha256','team_id'}:
+              raise SystemExit('Select one signed pair with exact filenames and independent SHA-256 digests.')
+          commit = os.environ['SELECTED_COMMIT']
+          version = acquire(root, temp/'selected-pair', commit=commit, **pair, for_feed=True,
+                            environment=os.environ, token=os.environ.pop('GITHUB_TOKEN'))
+          pins = check_pins({p: b for p, b, _ in source_files(root, commit)}, version)
+          if pins is None or pins['publisher_team_id'] != pair['team_id']:
+              raise SystemExit('Reviewed feed and signing identity are required.')
+          with (temp/'public-notes.txt').open('x', encoding='utf-8') as stream:
+              stream.write(os.environ['RELEASE_NOTES'])
+          with open(os.environ['GITHUB_ENV'], 'a') as stream:
+              for key in ('archive_name','archive_sha256','image_name','image_sha256'):
+                  print(key.upper() + '=' + pair[key], file=stream)
+              print('APP_VERSION=' + version, file=stream)
+          PY
+      - name: Select the pinned Sparkle signer
+        run: |
+          umask 077
+          cd "$RUNNER_TEMP"
+          curl --fail --location --proto '=https' --proto-redir '=https' --max-filesize 16319840 --max-time 120 --output sparkle-tools.tar.xz 'https://github.com/sparkle-project/Sparkle/releases/download/2.10.0/Sparkle-2.10.0.tar.xz'
+          echo 'c2bf58aa8387266ac179357b1415d6f2635f044da8be41042af32425dae6da0c  sparkle-tools.tar.xz' | shasum -a 256 --check
+          python3 -I - <<'PY'
+          import tarfile
+          from pathlib import Path
+          with tarfile.open('sparkle-tools.tar.xz','r:xz') as archive:
+              members = [m for m in archive if m.name.removeprefix('./') == 'bin/sign_update']
+              if len(members) != 1 or not members[0].isfile() or members[0].size != 1358624:
+                  raise SystemExit('Unexpected signer in Sparkle distribution.')
+              with open('sign_update','xb') as stream:
+                  stream.write(archive.extractfile(members[0]).read())
+          Path('sign_update').chmod(0o500)
+          PY
+      - name: Sign and verify the selected DMG and appcast
+        env:
+          SPARKLE_ED25519_SEED: ${{ secrets.SPARKLE_ED25519_SEED }}
+          PREVIOUS_VERSION: ${{ inputs.previous_version }}
+        run: |
+          set +x
+          set -euo pipefail
+          seed="${SPARKLE_ED25519_SEED:?Configure the backed-up Sparkle seed in apple-signing}"
+          unset SPARKLE_ED25519_SEED
+          printf '%s\n' "$seed" | python3 -B scripts/prepare_sparkle_feed.py \
+            --commit "$SELECTED_COMMIT" --version "$APP_VERSION" --previous-version "$PREVIOUS_VERSION" \
+            --archive "$RUNNER_TEMP/selected-pair/$ARCHIVE_NAME" --archive-sha256 "$ARCHIVE_SHA256" \
+            --image "$RUNNER_TEMP/selected-pair/$IMAGE_NAME" --image-sha256 "$IMAGE_SHA256" \
+            --signer "$RUNNER_TEMP/sign_update" --notes "$RUNNER_TEMP/public-notes.txt" \
+            --work "$RUNNER_TEMP/feed-inspection" --output "$RUNNER_TEMP/reviewed-feed"
+      - name: Retain the appcast for installed acceptance and website review
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: macos-appcast-${{ github.run_id }}-1
+          path: ${{ runner.temp }}/reviewed-feed/appcast.xml
+          if-no-files-found: error
+          retention-days: 7
