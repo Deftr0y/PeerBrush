@@ -1,7 +1,7 @@
 //! Owned manual information checks and the credential-free native component probe.
 use super::{require_supported_macos, Configuration};
 pub(crate) mod checkpoint;
-pub use checkpoint::offer_recovery;
+pub use checkpoint::{offer_recovery, preserved_app};
 mod coordinator;
 mod process_identity;
 #[doc(hidden)]

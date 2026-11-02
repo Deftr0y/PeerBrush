@@ -313,6 +313,14 @@ fn checkpoints(locations: &Locations) -> PathBuf {
     locations.data.join("update-checkpoints")
 }
 
+/// A Finder launch inside the preservation directory must never start the
+/// ordinary profile with an older editor, even if the journal was damaged.
+pub fn preserved_app(executable: &Path) -> bool {
+    executable
+        .ancestors()
+        .any(|dir| dir.ends_with("Library/Application Support/PeerBrush/Data/update-checkpoints"))
+}
+
 // The default-profile owner may still be alive and holding settings.lock.
 // Recovery only reads the durable checkpoint and uses a separate editor instance.
 fn recovery_attempt(locations: &Locations) -> Result<Option<PathBuf>, String> {

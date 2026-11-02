@@ -8,6 +8,8 @@ If an update has an uncertain outcome, the default-profile launcher can offer **
 
 The proposed stable feed is **https://peerbrush.com/updates/macos/stable/appcast.xml**. This is a proposed, unpublished location, not an available update service or download. Putting the URL in this document does not configure `SUFeedURL`, deploy a feed or authorize its publication.
 
+If an interrupted replacement leaves no app to open in Applications, use Finder's **Go to Folder** and enter `~/Library/Application Support/PeerBrush/Data/update-checkpoints`. Open the preserved `PeerBrush.app` inside the update folder. It verifies the recovery option before opening an editor. The resulting window is titled **PeerBrush — Recovery workspace**.
+
 ## Exact dependency and platform boundary
 
 The pin is Sparkle **2.10.0**, official source commit `eef1a539a373c1f1a320624b1130fc5de7b2e100`. Its [official Package.swift](https://github.com/sparkle-project/Sparkle/blob/eef1a539a373c1f1a320624b1130fc5de7b2e100/Package.swift) selects `Sparkle-for-Swift-Package-Manager.zip` with SHA-256 `17e28312b8e18ab7cdbbe09a6fb28cc55a5479ec6c371dbc07cdecd2a14fd959`. The archive verified during preparation is 10,193,895 bytes. The [source release](https://github.com/sparkle-project/Sparkle/releases/tag/2.10.0) and complete upstream/external license notice are recorded in `packaging/sparkle/`; the GPL license of PeerBrush is unchanged. A changed or republished upstream asset fails the committed hash pin.

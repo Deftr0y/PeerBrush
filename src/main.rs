@@ -164,6 +164,26 @@ fn run() -> Result<(), String> {
     }
     let launch = activation::Launch::parse(args)?;
     let files = launch.absolute_files()?;
+    let window_title = "PeerBrush";
+    #[cfg(target_os = "macos")]
+    let window_title = if peerbrush::sparkle::macos::preserved_app(
+        &std::env::current_exe().map_err(|e| e.to_string())?,
+    ) {
+        if !local_preferences {
+            if !launch.headless
+                && peerbrush::sparkle::macos::offer_recovery(
+                    &peerbrush::settings::Locations::user()?,
+                    &files,
+                )?
+            {
+                return Ok(());
+            }
+            return Err("The preserved editor could not verify a recovery workspace. Open the installed copy of PeerBrush.".into());
+        }
+        "PeerBrush — Recovery workspace"
+    } else {
+        window_title
+    };
     if server::activate_existing(&state_dir, &files)? {
         return Ok(());
     }
@@ -258,7 +278,7 @@ fn run() -> Result<(), String> {
             ..Default::default()
         },
         viewport: eframe::egui::ViewportBuilder::default()
-            .with_title("PeerBrush")
+            .with_title(window_title)
             .with_icon({
                 let mark = image::load_from_memory(include_bytes!("../assets/peerbrush-logo.png"))
                     .map_err(|e| e.to_string())?
