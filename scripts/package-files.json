@@ -540,6 +540,7 @@
     "src/sparkle/macos/coordinator.rs",
     "src/sparkle/macos/coordinator_tests.rs",
     "src/sparkle/macos/driver.rs",
+    "src/sparkle/macos/health.rs",
     "src/sparkle/macos/installed.rs",
     "src/sparkle/macos/process_identity.rs",
     "src/svg.rs",
