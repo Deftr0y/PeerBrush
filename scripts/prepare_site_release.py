@@ -30,7 +30,8 @@ DOWNLOAD = 'https://github.com/' + REPOSITORY + '/releases/download/'
 RELEASE = 'https://github.com/' + REPOSITORY + '/releases/tag/'
 WEBSITE = 'https://peerbrush.com/'
 SITE_FILES = ['downloads.json', 'index.html', 'main.js', 'platform.js',
-              'releases.js', 'release-page.js', 'releases.html']
+              'releases.js', 'release-page.js', 'releases.html', 'downloads.html', 'windows.html', 'download-page.js']
+STORE_URL = 'https://apps.microsoft.com/detail/9PNR6T1Q2ZL9'
 NUMERIC = r'(?:0|[1-9][0-9]*)'
 STABLE = NUMERIC + r'\.' + NUMERIC + r'\.' + NUMERIC
 PLATFORMS = {'Windows': ('windows', 'Windows', 'x64'),
@@ -458,6 +459,10 @@ def render(previous, entry):
         raise ValueError('History versions must be unique and a new release needs a public selectable platform.')
     selected = next((r for r in data['history'] if r['version'] == data.get('version')), None)
     latest_keys = {'version', 'label', 'commit', 'releaseUrl', 'buildUrl', 'platforms', 'caution', 'sourceUrl', 'checksumsUrl', 'releaseInventorySha256'}
+    # Deployed 0.26 updated the home caution for the Store without rewriting
+    # its historical notes. Only that exact published feed needs migration.
+    if sha(previous['downloads.json'].encode()) == '51c300375e191f38f9be63128ecbf019517cf9840d0f4be2997b1636103e040d':
+        latest_keys.remove('caution')
     if selected is None or any(data.get(key) != selected.get(key) for key in latest_keys):
         raise ValueError('Existing website latest fields must match one retained history entry.')
     old = next((r for r in history if r['version'] == entry['version']), None)
@@ -492,13 +497,30 @@ def render(previous, entry):
                            assets=[dict(file=urllib.parse.unquote(p['url'].rsplit('/', 1)[-1]), sha256=p['sha256']) for p in entry['platforms']]))
     result = dict(previous)
     latest = {key: value for key, value in entry.items() if key not in {'kind', 'publishedAt', 'notes'}}
-    feed = encode(dict(latest, schema=2, history=history))
+    # The website's confirmed Store version has an independent release cycle.
+    # Never advance it from the GitHub tag or put it into this release's inventory.
+    store = data.get('windowsStore')
+    if (not isinstance(store, dict) or set(store) != {'id', 'name', 'architecture', 'channel', 'url', 'version', 'description'}
+            or (store['id'], store['name'], store['architecture'], store['channel'], store['url'])
+            != ('windows', 'Windows', 'x64', 'microsoft-store', STORE_URL)
+            or not isinstance(store['version'], str) or not re.fullmatch(r'[0-9]{1,5}\.[0-9]{1,5}(?:\.[0-9]{1,5})?', store['version'])):
+        raise ValueError('Expected the reviewed public Windows Store fallback from site-content.')
+    store_version = store['version']
+    store = dict(store, description=f'x64 · Version {store_version} available from Microsoft Store')
+    feed = encode(dict(latest, schema=2, history=history, windowsStore=store))
     result['downloads.json'] = feed.decode()
     # A delayed platform changes the feed without changing its release version.
     cache = 'release=' + entry['version'] + '&layout=' + str(int(sha(feed)[:12], 16))
     escape = html.escape
-    rows = []
+    store_row = (f'<div class="platform-row"><div class="platform-info"><svg class="icon" aria-hidden="true"><use href="#windows"/></svg>'
+                 f'<div><h3><a href="windows.html">Windows</a></h3><p data-platform-description="windows">{store["description"]}</p></div></div>'
+                 f'<span class="package-size" data-platform-size="windows">Version {store_version}</span>'
+                 f'<a class="platform-download" data-download-platform="windows" href="{STORE_URL}">Microsoft Store '
+                 '<svg class="icon" aria-hidden="true"><use href="#download"/></svg></a></div>')
+    rows = [store_row]
     for p in entry['platforms']:
+        if p['id'] == 'windows':
+            continue  # Historical portable archives belong in version history.
         rows.append(f'<div class="platform-row"><div class="platform-info"><svg class="icon" aria-hidden="true"><use href="#{p["id"]}"/></svg><div><h3>{p["name"]}</h3><p>{escape(p["description"])}</p></div></div><span class="package-size">{p["bytes"]/1e6:.1f} MB</span><a class="platform-download" href="{escape(p["url"], quote=True)}">Download <svg class="icon" aria-hidden="true"><use href="#download"/></svg></a></div><p class="download-checksum">{p["name"]} SHA-256: <code>{p["sha256"]}</code></p>')
 
     def replace(text, pattern, replacement, count=1):
@@ -507,18 +529,27 @@ def render(previous, entry):
             raise ValueError('Reviewed website output layout changed; update the renderer before preparing output.')
         return updated
 
-    index = result['index.html']
-    index = replace(index, r'<div class="platform-list" id="platform-list">.*?</div>\s*<p class="download-caution">', '<div class="platform-list" id="platform-list">\n' + '\n'.join(rows) + '\n</div>\n<p class="download-caution">')
-    index = replace(index, r'<p class="download-caution">.*?</p>', '<p class="download-caution">' + escape(entry['caution']) + '</p>')
-    index = replace(index, r'<p class="download-meta" id="download-meta">.*?</p>', '<p class="download-meta" id="download-meta">' + escape(entry['label'] + ' · ' + ' & '.join(p['name'] for p in entry['platforms'])) + '</p>')
-    index = replace(index, r'<span class="build-label" id="build-label">.*?</span>', '<span class="build-label" id="build-label">' + escape(entry['label']) + '</span>')
-    index = replace(index, r'(<a class="text-link" id="release-link"\s+href=")[^"]*', '<a class="text-link" id="release-link" href="' + entry['releaseUrl'])
-    result['index.html'] = index
+    summary = ' · '.join([entry['label'], *(p['name'] for p in entry['platforms'] if p['id'] != 'windows'),
+                          f'Windows {store_version} from Microsoft Store'])
+    for name in ('index.html', 'downloads.html'):
+        page = replace(result[name], r'<div class="platform-list" id="platform-list">.*?</div>\s*<p class="download-caution">', '<div class="platform-list" id="platform-list">\n' + '\n'.join(rows) + '\n</div>\n<p class="download-caution">')
+        page = replace(page, r'<p class="download-caution">.*?</p>', '<p class="download-caution">' + escape(entry['caution']) + '</p>')
+        page = replace(page, r'<span class="build-label" id="build-label">.*?</span>', '<span class="build-label" id="build-label">' + escape(entry['label']) + '</span>')
+        result[name] = replace(page, r'(<a class="text-link" id="release-link"\s+href=")[^"]*', '<a class="text-link" id="release-link" href="' + entry['releaseUrl'])
+    result['index.html'] = replace(result['index.html'], r'<p class="download-meta" id="download-meta">.*?</p>', '<p class="download-meta" id="download-meta">' + escape(summary) + '</p>')
+    result['index.html'] = replace(result['index.html'], r'(<div class="other-downloads" id="other-downloads"[^>]*>).*?</div>', f'<div class="other-downloads" id="other-downloads" aria-label="Other operating systems"><a class="text-link" href="{STORE_URL}">Windows {store_version} · Microsoft Store</a></div>')
+    result['downloads.html'] = replace(result['downloads.html'], r'<p class="page-description">.*?</p>', '<p class="page-description">' + escape(summary) + '</p>')
+    win = replace(result['windows.html'], r'<div class="platform-row">.*?</a></div>(?=\s*</div></section>)', store_row)
+    win = replace(win, r'<p class="page-description" data-platform-label="windows">.*?</p>', f'<p class="page-description" data-platform-label="windows">PeerBrush {store_version} · Microsoft Store</p>')
+    result['windows.html'] = replace(win, r'<p data-platform-description="windows">.*?</p>', '<p data-platform-description="windows">' + store['description'] + '</p>', 2)
+    for name in ('downloads.html', 'windows.html'):
+        result[name] = replace(result[name], r'<meta name="description" content="[^"]*">', '<meta name="description" content="' + escape(summary, quote=True) + '">')
     result['main.js'] = replace(result['main.js'], r'''if \(!loaded\) document.querySelector\('#build-label'\).textContent = (?:'[^']*'|"[^"]*");''', "if (!loaded) document.querySelector('#build-label').textContent = " + json.dumps(entry['label']) + ';')
     cache_counts = {'index.html': 1, 'main.js': 2, 'platform.js': 0,
-                    'releases.js': 1, 'release-page.js': 2, 'releases.html': 1}
+                    'releases.js': 1, 'release-page.js': 2, 'releases.html': 1,
+                    'downloads.html': 1, 'windows.html': 1, 'download-page.js': 2}
     for name, count in cache_counts.items():
-        result[name] = replace(result[name], r'release=[^\s\'"&;]+(?:(?:&amp;|&)layout=[0-9]+)?',
+        result[name] = replace(result[name], r'release=[^\s\'"&;]+(?:(?:&amp;|&)(?:layout|downloads)=[0-9]+)?',
                                escape(cache, quote=True) if name.endswith('.html') else cache, count)
     result['releases.html'], count = re.subn(r'(data-doc="([a-z0-9.-]+)"\s+href=")https://github.com/Deftr0y/PeerBrush/blob/[^/]+/docs/[^"]+',
                                            lambda m: m[1] + 'https://github.com/' + REPOSITORY + '/blob/' + entry['commit'] + '/docs/' + m[2], result['releases.html'])

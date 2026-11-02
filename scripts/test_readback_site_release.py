@@ -87,7 +87,7 @@ class Readback(unittest.TestCase):
         self.assertEqual(result['downloads']['status'], 'verified')
         self.assertEqual(set(result['downloads']['verified_platforms']), {'windows', 'macos', 'linux'})
         self.assertEqual(set(self.urls), set(self.requests) & set(self.urls))
-        self.assertLessEqual(len(result['website']['files']), 16)
+        self.assertLessEqual(len(result['website']['files']), 17)
         self.assertIn(site.WEBSITE, self.requests)
         self.assertTrue(any('downloads.json?release=v0.2.0' in url for url in self.requests))
         revision = str(int(site.sha(self.files['downloads.json'])[:12], 16))

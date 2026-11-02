@@ -61,7 +61,7 @@ def expected(directory):
             or type(report['release_inventory_sha256']) is not str or not re.fullmatch('[0-9a-f]{64}', report['release_inventory_sha256'])
             or not isinstance(report['excluded'], list) or len(report['excluded']) > 16
             or not isinstance(report['files'], dict) or set(report['files']) != set(SITE_FILES)):
-        raise ValueError('Expected a prepared seven-file report with separate unverified production/Store status.')
+        raise ValueError('Expected a complete website report with separate unverified production/Store status.')
     files = {}
     for name, digest in report['files'].items():
         path = regular_file(directory, 'public-site/' + name)
@@ -117,16 +117,16 @@ def resource_urls(files):
                 if name in SITE_FILES:
                     requests[url] = name
 
-    for name in ['index.html', 'releases.html']:
+    for name in ['index.html', 'releases.html', 'downloads.html', 'windows.html']:
         Scripts().feed(files[name].decode())
-    for name in ['main.js', 'releases.js', 'release-page.js']:
+    for name in ['main.js', 'releases.js', 'release-page.js', 'download-page.js']:
         for value in re.findall(r'''from ['"](\./(?:platform|releases)\.js\?[^'"]+)['"]''', files[name].decode()):
             url = urllib.parse.urljoin(WEBSITE, value)
             requests[url] = urllib.parse.urlsplit(url).path.removeprefix('/')
     for url, name in list(requests.items()):
-        if name in {'main.js', 'release-page.js'} and urllib.parse.urlsplit(url).query:
+        if name in {'main.js', 'release-page.js', 'download-page.js'} and urllib.parse.urlsplit(url).query:
             requests[WEBSITE + 'downloads.json?' + urllib.parse.urlsplit(url).query] = 'downloads.json'
-    if len(requests) > 16 or any(not public_url(url, website=True) for url in requests):
+    if len(requests) > 17 or any(not public_url(url, website=True) for url in requests):
         raise ValueError('Expected page resource URLs left the bounded official website contract.')
     return requests
 

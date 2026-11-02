@@ -582,7 +582,7 @@ class Rendering(unittest.TestCase):
                           checksumsUrl=site.DOWNLOAD + 'v0.30.0/SHA256SUMS', releaseInventorySha256='d' * 64,
                           caution='Limited <checked> & honest.', notes=['New public notes.'])
         self.entry.pop('buildUrl', None)
-        self.entry['platforms'] = [dict(id='windows', name='Windows', architecture='x64', url=site.DOWNLOAD + 'v0.30.0/final.zip',
+        self.entry['platforms'] = [dict(id='macos', name='macOS', architecture='arm64', url=site.DOWNLOAD + 'v0.30.0/final.zip',
                                         bytes=1234, sha256='c' * 64, nativeSigning='unverified', description='Portable ZIP · Trust unverified')]
 
     def test_actual_site_output_updates_all_baked_fields_cache_and_history(self):
@@ -590,6 +590,10 @@ class Rendering(unittest.TestCase):
         data = json.loads(result['downloads.json'])
         self.assertEqual(data['history'][1:], self.history)
         self.assertEqual(data['platforms'], self.entry['platforms'])
+        self.assertEqual((data['windowsStore']['url'], data['windowsStore']['version']), (site.STORE_URL, '0.25'))
+        for page in ['index.html', 'downloads.html', 'windows.html']:
+            self.assertIn(site.STORE_URL.encode(), result[page])
+            self.assertIn(b'Version 0.25', result[page])
         for name, raw in result.items():
             text = raw.decode()
             if name != 'downloads.json':
