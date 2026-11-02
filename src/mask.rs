@@ -1,6 +1,7 @@
 //! Derived grayscale masks stay out of PSD source data and undo snapshots.
 //! Three sliding-window box passes feather edges in linear time.
 use crate::engine::{Layer, Mask};
+pub(crate) mod region;
 use std::{
     collections::{HashMap, VecDeque},
     sync::{Arc, Mutex, OnceLock},

@@ -132,6 +132,15 @@ pub fn defaults(kind: &str) -> Value {
     v
 }
 pub fn validate(kind: &str, value: &Value) -> Result<(), String> {
+    validate_with_bitmap(kind, value, |source| {
+        crate::effects::patterns::get(source).map(|_| ())
+    })
+}
+fn validate_with_bitmap(
+    kind: &str,
+    value: &Value,
+    mut validate_bitmap: impl FnMut(&str) -> Result<(), String>,
+) -> Result<(), String> {
     if !contains(kind) {
         return Err("Unsupported layer-style effect".into());
     }
@@ -199,9 +208,7 @@ pub fn validate(kind: &str, value: &Value) -> Result<(), String> {
             }
             "pattern" => choice(v, &["checker", "stripes", "dots", "noise"], key)?,
             "bitmap_png" => {
-                crate::effects::patterns::get(
-                    v.as_str().ok_or("bitmap_png must be base64 PNG text")?,
-                )?;
+                validate_bitmap(v.as_str().ok_or("bitmap_png must be base64 PNG text")?)?;
             }
             "sampling" => choice(v, &["bilinear", "nearest"], key)?,
             "position" => choice(v, &["inside", "outside", "center"], key)?,
@@ -249,7 +256,7 @@ pub fn validate(kind: &str, value: &Value) -> Result<(), String> {
         return Err("Contour points require the Custom contour".into());
     }
     if bitmap {
-        crate::effects::patterns::get(
+        validate_bitmap(
             value["bitmap_png"]
                 .as_str()
                 .ok_or("Bitmap pattern requires bitmap_png")?,
@@ -264,6 +271,32 @@ pub fn validate(kind: &str, value: &Value) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+pub(crate) fn normalized_prepared(
+    kind: &str,
+    value: &Value,
+    bitmap: Option<&crate::effects::patterns::PreparedBitmap>,
+) -> Result<Value, String> {
+    let active = crate::effects::patterns::active(kind, value);
+    if active != bitmap.is_some() {
+        return Err("Regional bitmap styles require their exact admitted native payload".into());
+    }
+    validate_with_bitmap(kind, value, |source| {
+        bitmap
+            .ok_or("Regional bitmap was not prepared")?
+            .matches_source(source)
+    })?;
+    let mut result = defaults(kind);
+    if active {
+        for (key, value) in bitmap_defaults().as_object().unwrap() {
+            result[key] = value.clone();
+        }
+    }
+    for (key, value) in value.as_object().unwrap() {
+        result[key] = value.clone();
+    }
+    Ok(result)
 }
 fn choice(value: &Value, allowed: &[&str], key: &str) -> Result<(), String> {
     if allowed.contains(&value.as_str().unwrap_or("")) {
@@ -293,12 +326,28 @@ fn profile(x: f64, key: &str) -> f64 {
 pub fn working_bytes(width: u32, height: u32) -> u64 {
     u64::from(width) * u64::from(height) * 64 + u64::from(width.max(height)) * 64
 }
+fn filled<T: Clone>(length: usize, value: T) -> Result<Vec<T>, String> {
+    let mut result = Vec::new();
+    result
+        .try_reserve_exact(length)
+        .map_err(|_| "Style buffer allocation failed")?;
+    result.resize(length, value);
+    Ok(result)
+}
+fn copied<T: Clone>(source: &[T]) -> Result<Vec<T>, String> {
+    let mut result = Vec::new();
+    result
+        .try_reserve_exact(source.len())
+        .map_err(|_| "Style buffer allocation failed")?;
+    result.extend_from_slice(source);
+    Ok(result)
+}
 /// Separable box smoothing with transparent samples outside the frame, O(pixels).
-fn smooth(values: &mut Vec<f64>, w: usize, h: usize, r: usize) {
+pub(super) fn smooth(values: &mut Vec<f64>, w: usize, h: usize, r: usize) -> Result<(), String> {
     if r == 0 || w == 0 || h == 0 {
-        return;
+        return Ok(());
     }
-    let mut out = vec![0.; values.len()];
+    let mut out = filled(values.len(), 0.)?;
     let span = (r * 2 + 1) as f64;
     for y in 0..h {
         let mut sum = (0..=r.min(w - 1)).map(|x| values[y * w + x]).sum::<f64>();
@@ -324,6 +373,7 @@ fn smooth(values: &mut Vec<f64>, w: usize, h: usize, r: usize) {
             }
         }
     }
+    Ok(())
 }
 fn sample(v: &[f64], w: usize, h: usize, x: f64, y: f64) -> f64 {
     let ix = x.floor() as i32;
@@ -382,8 +432,151 @@ pub fn apply(
     kind: &str,
     v: &Value,
 ) -> Result<(), String> {
+    apply_window(words, width, height, kind, v, Window::full(width, height))
+}
+
+/// Global alpha geometry is an explicit reduction of this exact stage's input.
+/// An unknown reduction must never be replaced by the current crop's bounds.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum AlphaBounds {
+    Empty,
+    Nonzero([u32; 4]),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Window {
+    pub origin: [u32; 2],
+    pub frame: [u32; 2],
+    pub alpha_bounds: Option<AlphaBounds>,
+}
+impl Window {
+    pub(crate) fn full(width: u32, height: u32) -> Self {
+        Self {
+            origin: [0, 0],
+            frame: [width, height],
+            alpha_bounds: None,
+        }
+    }
+    fn validate(self, width: u32, height: u32) -> Result<(), String> {
+        if self.origin[0]
+            .checked_add(width)
+            .is_none_or(|v| v > self.frame[0])
+            || self.origin[1]
+                .checked_add(height)
+                .is_none_or(|v| v > self.frame[1])
+        {
+            return Err("Style window is outside its declared full frame".into());
+        }
+        if let Some(AlphaBounds::Nonzero([left, top, right, bottom])) = self.alpha_bounds {
+            if left >= right || top >= bottom || right > self.frame[0] || bottom > self.frame[1] {
+                return Err("Style alpha reduction is outside its declared full frame".into());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The caller must prepare the complete finite-support input window first.
+/// Only output samples beyond the kernel halo are authoritative.
+pub(crate) fn apply_window(
+    words: &mut [u16],
+    width: u32,
+    height: u32,
+    kind: &str,
+    v: &Value,
+    window: Window,
+) -> Result<(), String> {
+    apply_window_field(words, width, height, kind, v, window, None)
+}
+
+pub(crate) fn smoothing_radii(kind: &str, settings: &Value) -> Vec<u32> {
+    let mut radii = if matches!(
+        kind,
+        "inner_glow" | "outer_glow" | "inner_shadow" | "drop_shadow" | "satin" | "bevel_emboss"
+    ) {
+        vec![(number(settings, "size") / 3.).ceil() as u32; 3]
+    } else {
+        Vec::new()
+    };
+    if kind == "bevel_emboss" {
+        radii.push(number(settings, "soften").ceil() as u32);
+    }
+    radii
+}
+
+pub(crate) fn field_padding(kind: &str, settings: &Value) -> i32 {
+    match kind {
+        "inner_shadow" | "drop_shadow" | "satin" => number(settings, "distance").ceil() as i32 + 1,
+        // Bilinear sampling reads the neighbouring cell even at an integer
+        // probe, so +/-1 gradient probes require two declared edge samples.
+        "bevel_emboss" => 2,
+        _ => 0,
+    }
+}
+
+pub(crate) fn apply_window_field(
+    words: &mut [u16],
+    width: u32,
+    height: u32,
+    kind: &str,
+    v: &Value,
+    window: Window,
+    prepared_field: Option<&super::field::PreparedField>,
+) -> Result<(), String> {
     let resolved = crate::effects::normalized(kind, v)?;
-    let v = &resolved;
+    let bitmap = crate::effects::patterns::from_settings(kind, &resolved)?;
+    apply_window_resolved(
+        words,
+        width,
+        height,
+        kind,
+        &resolved,
+        window,
+        prepared_field,
+        bitmap
+            .as_deref()
+            .map(|b| b as &dyn crate::effects::patterns::Sampler),
+    )
+}
+
+pub(crate) fn apply_window_prepared(
+    words: &mut [u16],
+    width: u32,
+    height: u32,
+    kind: &str,
+    v: &Value,
+    window: Window,
+    prepared_field: Option<&super::field::PreparedField>,
+    bitmap: Option<&crate::effects::patterns::PreparedBitmap>,
+) -> Result<(), String> {
+    // The regional Plan captured and validated these normalized settings and
+    // source-bound owner once. Borrow them; cloning PNG strings or decoding a
+    // legacy cache here would create unadmitted per-tile allocations.
+    if crate::effects::patterns::active(kind, v) != bitmap.is_some() {
+        return Err("Captured regional style is missing its admitted bitmap owner".into());
+    }
+    apply_window_resolved(
+        words,
+        width,
+        height,
+        kind,
+        v,
+        window,
+        prepared_field,
+        bitmap.map(|b| b as &dyn crate::effects::patterns::Sampler),
+    )
+}
+
+fn apply_window_resolved(
+    words: &mut [u16],
+    width: u32,
+    height: u32,
+    kind: &str,
+    v: &Value,
+    window: Window,
+    prepared_field: Option<&super::field::PreparedField>,
+    bitmap: Option<&dyn crate::effects::patterns::Sampler>,
+) -> Result<(), String> {
     let (w, h) = (width as usize, height as usize);
     if w.checked_mul(h).and_then(|n| n.checked_mul(4)) != Some(words.len()) {
         return Err("Style dimensions do not match native samples".into());
@@ -391,14 +584,73 @@ pub fn apply(
     if words.is_empty() || number(v, "opacity") == 0. {
         return Ok(());
     }
-    let source = words.to_vec();
-    let alpha: Vec<f64> = source
-        .chunks_exact(4)
-        .map(|p| f64::from(p[3]) / 65535.)
-        .collect();
-    let mut field = alpha.clone();
-    let gradient_grid = (kind == "gradient_overlay" && v["pixel_grid"] == true)
-        .then(|| crate::effects::gradient::Grid::new(&alpha, w, h, v));
+    window.validate(width, height)?;
+    if prepared_field.is_none()
+        && (window.origin != [0, 0] || window.frame != [width, height])
+        && smoothing_radii(kind, v).iter().any(|r| *r > 0)
+    {
+        return Err("Regional spatial styles require an exact full-origin smoothing field".into());
+    }
+    if let Some(field) = prepared_field {
+        let pad = field_padding(kind, v);
+        let need = [
+            (window.origin[0] as i32 - pad).max(0),
+            (window.origin[1] as i32 - pad).max(0),
+            (window.origin[0] as i32 + width as i32 + pad).min(window.frame[0] as i32),
+            (window.origin[1] as i32 + height as i32 + pad).min(window.frame[1] as i32),
+        ];
+        let bounds = field.bounds();
+        if field.frame() != window.frame
+            || bounds[0] > need[0]
+            || bounds[1] > need[1]
+            || bounds[2] < need[2]
+            || bounds[3] < need[3]
+        {
+            return Err(
+                "Prepared style field does not cover its exact global sampling footprint".into(),
+            );
+        }
+    }
+    let source = copied(words)?;
+    let mut alpha = filled(w * h, 0.)?;
+    for (a, p) in alpha.iter_mut().zip(source.chunks_exact(4)) {
+        *a = f64::from(p[3]) / 65535.;
+    }
+    let mut field = if prepared_field.is_none() {
+        copied(&alpha)?
+    } else {
+        Vec::new()
+    };
+    let gradient_grid = if kind == "gradient_overlay" && v["pixel_grid"] == true {
+        let full = window.origin == [0, 0] && window.frame == [width, height];
+        if full && window.alpha_bounds.is_none() {
+            Some(crate::effects::gradient::Grid::new(&alpha, w, h, v))
+        } else {
+            let bounds = if v["align_layer"] == true {
+                match window.alpha_bounds {
+                    Some(AlphaBounds::Nonzero(b)) => b,
+                    Some(AlphaBounds::Empty) => [0, 0, window.frame[0], window.frame[1]],
+                    None => return Err(
+                        "Regional layer-aligned gradient requires exact global input-alpha bounds"
+                            .into(),
+                    ),
+                }
+            } else {
+                [0, 0, window.frame[0], window.frame[1]]
+            };
+            Some(crate::effects::gradient::Grid::from_bounds(
+                (
+                    bounds[0] as usize,
+                    bounds[1] as usize,
+                    bounds[2] as usize,
+                    bounds[3] as usize,
+                ),
+                v,
+            ))
+        }
+    } else {
+        None
+    };
     let size = number(v, "size");
     let distance = number(v, "distance");
     let offset = (number(v, "offset_x"), number(v, "offset_y"));
@@ -427,21 +679,36 @@ pub fn apply(
     } else {
         (direction.0 * distance, -direction.1 * distance)
     };
-    if matches!(
-        kind,
-        "inner_glow" | "outer_glow" | "inner_shadow" | "drop_shadow" | "satin" | "bevel_emboss"
-    ) {
-        for _ in 0..3 {
-            smooth(&mut field, w, h, (size / 3.).ceil() as usize);
+    if prepared_field.is_none() {
+        for radius in smoothing_radii(kind, v) {
+            smooth(&mut field, w, h, radius as usize)?;
         }
     }
-    if kind == "bevel_emboss" {
-        smooth(&mut field, w, h, number(v, "soften").ceil() as usize);
-    }
+    let field_value = |x: usize, y: usize| -> Result<f64, String> {
+        prepared_field.map_or_else(
+            || Ok(field[y * w + x]),
+            |f| {
+                f.value(
+                    x as i32 + window.origin[0] as i32,
+                    y as i32 + window.origin[1] as i32,
+                )
+            },
+        )
+    };
+    let field_sample = |x: usize, y: usize, dx: f64, dy: f64| -> Result<f64, String> {
+        prepared_field.map_or_else(
+            || Ok(sample(&field, w, h, x as f64 + dx, y as f64 + dy)),
+            |f| {
+                f.sample(
+                    (x + window.origin[0] as usize) as f64 + dx,
+                    (y + window.origin[1] as usize) as f64 + dy,
+                )
+            },
+        )
+    };
     let color = rgb(v, "color");
     let color2 = rgb(v, "color2");
     let opacity = number(v, "opacity");
-    let bitmap = crate::effects::patterns::from_settings(kind, v)?;
     let blend = v["blend"].as_str().unwrap_or("normal");
     let channel_blend = |key: &str| {
         v[key]
@@ -466,6 +733,8 @@ pub fn apply(
     };
     for y in 0..h {
         for x in 0..w {
+            let global_x = x + window.origin[0] as usize;
+            let global_y = y + window.origin[1] as usize;
             let at = (y * w + x) * 4;
             let original: [u16; 4] = source[at..at + 4].try_into().unwrap();
             let a = alpha[y * w + x];
@@ -477,12 +746,12 @@ pub fn apply(
             match kind {
                 "gradient_overlay" => {
                     let scale = number(v, "scale");
-                    let px = (x as f64 + 0.5) / w as f64 - 0.5 - offset.0;
-                    let py = (y as f64 + 0.5) / h as f64 - 0.5 - offset.1;
+                    let px = (global_x as f64 + 0.5) / window.frame[0] as f64 - 0.5 - offset.0;
+                    let py = (global_y as f64 + 0.5) / window.frame[1] as f64 - 0.5 - offset.1;
                     let position = px * direction.0 - py * direction.1;
                     let style = v["style"].as_str().unwrap_or("linear");
                     let mut t = if let Some(grid) = &gradient_grid {
-                        grid.position(x, y, style)
+                        grid.position(global_x, global_y, style)
                     } else {
                         match style {
                             "radial" => px.hypot(py) * 2. / scale,
@@ -510,11 +779,11 @@ pub fn apply(
                 }
                 "pattern_overlay" => {
                     if let Some(bitmap) = &bitmap {
-                        let sample = bitmap.sample(x as f64, y as f64, v);
+                        let sample = bitmap.sample(global_x as f64, global_y as f64, v);
                         tint = sample[..3].try_into().unwrap();
                         coverage = f64::from(sample[3]) / 65535.;
                     } else {
-                        let t = pattern(x as f64, y as f64, v);
+                        let t = pattern(global_x as f64, global_y as f64, v);
                         tint = std::array::from_fn(|c| {
                             ((1. - t) * f64::from(color[c]) + t * f64::from(color2[c])).round()
                                 as u16
@@ -535,9 +804,10 @@ pub fn apply(
                             pattern(x, y, v)
                         }
                     };
-                    let light = (height(x as f64 + angle.cos(), y as f64 - angle.sin())
-                        - height(x as f64 - angle.cos(), y as f64 + angle.sin()))
-                        * number(v, "depth");
+                    let light =
+                        (height(global_x as f64 + angle.cos(), global_y as f64 - angle.sin())
+                            - height(global_x as f64 - angle.cos(), global_y as f64 + angle.sin()))
+                            * number(v, "depth");
                     coverage = light.abs().min(1.);
                     tint = if light > 0. { color2 } else { color };
                 }
@@ -554,25 +824,24 @@ pub fn apply(
                     tint = [word(mapped); 3];
                 }
                 "outer_glow" => {
-                    coverage =
-                        contour((field[y * w + x] / (1. - number(v, "spread")).max(0.01)).min(1.))
-                            * (1. - a);
+                    coverage = contour(
+                        (field_value(x, y)? / (1. - number(v, "spread")).max(0.01)).min(1.),
+                    ) * (1. - a);
                     behind = true;
                     outside = true;
                 }
                 "inner_glow" => {
                     coverage = if v["source"] == "center" {
-                        field[y * w + x]
+                        field_value(x, y)?
                     } else {
-                        1. - field[y * w + x]
+                        1. - field_value(x, y)?
                     };
                     coverage = contour((coverage / (1. - number(v, "spread")).max(0.01)).min(1.));
                 }
                 "drop_shadow" => {
                     coverage = contour(
-                        (sample(&field, w, h, x as f64 - dx, y as f64 - dy)
-                            / (1. - number(v, "spread")).max(0.01))
-                        .min(1.),
+                        (field_sample(x, y, -dx, -dy)? / (1. - number(v, "spread")).max(0.01))
+                            .min(1.),
                     );
                     // Optional pre-composite knockout. The later behind blend
                     // is separate: neither step replaces original alpha/RGB.
@@ -585,26 +854,22 @@ pub fn apply(
                 }
                 "inner_shadow" => {
                     coverage = contour(
-                        ((1. - sample(&field, w, h, x as f64 - dx, y as f64 - dy))
+                        ((1. - field_sample(x, y, -dx, -dy)?)
                             / (1. - number(v, "spread")).max(0.01))
                         .min(1.),
                     );
                 }
                 "satin" => {
                     coverage = contour(
-                        (sample(&field, w, h, x as f64 + dx, y as f64 + dy)
-                            - sample(&field, w, h, x as f64 - dx, y as f64 - dy))
-                        .abs(),
+                        (field_sample(x, y, dx, dy)? - field_sample(x, y, -dx, -dy)?).abs(),
                     );
                     if v["invert"] == true {
                         coverage = 1. - coverage;
                     }
                 }
                 "bevel_emboss" => {
-                    let gx = sample(&field, w, h, x as f64 + 1., y as f64)
-                        - sample(&field, w, h, x as f64 - 1., y as f64);
-                    let gy = sample(&field, w, h, x as f64, y as f64 + 1.)
-                        - sample(&field, w, h, x as f64, y as f64 - 1.);
+                    let gx = field_sample(x, y, 1., 0.)? - field_sample(x, y, -1., 0.)?;
+                    let gy = field_sample(x, y, 0., 1.)? - field_sample(x, y, 0., -1.)?;
                     let mut light = (gx * angle.cos() - gy * angle.sin())
                         * number(v, "depth")
                         * (size + 1.)
@@ -613,7 +878,7 @@ pub fn apply(
                         light = -light;
                     }
                     if v["style"] == "pillow" {
-                        light *= 2. * field[y * w + x] - 1.;
+                        light *= 2. * field_value(x, y)? - 1.;
                     }
                     coverage = contour(light.abs().min(1.));
                     tint = if light >= 0. { color } else { color2 };
@@ -667,20 +932,26 @@ pub fn apply(
         }
     }
     if kind == "stroke" {
-        stroke(words, &source, &alpha, w, h, v);
+        stroke(words, &source, &alpha, w, h, v, window)?;
     }
     Ok(())
 }
 // Exact squared Euclidean distance transform, linear work per row/column.
-fn distances(alpha: &[f64], w: usize, h: usize, inside: bool) -> Vec<f64> {
-    let mut values: Vec<f64> = alpha
-        .iter()
-        .map(|a| if (*a > 0.5) == inside { 1e12 } else { 0. })
-        .collect();
-    let transform = |input: &[f64]| -> Vec<f64> {
+fn distances(
+    alpha: &[f64],
+    w: usize,
+    h: usize,
+    inside: bool,
+    window: Window,
+) -> Result<Vec<f64>, String> {
+    let mut values = filled(alpha.len(), 0.)?;
+    for (value, a) in values.iter_mut().zip(alpha) {
+        *value = if (*a > 0.5) == inside { 1e12 } else { 0. };
+    }
+    let transform = |input: &[f64]| -> Result<Vec<f64>, String> {
         let n = input.len();
-        let mut sites = vec![0usize; n];
-        let mut bounds = vec![0.; n + 1];
+        let mut sites = filled(n, 0usize)?;
+        let mut bounds = filled(n + 1, 0.)?;
         let mut k = 0;
         bounds[0] = f64::NEG_INFINITY;
         bounds[1] = f64::INFINITY;
@@ -701,7 +972,7 @@ fn distances(alpha: &[f64], w: usize, h: usize, inside: bool) -> Vec<f64> {
             bounds[k + 1] = f64::INFINITY;
         }
         k = 0;
-        let mut result = vec![0.; n];
+        let mut result = filled(n, 0.)?;
         for (q, out) in result.iter_mut().enumerate() {
             while bounds[k + 1] < (q as f64) {
                 k += 1;
@@ -709,40 +980,55 @@ fn distances(alpha: &[f64], w: usize, h: usize, inside: bool) -> Vec<f64> {
             let p = sites[k];
             *out = ((q as f64 - p as f64).powi(2) + input[p]).max(0.);
         }
-        result
+        Ok(result)
     };
     for row in values.chunks_exact_mut(w) {
-        row.copy_from_slice(&transform(row));
+        row.copy_from_slice(&transform(row)?);
     }
-    let mut column = vec![0.; h];
+    let mut column = filled(h, 0.)?;
     for x in 0..w {
         for y in 0..h {
             column[y] = values[y * w + x];
         }
-        let result = transform(&column);
+        let result = transform(&column)?;
         for y in 0..h {
             let d = result[y].sqrt();
             values[y * w + x] = if inside {
-                d.min((x + 1).min(w - x).min(y + 1).min(h - y) as f64)
+                let gx = x + window.origin[0] as usize;
+                let gy = y + window.origin[1] as usize;
+                d.min(
+                    (gx + 1)
+                        .min(window.frame[0] as usize - gx)
+                        .min(gy + 1)
+                        .min(window.frame[1] as usize - gy) as f64,
+                )
             } else {
                 d
             };
         }
     }
-    values
+    Ok(values)
 }
-fn stroke(words: &mut [u16], source: &[u16], alpha: &[f64], w: usize, h: usize, v: &Value) {
+fn stroke(
+    words: &mut [u16],
+    source: &[u16],
+    alpha: &[f64],
+    w: usize,
+    h: usize,
+    v: &Value,
+    window: Window,
+) -> Result<(), String> {
     let size = number(v, "size");
     if size == 0. {
-        return;
+        return Ok(());
     }
     let radius = if v["position"] == "center" {
         size * 0.5
     } else {
         size
     };
-    let outer = distances(alpha, w, h, false);
-    let inner = distances(alpha, w, h, true);
+    let outer = distances(alpha, w, h, false, window)?;
+    let inner = distances(alpha, w, h, true, window)?;
     let color = rgb(v, "color");
     let opacity = number(v, "opacity");
     let blend = v["blend"].as_str().unwrap_or("normal");
@@ -766,5 +1052,303 @@ fn stroke(words: &mut [u16], source: &[u16], alpha: &[f64], w: usize, h: usize, 
             result[3] = original[3];
         }
         pixel.copy_from_slice(&result);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+    fn source(w: u32, h: u32, depth: u16) -> Vec<u16> {
+        (0..h)
+            .flat_map(|y| {
+                (0..w).flat_map(move |x| {
+                    let inside = x >= 11 && x < w - 12 && y >= 9 && y < h - 9;
+                    let a = if !inside || (x * 3 + y * 5) % 17 == 0 {
+                        0
+                    } else {
+                        27001 + (x * 317 + y * 173) % 38535
+                    };
+                    let pixel = [
+                        10001 + (x * 739 + y * 127) % 54001,
+                        21113 + (x * 137) % 40003,
+                        32213 + (y * 211) % 30011,
+                        a,
+                    ];
+                    pixel.map(|v| {
+                        if depth == 8 {
+                            (v / 257 * 257) as u16
+                        } else {
+                            v as u16
+                        }
+                    })
+                })
+            })
+            .collect()
+    }
+    fn crop(source: &[u16], width: u32, rect: [u32; 4]) -> Vec<u16> {
+        let mut result = Vec::new();
+        for y in rect[1]..rect[3] {
+            let begin = (y as usize * width as usize + rect[0] as usize) * 4;
+            result.extend_from_slice(&source[begin..begin + (rect[2] - rect[0]) as usize * 4]);
+        }
+        result
+    }
+    fn prepare_field(
+        source: &[u16],
+        w: u32,
+        h: u32,
+        depth: u16,
+        work: [u32; 4],
+        kind: &str,
+        settings: &Value,
+        budget: &crate::large_document::ResidentBudget,
+    ) -> Option<super::super::field::PreparedField> {
+        let radii = smoothing_radii(kind, settings);
+        if !radii.iter().any(|r| *r > 0) {
+            return None;
+        }
+        let pad = field_padding(kind, settings);
+        let bounds = [
+            (work[0] as i32 - pad).max(0),
+            (work[1] as i32 - pad).max(0),
+            (work[2] as i32 + pad).min(w as i32),
+            (work[3] as i32 + pad).min(h as i32),
+        ];
+        Some(
+            super::super::field::prepare(
+                [w, h],
+                bounds,
+                &radii,
+                depth,
+                budget,
+                &mut || Ok(()),
+                |region| {
+                    let length = region.pixels() * if depth == 16 { 8 } else { 4 };
+                    let mut bytes =
+                        crate::large_document::ScratchBytes::new(budget, length, length)
+                            .map_err(|e| e.to_string())?;
+                    let b = region.bounds();
+                    let mut at = 0;
+                    for y in b[1]..b[3] {
+                        for x in b[0]..b[2] {
+                            let start = (y as usize * w as usize + x as usize) * 4;
+                            let p = &source[start..start + 4];
+                            if depth == 16 {
+                                for v in p {
+                                    bytes[at..at + 2].copy_from_slice(&v.to_be_bytes());
+                                    at += 2;
+                                }
+                            } else {
+                                for v in p {
+                                    bytes[at] = crate::raster::project16(*v);
+                                    at += 1;
+                                }
+                            }
+                        }
+                    }
+                    super::super::regional::RegionalImage::from_native(
+                        region,
+                        depth,
+                        bytes.freeze(),
+                    )
+                },
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn regional_styles_keep_full_frame_phase_alpha_and_native_samples() {
+        let (w, h) = (129, 123);
+        let output = [49, 43, 80, 76];
+        for depth in [8, 16] {
+            let source = source(w, h, depth);
+            for kind in KINDS {
+                let mut settings = defaults(kind);
+                if *kind == "gradient_overlay" {
+                    settings["pixel_grid"] = json!(true);
+                    settings["align_layer"] = json!(true);
+                    settings["angle"] = json!(37.);
+                    settings["offset_x"] = json!(0.13);
+                }
+                let mut full = source.clone();
+                apply(&mut full, w, h, kind, &settings).unwrap();
+                let work = [17, 11, 112, 108];
+                let mut local = crop(&source, w, work);
+                let budget = crate::large_document::ResidentBudget::new(32 * 1024 * 1024).unwrap();
+                let field = prepare_field(&source, w, h, depth, work, kind, &settings, &budget);
+                apply_window_field(
+                    &mut local,
+                    work[2] - work[0],
+                    work[3] - work[1],
+                    kind,
+                    &settings,
+                    Window {
+                        origin: [work[0], work[1]],
+                        frame: [w, h],
+                        alpha_bounds: Some(AlphaBounds::Nonzero([11, 9, w - 12, h - 9])),
+                    },
+                    field.as_ref(),
+                )
+                .unwrap();
+                assert_eq!(
+                    crop(
+                        &local,
+                        work[2] - work[0],
+                        [
+                            output[0] - work[0],
+                            output[1] - work[1],
+                            output[2] - work[0],
+                            output[3] - work[1]
+                        ]
+                    ),
+                    crop(&full, w, output),
+                    "depth{depth} {kind}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_gradient_geometry_and_true_canvas_edges_match_full_frame() {
+        let (w, h) = (81, 79);
+        let source = source(w, h, 16);
+        for kind in ["gradient_overlay", "pattern_overlay", "texture", "stroke"] {
+            let settings = defaults(kind);
+            let mut full = source.clone();
+            apply(&mut full, w, h, kind, &settings).unwrap();
+            for work in [[0, 0, 50, 52], [29, 27, w, h]] {
+                let output = if work[0] == 0 {
+                    [0, 0, 18, 18]
+                } else {
+                    [61, 59, w, h]
+                };
+                let mut local = crop(&source, w, work);
+                apply_window(
+                    &mut local,
+                    work[2] - work[0],
+                    work[3] - work[1],
+                    kind,
+                    &settings,
+                    Window {
+                        origin: [work[0], work[1]],
+                        frame: [w, h],
+                        alpha_bounds: None,
+                    },
+                )
+                .unwrap();
+                assert_eq!(
+                    crop(
+                        &local,
+                        work[2] - work[0],
+                        [
+                            output[0] - work[0],
+                            output[1] - work[1],
+                            output[2] - work[0],
+                            output[3] - work[1]
+                        ]
+                    ),
+                    crop(&full, w, output),
+                    "{kind} {work:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn missing_or_invalid_global_geometry_refuses_without_changing_pixels() {
+        let mut settings = defaults("gradient_overlay");
+        settings["pixel_grid"] = json!(true);
+        settings["align_layer"] = json!(true);
+        let original = source(23, 29, 16);
+        for window in [
+            Window {
+                origin: [10, 11],
+                frame: [100, 100],
+                alpha_bounds: None,
+            },
+            Window {
+                origin: [90, 11],
+                frame: [100, 100],
+                alpha_bounds: Some(AlphaBounds::Empty),
+            },
+            Window {
+                origin: [10, 11],
+                frame: [100, 100],
+                alpha_bounds: Some(AlphaBounds::Nonzero([0, 0, 101, 100])),
+            },
+        ] {
+            let mut pixels = original.clone();
+            assert!(
+                apply_window(&mut pixels, 23, 29, "gradient_overlay", &settings, window).is_err()
+            );
+            assert_eq!(pixels, original);
+        }
+    }
+
+    #[test]
+    fn bitmap_patterns_preserve_global_phase_and_native_low_bits() {
+        let words = [
+            12347, 33559, 51237, 65535, 54321, 12345, 45679, 27139, 19001, 27003, 37007, 49151,
+            61001, 51003, 41009, 65535,
+        ];
+        let png = crate::raster::png16(2, 2, &words).unwrap();
+        let (w, h) = (73, 69);
+        let original = source(w, h, 16);
+        let area = [19, 17, 57, 53];
+        for kind in ["pattern_overlay", "texture"] {
+            let mut settings = defaults(kind);
+            settings["pattern"] = json!("bitmap");
+            settings["bitmap_png"] = json!(STANDARD.encode(&png));
+            settings["bitmap_scale"] = json!(1.7);
+            settings["bitmap_angle"] = json!(23.);
+            settings["phase_x"] = json!(-1.3);
+            settings["phase_y"] = json!(2.7);
+            settings["sampling"] = json!("bilinear");
+            let mut full = original.clone();
+            apply(&mut full, w, h, kind, &settings).unwrap();
+            let mut local = crop(&original, w, area);
+            apply_window(
+                &mut local,
+                area[2] - area[0],
+                area[3] - area[1],
+                kind,
+                &settings,
+                Window {
+                    origin: [area[0], area[1]],
+                    frame: [w, h],
+                    alpha_bounds: None,
+                },
+            )
+            .unwrap();
+            assert_eq!(local, crop(&full, w, area), "{kind}");
+        }
+    }
+
+    #[test]
+    fn impossible_style_buffer_request_returns_an_allocation_error() {
+        assert!(filled::<u64>(usize::MAX, 0).is_err());
+    }
+    #[test]
+    fn cropped_float_smoothing_without_a_global_field_refuses_unchanged_pixels() {
+        let original = source(23, 29, 16);
+        let mut pixels = original.clone();
+        assert!(apply_window(
+            &mut pixels,
+            23,
+            29,
+            "outer_glow",
+            &defaults("outer_glow"),
+            Window {
+                origin: [10, 11],
+                frame: [100, 100],
+                alpha_bounds: None
+            }
+        )
+        .is_err());
+        assert_eq!(pixels, original);
     }
 }

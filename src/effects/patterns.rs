@@ -8,6 +8,112 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
 };
 
+/// Derived native texture pixels prepared by an admitted PNG/color decoder.
+/// This owner grants no editable-source or recovery authority. Every clone
+/// retains the allocation's actual shared-pool reservation.
+pub(crate) struct PreparedBitmap {
+    width: u32,
+    height: u32,
+    depth: u16,
+    source_sha256: [u8; 32],
+    words: crate::large_document::PinnedBytes,
+}
+impl PreparedBitmap {
+    pub(crate) fn from_native(
+        source: &str,
+        width: u32,
+        height: u32,
+        depth: u16,
+        words: crate::large_document::PinnedBytes,
+        pool: &crate::large_document::ResidentBudget,
+        check: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<Self, String> {
+        source_text(source)?;
+        if width == 0
+            || height == 0
+            || width > EDGE_LIMIT
+            || height > EDGE_LIMIT
+            || ![8, 16].contains(&depth)
+            || words.len() != width as usize * height as usize * 8
+            || !words.uses_budget(pool)
+        {
+            return Err(
+                "Prepared bitmap geometry, precision or resource pool does not match".into(),
+            );
+        }
+        check()?;
+        if depth == 8 {
+            for (index, word) in words.chunks_exact(2).enumerate() {
+                if index % 8192 == 0 {
+                    check()?;
+                }
+                if u16::from_be_bytes(word.try_into().unwrap()) % 257 != 0 {
+                    return Err("Native8 bitmap pixels must be exact promoted bytes".into());
+                }
+            }
+        }
+        let source_sha256 = ring::digest::digest(&ring::digest::SHA256, source.as_bytes())
+            .as_ref()
+            .try_into()
+            .unwrap();
+        check()?;
+        Ok(Self {
+            width,
+            height,
+            depth,
+            source_sha256,
+            words,
+        })
+    }
+    pub(crate) fn uses_budget(&self, pool: &crate::large_document::ResidentBudget) -> bool {
+        self.words.uses_budget(pool)
+    }
+    pub(crate) fn matches_source(&self, source: &str) -> Result<(), String> {
+        source_text(source)?;
+        if ring::digest::digest(&ring::digest::SHA256, source.as_bytes()).as_ref()
+            != self.source_sha256
+        {
+            return Err("Prepared bitmap does not match its captured PNG source".into());
+        }
+        Ok(())
+    }
+    pub(crate) fn bytes(&self) -> usize {
+        self.words.len()
+    }
+    pub(crate) fn depth(&self) -> u16 {
+        self.depth
+    }
+    fn pixel(&self, x: i64, y: i64) -> [u16; 4] {
+        let at = (y.rem_euclid(i64::from(self.height)) as usize * self.width as usize
+            + x.rem_euclid(i64::from(self.width)) as usize)
+            * 8;
+        std::array::from_fn(|c| {
+            u16::from_be_bytes(self.words[at + c * 2..at + c * 2 + 2].try_into().unwrap())
+        })
+    }
+}
+
+pub(crate) trait Sampler {
+    fn sample(&self, x: f64, y: f64, settings: &Value) -> [u16; 4];
+}
+impl Sampler for PreparedBitmap {
+    fn sample(&self, x: f64, y: f64, settings: &Value) -> [u16; 4] {
+        sample_pixels(x, y, settings, |x, y| self.pixel(x, y))
+    }
+}
+impl Sampler for Bitmap {
+    fn sample(&self, x: f64, y: f64, settings: &Value) -> [u16; 4] {
+        Bitmap::sample(self, x, y, settings)
+    }
+}
+fn source_text(source: &str) -> Result<(), String> {
+    if source.is_empty() || source.len() > ENCODED_LIMIT.div_ceil(3) * 4 {
+        Err("Bitmap patterns require a base64 PNG of at most 4 MiB".into())
+    } else {
+        Ok(())
+    }
+}
+
 pub const ENCODED_LIMIT: usize = 4 * 1024 * 1024;
 pub const EDGE_LIMIT: u32 = 512;
 const CACHE_LIMIT: usize = 16 * 1024 * 1024;
@@ -32,53 +138,61 @@ impl Bitmap {
     }
     /// Inverse mapping of document pixel centers; positive angles rotate clockwise.
     pub fn sample(&self, x: f64, y: f64, settings: &Value) -> [u16; 4] {
-        let scale = settings["bitmap_scale"].as_f64().unwrap_or(1.);
-        let angle = settings["bitmap_angle"].as_f64().unwrap_or(0.).to_radians();
-        let x = x + 0.5 - settings["phase_x"].as_f64().unwrap_or(0.);
-        let y = y + 0.5 - settings["phase_y"].as_f64().unwrap_or(0.);
-        let (x, y) = (
-            (x * angle.cos() + y * angle.sin()) / scale - 0.5,
-            (-x * angle.sin() + y * angle.cos()) / scale - 0.5,
-        );
-        if settings["sampling"] == "nearest" {
-            return self.pixel((x + 0.5).floor() as i64, (y + 0.5).floor() as i64);
-        }
-        let (ix, iy) = (x.floor() as i64, y.floor() as i64);
-        let (fx, fy) = (x - x.floor(), y - y.floor());
-        let samples = [
-            self.pixel(ix, iy),
-            self.pixel(ix + 1, iy),
-            self.pixel(ix, iy + 1),
-            self.pixel(ix + 1, iy + 1),
-        ];
-        let weights = [
-            (1. - fx) * (1. - fy),
-            fx * (1. - fy),
-            (1. - fx) * fy,
-            fx * fy,
-        ];
-        let alpha: f64 = samples
+        sample_pixels(x, y, settings, |x, y| self.pixel(x, y))
+    }
+}
+fn sample_pixels(
+    x: f64,
+    y: f64,
+    settings: &Value,
+    mut pixel: impl FnMut(i64, i64) -> [u16; 4],
+) -> [u16; 4] {
+    let scale = settings["bitmap_scale"].as_f64().unwrap_or(1.);
+    let angle = settings["bitmap_angle"].as_f64().unwrap_or(0.).to_radians();
+    let x = x + 0.5 - settings["phase_x"].as_f64().unwrap_or(0.);
+    let y = y + 0.5 - settings["phase_y"].as_f64().unwrap_or(0.);
+    let (x, y) = (
+        (x * angle.cos() + y * angle.sin()) / scale - 0.5,
+        (-x * angle.sin() + y * angle.cos()) / scale - 0.5,
+    );
+    if settings["sampling"] == "nearest" {
+        return pixel((x + 0.5).floor() as i64, (y + 0.5).floor() as i64);
+    }
+    let (ix, iy) = (x.floor() as i64, y.floor() as i64);
+    let (fx, fy) = (x - x.floor(), y - y.floor());
+    let samples = [
+        pixel(ix, iy),
+        pixel(ix + 1, iy),
+        pixel(ix, iy + 1),
+        pixel(ix + 1, iy + 1),
+    ];
+    let weights = [
+        (1. - fx) * (1. - fy),
+        fx * (1. - fy),
+        (1. - fx) * fy,
+        fx * fy,
+    ];
+    let alpha: f64 = samples
+        .iter()
+        .zip(weights)
+        .map(|(p, w)| f64::from(p[3]) * w)
+        .sum();
+    if alpha <= 0. {
+        return [0; 4];
+    }
+    let mut result = [0; 4];
+    for c in 0..3 {
+        result[c] = (samples
             .iter()
             .zip(weights)
-            .map(|(p, w)| f64::from(p[3]) * w)
-            .sum();
-        if alpha <= 0. {
-            return [0; 4];
-        }
-        let mut result = [0; 4];
-        for c in 0..3 {
-            result[c] = (samples
-                .iter()
-                .zip(weights)
-                .map(|(p, w)| f64::from(p[c]) * f64::from(p[3]) * w)
-                .sum::<f64>()
-                / alpha)
-                .round()
-                .clamp(0., 65535.) as u16;
-        }
-        result[3] = alpha.round().clamp(0., 65535.) as u16;
-        result
+            .map(|(p, w)| f64::from(p[c]) * f64::from(p[3]) * w)
+            .sum::<f64>()
+            / alpha)
+            .round()
+            .clamp(0., 65535.) as u16;
     }
+    result[3] = alpha.round().clamp(0., 65535.) as u16;
+    result
 }
 pub fn active(kind: &str, settings: &Value) -> bool {
     matches!(kind, "pattern_overlay" | "texture") && settings["pattern"] == "bitmap"
