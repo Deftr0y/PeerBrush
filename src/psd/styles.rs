@@ -1433,6 +1433,8 @@ mod tests {
         } else {
             layout.block(&mut info).unwrap();
             info.block().unwrap();
+            assert_eq!(info.bytes(8).unwrap(), b"8BIMMt16");
+            assert!(layout.tag_block(&mut info, b"Mt16").unwrap().is_empty());
             assert_eq!(info.bytes(4).unwrap(), b"8BIM");
             assert_eq!(info.bytes(4).unwrap(), b"Lr16");
             let length = section_start + info.pos;

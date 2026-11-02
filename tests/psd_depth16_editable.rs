@@ -285,7 +285,10 @@ fn sixteen_bit_layer_records_are_read_from_lr16_with_lower_samples_intact() {
     let res_len = u32::from_be_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
     let layer_pos = pos + 4 + res_len;
     assert_eq!(&bytes[layer_pos + 4..layer_pos + 8], &[0; 4]);
-    assert!(bytes.windows(8).any(|v| v == b"8BIMLr16"));
+    assert_eq!(
+        &bytes[layer_pos + 12..layer_pos + 32],
+        b"8BIMMt16\x00\x00\x00\x008BIMLr16"
+    );
     let loaded = psd::decode(&bytes).unwrap();
     assert_eq!(
         loaded.layers[0].pixels.get16(0, 0),

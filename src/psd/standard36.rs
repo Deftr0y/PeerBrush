@@ -233,6 +233,8 @@ impl<'a> Plan<'a> {
         if self.header.depth == 16 {
             length(&mut output, 0, self.header.format)?;
             bytes32(&mut output, self.global_mask)?;
+            output.write_all(b"8BIMMt16").map_err(|e| e.to_string())?;
+            length(&mut output, 0, self.header.format)?;
             output.write_all(b"8BIMLr16").map_err(|e| e.to_string())?;
         }
         length(&mut output, self.info_bytes, self.header.format)?;
@@ -261,8 +263,6 @@ impl<'a> Plan<'a> {
         pad(&mut output, self.info_raw, 2)?;
         if self.header.depth == 16 {
             pad(&mut output, self.info_bytes, 4)?;
-            output.write_all(b"8BIMMt16").map_err(|e| e.to_string())?;
-            length(&mut output, 0, self.header.format)?;
         } else {
             bytes32(&mut output, self.global_mask)?;
         }

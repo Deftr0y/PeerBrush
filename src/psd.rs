@@ -1051,6 +1051,9 @@ fn encode_layout_scratch_to<S: Read + Write + Seek>(
                 .as_ref()
                 .map_or(&[], |mask| mask.data.as_slice()),
         );
+        // Photoshop needs the merged transparency marker before the 16-bit layer records.
+        prefix.extend(b"8BIMMt16");
+        layout.write_length(&mut prefix, 0)?;
         prefix.extend(b"8BIMLr16");
     }
     layout.write_length(&mut prefix, info_length)?;
@@ -1175,8 +1178,6 @@ fn encode_layout_scratch_to<S: Read + Write + Seek>(
     let mut suffix = vec![];
     if high {
         suffix.resize(((4 - info_length % 4) % 4) as usize, 0);
-        suffix.extend(b"8BIMMt16");
-        layout.write_length(&mut suffix, 0)?;
     } else {
         block(
             &mut suffix,
