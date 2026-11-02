@@ -18,7 +18,7 @@ from sparkle_bundle import PREFIX, pin
 from verify_release import inspect_archive
 
 
-def check(root, archive, work, commit, version, exercise_editor=False):
+def check(root, archive, work, commit, version, exercise_editor=False, manual_upgrade=False):
     if sys.platform != 'darwin':
         raise ValueError('Bundled Sparkle native fixture requires macOS 12+')
     import platform
@@ -46,9 +46,9 @@ def check(root, archive, work, commit, version, exercise_editor=False):
                  'PeerBrush dormant updater fixture', verify_app=verify_app)
     if digest(archive) != expected:
         raise ValueError('Original unsigned candidate changed during native fixture')
-    if exercise_editor:
+    if exercise_editor or manual_upgrade:
         from check_macos_editor_relaunch import exercise
-        exercise(payload / 'PeerBrush.app', work / 'editor-relaunch', selected['manifest']['executable_sha256'])
+        exercise(payload / 'PeerBrush.app', work / 'editor-relaunch', selected['manifest']['executable_sha256'], manual_upgrade)
 
 
 def main():
@@ -58,6 +58,7 @@ def main():
     for name in ['commit', 'version']:
         parser.add_argument('--' + name, required=True)
     parser.add_argument('--exercise-editor', action='store_true')
+    parser.add_argument('--manual-upgrade', action='store_true')
     args = parser.parse_args()
     try:
         check(pathlib.Path(__file__).resolve().parents[1], **vars(args))
