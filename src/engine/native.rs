@@ -1202,7 +1202,9 @@ mod tests {
     }
     #[test]
     fn cancellation_and_admission_refusal_preserve_original_native_metadata() {
-        let pool = ResidentBudget::new(64 * 1024 + 4096).unwrap();
+        // Admit the parser and runtime document first; ballast below exhausts
+        // the edit budget independently of the parser's transient footprint.
+        let pool = ResidentBudget::new(8 * 1024 * 1024).unwrap();
         let current = document(&pool);
         let key = current.key();
         let baseline = pool.used();
@@ -1295,7 +1297,12 @@ mod tests {
         };
         let first = make(document.clone());
         let second = make(document.clone());
-        assert_eq!(pool.used(), before);
+        assert!(first.capture_bytes() > 0);
+        assert_eq!(second.capture_bytes(), first.capture_bytes());
+        assert_eq!(
+            pool.used(),
+            before + first.capture_bytes() + second.capture_bytes()
+        );
         let first_metadata = first.metadata();
         let layer = first_metadata.layers().next().unwrap();
         let slot = layer.pixels().slot();

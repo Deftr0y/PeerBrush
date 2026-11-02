@@ -277,6 +277,14 @@ impl SceneSnapshot {
     pub fn identity(&self) -> &SceneIdentity {
         &self.identity
     }
+    #[cfg(test)]
+    pub(super) fn capture_bytes(&self) -> usize {
+        self._lease_charge
+            .iter()
+            .chain(self._header_charge.iter())
+            .map(|c| c.bytes())
+            .sum()
+    }
     pub(crate) fn from_native(
         identity: SceneIdentity,
         document: super::native::NativeDocument,
