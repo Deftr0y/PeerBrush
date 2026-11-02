@@ -445,7 +445,7 @@ impl PeerBrush {
                     .finish_update_exit(&self.workspace, blocked)
             }) {
                 Ok(()) => self.exit_approved = true,
-                Err(error) => self.message = error,
+                Err(error) => self.message = error.into(),
             }
             return true;
         }
@@ -459,7 +459,7 @@ impl PeerBrush {
                     "App update preparation requested. Installation and restart remain unavailable."
                         .into()
                 }
-                Err(error) => error,
+                Err(error) => error.into(),
             };
             return true;
         }
@@ -474,7 +474,7 @@ impl PeerBrush {
                     "Settings observation requested. Installation and restart remain unavailable."
                         .into()
                 }
-                Err(error) => error,
+                Err(error) => error.into(),
             };
             return true;
         }
@@ -490,7 +490,8 @@ impl PeerBrush {
             .err()
             .unwrap_or_else(|| {
                 "Automatic updates are not available in this development build.".into()
-            });
+            })
+            .into();
         true
     }
 
@@ -555,7 +556,7 @@ impl PeerBrush {
         } else {
             if idle && self.updates.native_updater.profile_capture_pending() {
                 if let Err(error) = self.flush_update_tool_profile() {
-                    self.message = format!("Tool settings not saved · {error}");
+                    self.message = format!("Tool settings not saved · {error}").into();
                     self.updates.native_updater.defer();
                 }
             }
