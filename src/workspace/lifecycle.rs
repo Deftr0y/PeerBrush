@@ -71,12 +71,10 @@ pub(crate) fn publish_update_checkpoint(
 }
 
 fn update_project_ready(e: &Engine) -> Result<(), String> {
-    if e.doc.revision != e.saved_revision
-        || crate::file_safety::source_conflict(e.path.as_deref(), e.file_version)
-    {
+    if needs_save(e) {
         return Err(format!(
             "Save {} before restarting for an update",
-            e.doc.name
+            engine::view::current(e).name()
         ));
     }
     if e.file_operations.load(std::sync::atomic::Ordering::Acquire) != 0
@@ -102,10 +100,11 @@ pub fn update_readiness(workspace: &Registry) -> Result<Vec<Reviewed>, String> {
             .map_err(|_| "A project is still working")?;
         e.ensure_open()?;
         update_project_ready(&e)?;
+        let view = engine::view::current(&e);
         reviewed.push(Reviewed {
             project,
-            document: e.doc.id.clone(),
-            revision: e.doc.revision,
+            document: view.id().to_owned(),
+            revision: view.revision(),
             discard: false,
         });
     }
@@ -143,23 +142,23 @@ fn windows_blank_workspace<'a>(engines: impl Iterator<Item = &'a Engine>) -> Res
     }
     let e = engines[0];
     if e.path.is_some()
-        || !e.undo.is_empty()
-        || !e.redo.is_empty()
+        || e.history_lengths() != [0, 0]
         || !e.changes.is_empty()
         || !e.leases.is_empty()
         || e.saved_revision != 0
     {
         return Err(refused());
     }
-    let mut blank = Document::new(1024, 768)?;
-    blank.id = e.doc.id.clone();
-    if e.doc.layers.len() != 1 {
+    let doc = e.resident().map_err(|_| refused())?;
+    if (doc.width, doc.height, doc.bit_depth, doc.layers.len()) != (1024, 768, 8, 1) {
         return Err(refused());
     }
-    blank.layers[0].id = e.doc.layers[0].id.clone();
-    blank.layers[0].effect_key = e.doc.layers[0].effect_key.clone();
+    let mut blank = Document::new(1024, 768)?;
+    blank.id = doc.id.clone();
+    blank.layers[0].id = doc.layers[0].id.clone();
+    blank.layers[0].effect_key = doc.layers[0].effect_key.clone();
     if serde_json::to_value(&blank).map_err(|e| e.to_string())?
-        != serde_json::to_value(&e.doc).map_err(|e| e.to_string())?
+        != serde_json::to_value(doc).map_err(|e| e.to_string())?
     {
         return Err(refused());
     }
@@ -236,13 +235,10 @@ fn finish(
         } else {
             file_operations_idle(&e.file_operations)?;
         }
-        if !r.discard
-            && (e.doc.revision != e.saved_revision
-                || crate::file_safety::source_conflict(e.path.as_deref(), e.file_version))
-        {
+        if !r.discard && needs_save(e) {
             return Err(format!(
                 "{} still has unsaved changes. Save, Don't Save or Cancel before exiting.",
-                e.doc.name
+                engine::view::current(e).name()
             ));
         }
         e.check(

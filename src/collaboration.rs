@@ -193,7 +193,8 @@ impl Engine {
             return Err("Proposals need explicit human acceptance".into());
         }
         self.expire();
-        if self.doc.id != document || self.doc.revision != revision {
+        let view = engine::view::current(self);
+        if view.id() != document || view.revision() != revision {
             return Err("The project changed; review a fresh proposal before accepting".into());
         }
         let p = self
@@ -218,7 +219,8 @@ impl Engine {
     }
     fn queue_proposal(&mut self, p: Proposal) -> Result<Value, String> {
         self.expire();
-        if p.document != self.doc.id || p.revision != self.doc.revision {
+        let view = engine::view::current(self);
+        if p.document != view.id() || p.revision != view.revision() {
             return Err(
                 "The project changed while preparing the proposal; current work preserved".into(),
             );
@@ -234,7 +236,7 @@ impl Engine {
             return Err("Four proposals are already pending. Review or reject one first".into());
         }
         let mut base = HashMap::new();
-        doc_tiles(&self.doc, &mut base);
+        doc_tiles(self.resident()?, &mut base);
         let mut pending = HashMap::new();
         for old in self.proposals.iter().chain(std::iter::once(&p)) {
             if let Some(d) = &old.draft {
@@ -291,18 +293,15 @@ pub fn propose(shared: &Shared, actor: &str, p: &Value) -> Result<Value, String>
         return Err("Choose a proposal label of 1–160 characters".into());
     }
     let task = p["task"].as_str();
-    let mut draft = Engine::new();
-    {
+    let mut draft = {
         let mut e = shared.lock().unwrap();
         e.expire();
-        if e.doc.id != document || e.doc.revision != revision {
+        let view = engine::view::current(&e);
+        if view.id() != document || view.revision() != revision {
             return Err("The proposal source changed. Observe the current project again".into());
         }
-        draft.doc = e.doc.clone();
-        draft.leases = e.leases.clone();
-        draft.brush_library = e.brush_library.clone();
-        draft.filter_library = e.filter_library.clone();
-    }
+        e.resident_draft()?
+    };
     let commands = draft
         .filter_library
         .lock()
@@ -314,15 +313,15 @@ pub fn propose(shared: &Shared, actor: &str, p: &Value) -> Result<Value, String>
         .unwrap()
         .resolve_commands(&commands)?;
     let result = draft.edit(actor, &commands, Some(revision), task, label)?;
-    if draft.doc.id != document {
+    if engine::view::current(&draft).id() != document {
         return Err("Proposals edit the current project; new/open are document actions".into());
     }
     let scopes = draft
-        .undo
-        .last()
+        .history_entries()
+        .next_back()
         .ok_or("Missing proposal scope")?
-        .scopes
-        .clone();
+        .scopes()
+        .to_vec();
     let proposal = Proposal {
         id: engine::id(),
         actor: actor.into(),
@@ -332,7 +331,7 @@ pub fn propose(shared: &Shared, actor: &str, p: &Value) -> Result<Value, String>
         revision,
         commands: commands.clone(),
         scopes,
-        draft: Some(draft.doc),
+        draft: Some(draft.into_resident_document()?),
         expires: engine::now() + 900,
         status: "pending".into(),
         reason: String::new(),

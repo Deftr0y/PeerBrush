@@ -498,6 +498,21 @@ impl Engine {
     pub(crate) fn resident(&self) -> Result<&Document, String> {
         Ok(&self.doc)
     }
+    pub(crate) fn into_resident_document(self) -> Result<Document, String> {
+        Ok(self.doc)
+    }
+    /// Isolated edit against the captured revision. Keep the live write guards
+    /// and preset resolution; the draft needs no earlier history or file owner.
+    pub(crate) fn resident_draft(&self) -> Result<Self, String> {
+        self.ensure_write_available()?;
+        let mut draft = Self::from_document(self.resident()?.clone());
+        draft.project_id = self.project_id.clone();
+        draft.leases = self.leases.clone();
+        draft.saving = self.saving.clone();
+        draft.brush_library = self.brush_library.clone();
+        draft.filter_library = self.filter_library.clone();
+        Ok(draft)
+    }
     pub(crate) fn doc_snapshot(&self) -> view::DocumentSnapshot {
         self.doc.clone().into()
     }
@@ -666,7 +681,7 @@ impl Engine {
             crate::depth16::validate_budget(&engine.doc)?;
         }
         crate::effects::invalidate(&mut engine.doc, &commands);
-        Ok(engine.doc)
+        engine.into_resident_document()
     }
     pub fn new() -> Self {
         Self::from_document(Document::new(1024, 768).unwrap())
