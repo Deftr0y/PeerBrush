@@ -349,9 +349,11 @@ pub(crate) fn startup_guard(locations: &Locations) -> Result<(), String> {
 }
 
 fn inspect_unstarted_attempt(path: &Path) -> Result<(), String> {
-    // Observation markers contradict a never-started outcome even if no intent
-    // remains. Absence is rechecked after reading the retained app/profile.
+    // Final profile capture starts only after native Ready. A partial copy is
+    // evidence of that stage even if the intent or final manifest is lost.
     let forbidden = [
+        "final-profile",
+        "final-profile.json",
         "native-owner-exited.json",
         "native-parent-exited.json",
         "native-aborted.json",

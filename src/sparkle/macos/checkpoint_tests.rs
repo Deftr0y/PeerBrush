@@ -468,6 +468,8 @@ fn profile_backup_alias_and_nonprivate_journal_remain_held_without_copying_forei
 fn contradictory_and_orphan_native_markers_never_admit_profile_migration() {
     for armed in [false, true] {
         for marker in [
+            "final-profile",
+            "final-profile.json",
             "native-owner-exited.json",
             "native-parent-exited.json",
             "native-aborted.json",
@@ -491,8 +493,19 @@ fn contradictory_and_orphan_native_markers_never_admit_profile_migration() {
                     continue;
                 }
             }
-            write_new(&attempt.join(marker), b"{}").unwrap();
-            assert!(startup_guard(&f.locations()).is_err(), "{armed} {marker}");
+            if marker == "final-profile" {
+                fs::DirBuilder::new()
+                    .mode(0o700)
+                    .create(attempt.join(marker))
+                    .unwrap();
+            } else {
+                write_new(&attempt.join(marker), b"{}").unwrap();
+            }
+            drop(profile);
+            assert!(
+                crate::settings::Profile::open(f.locations(), &f.0.join("legacy")).is_err(),
+                "{armed} {marker}"
+            );
             assert_eq!(fs::read(path.join("profile.json")).unwrap(), before);
             assert!(attempt.join(marker).exists());
         }

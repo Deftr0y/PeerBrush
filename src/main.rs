@@ -17,9 +17,9 @@ fn main() {
     }
     if let Err(error) = run() {
         eprintln!("PeerBrush: {error}");
-        // File-association launches have no console. Keep failures visible without
-        // interfering with the stdio MCP bridge or command-line clients.
-        #[cfg(windows)]
+        // Finder and Explorer launches have no visible console, including when
+        // profile recovery prevents the main window from opening.
+        #[cfg(any(windows, target_os = "macos"))]
         {
             let native = activation::native_error_dialog(std::env::args_os().skip(1));
             if native {
