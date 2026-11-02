@@ -199,7 +199,7 @@ class NativeJxlBuild(unittest.TestCase):
                 path, version = jxl_build.tool('clang-cl', 'clang', {'21.1.8'}, {'PATH': 'fixture'})
                 self.assertEqual((path, version), (str(executable.resolve()), '21.1.8'))
                 self.assertEqual(run.call_args.args[0], [str(executable.resolve()), '--version'])
-                self.assertEqual(run.call_args.kwargs['timeout'], 10)
+                self.assertEqual(run.call_args.kwargs['timeout'], 60)
                 self.assertNotIn('shell', run.call_args.kwargs)
                 for output in [b'clang version 22.0.0\n', b'not a version', b'x' * 16385]:
                     response.stdout = output
@@ -485,15 +485,17 @@ exit $LASTEXITCODE
         with tempfile.TemporaryDirectory() as temporary:
             executable = Path(temporary) / sentinel
             executable.write_bytes(b'never executed')
-            errors = [FileNotFoundError(sentinel),
-                      subprocess.CalledProcessError(9, [str(executable)], stderr=sentinel),
-                      subprocess.TimeoutExpired([str(executable)], 10, output=sentinel)]
-            for error in errors:
+            errors = [(FileNotFoundError(sentinel), 'Native JPEG XL build tool unavailable: ninja'),
+                      (subprocess.CalledProcessError(9, [str(executable)], stderr=sentinel),
+                       'Native JPEG XL version probe failed: ninja (exit=9)'),
+                      (subprocess.TimeoutExpired([str(executable)], 60, output=sentinel),
+                       'Native JPEG XL version probe timed out after 60 seconds: ninja')]
+            for error, expected in errors:
                 with self.subTest(error=type(error).__name__), \
                         mock.patch.object(jxl_build.subprocess, 'run', side_effect=error):
                     with self.assertRaises(ValueError) as caught:
                         jxl_build.tool('ninja', 'ninja', {'1.13.2'}, {}, selected=executable)
-                    self.assertEqual(str(caught.exception), 'Native JPEG XL build tool unavailable: ninja')
+                    self.assertEqual(str(caught.exception), expected)
                     self.assertNotIn(sentinel, str(caught.exception))
             with mock.patch.object(jxl_build.subprocess, 'run',
                                    return_value=subprocess.CompletedProcess([], 0, b'\xff', b'')):

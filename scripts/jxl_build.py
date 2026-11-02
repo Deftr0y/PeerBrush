@@ -31,8 +31,12 @@ def tool(name, kind, allowed, environment, selected=None):
         if not path.is_file():
             raise OSError('not a file')
         result = subprocess.run([str(path), '--version'], env=environment, capture_output=True,
-                                check=True, timeout=10)
-    except (OSError, subprocess.SubprocessError):
+                                check=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        raise ValueError('Native JPEG XL version probe timed out after 60 seconds: ' + name) from None
+    except subprocess.CalledProcessError as error:
+        raise ValueError(f'Native JPEG XL version probe failed: {name} (exit={error.returncode})') from None
+    except OSError:
         raise ValueError('Native JPEG XL build tool unavailable: ' + name) from None
     if len(result.stdout) > 16384 or len(result.stderr) > 16384:
         raise ValueError('Native build tool version output exceeds bound')
