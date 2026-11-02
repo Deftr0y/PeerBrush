@@ -138,6 +138,7 @@
     "scripts/build_windows_setup.py",
     "scripts/check_branch_policy.py",
     "scripts/check_bundled_sparkle.py",
+    "scripts/check_macos_editor_relaunch.py",
     "scripts/dev.ps1",
     "scripts/final_release.py",
     "scripts/handoff_store_msix.py",

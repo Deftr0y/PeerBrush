@@ -1,7 +1,7 @@
 """Credential-free native fixture: inspect/extract/mount an unsigned dormant app.
 
-The image is a local component fixture, not a signed or installed release. No app
-is launched, no updater is loaded and no output is published by this script.
+The image is a local component fixture. Hosted candidates can additionally run
+the staged editor with a disposable profile and exercise an interrupted relaunch.
 """
 import argparse
 import os
@@ -18,7 +18,7 @@ from sparkle_bundle import PREFIX, pin
 from verify_release import inspect_archive
 
 
-def check(root, archive, work, commit, version):
+def check(root, archive, work, commit, version, exercise_editor=False):
     if sys.platform != 'darwin':
         raise ValueError('Bundled Sparkle native fixture requires macOS 12+')
     import platform
@@ -46,6 +46,9 @@ def check(root, archive, work, commit, version):
                  'PeerBrush dormant updater fixture', verify_app=verify_app)
     if digest(archive) != expected:
         raise ValueError('Original unsigned candidate changed during native fixture')
+    if exercise_editor:
+        from check_macos_editor_relaunch import exercise
+        exercise(payload / 'PeerBrush.app', work / 'editor-relaunch', selected['manifest']['executable_sha256'])
 
 
 def main():
@@ -54,6 +57,7 @@ def main():
         parser.add_argument('--' + name, type=pathlib.Path, required=True)
     for name in ['commit', 'version']:
         parser.add_argument('--' + name, required=True)
+    parser.add_argument('--exercise-editor', action='store_true')
     args = parser.parse_args()
     try:
         check(pathlib.Path(__file__).resolve().parents[1], **vars(args))

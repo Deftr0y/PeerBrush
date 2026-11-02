@@ -149,13 +149,13 @@ jobs:
           else
             python scripts/package.py
           fi
-      - name: Round-trip exact dormant app framework and native continuations
+      - name: Round-trip packaged macOS editor, interrupted relaunch and dormant framework
         if: runner.os == 'macOS'
         shell: bash
         run: |
           VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["version"])')
           COMMIT=$(git rev-parse HEAD)
-          python3 -B scripts/check_bundled_sparkle.py --archive "dist/PeerBrush-$VERSION-macOS-arm64.zip" --work "$RUNNER_TEMP/peerbrush-sparkle-bundle-fixture" --commit "$COMMIT" --version "$VERSION"
+          python3 -B scripts/check_bundled_sparkle.py --archive "dist/PeerBrush-$VERSION-macOS-arm64.zip" --work "$RUNNER_TEMP/peerbrush-sparkle-bundle-fixture" --commit "$COMMIT" --version "$VERSION" --exercise-editor
           cargo run --locked --example sparkle_preparation -- "$RUNNER_TEMP/peerbrush-sparkle-bundle-fixture/payload/PeerBrush.app" --bundled
       - name: Build and test Ubuntu installation candidate in a disposable container
         if: runner.os == 'Linux'
