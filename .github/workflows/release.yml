@@ -9,6 +9,10 @@ on:
         description: Full commit SHA matching the selected workflow ref
         required: true
         type: string
+      macos_recovery_only:
+        description: Qualify only the unsigned macOS recovery candidate on version/0.3
+        default: false
+        type: boolean
       sign_sigstore:
         description: Sign and verify the candidates with Sigstore
         required: true
@@ -37,10 +41,11 @@ env:
 
 jobs:
   native:
+    if: ${{ !inputs.macos_recovery_only || (github.ref == 'refs/heads/version/0.3' && !inputs.sign_sigstore && !inputs.build_store_msix) }}
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-2025, macos-26, ubuntu-24.04]
+        os: ${{ fromJSON(inputs.macos_recovery_only && '["macos-26"]' || '["windows-2025","macos-26","ubuntu-24.04"]') }}
     runs-on: ${{ matrix.os }}
     env:
       EXPECTED_COMMIT: ${{ inputs.expected_commit || github.sha }}
@@ -123,6 +128,16 @@ jobs:
           cargo run --locked --example sparkle_preparation -- "$RUNNER_TEMP/peerbrush-sparkle-preparation/Sparkle.framework"
           python3 -B scripts/prepare_sparkle.py --archive "$RUNNER_TEMP/Sparkle-2.10.0.zip" --native-audit-output "$RUNNER_TEMP/peerbrush-sparkle-native-audit"
           cat "$RUNNER_TEMP/peerbrush-sparkle-native-audit/native-policy-candidate.json"
+      - name: Verify macOS recovery after a planned or interrupted exit
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          cargo test --locked --lib -- --exact --test-threads=1 \
+            sparkle::macos::coordinator::tests::sealed_exit_notice_survives_disconnect_and_requires_the_reviewed_final_profile \
+            sparkle::macos::checkpoint::tests::contradictory_and_orphan_native_markers_never_admit_profile_migration \
+            sparkle::macos::checkpoint::tests::planned_update_exit_seals_current_joint_sources_only_after_final_owner_authentication \
+            | tee "$RUNNER_TEMP/macos-recovery-checks.log"
+          grep -Fq 'test result: ok. 3 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/macos-recovery-checks.log"
       - run: python scripts/build_release.py
       - name: Build dormant setup entry without an offer
         run: python -B scripts/build_release.py --setup-entry
@@ -218,6 +233,7 @@ jobs:
           if-no-files-found: error
 
   inspect:
+    if: ${{ !inputs.macos_recovery_only }}
     needs: native
     runs-on: ubuntu-24.04
     env:

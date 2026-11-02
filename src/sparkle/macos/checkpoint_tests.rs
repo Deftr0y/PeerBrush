@@ -468,6 +468,7 @@ fn profile_backup_alias_and_nonprivate_journal_remain_held_without_copying_forei
 fn contradictory_and_orphan_native_markers_never_admit_profile_migration() {
     for armed in [false, true] {
         for marker in [
+            "sealed-parent-exit.json",
             "final-profile",
             "final-profile.json",
             "native-owner-exited.json",
@@ -2851,6 +2852,27 @@ fn planned_update_exit_seals_current_joint_sources_only_after_final_owner_authen
                 row["owner_project"] = serde_json::Value::Null;
             }
             assert!(tools.lock().unwrap().flush().is_err());
+            let armed = ArmedCheck {
+                app: attempt.join("PeerBrush.app"),
+                manifest: initial.clone(),
+                intent: read_marker(&attempt.join("native-start-intent.json")).unwrap(),
+                owner_pid: std::process::id(),
+            };
+            armed
+                .record_event(
+                    &lease,
+                    NativeEvent::ParentExited,
+                    Some(binding.ready_generation),
+                )
+                .unwrap();
+            assert!(!native_recovery_message(&attempt)
+                .unwrap()
+                .contains("closed its saved projects"));
+            armed.record_sealed_exit(&lease, binding).unwrap();
+            assert!(native_recovery_message(&attempt)
+                .unwrap()
+                .contains("closed its saved projects"));
+            assert!(startup_guard(&profile.locations).is_err());
             let output = ctx.run(Default::default(), |_| checks.close_after_update_exit());
             assert!(output.viewport_output[&eframe::egui::ViewportId::ROOT]
                 .commands

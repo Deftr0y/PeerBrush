@@ -12,7 +12,7 @@ use std::{
     io::{Read, Write},
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
-        unix::net::UnixStream,
+        unix::net::{UnixDatagram, UnixStream},
     },
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -26,6 +26,8 @@ use std::{
 const ENTRY: &str = "--peerbrush-update-capture-owner";
 const FAILED: &str = "App update capture owner is unavailable; all projects remain open";
 const FRAME_LIMIT: usize = 4096;
+const PROFILE_LOCK_FD: u8 = 0x50;
+const SEALED_EXIT_FD: u8 = 0x51;
 const DEADLINE: Duration = Duration::from_secs(600);
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -564,8 +566,8 @@ fn no_sigpipe(socket: &UnixStream) -> Result<(), String> {
     }
     Ok(())
 }
-fn send_lock(socket: &UnixStream, file: &File) -> Result<(), String> {
-    let mut marker = [0x50_u8];
+fn send_descriptor(socket: &UnixStream, file: &impl AsRawFd, kind: u8) -> Result<(), String> {
+    let mut marker = [kind];
     let mut iov = libc::iovec {
         iov_base: marker.as_mut_ptr().cast(),
         iov_len: 1,
@@ -593,10 +595,11 @@ fn send_lock(socket: &UnixStream, file: &File) -> Result<(), String> {
     }
     Ok(())
 }
-fn receive_lock(
+fn receive_descriptor(
     socket: &UnixStream,
     deadline: Instant,
     cancel: &AtomicBool,
+    kind: u8,
 ) -> Result<File, String> {
     loop {
         socket
@@ -676,7 +679,7 @@ fn receive_lock(
             }
         }
         if count != 1
-            || marker != [0x50]
+            || marker != [kind]
             || message.msg_flags & libc::MSG_CTRUNC != 0
             || !valid
             || files.len() != 1
@@ -754,10 +757,18 @@ impl Drop for Reaper {
 /// kills a process nor treats its disappearance as native installer absence.
 pub(super) struct Owner {
     socket: UnixStream,
+    sealed_exit: Option<UnixDatagram>,
     child: Option<(Child, Reaper)>,
     request: Option<Request>,
 }
 impl Owner {
+    pub(super) fn notify_sealed_exit(&self, binding: &checkpoint::FinalProfileBinding) {
+        // The workspace is already closed. A failed send must leave the child
+        // treating this as an unexpected exit, without undoing the committed Quit.
+        if let Some(socket) = &self.sealed_exit {
+            let _ = socket.send(binding.record_sha256.as_bytes());
+        }
+    }
     pub(super) fn take_exited(&mut self) -> Result<Option<u32>, String> {
         let Some((child, _)) = self.child.as_mut() else {
             return Ok(None);
@@ -899,6 +910,7 @@ fn spawn_owned(
     let child = spawn()?;
     Ok(Owner {
         socket,
+        sealed_exit: None,
         child: Some((child, reaper)),
         request: None,
     })
@@ -965,7 +977,14 @@ pub(super) fn launch(
     // Do not transfer the actual profile-lock capability before mutual native
     // identity authentication. A challenge/hash is not a file capability.
     remaining(deadline, cancel)?;
-    send_lock(&owner.socket, &inherited)?;
+    send_descriptor(&owner.socket, &inherited, PROFILE_LOCK_FD)?;
+    // Only this parent can send on this attempt's endpoint. A datagram written
+    // after the writer seal survives process exit without racing control-channel EOF.
+    let (sender, receiver) = UnixDatagram::pair().map_err(|_| FAILED)?;
+    sender.set_nonblocking(true).map_err(|_| FAILED)?;
+    receiver.set_nonblocking(true).map_err(|_| FAILED)?;
+    send_descriptor(&owner.socket, &receiver, SEALED_EXIT_FD)?;
+    owner.sealed_exit = Some(sender);
     let response: Captured = receive(&mut owner.socket, deadline, cancel)?;
     response.validate(&request, child.id(), ReplyKind::Captured)?;
     process_identity::authenticate(&owner.socket, child.id(), &configuration.publisher_team_id)?;
@@ -1005,12 +1024,21 @@ pub(super) fn assert_native_termination_refusal(marker: MainThreadMarker) {
     );
 }
 
+fn received_sealed_exit(socket: &UnixDatagram, binding: &checkpoint::FinalProfileBinding) -> bool {
+    let mut bytes = [0u8; 65];
+    binding.validate().is_ok()
+        && socket
+            .recv(&mut bytes)
+            .is_ok_and(|n| &bytes[..n] == binding.record_sha256.as_bytes())
+}
+
 /// Main-thread lifetime for the copied native owner. Every check remains behind
 /// the independent source refusal; no install or successful retirement API exists.
 struct NativeOwner {
     _updater: Probe,
     _profile: UpdateProfile,
     _channel: UnixStream,
+    sealed_exit: UnixDatagram,
     _bundles: checkpoint::OwnerBundles,
     _application: Retained<AnyObject>,
     _termination: Retained<NativeOwnerTermination>,
@@ -1038,6 +1066,7 @@ impl NativeOwner {
         bundles: checkpoint::OwnerBundles,
         profile: UpdateProfile,
         channel: UnixStream,
+        sealed_exit: UnixDatagram,
         parent: u32,
         manifest: &str,
         configuration: ApprovedCheck,
@@ -1120,6 +1149,7 @@ impl NativeOwner {
             _updater: updater,
             _profile: profile,
             _channel: channel,
+            sealed_exit,
             _bundles: bundles,
             _application: application,
             _termination: termination,
@@ -1380,6 +1410,11 @@ impl NativeOwner {
                         checkpoint::NativeEvent::ParentExited,
                         self.checks.held_generation(),
                     );
+                    if let Some(binding) = &self.final_control {
+                        if received_sealed_exit(&self.sealed_exit, binding) {
+                            let _ = armed.record_sealed_exit(&self._profile, binding);
+                        }
+                    }
                 }
                 self.checks.quarantine();
             }
@@ -1537,7 +1572,10 @@ fn run() -> Result<(), String> {
         deadline,
         &cancel,
     )?;
-    let lock = receive_lock(&socket, deadline, &cancel)?;
+    let lock = receive_descriptor(&socket, deadline, &cancel, PROFILE_LOCK_FD)?;
+    let sealed_fd: OwnedFd = receive_descriptor(&socket, deadline, &cancel, SEALED_EXIT_FD)?.into();
+    let sealed_exit = UnixDatagram::from(sealed_fd);
+    sealed_exit.set_nonblocking(true).map_err(|_| FAILED)?;
     let profile = UpdateProfile::from_inherited(crate::settings::Locations::user()?, lock)?;
     let executable = std::env::current_exe().map_err(|_| FAILED)?;
     let parent_executable = process_identity::executable(parent)?;
@@ -1593,6 +1631,7 @@ fn run() -> Result<(), String> {
             bundles,
             profile.clone(),
             socket.try_clone().map_err(|_| FAILED)?,
+            sealed_exit,
             parent,
             &request.manifest_sha256,
             configuration.clone(),

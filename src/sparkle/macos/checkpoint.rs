@@ -293,7 +293,15 @@ fn native_recovery_message(path: &Path) -> Result<&'static str, String> {
         // migration, installer acknowledgement, recovery or barrier retirement.
         return Ok(match value.observation {
             NativeEvent::OwnerExited => "The app update preservation owner exited before verified completion. Keep the previous app and preserved settings for recovery.",
-            NativeEvent::ParentExited => "The previous application exited during an app update. Its update outcome and preserved settings require recovery verification.",
+            NativeEvent::ParentExited => {
+                if Stamp::read(&path.join("sealed-parent-exit.json"))?.is_some() {
+                    let binding: FinalProfileBinding = serde_json::from_slice(&read_marker(&path.join("sealed-parent-exit.json"))?).map_err(|_| HOLD)?;
+                    read_final_profile(path, &initial, expected.owner_pid, &binding)?;
+                    "PeerBrush closed its saved projects and preserved its final settings before exiting. The update needs recovery verification."
+                } else {
+                    "The previous application exited during an app update. Its update outcome and preserved settings require recovery verification."
+                }
+            },
             NativeEvent::Callback { outcome: NativeOutcome::Installed { .. } } => "The updater reported installation, but the new signed version and launch health are not verified. Preserved settings remain protected.",
             _ => "The app update was interrupted or has no verified installed outcome. Keep the previous app and preserved settings for recovery.",
         });
@@ -352,6 +360,7 @@ fn inspect_unstarted_attempt(path: &Path) -> Result<(), String> {
     // Final profile capture starts only after native Ready. A partial copy is
     // evidence of that stage even if the intent or final manifest is lost.
     let forbidden = [
+        "sealed-parent-exit.json",
         "final-profile",
         "final-profile.json",
         "native-owner-exited.json",
@@ -1072,7 +1081,9 @@ impl Prepared {
                 remote.require_active()?;
                 self.check_identity()
             },
-        )
+        )?;
+        self._owner.notify_sealed_exit(binding);
+        Ok(())
     }
     /// Actual caller holds sorted engines, registry and the Store writer mutex.
     /// Never reacquire workspace locks here or invoke a native continuation.
@@ -1591,6 +1602,18 @@ pub(super) struct ArmedCheck {
     owner_pid: u32,
 }
 impl ArmedCheck {
+    pub(super) fn record_sealed_exit(
+        &self,
+        profile: &UpdateProfile,
+        binding: &FinalProfileBinding,
+    ) -> Result<(), String> {
+        let path = self.check_records(profile)?;
+        read_final_profile(&path, &self.manifest, self.owner_pid, binding)?;
+        write_new(
+            &path.join("sealed-parent-exit.json"),
+            &serde_json::to_vec(binding).map_err(|_| HOLD)?,
+        )
+    }
     pub(super) fn record_event(
         &self,
         profile: &UpdateProfile,

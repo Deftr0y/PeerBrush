@@ -127,11 +127,12 @@ fn inherited_descriptor_is_cloexec_and_closing_it_does_not_change_parent_bytes()
     let (_temp, file) = Temp::new();
     let before = file.metadata().unwrap();
     let (parent, child) = UnixStream::pair().unwrap();
-    send_lock(&parent, &file).unwrap();
-    let received = receive_lock(
+    send_descriptor(&parent, &file, PROFILE_LOCK_FD).unwrap();
+    let received = receive_descriptor(
         &child,
         Instant::now() + Duration::from_secs(2),
         &AtomicBool::new(false),
+        PROFILE_LOCK_FD,
     )
     .unwrap();
     let after = received.metadata().unwrap();
@@ -214,10 +215,63 @@ fn captured_reply_is_bound_to_exact_request_and_child_but_never_install_authorit
     }
 }
 #[test]
+fn sealed_exit_notice_survives_disconnect_and_requires_the_reviewed_final_profile() {
+    let binding = final_binding();
+    for case in ["sealed", "crash", "different", "truncated", "oversized"] {
+        let (sender, receiver) = UnixDatagram::pair().unwrap();
+        let (control, child) = UnixStream::pair().unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        send_descriptor(&control, &receiver, SEALED_EXIT_FD).unwrap();
+        drop(receiver);
+        let fd: OwnedFd = receive_descriptor(
+            &child,
+            Instant::now() + Duration::from_secs(2),
+            &AtomicBool::new(false),
+            SEALED_EXIT_FD,
+        )
+        .unwrap()
+        .into();
+        let reader = UnixDatagram::from(fd);
+        let owner = Owner {
+            socket: control,
+            sealed_exit: Some(sender),
+            child: None,
+            request: None,
+        };
+        match case {
+            "sealed" => owner.notify_sealed_exit(&binding),
+            "different" => {
+                let mut other = binding.clone();
+                other.record_sha256 = "0".repeat(64);
+                owner.notify_sealed_exit(&other);
+            }
+            "truncated" | "oversized" => {
+                let bytes = if case == "truncated" {
+                    binding.record_sha256[..63].to_owned()
+                } else {
+                    format!("{}0", binding.record_sha256)
+                };
+                owner
+                    .sealed_exit
+                    .as_ref()
+                    .unwrap()
+                    .send(bytes.as_bytes())
+                    .unwrap();
+            }
+            _ => {}
+        }
+        drop(owner);
+        assert_eq!(received_sealed_exit(&reader, &binding), case == "sealed");
+        assert!(!received_sealed_exit(&reader, &binding));
+    }
+}
+
+#[test]
 fn dropping_capture_channel_only_disconnects_our_owner_without_native_outcome() {
     let (parent, mut child) = UnixStream::pair().unwrap();
     let owner = Owner {
         socket: parent,
+        sealed_exit: None,
         child: None,
         request: None,
     };
@@ -362,6 +416,7 @@ fn copied_check_parent_transport_refuses_before_reader_consumption_or_native_aut
     let nonce = request.nonce.clone();
     let mut owner = Owner {
         socket: parent,
+        sealed_exit: None,
         child: None,
         request: Some(request),
     };
@@ -471,10 +526,11 @@ fn actual_descriptor_receiver_refuses_missing_multiple_truncated_and_wrong_marke
             }
         }
         assert!(
-            receive_lock(
+            receive_descriptor(
                 &child,
                 Instant::now() + Duration::from_secs(2),
-                &AtomicBool::new(false)
+                &AtomicBool::new(false),
+                PROFILE_LOCK_FD
             )
             .is_err(),
             "{damage}"
@@ -631,6 +687,7 @@ fn public_pins_and_capture_roles_cannot_activate_the_child_native_load_boundary(
         bundles,
         profile.update_profile(),
         channel,
+        UnixDatagram::unbound().unwrap(),
         std::process::id(),
         &"a".repeat(64),
         configuration,
