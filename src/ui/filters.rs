@@ -370,10 +370,9 @@ impl Editor {
 }
 impl PeerBrush {
     pub(super) fn document_filter_stack(&mut self, ui: &mut egui::Ui, doc: &Document) {
-        let mut display = self.animation.document(doc, ui.input(|i| i.time), false);
-        if let Some(preview) = self.pending_parameter_document(ui.ctx(), doc) {
-            display = preview;
-        }
+        let display = self.pending_parameter_document(ui.ctx(), doc)
+            .map(std::borrow::Cow::Owned)
+            .unwrap_or_else(|| self.animation.document(doc, ui.input(|i| i.time), false));
         ui.set_min_width(290.);
         ui.add_enabled_ui(!doc.read_only && !self.busy, |ui| {
             for (index, f) in display.filters.iter().enumerate().rev() {

@@ -415,12 +415,10 @@ pub fn restore(
         );
     }
     doc.name = entry.name;
-    let mut e = engine::Engine::new();
-    e.doc = doc;
+    let mut e = engine::Engine::from_document(doc);
     e.saved_revision = u64::MAX;
     e.status = "Recovered into an unsaved tab · choose Save As · recovery retained".into();
-    // Engine::new has no destination or external file version. Register assigns a
-    // fresh runtime document identity; recovery files remain until explicit discard.
+    // Register assigns a fresh runtime identity. Recovery files remain until explicit discard.
     workspace::register_in(workspace, e, initiating)
 }
 

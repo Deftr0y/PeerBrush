@@ -1936,8 +1936,7 @@ impl PeerBrush {
                     e.doc.name = format!("Recovered — {name}");
                 }
             }
-            let engine = s.lock().unwrap().clone();
-            crate::workspace::register_in(&workspace, engine, Some(&initiating))?;
+            crate::workspace::register_opened(&workspace, s, Some(&initiating))?;
             Ok(if recover {
                 "Recovered version — save to your chosen PSD or PSB"
             } else {
@@ -2591,7 +2590,7 @@ impl PeerBrush {
                 if parameter.is_some() {
                     current.clone()
                 } else {
-                    self.animation.document(doc, time, true)
+                    self.animation.document(doc, time, true).into_owned()
                 }
             });
             doc.revision = current.revision;
@@ -5650,13 +5649,14 @@ impl PeerBrush {
         {
             self.finish_parameter(false);
         }
-        let (doc, ai_change) = {
+        let (frame, ai_change) = {
             let mut e = self.shared.lock().unwrap();
             e.expire();
-            (e.doc.clone(), e.ai_change.clone())
+            (Arc::new(e.doc.clone()), e.ai_change.clone())
         };
-        self.doc_snapshot = doc.clone().into();
-        self.sync_free_transform(ctx, &doc);
+        self.doc_snapshot = DocumentSnapshot::Resident(frame.clone());
+        let doc = frame.as_ref();
+        self.sync_free_transform(ctx, doc);
         if self.lifecycle.is_none() && !self.lifecycle_frame {
             self.import_dialog(ctx);
             self.image_open_dialog(ctx);
@@ -5714,7 +5714,7 @@ impl PeerBrush {
                     }
                 })
         });
-        self.thumb_worker.document(&doc);
+        self.thumb_worker.document(doc);
         if self.thumb_document != doc.id {
             self.retouch_source = None;
             self.retouch_revision = None;
@@ -5774,13 +5774,13 @@ impl PeerBrush {
             }
         }
         self.file_drop_feedback(ctx);
-        let held_selection_shortcuts = self.hold_canvas_selection_shortcuts(ctx, &doc);
-        let deferred_shortcuts = self.defer_canvas_shortcuts(ctx, &doc);
+        let held_selection_shortcuts = self.hold_canvas_selection_shortcuts(ctx, doc);
+        let deferred_shortcuts = self.defer_canvas_shortcuts(ctx, doc);
         let show_held_shortcut_message = held_selection_shortcuts.is_some()
             && deferred_shortcuts
                 .as_ref()
                 .is_none_or(|(_, late, _)| late.is_empty());
-        self.document_shortcuts(ctx, &doc);
+        self.document_shortcuts(ctx, doc);
         egui::TopBottomPanel::top("context")
             .exact_height(48.0)
             .show(ctx, |ui| {
@@ -5839,7 +5839,7 @@ impl PeerBrush {
                             ui.close_menu();
                         }
                         if ui.button("Production export…").clicked() {
-                            self.open_exports(&doc);
+                            self.open_exports(doc);
                             ui.close_menu();
                         }
                         ui.separator();
@@ -5853,36 +5853,36 @@ impl PeerBrush {
                     egui::menu::menu_custom_button(ui, egui::Button::new("View").corner_radius(egui::CornerRadius::same(0)),|ui| { ui.spacing_mut().item_spacing.x = 8.; self.canvas_view_menu(ui) });
                     egui::menu::menu_custom_button(ui, egui::Button::new("Image").corner_radius(egui::CornerRadius::same(0)),|ui| {
                         ui.spacing_mut().item_spacing.x = 8.;
-                        if ui.add_enabled(!doc.read_only&&!self.busy,egui::Button::new("Whole-image filters…")).clicked(){self.open_filters(&doc);ui.close_menu();}
-                        if !doc.filters.is_empty(){ui.menu_button("Filter stack",|ui|self.document_filter_stack(ui,&doc));}
+                        if ui.add_enabled(!doc.read_only&&!self.busy,egui::Button::new("Whole-image filters…")).clicked(){self.open_filters(doc);ui.close_menu();}
+                        if !doc.filters.is_empty(){ui.menu_button("Filter stack",|ui|self.document_filter_stack(ui,doc));}
                         for (label,mode) in [("Crop…","crop"),("Canvas size…","canvas.resize"),("Image size…","image.resize")] {
-                            if ui.add_enabled(!doc.read_only && !self.busy,egui::Button::new(label)).clicked() {self.open_geometry(&doc,mode);ui.close_menu();}
+                            if ui.add_enabled(!doc.read_only && !self.busy,egui::Button::new(label)).clicked() {self.open_geometry(doc,mode);ui.close_menu();}
                         }
                     });
                     egui::menu::menu_custom_button(ui, egui::Button::new("Layer").corner_radius(egui::CornerRadius::same(0)),|ui| {
                         ui.spacing_mut().item_spacing.x = 8.;
-                        if ui.add_enabled(!self.busy&&!doc.read_only,egui::Button::new("Free Transform...").shortcut_text(if cfg!(target_os="macos") {"Cmd+T"}else{"Ctrl+T"})).clicked(){self.open_free_transform(ctx,&doc);ui.close_menu();}
-                        if ui.add_enabled(!self.busy&&!doc.read_only,egui::Button::new("Group layers").shortcut_text(if cfg!(target_os="macos") {"⌘ G"} else {"Ctrl+G"})).clicked(){self.create_folder(&doc);ui.close_menu();}
-                        if ui.add_enabled(!self.busy&&!doc.read_only,egui::Button::new("Merge layers").shortcut_text(if cfg!(target_os="macos") {"⌘ ⇧ G"} else {"Ctrl+Shift+G"})).clicked(){self.merge_layers(ctx,&doc);ui.close_menu();}
+                        if ui.add_enabled(!self.busy&&!doc.read_only,egui::Button::new("Free Transform...").shortcut_text(if cfg!(target_os="macos") {"Cmd+T"}else{"Ctrl+T"})).clicked(){self.open_free_transform(ctx,doc);ui.close_menu();}
+                        if ui.add_enabled(!self.busy&&!doc.read_only,egui::Button::new("Group layers").shortcut_text(if cfg!(target_os="macos") {"⌘ G"} else {"Ctrl+G"})).clicked(){self.create_folder(doc);ui.close_menu();}
+                        if ui.add_enabled(!self.busy&&!doc.read_only,egui::Button::new("Merge layers").shortcut_text(if cfg!(target_os="macos") {"⌘ ⇧ G"} else {"Ctrl+Shift+G"})).clicked(){self.merge_layers(ctx,doc);ui.close_menu();}
                         ui.separator();
                         for (label,kind) in [("New text…","text"),("New vector shape…","shape"),("Edit text/vector…","edit")] {
                             let enabled=!doc.read_only&&!self.busy && (kind!="edit"||doc.layers.iter().any(|l|l.id==self.selected&&l.source.is_some()));
-                            if ui.add_enabled(enabled,egui::Button::new(label)).clicked(){self.open_source(&doc,kind);ui.close_menu();}
+                            if ui.add_enabled(enabled,egui::Button::new(label)).clicked(){self.open_source(doc,kind);ui.close_menu();}
                         }
                         if ui.add_enabled(!doc.read_only&&doc.layers.iter().any(|l|l.id==self.selected&&l.source.is_some()),egui::Button::new("Rasterize text/vector")).on_hover_text("Keep the current pixels and remove editable properties · Undo restores the source").clicked(){self.layer_cmd("source.rasterize",json!({}),"Rasterize text/vector");ui.close_menu();}
                     });
                     egui::menu::menu_custom_button(ui, egui::Button::new("Select").corner_radius(egui::CornerRadius { nw: 0, sw: 0, ne: 6, se: 6 }),|ui| {
                         ui.spacing_mut().item_spacing.x = 8.;
                         let learned = crate::segmentation::configured() && !doc.read_only && !self.busy;
-                        if ui.add_enabled(learned, egui::Button::new("Select subject")).on_hover_text("Uses the externally configured local selection provider").clicked(){self.segment_subject(&doc,false);ui.close_menu();}
-                        if ui.add_enabled(learned && doc.selection.is_some(), egui::Button::new("Select subject in region")).clicked(){self.segment_subject(&doc,true);ui.close_menu();}
-                        if ui.add_enabled(doc.selection.is_some()&&!doc.read_only,egui::Button::new("Refine selection…")).clicked(){self.open_refinement(&doc,None);ui.close_menu();}
+                        if ui.add_enabled(learned, egui::Button::new("Select subject")).on_hover_text("Uses the externally configured local selection provider").clicked(){self.segment_subject(doc,false);ui.close_menu();}
+                        if ui.add_enabled(learned && doc.selection.is_some(), egui::Button::new("Select subject in region")).clicked(){self.segment_subject(doc,true);ui.close_menu();}
+                        if ui.add_enabled(doc.selection.is_some()&&!doc.read_only,egui::Button::new("Refine selection…")).clicked(){self.open_refinement(doc,None);ui.close_menu();}
                         if ui.add_enabled(doc.selection.is_some()&&!doc.read_only,egui::Button::new("Mask from selection")).clicked(){self.layer_cmd("mask.from_selection",json!({}),"Mask from selection");ui.close_menu();}
-                        if ui.add_enabled(doc.layers.iter().any(|l|l.id==self.selected&&l.mask.is_some())&&!doc.read_only,egui::Button::new("Refine layer mask…")).clicked(){self.open_refinement(&doc,Some(self.selected.clone()));ui.close_menu();}
+                        if ui.add_enabled(doc.layers.iter().any(|l|l.id==self.selected&&l.mask.is_some())&&!doc.read_only,egui::Button::new("Refine layer mask…")).clicked(){self.open_refinement(doc,Some(self.selected.clone()));ui.close_menu();}
                         for (label,op) in [("All · Ctrl+A","all"),("Deselect · Ctrl+Shift+D","selection.clear"),("Reselect · Ctrl+Alt+D","selection.reselect"),("Inverse","selection.invert")] {
                             let button=egui::Button::new(label);
                             let button=if op=="selection.invert" {button.shortcut_text(if cfg!(target_os="macos") {"⌘ ⇧ I"} else {"Ctrl+Shift+I"})} else {button};
-                            if ui.add(button).clicked(){if op=="selection.clear" {self.deselect_area(&doc,false);}else{self.edit(vec![if op=="all"{json!({"op":"selection","kind":"rectangle","rect":[0,0,doc.width,doc.height]})}else{json!({"op":op})}],label);}ui.close_menu();}
+                            if ui.add(button).clicked(){if op=="selection.clear" {self.deselect_area(doc,false);}else{self.edit(vec![if op=="all"{json!({"op":"selection","kind":"rectangle","rect":[0,0,doc.width,doc.height]})}else{json!({"op":op})}],label);}ui.close_menu();}
                         }
                         for (label,mode) in [("Expand by 1 px","expand"),("Contract by 1 px","contract")] {if ui.button(label).clicked(){self.edit(vec![json!({"op":"selection.modify","mode":mode,"radius":1})],label);ui.close_menu();}}
                     });
@@ -5923,8 +5923,8 @@ impl PeerBrush {
                         let ai=self.tool_preferences_ai(time);
                         liquify::toolbar(ui, &mut self.radius, &mut self.liquify,radius,strength,ai);
                     }
-                    self.transform_snap_toolbar(ui, &doc);
-                    self.pen_toolbar(ui,&doc);
+                    self.transform_snap_toolbar(ui, doc);
+                    self.pen_toolbar(ui,doc);
                     self.retouch_toolbar(ui);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if icons::button(ui, Icon::Frame, "Frame selection or canvas · F").clicked()
@@ -5960,7 +5960,7 @@ impl PeerBrush {
                     if self.animation.layer("@selection", ui.input(|i| i.time)) {
                         ui.style_mut().visuals.selection.stroke.color = AI_BLUE;
                     }
-                    self.selection_toolbar(ui, &doc);
+                    self.selection_toolbar(ui, doc);
                 });
         }
         self.recovery_failure(ctx);
@@ -6141,7 +6141,7 @@ impl PeerBrush {
                 ui.add_space((ui.available_height() - 64.0).max(0.0));
                 self.palette(ui);
             });
-        self.sync_solo(&doc);
+        self.sync_solo(doc);
         egui::SidePanel::right("layer_panel")
             .default_width(320.0)
             .min_width(300.0)
@@ -6150,16 +6150,15 @@ impl PeerBrush {
                 if self.lifecycle.is_some() || self.lifecycle_frame {
                     ui.disable();
                 }
-                let mut display = self.animation.document(&doc, ui.input(|i| i.time), false);
-                if let Some(preview) = self.pending_parameter_document(ui.ctx(), &doc) {
-                    display = preview;
-                }
+                let display = self.pending_parameter_document(ui.ctx(), doc)
+                    .map(std::borrow::Cow::Owned)
+                    .unwrap_or_else(|| self.animation.document(doc, ui.input(|i| i.time), false));
                 if self.ai_layer(&self.selected, ui.input(|i| i.time)) {
                     ui.style_mut().visuals.selection.stroke.color = AI_BLUE;
                 }
-                self.layers(ui, &display);
+                self.layers(ui, display.as_ref());
             });
-        self.sync_solo(&doc);
+        self.sync_solo(doc);
         let shortcut_modifiers = deferred_shortcuts
             .as_ref()
             .map(|(_, _, release_modifiers)| {
@@ -6195,8 +6194,8 @@ impl PeerBrush {
                     ui.add(egui::Image::new((texture.id(), size * scale)));
                     return;
                 }
-                let display = self.review_document(&doc);
-                self.canvas(ui, display.as_ref().unwrap_or(&doc));
+                let display = self.review_document(doc);
+                self.canvas(ui, display.as_ref().unwrap_or(doc));
             });
 
         if let Some(modifiers) = shortcut_modifiers {
@@ -6204,10 +6203,10 @@ impl PeerBrush {
         }
         if let Some((original, late, _)) = deferred_shortcuts {
             ctx.input_mut(|i| i.events = late);
-            let current = self.shared.lock().unwrap().doc.clone();
+            let current = Arc::new(self.shared.lock().unwrap().doc.clone());
             if current.id == doc.id && self.tab_transfer.is_none() && !self.selection_commit_failed
             {
-                self.doc_snapshot = current.clone().into();
+                self.doc_snapshot = DocumentSnapshot::Resident(current.clone());
                 self.document_shortcuts(ctx, &current);
                 ctx.request_repaint();
             }
@@ -6234,7 +6233,7 @@ impl PeerBrush {
         }
 
         if self.tab_transfer.is_none() {
-            self.request_preview(ctx, &doc);
+            self.request_preview(ctx, doc);
         }
         if self.lifecycle.is_some() || self.lifecycle_frame {
             if self.lifecycle.is_none() && self.save_loss_review.is_none() {
@@ -6298,17 +6297,17 @@ impl PeerBrush {
             self.brush_settings(ctx);
         }
         self.color_window(ctx);
-        self.task_history_review(ctx, &doc);
-        self.proposal_window(ctx, &doc);
-        self.refinement_window(ctx, &doc);
-        self.geometry_window(ctx, &doc);
-        self.free_transform_window(ctx, &doc, drawn_generation);
-        self.source_window(ctx, &doc);
-        self.filters_window(ctx, &doc);
-        self.exports_window(ctx, &doc);
-        self.protection_window(ctx, &doc);
-        self.patterns_window(ctx, &doc);
-        self.compatibility_window(ctx, &doc);
+        self.task_history_review(ctx, doc);
+        self.proposal_window(ctx, doc);
+        self.refinement_window(ctx, doc);
+        self.geometry_window(ctx, doc);
+        self.free_transform_window(ctx, doc, drawn_generation);
+        self.source_window(ctx, doc);
+        self.filters_window(ctx, doc);
+        self.exports_window(ctx, doc);
+        self.protection_window(ctx, doc);
+        self.patterns_window(ctx, doc);
+        self.compatibility_window(ctx, doc);
         self.associations.show(ctx);
         self.new_canvas_window(ctx);
         if self.show_connection {

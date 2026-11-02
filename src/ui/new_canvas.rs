@@ -118,11 +118,9 @@ impl PeerBrush {
                             self.new_bit_depth,
                         )
                         .and_then(|doc| {
-                            let mut engine = crate::engine::Engine::new();
-                            engine.doc = doc;
                             crate::workspace::register_in(
                                 &self.workspace,
-                                engine,
+                                crate::engine::Engine::from_document(doc),
                                 Some(&self.project_id),
                             )
                         });

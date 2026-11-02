@@ -219,15 +219,16 @@ pub fn mutating(method: &str, p: &Value) -> bool {
 }
 pub fn validate_target(e: &Engine, p: &Value) -> Result<(), String> {
     e.ensure_open()?;
+    let view = engine::view::current(e);
     if let Some(document) = p.get("document_id") {
-        if document.as_str() != Some(&e.doc.id) {
+        if document.as_str() != Some(view.id()) {
             return Err("Project document changed; observe this project again".into());
         }
     }
     if p.get("project_id").is_some()
         && p["expected_revision"]
             .as_u64()
-            .is_some_and(|r| r != e.doc.revision)
+            .is_some_and(|r| r != view.revision())
     {
         return Err("Targeted project revision changed; observe this project again".into());
     }
@@ -361,6 +362,18 @@ pub fn register_in(
     }
     Ok(shared)
 }
+/// Move the independently opened project, including its file ownership, into its tab.
+pub(crate) fn register_opened(
+    workspace: &Registry,
+    prepared: Shared,
+    activate_if: Option<&str>,
+) -> Result<Shared, String> {
+    let engine = Arc::try_unwrap(prepared)
+        .map_err(|_| "Opened project still has an active worker")?
+        .into_inner()
+        .map_err(|_| "Opened project worker failed")?;
+    register_in(workspace, engine, activate_if)
+}
 pub fn new_project(
     root: &Shared,
     width: u32,
@@ -368,13 +381,13 @@ pub fn new_project(
     depth: u16,
     activate_if: Option<&str>,
 ) -> Result<Shared, String> {
-    let mut e = Engine::new();
-    e.doc = Document::new_depth(width, height, depth)?;
-    register(root, e, activate_if)
+    let engine = Engine::from_document(Document::new_depth(width, height, depth)?);
+    register(root, engine, activate_if)
 }
 pub fn guard(e: &Engine, document: &str, revision: u64) -> Result<(), String> {
     e.ensure_open()?;
-    if e.doc.id != document || e.doc.revision != revision {
+    let view = engine::view::current(e);
+    if view.id() != document || view.revision() != revision {
         return Err("Project source changed; observe its document ID and revision again".into());
     }
     Ok(())

@@ -634,8 +634,7 @@ impl SelectionGesture {
 impl Engine {
     /// Transient visual feedback uses the same commands as a committed edit, without touching history or shared state.
     pub fn preview_edits(doc: Document, commands: &[Value]) -> Result<Document, String> {
-        let mut engine = Self::new();
-        engine.doc = doc;
+        let mut engine = Self::from_document(doc);
         let commands = engine
             .filter_library
             .lock()
@@ -670,12 +669,15 @@ impl Engine {
         Ok(engine.doc)
     }
     pub fn new() -> Self {
+        Self::from_document(Document::new(1024, 768).unwrap())
+    }
+    pub(crate) fn from_document(doc: Document) -> Self {
         Self {
             project_id: id(),
             closed: false,
             workspace: None,
             workspace_owner: None,
-            doc: Document::new(1024, 768).unwrap(),
+            doc,
             leases: vec![],
             undo: vec![],
             redo: vec![],

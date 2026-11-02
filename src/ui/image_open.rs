@@ -22,8 +22,7 @@ pub(super) fn finish(
         &pending.control,
         &options,
     )?;
-    let engine = pending.shared.lock().unwrap().clone();
-    crate::workspace::register_in(workspace, engine, Some(&pending.initiating))?;
+    crate::workspace::register_opened(workspace, pending.shared, Some(&pending.initiating))?;
     Ok("Image opened — save as PSD or PSB".into())
 }
 

@@ -1455,6 +1455,22 @@ fn dispatch_reply(
     }
     Ok(result)
 }
+fn new_document(p: &Value) -> Result<engine::Document, String> {
+    let size = |key: &str, default| {
+        p.get(key).map_or(Ok(default), |v| {
+            v.as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+                .ok_or("Invalid canvas size")
+        })
+    };
+    let depth = p.get("bit_depth").map_or(Ok(8), |v| {
+        v.as_u64()
+            .filter(|n| [8, 16].contains(n))
+            .map(|n| n as u16)
+            .ok_or("Color depth must be 8 or 16 bits")
+    })?;
+    engine::Document::new_depth(size("width", 1024)?, size("height", 768)?, depth)
+}
 fn projects(root: &Shared, p: &Value) -> Result<Value, String> {
     use crate::workspace as w;
     let actor = p["actor"].as_str().unwrap_or("agent");
@@ -1465,7 +1481,8 @@ fn projects(root: &Shared, p: &Value) -> Result<Value, String> {
         "new" | "open" => {
             let active = w::active_id(root);
             let activate = actor == "human" && p["activate"] != false;
-            let engine = if p["action"] == "open" {
+            let activate_if = activate.then_some(active.as_str());
+            let shared = if p["action"] == "open" {
                 let shared = Arc::new(Mutex::new(Engine::new()));
                 let path = Path::new(text("path")?);
                 if let Err(error) =
@@ -1474,28 +1491,10 @@ fn projects(root: &Shared, p: &Value) -> Result<Value, String> {
                     w::duplicate_warning(&w::attach(root), path, &error, activate);
                     return Err(error);
                 }
-                let result = shared.lock().unwrap().clone();
-                result
+                w::register_opened(&w::attach(root), shared, activate_if)?
             } else {
-                let mut engine = Engine::new();
-                let size = |key: &str, default: u32| {
-                    p.get(key).map_or(Ok(default), |v| {
-                        v.as_u64()
-                            .and_then(|n| u32::try_from(n).ok())
-                            .ok_or("Invalid canvas size")
-                    })
-                };
-                let depth = p.get("bit_depth").map_or(Ok(8), |v| {
-                    v.as_u64()
-                        .filter(|n| [8, 16].contains(n))
-                        .map(|n| n as u16)
-                        .ok_or("Color depth must be 8 or 16 bits")
-                })?;
-                engine.doc =
-                    engine::Document::new_depth(size("width", 1024)?, size("height", 768)?, depth)?;
-                engine
+                w::register(root, Engine::from_document(new_document(p)?), activate_if)?
             };
-            let shared = w::register(root, engine, activate.then_some(active.as_str()))?;
             let result = shared.lock().unwrap().state();
             Ok(result)
         }
@@ -2269,17 +2268,7 @@ fn dispatch_project(
                     return Ok(result);
                 }
                 "new" => {
-                    let depth = p.get("bit_depth").map_or(Ok(8), |v| {
-                        v.as_u64()
-                            .filter(|d| [8, 16].contains(d))
-                            .map(|d| d as u16)
-                            .ok_or("Color depth must be 8 or 16 bits")
-                    })?;
-                    let doc = engine::Document::new_depth(
-                        p.get("width").and_then(Value::as_u64).unwrap_or(1024) as u32,
-                        p.get("height").and_then(Value::as_u64).unwrap_or(768) as u32,
-                        depth,
-                    )?;
+                    let doc = new_document(p)?;
                     let mut e = shared.lock().unwrap();
                     if opening_source.as_ref()
                         != Some(&(

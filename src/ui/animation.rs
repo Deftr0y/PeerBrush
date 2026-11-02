@@ -1,6 +1,7 @@
 //! Presentation-only animation. Shared edits and history are committed immediately.
 use super::*;
 use crate::engine::{AiChange, Scope};
+use std::borrow::Cow;
 
 const DURATION: f64 = 0.36;
 const HIGHLIGHT: f64 = 3.0;
@@ -212,12 +213,17 @@ impl Animation {
             .filter(|t| t.interpolated_canvas)
             .map_or_else(String::new, |t| format!("ai:{}", t.change.serial))
     }
-    pub(super) fn document(&self, doc: &Document, time: f64, canvas: bool) -> Document {
+    pub(super) fn document<'a>(
+        &self,
+        doc: &'a Document,
+        time: f64,
+        canvas: bool,
+    ) -> Cow<'a, Document> {
         let Some(transition) = &self.transition else {
-            return doc.clone();
+            return Cow::Borrowed(doc);
         };
         if canvas && !transition.interpolated_canvas {
-            return doc.clone();
+            return Cow::Borrowed(doc);
         }
         let linear = ((time - transition.started) / DURATION).clamp(0.0, 1.0) as f32;
         // Match the render key exactly so a cached presentation never represents a different value.
@@ -226,20 +232,23 @@ impl Animation {
         } else {
             linear
         });
-        if t >= 1.0 || doc.revision != transition.after.view().revision() {
-            return doc.clone();
+        if t >= 1.0
+            || doc.id != transition.after.view().id()
+            || doc.revision != transition.after.view().revision()
+        {
+            return Cow::Borrowed(doc);
         }
         let cache_tag = if canvas {
             format!("step{}", (linear * 12.0).round() as u8)
         } else {
             format!("ui{}", (time * 1000.0).round() as u64)
         };
-        let mut display = doc.clone();
         // This compatibility renderer accepts an actual resident source only;
         // native presentation uses its source-backed worker and metadata view.
         let DocumentSnapshot::Resident(before) = &transition.before else {
-            return display;
+            return Cow::Borrowed(doc);
         };
+        let mut display = doc.clone();
         if !canvas {
             if let (Some(old), Some(source)) = (
                 crate::selection::wand_source(before),
@@ -315,7 +324,7 @@ impl Animation {
                 }
             }
         }
-        display
+        Cow::Owned(display)
     }
     pub(super) fn fade_preview(
         &mut self,
@@ -594,6 +603,10 @@ mod tests {
         ], None, None, "Soften").unwrap();
         animation.observe(&engine.doc, engine.ai_change.clone(), 1.0);
         let display = animation.document(&engine.doc, 1.18, false);
+        assert!(matches!(display, Cow::Owned(_)));
+        let mut other = Document::new(1, 1).unwrap();
+        other.revision = engine.doc.revision;
+        assert!(matches!(animation.document(&other, 1.18, false), Cow::Borrowed(_)));
         assert!((display.layers[0].opacity - 0.6).abs() < 0.001);
         assert!(
             (display.layers[0].effects[0].settings["radius"]
@@ -616,6 +629,7 @@ mod tests {
             )
             .unwrap();
         animation.observe(&engine.doc, engine.ai_change.clone(), 1.2);
+        assert!(matches!(animation.document(&engine.doc, 1.2, false), Cow::Borrowed(_)));
         assert_eq!(
             animation.document(&engine.doc, 1.2, false).layers[0].opacity,
             0.8
