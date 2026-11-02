@@ -415,7 +415,13 @@ fn empty_prearmed_outcome_keeps_pending_growth_but_native_checkpoint_remains_rea
     let f = Fixture::new();
     let (_engine, connection) = f.connection();
     let context = PersistentRootContext::from_explicit_state(&connection).unwrap();
-    let runtime = SourceRuntime::new(context.clone(), limits()).unwrap();
+    // Staging retains its 64 MiB metadata reservation alongside the scene cache.
+    // This fixture measures persisted disk debt, independently of resident RAM.
+    let checkpoint_limits = || super::super::Limits {
+        resident_bytes: 96 * 1024 * 1024,
+        ..limits()
+    };
+    let runtime = SourceRuntime::new(context.clone(), checkpoint_limits()).unwrap();
     let mut engine = crate::engine::Engine::new();
     engine.doc = crate::engine::Document::new_depth(2, 2, 16).unwrap();
     engine.doc.layers[0]
@@ -474,7 +480,7 @@ fn empty_prearmed_outcome_keeps_pending_growth_but_native_checkpoint_remains_rea
     drop(engine);
     drop(session);
     drop(runtime);
-    let restored = SourceRuntime::new(context, limits()).unwrap();
+    let restored = SourceRuntime::new(context, checkpoint_limits()).unwrap();
     let session = restored.begin().unwrap();
     assert_eq!(
         restored.disk().admitted().unwrap() - restored.disk().used().unwrap(),

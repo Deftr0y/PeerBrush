@@ -218,7 +218,7 @@ fn actual_native_replay_cancellation_is_latched_and_keeps_prefix_as_charged_debt
 
 #[test]
 fn actual_native_committed_new_target_finishes_after_closing_without_new_source_admission() {
-    crate::psd::save36::with_session_candidate_join(
+    let finished = crate::psd::save36::with_session_candidate_join(
         16,
         |session, candidate, runtime, root, connection| {
             let path = root.join("new-source.psb");
@@ -277,9 +277,10 @@ fn actual_native_committed_new_target_finishes_after_closing_without_new_source_
             drop(receipt);
             drop(inventory);
             drop(lease);
-            ((), Some(closer))
+            (finished, Some(closer))
         },
     );
+    finished.try_recv().unwrap();
 }
 
 #[test]

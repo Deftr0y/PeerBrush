@@ -2577,16 +2577,16 @@ fn owned_response_checked(
     body: reply::OwnedReply,
     check: impl Fn() -> Result<(), String> + Send + 'static,
 ) -> Result<tiny_http::ResponseBox, String> {
-    check()?;
-    let header = body
-        .response_pool()
-        .map(|pool| pool.reserve_bytes(4096, 4096).map_err(|e| e.to_string()))
-        .transpose()?;
     let headers = vec![
         tiny_http::Header::from_bytes("Cache-Control", "no-store").unwrap(),
         tiny_http::Header::from_bytes("Content-Type", "application/json").unwrap(),
     ];
     let response = if body.admitted() {
+        check()?;
+        let header = body
+            .response_pool()
+            .map(|pool| pool.reserve_bytes(4096, 4096).map_err(|e| e.to_string()))
+            .transpose()?;
         let bytes = body.serialized(&mut || check())?;
         let length = bytes.len();
         let reader = CheckedResponse {
@@ -2603,18 +2603,14 @@ fn owned_response_checked(
         )
         .boxed()
     } else {
+        // This resident operation already ran. Draining must deliver its result,
+        // including successful writes, before releasing the request guard.
         let bytes = serde_json::to_vec(&body).map_err(|_| "Response serialization failed")?;
-        check()?;
         let length = bytes.len();
-        let reader = CheckedResponse {
-            reader: std::io::Cursor::new(bytes),
-            check,
-            _header: header,
-        };
         tiny_http::Response::new(
             tiny_http::StatusCode(200),
             headers,
-            reader,
+            std::io::Cursor::new(bytes),
             Some(length),
             None,
         )

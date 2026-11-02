@@ -22,7 +22,7 @@ fn draw(
     )
 }
 
-fn wait_edit(app: &mut PeerBrush) {
+pub(super) fn wait_edit(app: &mut PeerBrush) {
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     while app.edit_worker.pending() {
         app.poll_edit_job();
@@ -894,6 +894,8 @@ fn pending_source_apply_preserves_its_draft_until_real_terminal_completion() {
                 |ctx| app.source_window(ctx, &doc),
             )
         };
+        // egui uses the first frame of a new window to measure its contents.
+        render(&mut app, vec![]);
         let output = render(&mut app, vec![]);
         let at = label(&output, "Apply");
         for pressed in [true, false] {

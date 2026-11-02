@@ -11473,6 +11473,7 @@ mod tests {
         assert!(app.shared.lock().unwrap().undo.is_empty());
         let apply = control(&mut app, &ctx, "Apply");
         click(&mut app, &ctx, apply);
+        super::text_tests::wait_edit(&mut app);
         assert!(app.source_editor.is_none());
         let mut engine = app.shared.lock().unwrap();
         assert_eq!(engine.undo.len(), 1);
@@ -11489,6 +11490,7 @@ mod tests {
         drop(engine);
         let current = app.shared.lock().unwrap().doc.clone();
         app.open_source(&current, "edit");
+        frame(&mut app, &ctx, vec![], Default::default());
         let cancel = control(&mut app, &ctx, "Cancel");
         click(&mut app, &ctx, cancel);
         assert!(app.source_editor.is_none());
