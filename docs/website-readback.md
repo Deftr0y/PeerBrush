@@ -29,8 +29,11 @@ The fixed website origin is `https://peerbrush.com/`. The reader checks each can
 - `releases.js`
 - `release-page.js`
 - `releases.html`
+- `downloads.html`
+- `windows.html`
+- `download-page.js`
 
-It also enumerates the actual module/feed query URLs from the expected HTML and JS, including versioned `main.js`, `release-page.js`, shared imports and the `downloads.json` query copied by those modules. Canonical files and query variants must independently match the expected bytes. A fresh unversioned file cannot hide a stale versioned cache response, or vice versa. There are at most 16 distinct website requests, each at most 2 MiB. Allowed queries contain one canonical stable `release=vA.B.C` and, optionally, a numeric `layout`; unknown parameters, credentials, ports, fragments, foreign hosts and every website redirect are rejected. The www subdomain and a redirect from an HTML path to the homepage are deliberately not silently accepted.
+It also enumerates the actual module/feed query URLs from the expected HTML and JS, including versioned `main.js`, `release-page.js`, shared imports and the `downloads.json` query copied by those modules. Canonical files and query variants must independently match the expected bytes. A fresh unversioned file cannot hide a stale versioned cache response, or vice versa. There are at most 17 distinct website requests, each at most 2 MiB. Allowed queries contain one canonical stable `release=vA.B.C` and, optionally, a numeric `layout`; unknown parameters, credentials, ports, fragments, foreign hosts and every website redirect are rejected. The www subdomain and a redirect from an HTML path to the homepage are deliberately not silently accepted.
 
 Requests send `Cache-Control: no-cache` and `Pragma: no-cache`, with no Authorization header or account credentials. A cached 304 cannot establish equality without bytes and is unavailable. Missing/failed requests are unavailable; returned bytes that differ from the expected file are a mismatch. The report records only bounded official paths and expected/actual SHA-256 values, never response bodies, presigned redirect URLs or remote exception text.
 
