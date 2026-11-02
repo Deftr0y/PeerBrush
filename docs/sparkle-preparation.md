@@ -1,6 +1,8 @@
 # Sparkle preparation for macOS updates
 
-This unreleased source prepares an exact Sparkle framework and an app-owned manual information check. Default public configuration and reviewed native policy are absent, so the application loads no framework and starts no Sparkle check. Installation has no executable route: no Install choice, package download, installer continuation, document close or relaunch is permitted. Even complete stable-release public feed/key/publisher/native pins cannot enable application startup: the source gate remains disabled until safe native termination, installer cancellation and recovery are implemented and verified. No key is generated, imported, exported or stored by these tools. Prepared source and tests are not native execution evidence.
+PeerBrush 0.30.0 bundles Sparkle 2.10.0. The manual updater is disabled while the feed, public key, publisher and installed recovery checks are outstanding.
+
+`packaging/sparkle/native-policy.json` pins the expected distribution identifiers, normalized executable hashes and entitlements for all five nested objects. Two native audits of the pinned archive produced identical values. A separate inspection of the arm64 code signatures confirmed the upstream identifiers and entitlements. The upstream Autoupdate tool carries `com.apple.application-identifier` for Sparkle's own helper. The distribution signing command strips that entitlement. Only Downloader preserves upstream entitlements, and its dictionary is empty for this archive. The final signed media must match the committed policy. [Sparkle's manual signing instructions](https://sparkle-project.org/documentation/sandboxing/#code-signing)
 
 The proposed stable feed is **https://peerbrush.com/updates/macos/stable/appcast.xml**. This is a proposed, unpublished location, not an available update service or download. Putting the URL in this document does not configure `SUFeedURL`, deploy a feed or authorize its publication.
 

@@ -170,13 +170,19 @@ class Bundle(unittest.TestCase):
         with self.assertRaises(KeyError):
             bundle.check_pins(sources, '0.30.0')
 
-    def test_committed_unreviewed_policy_blocks_before_any_native_signing(self):
-        with self.assertRaisesRegex(ValueError, 'awaits independent review'):
-            bundle.reviewed_policy()
+    def test_unreviewed_policy_blocks_before_any_native_signing(self):
+        reviewed = bundle.reviewed_policy()
+        self.assertEqual(set(reviewed), {name for name, _ in bundle.OBJECTS})
+        self.assertTrue(all(obj['entitlements'] == {} for obj in reviewed.values()))
+        (self.base / 'packaging/sparkle').mkdir(parents=True)
+        (self.base / bundle.POLICY_NAME).write_text(json.dumps(dict(schema=1,
+            archive_sha256=self.pin['archive_sha256'], objects=None)))
         app = self.base / 'PeerBrush.app'
         (app / 'Contents/Frameworks/Sparkle.framework').mkdir(parents=True)
         native = mock.Mock()
-        with self.assertRaisesRegex(ValueError, 'awaits independent review'):
+        read_policy = bundle.reviewed_policy
+        with mock.patch.object(bundle, 'reviewed_policy', lambda: read_policy(self.base)), \
+                self.assertRaisesRegex(ValueError, 'awaits independent review'):
             bundle.sign_nested(app, 'A' * 40, None, native)
         native.assert_not_called()
 

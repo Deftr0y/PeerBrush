@@ -282,7 +282,7 @@ mod tests {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use serde_json::json;
     #[test]
-    fn current_compiled_configuration_is_missing_without_native_policy_or_activation() {
+    fn public_pins_and_reviewed_native_policy_are_both_required() {
         assert!(compiled().unwrap().is_none());
         assert!(configuration(
             br#"{"schema":1,"feed_url":null,"public_ed_key":null,"publisher_team_id":null}"#,
@@ -292,12 +292,20 @@ mod tests {
         .unwrap()
         .is_none());
         let pins = json!({"schema":1,"feed_url":PROPOSED_FEED_URL,"public_ed_key":STANDARD.encode([1;32]),"publisher_team_id":"ABCD123456"});
+        let policy = include_bytes!("../../packaging/sparkle/native-policy.json");
+        let mut incomplete: Value = serde_json::from_slice(policy).unwrap();
+        incomplete["objects"] = Value::Null;
         assert!(configuration(
             &serde_json::to_vec(&pins).unwrap(),
-            include_bytes!("../../packaging/sparkle/native-policy.json"),
+            &serde_json::to_vec(&incomplete).unwrap(),
             "0.30.0"
         )
         .is_err());
+        assert!(
+            configuration(&serde_json::to_vec(&pins).unwrap(), policy, "0.30.0")
+                .unwrap()
+                .is_some()
+        );
         assert!(configuration(&serde_json::to_vec(&pins).unwrap(), b"{}", "0.30.0-dev.1").is_err());
     }
     #[test]
