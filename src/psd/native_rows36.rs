@@ -102,18 +102,41 @@ impl<'a> Rows36<'a> {
         if !["paint", "fill", "group", "adjustment"].contains(&layer.kind()) {
             return Err("Native standard layer kind requires explicit source support".into());
         }
-        if request.bounds != self.raw_frame(layer, request.source)? {
+        if request.bounds
+            != scene_save36::layer_frame(
+                self.scene.metadata(),
+                layer,
+                matches!(request.source, RowSource::OriginalLayer(_)),
+            )?
+        {
             return Err(
                 "Native layer channel request differs from its planned source frame".into(),
             );
         }
         if request.channel == -2 {
-            return Err(if layer.mask().is_some() {
-                "Raw standard mask channels require the explicit prepared mask provider"
-            } else {
-                "Native standard layer has no mask channel"
+            let mask =
+                crate::mask::region::prepare_scene(self.scene, layer, stripe.bounds, &mut || {
+                    check()
+                })?;
+            let [left, top, _, _] = mask.bounds();
+            for (row, bytes) in output
+                .chunks_exact_mut(stripe.width * usize::from(request.depth / 8))
+                .enumerate()
+            {
+                check()?;
+                let y = top + row as i32;
+                if request.depth == 16 {
+                    for (x, sample) in bytes.chunks_exact_mut(2).enumerate() {
+                        let v = (mask.value16(left + x as i32, y)? * 65535.).round() as u16;
+                        sample.copy_from_slice(&v.to_be_bytes());
+                    }
+                } else {
+                    for (x, sample) in bytes.iter_mut().enumerate() {
+                        *sample = (mask.value8(left + x as i32, y)? * 255.).round() as u8;
+                    }
+                }
             }
-            .into());
+            return check();
         }
         let source = self.scene.raster(layer.pixels().slot())?;
         if !source.uses_budget(self.scene.budget())
@@ -174,26 +197,6 @@ impl<'a> Rows36<'a> {
                     .map_err(|e| e.to_string())
             }
         })
-    }
-    fn raw_frame(&self, layer: LayerMetadata<'_>, source: RowSource) -> Result<[i32; 4]> {
-        if matches!(source, RowSource::OriginalLayer(_))
-            && ["group", "adjustment"].contains(&layer.kind())
-        {
-            return Ok(self.canvas());
-        }
-        let [x, y] = layer.origin();
-        let right = i64::from(x) + i64::from(layer.pixels().width());
-        let bottom = i64::from(y) + i64::from(layer.pixels().height());
-        Ok([
-            x,
-            y,
-            right
-                .try_into()
-                .map_err(|_| "Native layer right overflow")?,
-            bottom
-                .try_into()
-                .map_err(|_| "Native layer bottom overflow")?,
-        ])
     }
     fn canvas(&self) -> [i32; 4] {
         [

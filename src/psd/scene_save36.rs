@@ -297,19 +297,17 @@ fn synthetic(
         metadata: vec![],
     }
 }
-fn record<'a>(
-    doc: DocumentMetadata<'a>,
-    layer: LayerMetadata<'a>,
-    i: usize,
-    section: u32,
+pub(super) fn layer_frame(
+    doc: DocumentMetadata<'_>,
+    layer: LayerMetadata<'_>,
     originals: bool,
-) -> Result<Record<'a>, String> {
+) -> Result<[i32; 4], String> {
     let canvas_frame = ["group", "adjustment"].contains(&layer.kind())
         || !originals
             && layer.effects().any(|e| {
                 e.enabled() && e.weight() > 0. && crate::effects::styles::contains(e.kind())
             });
-    let frame = if canvas_frame {
+    Ok(if canvas_frame {
         [0, 0, doc.width() as i32, doc.height() as i32]
     } else {
         [
@@ -320,7 +318,16 @@ fn record<'a>(
             i32::try_from(i64::from(layer.origin()[1]) + i64::from(layer.pixels().height()))
                 .map_err(|_| "Source36 layer bottom overflow")?,
         ]
-    };
+    })
+}
+fn record<'a>(
+    doc: DocumentMetadata<'a>,
+    layer: LayerMetadata<'a>,
+    i: usize,
+    section: u32,
+    originals: bool,
+) -> Result<Record<'a>, String> {
+    let frame = layer_frame(doc, layer, originals)?;
     let mut metadata = Vec::new();
     if section != 3 {
         metadata

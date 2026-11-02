@@ -146,9 +146,6 @@ impl Prepared {
             return Err("Native preview requires prepared document filters".into());
         }
         for layer in doc.layers() {
-            if layer.mask().is_some() {
-                return Err("Native preview requires prepared raw and composed masks".into());
-            }
             if layer.source().is_some() {
                 return Err("Native preview requires its prepared editable-source provider".into());
             }
@@ -736,16 +733,24 @@ mod tests {
         crate::compositor::native::tests::cleanup(&other_path);
     }
     #[test]
-    fn unsupported_derived_providers_are_explicit_refusals_not_blank_frames() {
-        for variant in 0..2 {
+    fn disabled_mask_renders_its_raw_channel_and_unprepared_effects_refuse() {
+        for variant in 0..3 {
             let mut doc = document(16, 9, 7);
             match variant {
-                0 => {
+                0 | 1 => {
                     doc.layers[0].mask = Some(crate::engine::Mask {
-                        enabled: false,
+                        enabled: variant == 1,
                         linked: true,
                         cache_key: crate::engine::id(),
-                        steps: vec![],
+                        steps: vec![crate::engine::MaskStep {
+                            id: crate::engine::id(),
+                            kind: "fill".into(),
+                            enabled: true,
+                            weight: 0.7,
+                            value: 91.,
+                            settings: serde_json::Value::Null,
+                            pixels: crate::raster::Raster::new_depth(9, 7, 16),
+                        }],
                     })
                 }
                 _ => doc.layers[0].effects.push(crate::effects::Effect {
@@ -757,15 +762,21 @@ mod tests {
                 }),
             }
             let (scene, path) = capture(&doc);
-            assert!(Prepared::capture(
-                &scene,
-                None,
-                48,
-                Some(&doc.layers[0].id),
-                true,
-                &mut || Ok(())
-            )
-            .is_err());
+            let target = Some(doc.layers[0].id.as_str());
+            for (target, mask) in [(target, true), (None, false)] {
+                let result = Prepared::capture(&scene, None, 48, target, mask, &mut || Ok(()));
+                if variant == 2 {
+                    assert!(result.is_err());
+                } else {
+                    let frame = Arc::new(result.unwrap())
+                        .render(&scene, &mut || Ok(()))
+                        .unwrap();
+                    assert_eq!(
+                        &*frame.copy_rgba8(&mut || Ok(())).unwrap(),
+                        &doc.preview(None, 48, target, mask).unwrap().2
+                    );
+                }
+            }
             drop(scene);
             crate::compositor::native::tests::cleanup(&path);
         }

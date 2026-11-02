@@ -9,41 +9,41 @@ use crate::{
     },
 };
 use serde_json::Value;
-use std::sync::Arc;
 
 #[derive(Clone)]
-pub(crate) struct Step {
-    pub kind: String,
+pub(crate) struct Step<'a> {
+    pub kind: &'a str,
     pub enabled: bool,
     pub weight: f32,
     pub value: f32,
-    pub settings: Arc<Value>,
+    pub settings: &'a Value,
 }
-impl From<&crate::engine::MaskStep> for Step {
-    fn from(step: &crate::engine::MaskStep) -> Self {
+#[cfg(test)]
+impl<'a> From<&'a crate::engine::MaskStep> for Step<'a> {
+    fn from(step: &'a crate::engine::MaskStep) -> Self {
         Self {
-            kind: step.kind.clone(),
+            kind: &step.kind,
             enabled: step.enabled,
             weight: step.weight,
             value: step.value,
-            settings: Arc::new(step.settings.clone()),
+            settings: &step.settings,
         }
     }
 }
-pub(crate) struct Plan {
+pub(crate) struct Plan<'a> {
     frame: Frame,
     output: Region,
     input: [i32; 4],
     depth: u16,
     cached: bool,
-    steps: Vec<Step>,
+    steps: Vec<Step<'a>>,
 }
-impl Plan {
+impl<'a> Plan<'a> {
     pub(crate) fn new(
         frame: Frame,
         output: Region,
         depth: u16,
-        steps: &[Step],
+        steps: &[Step<'a>],
     ) -> Result<Self, String> {
         if ![8, 16].contains(&depth) || steps.len() > 64 {
             return Err("Invalid native mask depth or stage count".into());
@@ -60,27 +60,25 @@ impl Plan {
             if ![
                 "fill", "paint", "invert", "levels", "curves", "adjust", "blur", "gaussian",
             ]
-            .contains(&step.kind.as_str())
+            .contains(&step.kind)
             {
                 return Err("Unsupported regional mask stage".into());
             }
-            if ["curves", "adjust"].contains(&step.kind.as_str()) {
-                effects::normalized(&step.kind, &step.settings)?;
+            if ["curves", "adjust"].contains(&step.kind) {
+                effects::normalized(step.kind, step.settings)?;
             }
             if step.kind == "gaussian" {
-                effects::validate("blur", &step.settings)?;
+                effects::validate("blur", step.settings)?;
             }
             if !step.enabled || step.weight == 0. {
                 continue;
             }
-            cached |= ["curves", "adjust", "gaussian"].contains(&step.kind.as_str())
+            cached |= ["curves", "adjust", "gaussian"].contains(&step.kind)
                 || (step.kind == "blur" && step.value >= 0.5);
-            let radius = match step.kind.as_str() {
-                "gaussian" => {
-                    effects::gaussian_radii(effects::number(&step.settings, "radius", 8.))
-                        .iter()
-                        .sum::<usize>() as i32
-                }
+            let radius = match step.kind {
+                "gaussian" => effects::gaussian_radii(effects::number(step.settings, "radius", 8.))
+                    .iter()
+                    .sum::<usize>() as i32,
                 "blur" if step.value >= 0.5 => {
                     3 * (step.value.round().clamp(1., 64.) as usize).div_ceil(3) as i32
                 }
@@ -115,23 +113,6 @@ impl Plan {
     }
     pub(crate) fn input_bounds(&self) -> [i32; 4] {
         self.input
-    }
-    pub(crate) fn input_regions(&self) -> Result<Vec<Region>, String> {
-        let width = (self.input[2] - self.input[0]) as usize;
-        let height = (MAX_REGION_PIXELS / width).max(1) as i32;
-        let mut output = Vec::new();
-        output
-            .try_reserve_exact(((self.input[3] - self.input[1]) as usize).div_ceil(height as usize))
-            .map_err(|_| "Mask footprint allocation failed")?;
-        let mut y = self.input[1];
-        while y < self.input[3] {
-            let b = (y + height).min(self.input[3]);
-            output.push(
-                Region::new([self.input[0], y, self.input[2], b]).map_err(|e| e.to_string())?,
-            );
-            y = b;
-        }
-        Ok(output)
     }
     pub(crate) fn paint_steps(&self) -> impl Iterator<Item = usize> + '_ {
         self.steps
@@ -179,7 +160,7 @@ impl Plan {
             } else {
                 None
             };
-            match step.kind.as_str() {
+            match step.kind {
                 "fill" => values.fill(if self.depth == 16 {
                     (f64::from(step.value) * 257.).round().clamp(0., 65535.) as u16
                 } else {
@@ -232,13 +213,13 @@ impl Plan {
                         table.push(if self.depth == 16 {
                             (crate::depth16::color::map(
                                 &step.kind,
-                                &step.settings,
+                                step.settings,
                                 f64::from(v) / 65535.,
                             ) * 65535.)
                                 .round()
                                 .clamp(0., 65535.) as u16
                         } else {
-                            (effects::map_value(&step.kind, &step.settings, f32::from(v) / 255.)
+                            (effects::map_value(step.kind, step.settings, f32::from(v) / 255.)
                                 * 255.)
                                 .round() as u16
                         });
@@ -249,7 +230,7 @@ impl Plan {
                 }
                 "gaussian" | "blur" => {
                     let radii = if step.kind == "gaussian" {
-                        effects::gaussian_radii(effects::number(&step.settings, "radius", 8.))
+                        effects::gaussian_radii(effects::number(step.settings, "radius", 8.))
                     } else if step.value >= 0.5 {
                         [(step.value.round().clamp(1., 64.) as usize).div_ceil(3); 3]
                     } else {
@@ -326,7 +307,7 @@ impl Plan {
                         .filter(|(_, s)| s.enabled && s.weight > 0.)
                     {
                         let before = value;
-                        match s.kind.as_str() {
+                        match s.kind {
                             "fill" => value = f64::from(s.value) * 257.,
                             "paint" => {
                                 let p = paint(index, x, y)?;
@@ -357,7 +338,7 @@ impl Plan {
                         .filter(|(_, s)| s.enabled && s.weight > 0.)
                     {
                         let before = value;
-                        match s.kind.as_str() {
+                        match s.kind {
                             "fill" => value = s.value,
                             "paint" => {
                                 let p = paint(index, x, y)?.map(project16);
@@ -432,6 +413,92 @@ fn box_pass(
         }
     }
 }
+/// Prepare the raw layer-local mask. The enabled flag controls composition,
+/// but must never erase disabled mask samples in a Photoshop channel.
+pub(crate) fn prepare_scene(
+    scene: &crate::engine::scene::SceneSnapshot,
+    layer: crate::engine::native::LayerMetadata<'_>,
+    bounds: [i32; 4],
+    check: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<RegionalMask, String> {
+    check()?;
+    let [l, t, r, b] = bounds;
+    let [ox, oy] = layer.origin();
+    let local = |v: i32, origin| v.checked_sub(origin).ok_or("Native mask offset overflow");
+    let output = Region::new([local(l, ox)?, local(t, oy)?, local(r, ox)?, local(b, oy)?])
+        .map_err(|e| e.to_string())?;
+    let mask = layer.mask().ok_or("Native layer has no mask channel")?;
+    let count = mask.steps().len();
+    if count > 64 {
+        return Err("Too many regional mask stages".into());
+    }
+    let budget = scene.budget();
+    let _metadata = budget
+        .reserve_bytes(512 + count * 256, 32 * 1024)
+        .map_err(|e| e.to_string())?;
+    let steps: Vec<_> = mask
+        .steps()
+        .map(|s| Step {
+            kind: s.kind(),
+            enabled: s.enabled(),
+            weight: s.weight(),
+            value: s.value(),
+            settings: s.settings(),
+        })
+        .collect();
+    let frame = Frame::new(layer.pixels().width(), layer.pixels().height())?;
+    let plan = Plan::new(frame, output, scene.metadata().depth(), &steps)?;
+    let [left, top, right, bottom] = plan.input_bounds();
+    let band_height = (MAX_REGION_PIXELS / (right - left) as usize).max(1);
+    let bands = ((bottom - top) as usize).div_ceil(band_height);
+    let slots = plan
+        .paint_steps()
+        .count()
+        .checked_mul(bands)
+        .ok_or("Mask paint footprint count overflow")?;
+    let _pins = budget
+        .reserve_bytes(
+            slots
+                .checked_mul(std::mem::size_of::<crate::raster::SurfaceRegion>())
+                .ok_or("Mask paint footprint size overflow")?,
+            16 * 1024 * 1024,
+        )
+        .map_err(|e| e.to_string())?;
+    let mut pins = Vec::new();
+    pins.try_reserve_exact(slots)
+        .map_err(|_| "Mask paint index allocation refused")?;
+    let mut bases = [None; 64];
+    for i in plan.paint_steps() {
+        let step = mask.steps().nth(i).ok_or("Mask stage is missing")?;
+        let surface = scene.raster(step.pixels().slot())?;
+        if !surface.uses_budget(budget) || !surface.uses_disk_budget(scene.disk_budget()) {
+            return Err("Mask paint source differs from captured admission".into());
+        }
+        bases[i] = Some(pins.len());
+        for y in (top..bottom).step_by(band_height) {
+            let region = Region::new([left, y, right, (y + band_height as i32).min(bottom)])
+                .map_err(|e| e.to_string())?;
+            check()?;
+            let prepared = surface.prepare_region(region, &mut || {
+                check().map_err(|_| crate::large_document::Error::Cancelled)
+            });
+            check()?;
+            pins.push(prepared.map_err(|e| e.to_string())?);
+        }
+    }
+
+    plan.render(budget, check, |i, x, y| {
+        let offset = usize::try_from(y - top)
+            .map_err(|_| "Mask paint sample precedes footprint")?
+            / band_height;
+        let base = bases[i].ok_or("Mask paint stage was not prepared")?;
+        if offset >= bands {
+            return Err("Mask paint sample exceeds footprint".into());
+        }
+        pins[base + offset].pixel16(x, y).map_err(|e| e.to_string())
+    })
+}
+
 #[derive(Clone)]
 pub(crate) struct RegionalMask {
     bounds: [i32; 4],

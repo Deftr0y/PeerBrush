@@ -343,14 +343,28 @@ fn raw_adjustment_canvas_padding_reads_current_physical_source_without_a_derived
     assert_eq!(bytes, [0xcd; 4]);
 }
 #[test]
-fn disabled_raw_masks_current_effects_and_editable_sources_refuse_without_fabricated_samples() {
+fn disabled_raw_mask_keeps_native_samples_while_unprepared_colour_still_refuses() {
     for depth in [8, 16] {
         let mut doc = doc(depth);
+        let mut pixels = Raster::new_depth(4, 3, depth);
+        if depth == 16 {
+            pixels.set16(1, 0, [12347, 0, 0, 65535]);
+        } else {
+            pixels.set(1, 0, [37, 0, 0, 255]);
+        }
         doc.layers[0].mask = Some(crate::engine::Mask {
             enabled: false,
             linked: true,
             cache_key: crate::engine::id(),
-            steps: vec![],
+            steps: vec![crate::engine::MaskStep {
+                id: "paint-mask".into(),
+                kind: "paint".into(),
+                enabled: true,
+                value: 0.,
+                weight: 1.,
+                settings: serde_json::Value::Null,
+                pixels,
+            }],
         });
         doc.layers[0].effects.push(crate::effects::Effect {
             id: "effect".into(),
@@ -363,11 +377,18 @@ fn disabled_raw_masks_current_effects_and_editable_sources_refuse_without_fabric
         let mut rows = Rows36::new(fixture.scene()).unwrap();
         let mut bytes = vec![0xcd; 4 * usize::from(depth / 8)];
         let r = request(&rows, RowSource::OriginalLayer(0), -2, [0, 0, 4, 3], 0, 1);
-        assert!(rows
-            .fill(r, &mut bytes, &|| Ok(()))
-            .unwrap_err()
-            .contains("prepared mask"));
-        assert!(bytes.iter().all(|v| *v == 0xcd));
+        rows.fill(r, &mut bytes, &|| Ok(())).unwrap();
+        if depth == 16 {
+            assert_eq!(
+                bytes,
+                [65535u16, 12347, 65535, 65535]
+                    .map(u16::to_be_bytes)
+                    .concat()
+            );
+        } else {
+            assert_eq!(bytes, [255, 37, 255, 255]);
+        }
+        bytes.fill(0xcd);
         let r = request(&rows, RowSource::Layer(0), 0, [0, 0, 4, 3], 0, 1);
         assert!(rows
             .fill(r, &mut bytes, &|| Ok(()))

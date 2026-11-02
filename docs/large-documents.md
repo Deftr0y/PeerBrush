@@ -1,5 +1,12 @@
 # Large-document loading and derived caches
 
+Captured native scenes now prepare layer-local mask stripes for the compositor,
+preview, export and standard PSD/PSB channel writer. Disabling a mask suppresses
+its effect on the composite; the raw mask preview and saved channel still use
+its actual samples. Native16 mask channels are written as big-endian words.
+Layer effects and document filters still require their own prepared renderers.
+These data paths do not change the live editor's document limits.
+
 ## Owned native response transport (unreleased preparation)
 
 The native response owner keeps metadata admission and encoded image bytes inseparable from their wire representation. Its sealed image slots stream base64 from bounded segments; MCP text metadata is serialized directly without constructing a second complete string. Serialized segments retain their own charges through the final reader, including cancellation, failed serialization and early connection closure.

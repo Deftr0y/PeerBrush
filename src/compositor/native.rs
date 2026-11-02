@@ -21,6 +21,11 @@ pub(crate) trait Precision {
     fn opacity(value: f32) -> Self::Amount;
     fn multiply(a: Self::Amount, b: Self::Amount) -> Self::Amount;
     fn sample(view: &SurfaceRegion, x: i32, y: i32) -> Result<Self::Pixel>;
+    fn mask_sample(
+        view: &crate::mask::region::RegionalMask,
+        x: i32,
+        y: i32,
+    ) -> Result<Self::Amount>;
     fn opaque(pixel: Self::Pixel) -> Self::Pixel;
     fn alpha_from(pixel: Self::Pixel, source: Self::Pixel) -> Self::Pixel;
     fn compose(a: Self::Pixel, b: Self::Pixel, t: Self::Amount, mode: &str) -> Self::Pixel;
@@ -296,7 +301,7 @@ mod derived_tests {
 // Keep the established precision and operation order of each native renderer.
 // In particular an eight-bit mask/opacity product must remain f32.
 macro_rules! precision {
-    ($name:ty, $pixel:ty, $word:ty, $float:ty, $depth:expr, $max:expr, $blend:path, $fill:expr, $sample:ident) => {
+    ($name:ty, $pixel:ty, $word:ty, $float:ty, $depth:expr, $max:expr, $blend:path, $fill:expr, $sample:ident, $mask_sample:ident) => {
         impl Precision for $name {
             const DEPTH: u16 = $depth;
             type Pixel = $pixel;
@@ -315,6 +320,13 @@ macro_rules! precision {
             }
             fn sample(view: &SurfaceRegion, x: i32, y: i32) -> Result<Self::Pixel> {
                 view.$sample(x, y).map_err(|e| e.to_string())
+            }
+            fn mask_sample(
+                view: &crate::mask::region::RegionalMask,
+                x: i32,
+                y: i32,
+            ) -> Result<Self::Amount> {
+                view.$mask_sample(x, y)
             }
             fn opaque(mut pixel: Self::Pixel) -> Self::Pixel {
                 pixel[3] = $max;
@@ -375,7 +387,8 @@ precision!(
     255,
     crate::raster::blend,
     |p| p,
-    pixel
+    pixel,
+    value8
 );
 precision!(
     Native16,
@@ -386,7 +399,8 @@ precision!(
     65535,
     crate::raster::blend16,
     |p: Pixel| p.map(|v| u16::from(v) * 257),
-    pixel16
+    pixel16,
+    value16
 );
 
 /// Implementations retain all pins, derived outputs and their shared charges.
@@ -410,6 +424,7 @@ pub(crate) struct RawLayers<'a> {
     scene: &'a SceneSnapshot,
     target: Option<&'a str>,
     sources: Vec<Option<SurfaceRegion>>,
+    masks: Vec<Option<crate::mask::region::RegionalMask>>,
     _index: Reservation,
 }
 impl<'a> RawLayers<'a> {
@@ -444,6 +459,10 @@ impl<'a> RawLayers<'a> {
             .reserve_bytes(bytes, 4 * 1024 * 1024)
             .map_err(|e| e.to_string())?;
         let mut sources = Vec::new();
+        let mut masks = Vec::new();
+        masks
+            .try_reserve_exact(layers.len())
+            .map_err(|_| "Regional mask index allocation refused")?;
         sources
             .try_reserve_exact(layers.len())
             .map_err(|_| "Regional source index allocation refused")?;
@@ -452,15 +471,25 @@ impl<'a> RawLayers<'a> {
             check().map_err(|e| e.to_string())?;
             if topology.is_some_and(|topology| !topology.active[index]) {
                 sources.push(None);
+                masks.push(None);
                 continue;
             }
-            if layer.mask().is_some_and(|mask| mask.enabled())
-                || layer
-                    .effects()
-                    .any(|effect| effect.enabled() && effect.weight() > 0.0)
+            if layer
+                .effects()
+                .any(|effect| effect.enabled() && effect.weight() > 0.0)
             {
-                return Err("Regional source stage requires prepared masks and effects".into());
+                return Err("Regional source stage requires prepared effects".into());
             }
+            masks.push(if layer.mask().is_some() {
+                Some(crate::mask::region::prepare_scene(
+                    scene,
+                    layer,
+                    region.bounds(),
+                    &mut || check().map_err(|e| e.to_string()),
+                )?)
+            } else {
+                None
+            });
             let source = scene.raster(layer.pixels().slot())?;
             if !source.uses_budget(scene.budget()) || !source.uses_disk_budget(scene.disk_budget())
             {
@@ -493,6 +522,7 @@ impl<'a> RawLayers<'a> {
             scene,
             target: topology.and_then(Topology::target),
             sources,
+            masks,
             _index: charge,
         })
     }
@@ -838,8 +868,13 @@ impl<P: Precision> PreparedLayers<P> for RawLayers<'_> {
             .ok_or("No native source footprint was prepared")?;
         P::sample(view, x, y)
     }
-    fn mask(&self, _: usize, _: i32, _: i32, _: bool) -> Result<P::Amount> {
-        Err("No native mask region was prepared".into())
+    fn mask(&self, layer: usize, x: i32, y: i32, _: bool) -> Result<P::Amount> {
+        let mask = self
+            .masks
+            .get(layer)
+            .and_then(Option::as_ref)
+            .ok_or("No native mask region was prepared")?;
+        P::mask_sample(mask, x, y)
     }
 }
 
