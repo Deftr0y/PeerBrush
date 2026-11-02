@@ -557,9 +557,9 @@ fn run(
             let mut e = shared.lock().unwrap();
             guard(&mut e, job, &source)?;
         }
-        let mut inspector = Engine::new();
-        inspector.doc = draft.clone();
+        let inspector = Engine::from_document(draft);
         let actual = inspector.scopes(command);
+        draft = inspector.into_resident_document()?;
         contained(DocumentView::from(&draft), &job.scopes, &actual)?;
         if let Some(target) = command["layer"].as_str() {
             crate::placement::unlocked(&draft, target)?;

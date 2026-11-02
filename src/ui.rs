@@ -1516,7 +1516,7 @@ impl PeerBrush {
                 ctx.request_repaint_after(Duration::from_millis(16));
                 return None;
             };
-            if engine.doc.id != edit.document || engine.doc.revision != edit.revision {
+            if crate::workspace::guard(&engine, &edit.document, edit.revision).is_err() {
                 edit.preview = None;
                 return None;
             }
@@ -1548,7 +1548,7 @@ impl PeerBrush {
             return;
         }
         let mut engine = self.shared.lock().unwrap();
-        if engine.doc.id != edit.document || engine.doc.revision != edit.revision {
+        if crate::workspace::guard(&engine, &edit.document, edit.revision).is_err() {
             self.cancelled_parameter = Some(edit.control);
             self.message = "Image changed during parameter edit · preview cancelled".into();
             return;
@@ -1876,7 +1876,8 @@ impl PeerBrush {
         let control = crate::loading::Control::default();
         {
             let e = s.lock().unwrap();
-            control.bind(e.doc.id.clone(), e.doc.revision);
+            let view = crate::engine::view::current(&e);
+            control.bind(view.id().to_owned(), view.revision());
         }
         self.load_control = Some(control.clone());
         self.load_preview = None;
@@ -2068,7 +2069,8 @@ impl PeerBrush {
         let project = self.project_id.clone();
         let (document, revision) = {
             let e = self.shared.lock().unwrap();
-            (e.doc.id.clone(), e.doc.revision)
+            let view = crate::engine::view::current(&e);
+            (view.id().to_owned(), view.revision())
         };
         self.busy = true;
         self.jobs.insert(project.clone());
@@ -2137,7 +2139,8 @@ impl PeerBrush {
                 commands.push(command); pixels.push(image);
             }
             let count = commands.len(); let mut engine = shared.lock().unwrap();
-            if engine.doc.id != pending.document || engine.doc.revision != pending.revision { return Err("The source project changed; import the images again".into()); }
+            crate::workspace::guard(&engine, &pending.document, pending.revision)
+                .map_err(|_| "The source project changed; import the images again")?;
             engine.import_images(&commands,pixels,pending.revision)?;
             Ok(format!("Imported {count} image layers"))
         });

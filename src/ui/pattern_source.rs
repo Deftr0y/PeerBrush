@@ -22,8 +22,7 @@ fn apply(
     source: &str,
 ) -> Result<(), String> {
     if engine.project_id != pending.project
-        || engine.doc.id != pending.document
-        || engine.doc.revision != pending.revision
+        || crate::workspace::guard(engine, &pending.document, pending.revision).is_err()
     {
         return Err("Pattern source changed while choosing the PNG · import cancelled".into());
     }
@@ -47,8 +46,7 @@ pub(super) fn poll(app: &mut PeerBrush, ctx: &egui::Context) {
     let current = {
         let engine = app.shared.lock().unwrap();
         engine.project_id == pending.project
-            && engine.doc.id == pending.document
-            && engine.doc.revision == pending.revision
+            && crate::workspace::guard(&engine, &pending.document, pending.revision).is_ok()
             && app.effect_is_selected(&pending.layer, false, &pending.effect)
             && app.selected == pending.layer
     };
@@ -109,14 +107,15 @@ pub(super) fn control(
     if response.clicked() {
         app.finish_parameter(false);
         let engine = app.shared.lock().unwrap();
-        if engine.doc.revision != revision {
+        let view = crate::engine::view::current(&engine);
+        if view.revision() != revision {
             app.message = "Finish the current edit before choosing a pattern".into();
             return;
         }
         let (tx, rx) = mpsc::channel();
         let pending = Pending {
             project: engine.project_id.clone(),
-            document: engine.doc.id.clone(),
+            document: view.id().to_owned(),
             revision,
             layer: layer.id.clone(),
             effect: effect.id.clone(),

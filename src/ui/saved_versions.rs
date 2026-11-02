@@ -117,7 +117,7 @@ impl PeerBrush {
     pub(super) fn show_previous_saves(&mut self) {
         let (document, path) = {
             let e = self.shared.lock().unwrap();
-            (e.doc.id.clone(), e.path.clone())
+            (crate::engine::view::current(&e).id().to_owned(), e.path.clone())
         };
         let Some(original) = path else {
             self.message = "This project has no saved destination yet".into();
@@ -140,7 +140,7 @@ impl PeerBrush {
             return;
         };
         if browser.project != self.project_id
-            || browser.document != self.shared.lock().unwrap().doc.id
+            || browser.document != crate::engine::view::current(&self.shared.lock().unwrap()).id()
         {
             return;
         }

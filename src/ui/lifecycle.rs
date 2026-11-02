@@ -924,19 +924,19 @@ impl PeerBrush {
                 return;
             }
         };
-        let report = {
+        let snapshot = {
             let e = shared.lock().unwrap();
             crate::workspace::guard(&e, &row.source.document, row.source.revision)
-                .and_then(|_| crate::compatibility::report(&e.doc))
+                .map(|_| e.doc_snapshot())
         };
-        let report = match report {
+        let report = match snapshot.and_then(|doc| crate::compatibility::report_snapshot(&doc)) {
             Ok(report) => report,
             Err(error) => {
                 self.lifecycle.as_mut().unwrap().error = Some(error.into());
                 return;
             }
         };
-        if !report.save_allowed {
+        if !report.data().save_allowed {
             self.lifecycle.as_mut().unwrap().error =
                 Some("Protected source · create an explicit compatible copy before saving".into());
             return;
@@ -948,7 +948,7 @@ impl PeerBrush {
                 Some("Work changed after save-loss review · review the current changes".into());
             return;
         }
-        if report.has_editability_losses && accepted.is_none() {
+        if report.data().has_editability_losses && accepted.is_none() {
             self.save_loss_review = Some(super::compatibility::SaveReview::new(
                 row.source.project.clone(),
                 row.name.clone(),

@@ -299,15 +299,17 @@ impl PeerBrush {
             });
         let (document, revision) = {
             let e = self.shared.lock().unwrap();
-            (e.doc.id.clone(), e.doc.revision)
+            let view = crate::engine::view::current(&e);
+            (view.id().to_owned(), view.revision())
         };
         self.edit(vec![command], label);
         let e = self.shared.lock().unwrap();
+        let view = crate::engine::view::current(&e);
         self.straight.last = last
-            .filter(|_| e.doc.id == document && e.doc.revision == revision + 1)
+            .filter(|_| view.id() == document && Some(view.revision()) == revision.checked_add(1))
             .map(|(point, pressure)| Last {
                 document,
-                revision: e.doc.revision,
+                revision: view.revision(),
                 layer: self.selected.clone(),
                 mask: self.mask,
                 step: self.mask_step.clone(),

@@ -1314,16 +1314,17 @@ fn observation(
     if let Some(captured) = observation::capture(shared, p, admission)? {
         return captured.observe(shared, p, admission);
     }
-    let (state, doc) = {
+    let (state, revision, pixels) = {
         let mut e = shared.lock().unwrap();
         crate::workspace::validate_target(&e, p)?;
-        (e.state(), e.doc.clone())
+        let revision = view::current(&e).revision();
+        let image = p.get("image").and_then(Value::as_bool).unwrap_or(true)
+            && p.get("since_revision").and_then(Value::as_u64) != Some(revision);
+        let pixels = if image { Some(e.resident()?.clone()) } else { None };
+        (e.state(), revision, pixels)
     };
-    let revision = doc.revision;
-    let image = p.get("image").and_then(Value::as_bool).unwrap_or(true)
-        && p.get("since_revision").and_then(Value::as_u64) != Some(revision);
     let mut result = json!({"state":state,"revision":revision,"images":[]});
-    if image {
+    if let Some(doc) = pixels {
         let (w, h, rgba, rect) = doc.preview(
             p.get("rect").and_then(engine::rect),
             p.get("max_edge")
@@ -2236,7 +2237,13 @@ fn dispatch_project(
                                 .into(),
                         );
                     }
-                    return serde_json::to_value(crate::compatibility::report(&e.doc)?)
+                    let snapshot = e.doc_snapshot();
+                    drop(e);
+                    let report = crate::compatibility::report_snapshot(&snapshot)?;
+                    if let Some(native) = snapshot.view().native() {
+                        admission.admit_projection(native.budget(), &report)?;
+                    }
+                    return serde_json::to_value(&report)
                         .map_err(|error| error.to_string());
                 }
                 "pattern_sources" => {
@@ -2247,15 +2254,16 @@ fn dispatch_project(
                     {
                         return Err("Pattern inspection requires the observed document_id and expected_revision".into());
                     }
-                    let mut result = json!({"document_id":view::current(&e).id(),"revision":view::current(&e).revision(),"read_only":view::current(&e).read_only(),"coordinate_space":"pattern_asset","color_space":"unmanaged_source_samples","reason":"Raw pattern pixels are inspected without interpreting Photoshop profile/color handling or layer-style placement. Original documents remain protected.","patterns":e.doc.source_patterns});
+                    let view = view::current(&e);
+                    let (_, patterns) = view.legacy_inspection()
+                        .ok_or("Photoshop source-pattern inspection is unavailable for this document")?;
+                    let mut result = json!({"document_id":view.id(),"revision":view.revision(),"read_only":view.read_only(),"coordinate_space":"pattern_asset","color_space":"unmanaged_source_samples","reason":"Raw pattern pixels are inspected without interpreting Photoshop profile/color handling or layer-style placement. Original documents remain protected.","patterns":patterns});
                     if let Some(index) = p.get("pattern_index") {
                         let index = index
                             .as_u64()
                             .ok_or("pattern_index must be a zero-based integer")?
                             as usize;
-                        let source = e
-                            .doc
-                            .source_patterns
+                        let source = patterns
                             .get(index)
                             .ok_or("Unknown inspected pattern index")?;
                         let png = if source.bit_depth == 16 {
