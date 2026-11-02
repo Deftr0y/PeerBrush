@@ -32,6 +32,9 @@ on:
 permissions:
   contents: read
 
+env:
+  DEB_MAINTAINER: 'PeerBrush Maintainers <peerbrush.help@gmail.com>'
+
 jobs:
   native:
     strategy:
@@ -146,7 +149,7 @@ jobs:
           VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["version"])')
           PORTABLE="dist/PeerBrush-$VERSION-Linux-x64.zip"
           DIGEST=$(sha256sum "$PORTABLE" | cut -d ' ' -f 1)
-          python3 -B scripts/package_deb.py --portable "$PORTABLE" --portable-sha256 "$DIGEST" --output dist/deb --maintainer 'PeerBrush CI fixture <builds@example.invalid>'
+          python3 -B scripts/package_deb.py --portable "$PORTABLE" --portable-sha256 "$DIGEST" --output dist/deb --maintainer "$DEB_MAINTAINER"
           SOURCE_COMMIT=$(git rev-parse HEAD)
           HASHES=$(python3 -c 'import pathlib,sys; sys.path.insert(0,"scripts"); from verify_release import inspect_archive; record=inspect_archive(pathlib.Path(sys.argv[1]),sys.argv[2],sys.argv[3])["manifest"]; print(record["executable_sha256"],record["source_sha256"])' "$PORTABLE" "$SOURCE_COMMIT" "$VERSION")
           read -r EXECUTABLE_SHA SOURCE_SHA <<< "$HASHES"
@@ -162,7 +165,7 @@ jobs:
           python3 -B scripts/production_readiness.py --deb "$DEB" --deb-sha256 "$DEB_SHA" \
             --portable "$PORTABLE" --portable-sha256 "$DIGEST" \
             --installation-receipt "$EVIDENCE/installation.json" --commit "$SOURCE_COMMIT" --version "$VERSION" \
-            --maintainer 'PeerBrush CI fixture <builds@example.invalid>' --output "$DEB.qualification.json"
+            --maintainer "$DEB_MAINTAINER" --output "$DEB.qualification.json"
 
           # Actual published portable -> current installed application; no historical DEB is invented.
           docker run --rm --env PEERBRUSH_DISPOSABLE_PACKAGE_TEST=1 --env PEERBRUSH_DISPOSABLE_REAL_UPGRADE_TEST=1 --env DEBIAN_FRONTEND=noninteractive \
@@ -273,7 +276,7 @@ jobs:
           # Job success supplies producer provenance; report JSON grants no authority.
           python3 -B scripts/production_readiness.py --directory verified-portable --include-deb "$DEB" \
             --deb-sha256 "$DEB_SHA" --portable-sha256 "$PORTABLE_SHA" \
-            --maintainer 'PeerBrush CI fixture <builds@example.invalid>' \
+            --maintainer "$DEB_MAINTAINER" \
             --commit "$EXPECTED_COMMIT" --version "$VERSION" --output dist
           echo 'Exact-source candidate archives verified. Production publication remains blocked pending native signing, installed acceptance, protected approval and public asset reconciliation.' >> "$GITHUB_STEP_SUMMARY"
       - name: Bind a separate immutable Store content bundle
@@ -299,7 +302,7 @@ jobs:
             --commit "$EXPECTED_COMMIT" --version "$VERSION" --previous-version "$PREVIOUS_STORE_VERSION" \
             --inventory-sha256 "$INVENTORY_SHA" --portable-sha256 "$WINDOWS_SHA" \
             --package-sha256 "$MSIX_SHA" --report-sha256 "$REPORT_SHA" \
-            --maintainer 'PeerBrush CI fixture <builds@example.invalid>'
+            --maintainer "$DEB_MAINTAINER"
           echo "directory=$OUTPUT" >> "$GITHUB_OUTPUT"
       - name: Retain the separate Store auxiliary bundle
         if: inputs.build_store_msix
