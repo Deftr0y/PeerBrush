@@ -471,6 +471,33 @@ pub(super) fn verify_selected(
     verify_app(app, configuration, cancel, &selected, true)
 }
 
+/// The recovery launcher can be the newly installed version. Authenticate the
+/// preserved release against its own signed source and embedded build record.
+pub(super) fn verify_preserved(
+    app: PathBuf,
+    configuration: ApprovedCheck,
+    build_record: &str,
+    cancel: Arc<AtomicBool>,
+) -> Result<Verified, String> {
+    let build: Value = serde_json::from_str(build_record).map_err(|_| "Invalid saved build")?;
+    let version = build["version"]
+        .as_str()
+        .filter(|v| machine_version(v))
+        .ok_or("Invalid saved version")?;
+    let verified = verify_app(app, configuration, cancel, version, true)?;
+    let release = verified
+        .release
+        .as_ref()
+        .ok_or("Missing signed release identity")?;
+    if build
+        != json!({"format":"PeerBrushBuildInfoV1","schema":1,"product":"PeerBrush",
+        "version":version,"commit":release.binary_source_commit,"tree":"clean","end":"PeerBrushBuildInfoEnd"})
+    {
+        return Err("The preserved app differs from the last-working build".into());
+    }
+    Ok(verified)
+}
+
 fn verify_app(
     app: PathBuf,
     configuration: ApprovedCheck,

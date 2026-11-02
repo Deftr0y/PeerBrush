@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const FILES: &[&str] = &[
+pub(crate) const FILES: &[&str] = &[
     "brushes.json",
     "export-presets.json",
     "filters.json",
@@ -507,7 +507,7 @@ fn publish_directory(from: &Path, to: &Path) -> Result<(), String> {
     fs::rename(from, to).map_err(|e| e.to_string())
 }
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn publish_directory(from: &Path, to: &Path) -> Result<(), String> {
+pub(crate) fn publish_directory(from: &Path, to: &Path) -> Result<(), String> {
     use std::{
         ffi::{c_char, CString},
         os::unix::ffi::OsStrExt,

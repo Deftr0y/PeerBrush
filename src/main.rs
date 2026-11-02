@@ -187,6 +187,15 @@ fn run() -> Result<(), String> {
                         std::thread::sleep(std::time::Duration::from_millis(50));
                     }
                 }
+                #[cfg(target_os = "macos")]
+                if !launch.headless
+                    && peerbrush::sparkle::macos::offer_recovery(
+                        &peerbrush::settings::Locations::user()?,
+                        &files,
+                    )?
+                {
+                    return Ok(());
+                }
                 return Err(error);
             }
         }

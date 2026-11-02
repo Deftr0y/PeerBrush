@@ -312,6 +312,153 @@ fn native_recovery_message(path: &Path) -> Result<&'static str, String> {
 fn checkpoints(locations: &Locations) -> PathBuf {
     locations.data.join("update-checkpoints")
 }
+
+// The default-profile owner may still be alive and holding settings.lock.
+// Recovery only reads the durable checkpoint and uses a separate editor instance.
+fn recovery_attempt(locations: &Locations) -> Result<Option<PathBuf>, String> {
+    let root = checkpoints(locations);
+    if Stamp::read(&root)?.is_none() {
+        return Ok(None);
+    }
+    if !private(&root, false)? {
+        return Err(HOLD.into());
+    }
+    let mut held = None;
+    for path in entries(&root)? {
+        if inspect_unstarted_attempt(&path).is_err() {
+            if held.is_some() {
+                return Err(HOLD.into());
+            }
+            held = Some(path);
+        }
+    }
+    Ok(held)
+}
+
+fn recovery_settings(
+    path: &Path,
+    initial: &[u8],
+    owner_pid: u32,
+) -> Result<(PathBuf, BTreeMap<PathBuf, Entry>), String> {
+    final_intent(path, initial, owner_pid)?;
+    let seal = path.join("sealed-parent-exit.json");
+    if Stamp::read(&seal)?.is_some() {
+        let binding: FinalProfileBinding =
+            serde_json::from_slice(&read_marker(&seal)?).map_err(|_| HOLD)?;
+        read_final_profile(path, initial, owner_pid, &binding)?;
+        let bytes = read_private(&path.join("final-profile.json"), 1024 * 1024)?;
+        if digest(&bytes) != binding.record_sha256 {
+            return Err(HOLD.into());
+        }
+        let final_profile: FinalProfileRecord = serde_json::from_slice(&bytes).map_err(|_| HOLD)?;
+        return Ok((path.join("final-profile"), final_profile.profile));
+    }
+    let current: CurrentProfile =
+        serde_json::from_slice(&read_current_profile(path, initial)?).map_err(|_| HOLD)?;
+    Ok((path.join("current-profile"), current.profile))
+}
+
+fn recovery_workspace(
+    locations: &Locations,
+    attempt: &Path,
+    initial: &[u8],
+    owner_pid: u32,
+) -> Result<PathBuf, String> {
+    let (source, files) = recovery_settings(attempt, initial, owner_pid)?;
+    let root = locations.config.join("update-recovery");
+    private(&root, true)?;
+    let workspace = root.join(attempt.file_name().ok_or(HOLD)?);
+    let binding = digest(initial);
+    let marker = "recovery-origin";
+    if !private(&workspace, false)? {
+        let stage = root.join(format!(".preparing-{}", uuid::Uuid::new_v4()));
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&stage)
+            .map_err(|_| HOLD)?;
+        let prepared = (|| -> Result<(), String> {
+            for &name in crate::settings::FILES {
+                let Some(Entry::File { bytes, sha256, .. }) = files.get(Path::new(name)) else {
+                    continue;
+                };
+                let data = installed::bounded(&source.join(name), *bytes)?;
+                if data.len() as u64 != *bytes || digest(&data) != *sha256 {
+                    return Err(HOLD.into());
+                }
+                write_new_file(&stage.join(name), &data)?;
+            }
+            write_new(&stage.join(marker), binding.as_bytes())?;
+            crate::settings::publish_directory(&stage, &workspace)
+        })();
+        if prepared.is_err() {
+            // Only our fresh staging files. A concurrent completed session wins.
+            for name in crate::settings::FILES.iter().copied().chain([marker]) {
+                let _ = fs::remove_file(stage.join(name));
+            }
+            let _ = fs::remove_dir(&stage);
+            if !private(&workspace, false)? {
+                prepared?;
+            }
+        }
+    }
+    crate::server::sync_parent(&workspace)?;
+    if !private(&workspace, false)? || read_marker(&workspace.join(marker))? != binding.as_bytes() {
+        return Err(HOLD.into());
+    }
+    Ok(workspace)
+}
+
+/// Called only when an interactive default-profile launch failed.
+pub fn offer_recovery(locations: &Locations, files: &[PathBuf]) -> Result<bool, String> {
+    let Some(configuration) = crate::sparkle::check::compiled()? else {
+        return Ok(false);
+    };
+    let Some(path) = recovery_attempt(locations)? else {
+        return Ok(false);
+    };
+    let initial = read_private(&path.join("capture.json"), 1024 * 1024)?;
+    let manifest: Manifest = serde_json::from_slice(&initial).map_err(|_| HOLD)?;
+    validate_manifest(&manifest)?;
+    let app = path.join("PeerBrush.app");
+    let binary = Path::new("Contents/MacOS/peerbrush");
+    let running = std::env::current_exe().map_err(|_| HOLD)?;
+    if manifest.publisher_team_id != configuration.publisher_team_id
+        || (running != manifest.target.join(binary) && running != app.join(binary))
+    {
+        return Err(HOLD.into());
+    }
+    let intent: Intent =
+        serde_json::from_slice(&read_marker(&path.join("native-start-intent.json"))?)
+            .map_err(|_| HOLD)?;
+    final_intent(&path, &initial, intent.owner_pid)?;
+    let cancel = Arc::new(AtomicBool::new(false));
+    let copy = check_copy(&app, &manifest.app, &cancel)?;
+    let verified =
+        installed::verify_preserved(app.clone(), configuration, &manifest.build_record, cancel)?;
+    let version = &verified.release.as_ref().ok_or(HOLD)?.version;
+    const OPEN: &str = "Open recovery workspace";
+    let choice = rfd::MessageDialog::new().set_title("PeerBrush update recovery")
+        .set_description(format!("PeerBrush could not confirm that the update finished. Open the last-working version ({version}) with separate settings? Your preferences in this recovery workspace will be available the next time you open it."))
+        .set_buttons(rfd::MessageButtons::OkCancelCustom(OPEN.into(), "Quit".into())).show();
+    if choice != rfd::MessageDialogResult::Custom(OPEN.into()) {
+        return Ok(true);
+    }
+    if recovery_attempt(locations)?.as_deref() != Some(&path) {
+        return Err(HOLD.into());
+    }
+    let workspace = recovery_workspace(locations, &path, &initial, intent.owner_pid)?;
+    final_intent(&path, &initial, intent.owner_pid)?;
+    copy.recheck()?;
+    verified.recheck()?;
+    std::process::Command::new(app.join(binary))
+        .arg("--state-dir")
+        .arg(workspace)
+        .arg("--")
+        .args(files)
+        .spawn()
+        .map_err(|_| "The verified recovery editor could not start")?;
+    Ok(true)
+}
 fn entries(root: &Path) -> Result<Vec<PathBuf>, String> {
     let mut paths = Vec::new();
     for entry in fs::read_dir(root).map_err(|_| HOLD)? {

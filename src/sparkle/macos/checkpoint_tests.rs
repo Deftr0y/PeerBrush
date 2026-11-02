@@ -2868,10 +2868,46 @@ fn planned_update_exit_seals_current_joint_sources_only_after_final_owner_authen
             assert!(!native_recovery_message(&attempt)
                 .unwrap()
                 .contains("closed its saved projects"));
+            let pid = armed.owner_pid;
+            assert_eq!(
+                recovery_attempt(&profile.locations).unwrap().as_ref(),
+                Some(&attempt)
+            );
+            assert_eq!(
+                recovery_settings(&attempt, &initial, pid).unwrap().0,
+                attempt.join("current-profile")
+            );
             armed.record_sealed_exit(&lease, binding).unwrap();
             assert!(native_recovery_message(&attempt)
                 .unwrap()
                 .contains("closed its saved projects"));
+            let (saved, _) = recovery_settings(&attempt, &initial, pid).unwrap();
+            assert_eq!(saved, attempt.join("final-profile"));
+            let isolated = recovery_workspace(&profile.locations, &attempt, &initial, pid).unwrap();
+            assert_eq!(
+                fs::read(isolated.join("tool-settings.json")).unwrap(),
+                fs::read(saved.join("tool-settings.json")).unwrap()
+            );
+            assert!(!isolated.join("connection.json").exists());
+            fs::write(
+                isolated.join("tool-settings.json"),
+                b"recovery session edits",
+            )
+            .unwrap();
+            assert_eq!(
+                recovery_workspace(&profile.locations, &attempt, &initial, pid).unwrap(),
+                isolated
+            );
+            assert_eq!(
+                fs::read(isolated.join("tool-settings.json")).unwrap(),
+                b"recovery session edits"
+            );
+            assert_eq!(
+                fs::read(saved.join("tool-settings.json")).unwrap(),
+                profile_before
+            );
+            fs::write(isolated.join("recovery-origin"), b"wrong attempt").unwrap();
+            assert!(recovery_workspace(&profile.locations, &attempt, &initial, pid).is_err());
             assert!(startup_guard(&profile.locations).is_err());
             let output = ctx.run(Default::default(), |_| checks.close_after_update_exit());
             assert!(output.viewport_output[&eframe::egui::ViewportId::ROOT]

@@ -2,6 +2,8 @@
 
 PeerBrush 0.30.0 bundles Sparkle 2.10.0. The manual updater is disabled while the feed, public key, publisher and installed recovery checks are outstanding.
 
+If an update has an uncertain outcome, the default-profile launcher can offer **Open recovery workspace** after verifying the preserved app's Developer ID, source archive, embedded build identity and captured files. The editor starts with its own workspace under `Config/update-recovery`, using the sealed final preferences when available or the settings captured before the update. Subsequent launches reuse that workspace and its edits. The installation and original profile remain under the update hold. This path still needs acceptance with a real signed update.
+
 `packaging/sparkle/native-policy.json` pins the expected distribution identifiers, normalized executable hashes and entitlements for all five nested objects. Two native audits of the pinned archive produced identical values. A separate inspection of the arm64 code signatures confirmed the upstream identifiers and entitlements. The upstream Autoupdate tool carries `com.apple.application-identifier` for Sparkle's own helper. The distribution signing command strips that entitlement. Only Downloader preserves upstream entitlements, and its dictionary is empty for this archive. The final signed media must match the committed policy. [Sparkle's manual signing instructions](https://sparkle-project.org/documentation/sandboxing/#code-signing)
 
 The proposed stable feed is **https://peerbrush.com/updates/macos/stable/appcast.xml**. This is a proposed, unpublished location, not an available update service or download. Putting the URL in this document does not configure `SUFeedURL`, deploy a feed or authorize its publication.
