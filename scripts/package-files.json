@@ -154,6 +154,7 @@
     "scripts/prepare_final_inputs.py",
     "scripts/prepare_site_release.py",
     "scripts/prepare_sparkle.py",
+    "scripts/prepare_sparkle_feed.py",
     "scripts/produce_windows_installer.py",
     "scripts/production_readiness.py",
     "scripts/publish_release.py",

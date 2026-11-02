@@ -42,7 +42,7 @@ Use standard Sparkle 2 instead of introducing a custom executable-replacement en
 
 Prepare the actual signed feed/archive pipeline before enabling an adapter. Require signed feeds and archive verification before extraction (`SURequireSignedFeed` and `SUVerifyUpdateBeforeExtraction`), monotonic versions and explicit error behavior. Preserve the installed app's expected Developer ID/bundle identity and notarization checks. Exact framework, XPC/helper and nine-link policy is now prepared; its native normalization/entitlement facts still await independent macOS review. Do not weaken this policy with general link/framework exceptions. Sign nested code before the app, sign/notarize/staple the final distribution, then recompute immutable final checksums. Test Sparkle's helper permissions, user quit deferral, unsaved projects, failed/interrupted installation and retained last-working app/settings on actual macOS.
 
-Windows direct distribution still needs its approved trusted native signing and installer channel. Store update calls need installed Store-runtime acceptance. Linux needs real package-manager upgrade/repository acceptance. The discovery result cannot enable any of these missing capabilities.
+Windows 0.30 distribution and updates use the Microsoft Store. Store update calls still need installed Store-runtime acceptance. The standalone Windows installer is outside this release. Linux needs package-manager acceptance; local installation does not establish a public APT repository.
 
 ## Verification
 
