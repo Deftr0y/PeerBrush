@@ -171,7 +171,9 @@ fn safe_ancestor(path: &Path, app: &Path, value: &Stamp, user: u32, admin: Optio
         && admin == Some(value.gid)
 }
 
+#[derive(Clone)]
 pub(super) struct Verified {
+    pub cdhash: String,
     pub framework: PathBuf,
     pub release: Option<InstalledRelease>,
     snapshots: Vec<(PathBuf, Stamp)>,
@@ -190,14 +192,14 @@ impl Verified {
     }
 }
 
-struct Scratch {
-    path: PathBuf,
+pub(super) struct Scratch {
+    pub(super) path: PathBuf,
     identity: Stamp,
     sequence: u32,
     cancel: Arc<AtomicBool>,
 }
 impl Scratch {
-    fn new(cancel: Arc<AtomicBool>) -> Result<Self, String> {
+    pub(super) fn new(cancel: Arc<AtomicBool>) -> Result<Self, String> {
         let parent = std::env::temp_dir()
             .canonicalize()
             .map_err(|_| "Update inspection storage is unavailable")?;
@@ -397,7 +399,7 @@ fn native_object(
     identifier: &str,
     entitlements: &BTreeMap<String, Value>,
     team: &str,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let requirement=format!("=anchor apple generic and certificate leaf[subject.OU] = \"{team}\" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists");
     scratch.command(
         &["--verify", "--strict", "--test-requirement", &requirement],
@@ -413,7 +415,9 @@ fn native_object(
             .filter_map(|line| line.strip_prefix(prefix))
             .collect::<Vec<_>>()
     };
-    if one("Identifier=") != [identifier]
+    if one("CDHash=").len() != 1
+        || !hex(one("CDHash=")[0], 40)
+        || one("Identifier=") != [identifier]
         || one("TeamIdentifier=") != [team]
         || one("Authority=").first().is_none_or(|authority| {
             !authority.starts_with("Developer ID Application: ")
@@ -442,7 +446,7 @@ fn native_object(
     if actual != serde_json::to_value(entitlements).map_err(|_| "Invalid reviewed entitlements")? {
         return Err("Native updater entitlements differ from reviewed policy".into());
     }
-    Ok(())
+    Ok(one("CDHash=")[0].to_owned())
 }
 
 pub(super) fn verify(
@@ -589,6 +593,7 @@ fn verify_app(
             snapshots.push((path.clone(), value));
         }
         let mut verified = Verified {
+            cdhash: String::new(),
             framework: framework.clone(),
             release: None,
             snapshots,
@@ -628,7 +633,7 @@ fn verify_app(
             &["--verify", "--strict", "--test-requirement", &requirement],
             Path::new(&std::process::id().to_string()),
         )?;
-        native_object(
+        verified.cdhash = native_object(
             &mut scratch,
             &app,
             "com.peerbrush.PeerBrush",
@@ -757,6 +762,7 @@ mod tests {
         let file = directory.join("installed-release.json");
         fs::write(&file, b"original source identity").unwrap();
         let proof = Verified {
+            cdhash: String::new(),
             framework: directory.clone(),
             release: None,
             snapshots: vec![(file.clone(), stamp(&file).unwrap())],

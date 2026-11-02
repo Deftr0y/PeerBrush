@@ -6453,6 +6453,24 @@ impl PeerBrush {
     }
 }
 
+// The disposable health workspace renders the real app but must never accept
+// human document edits which would disappear when the probe exits.
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) fn isolate_probe_input(ctx: &eframe::egui::Context) {
+    ctx.input_mut(|input| {
+        input.events.clear();
+        input.raw.events.clear();
+        input.keys_down.clear();
+        input.modifiers = Default::default();
+        input.raw.modifiers = Default::default();
+        input.pointer = Default::default();
+        input.raw.dropped_files.clear();
+        input.raw.hovered_files.clear();
+        input.raw_scroll_delta = eframe::egui::Vec2::ZERO;
+        input.smooth_scroll_delta = eframe::egui::Vec2::ZERO;
+    });
+}
+
 impl eframe::App for PeerBrush {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         #[cfg(windows)]

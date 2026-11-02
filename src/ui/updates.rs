@@ -389,7 +389,7 @@ impl Panel {
 }
 
 impl PeerBrush {
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     pub(crate) fn suspend_updates_for_health(&mut self) {
         self.updates.health_probe = true;
     }

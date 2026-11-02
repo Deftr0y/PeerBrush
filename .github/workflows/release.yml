@@ -138,6 +138,9 @@ jobs:
             sparkle::macos::checkpoint::tests::planned_update_exit_seals_current_joint_sources_only_after_final_owner_authentication \
             | tee "$RUNNER_TEMP/macos-recovery-checks.log"
           grep -Fq 'test result: ok. 3 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/macos-recovery-checks.log"
+          fixture=$(mktemp -d "$RUNNER_TEMP/peerbrush-health-fixture.XXXXXXXX")
+          probe="$PWD/target/debug/examples/sparkle_preparation"
+          (cd "$fixture" && HOME="$(pwd -P)" TMPDIR="$(pwd -P)" "$probe" --health-editor)
       - run: python scripts/build_release.py
       - name: Build dormant setup entry without an offer
         run: python -B scripts/build_release.py --setup-entry

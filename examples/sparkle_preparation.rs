@@ -12,6 +12,11 @@ fn main() {
             .nth(1)
             .expect("external verified framework path"),
     );
+    if path == std::path::Path::new("--health-editor") {
+        macos::exercise_health_editor().expect("isolated editor must render and close cleanly");
+        println!("Isolated replacement editor rendered a native framebuffer and exited cleanly.");
+        return;
+    }
     objc2::rc::autoreleasepool(|_| {
         let mut blocked = Configuration {
             enabled: true,

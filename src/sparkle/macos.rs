@@ -6,6 +6,30 @@ mod coordinator;
 mod process_identity;
 #[doc(hidden)]
 pub use coordinator::main_entry as coordinator_main_entry;
+/// Run only the renderer component in a disposable candidate HOME. No capture,
+/// signed identity, installer acknowledgement or profile retirement is simulated.
+#[doc(hidden)]
+pub fn exercise_health_editor() -> Result<(), String> {
+    let home = std::env::current_dir().map_err(|e| e.to_string())?;
+    if std::env::var_os("RUNNER_ENVIRONMENT").as_deref()
+        != Some(std::ffi::OsStr::new("github-hosted"))
+        || !home
+            .file_name()
+            .and_then(|v| v.to_str())
+            .is_some_and(|s| s.starts_with("peerbrush-health-fixture."))
+        || std::fs::read_dir(&home)
+            .map_err(|e| e.to_string())?
+            .next()
+            .is_some()
+        || std::env::var_os("HOME").as_deref() != Some(home.as_os_str())
+    {
+        return Err("A new disposable hosted fixture is required".into());
+    }
+    coordinator::health::render(
+        &home,
+        std::time::Instant::now() + std::time::Duration::from_secs(90),
+    )
+}
 mod driver;
 mod installed;
 use block2::{Block, RcBlock};

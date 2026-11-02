@@ -2877,7 +2877,36 @@ fn planned_update_exit_seals_current_joint_sources_only_after_final_owner_authen
                 recovery_settings(&attempt, &initial, pid).unwrap().0,
                 attempt.join("current-profile")
             );
+            let probe_profile = attempt.join("isolated-settings");
+            assert!(armed
+                .health_profile(&lease, binding, &probe_profile)
+                .is_err());
+            assert!(!probe_profile.exists());
             armed.record_sealed_exit(&lease, binding).unwrap();
+            let original = armed
+                .health_profile(&lease, binding, &probe_profile)
+                .unwrap();
+            let live = profile.locations.profile().join("tool-settings.json");
+            let old = fs::read(&live).unwrap();
+            assert_eq!(
+                fs::read(probe_profile.join("tool-settings.json")).unwrap(),
+                old
+            );
+            fs::write(
+                probe_profile.join("tool-settings.json"),
+                b"disposable changes",
+            )
+            .unwrap();
+            original
+                .0
+                .authenticate_profile(&profile.locations.profile())
+                .unwrap();
+            fs::write(&live, b"late human edit").unwrap();
+            assert!(original
+                .0
+                .authenticate_profile(&profile.locations.profile())
+                .is_err());
+            fs::write(&live, &old).unwrap();
             assert!(native_recovery_message(&attempt)
                 .unwrap()
                 .contains("closed its saved projects"));

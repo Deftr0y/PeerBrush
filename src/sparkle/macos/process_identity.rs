@@ -115,6 +115,18 @@ fn peer_audit(socket: &UnixStream, expected: u32) -> Result<[u32; 8], String> {
 }
 
 pub(super) fn authenticate(socket: &UnixStream, expected: u32, team: &str) -> Result<(), String> {
+    authenticate_peer(socket, expected, team, true, None)
+}
+
+// A replacement and its preservation owner legitimately have different code.
+// Pin the running replacement to the CodeDirectory from the verified signed bundle.
+pub(super) fn authenticate_peer(
+    socket: &UnixStream,
+    expected: u32,
+    team: &str,
+    same_build: bool,
+    cdhash: Option<&str>,
+) -> Result<(), String> {
     if team.len() != 10
         || !team
             .bytes()
@@ -149,7 +161,26 @@ pub(super) fn authenticate(socket: &UnixStream, expected: u32, team: &str) -> Re
         };
         let peer = OwnedCF::returned(status, raw)?;
         peer.valid(&requirement)?;
-        if peer.unique()? != this.unique()? {
+        if let Some(hash) = cdhash {
+            if hash.len() != 40
+                || !hash
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            {
+                return Err(FAILED.into());
+            }
+            let expression = NSString::from_str(&format!("cdhash H\"{hash}\""));
+            let mut raw = std::ptr::null();
+            let status = unsafe {
+                SecRequirementCreateWithString(
+                    (&*expression as *const NSString).cast(),
+                    0,
+                    &mut raw,
+                )
+            };
+            peer.valid(&OwnedCF::returned(status, raw)?)?;
+        }
+        if same_build && peer.unique()? != this.unique()? {
             return Err(FAILED.into());
         }
         this.valid(&requirement)?;

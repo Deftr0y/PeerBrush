@@ -23,6 +23,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "health.rs"]
+pub(super) mod health;
+
 const ENTRY: &str = "--peerbrush-update-capture-owner";
 const FAILED: &str = "App update capture owner is unavailable; all projects remain open";
 const FRAME_LIMIT: usize = 4096;
@@ -1055,6 +1058,12 @@ struct NativeOwner {
     parent_exit_recorded: bool,
     outcome_recorded: NativeOutcome,
     target_attempted: bool,
+    sealed: bool,
+    health_attempted: bool,
+    health: Option<(
+        driver::InstalledSelection,
+        mpsc::Receiver<Result<checkpoint::HealthProfile, String>>,
+    )>,
     target_verification: Option<(
         driver::InstalledSelection,
         mpsc::Receiver<Result<super::installed::Verified, String>>,
@@ -1166,6 +1175,9 @@ impl NativeOwner {
             parent_exit_recorded: false,
             outcome_recorded: NativeOutcome::Unknown,
             target_attempted: false,
+            sealed: false,
+            health_attempted: false,
+            health: None,
             target_verification: None,
             verified_target: None,
         })
@@ -1395,8 +1407,69 @@ impl NativeOwner {
             self.verified_target = None;
         }
     }
-    fn retain_unknown_outcome(mut self, commands: mpsc::Receiver<NativeCommand>) -> ! {
-        // No verified native outcome/health retirement exists yet. In particular,
+    fn healthy_install(&mut self) -> Result<bool, String> {
+        let Some(binding) = self.final_control.as_ref().filter(|_| self.sealed) else {
+            return Ok(false);
+        };
+        let Some((selection, target)) = &self.verified_target else {
+            return Ok(false);
+        };
+        if self.checks.installed_selection().as_ref() != Some(selection)
+            || selection.generation != binding.ready_generation
+        {
+            return Ok(false);
+        }
+        let armed = self.armed.as_ref().ok_or(FAILED)?;
+        if !self.health_attempted {
+            self.health_attempted = true;
+            let (send, recv) = mpsc::sync_channel(1);
+            let app = self._bundles.application.clone();
+            let proof = target.clone();
+            let team = self.configuration.publisher_team_id.clone();
+            let armed = armed.clone();
+            let profile = self._profile.clone();
+            let final_profile = binding.clone();
+            std::thread::Builder::new()
+                .name("peerbrush-installed-editor".into())
+                .spawn(move || {
+                    let _ = send.send(health::probe(
+                        app,
+                        proof,
+                        team,
+                        armed,
+                        profile,
+                        final_profile,
+                    ));
+                })
+                .map_err(|_| FAILED)?;
+            self.health = Some((selection.clone(), recv));
+        }
+        let Some((tested, recv)) = &self.health else {
+            return Ok(false);
+        };
+        if tested != selection {
+            return Ok(false);
+        }
+        let response = match recv.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return Ok(false),
+            Err(_) => Err(FAILED.into()),
+        };
+        self.health = None;
+        let original = response?;
+        let ack = self
+            .checks
+            .installed_acknowledgement(selection)
+            .ok_or(FAILED)?;
+        armed.archive_healthy(&self._profile, binding, &original, target)?;
+        ack.call(());
+        Ok(true)
+    }
+    fn retain_unknown_outcome(
+        mut self,
+        commands: mpsc::Receiver<NativeCommand>,
+    ) -> Result<(PathBuf, super::installed::Verified), String> {
+        // Only a verified installed editor and intact final settings permit retirement;
         // parent EOF, deadline, NoUpdate and cycle finish cannot release this owner.
         loop {
             // Only kernel reparenting establishes this direct parent's exit.
@@ -1412,7 +1485,7 @@ impl NativeOwner {
                     );
                     if let Some(binding) = &self.final_control {
                         if received_sealed_exit(&self.sealed_exit, binding) {
-                            let _ = armed.record_sealed_exit(&self._profile, binding);
+                            self.sealed = armed.record_sealed_exit(&self._profile, binding).is_ok();
                         }
                     }
                 }
@@ -1438,6 +1511,12 @@ impl NativeOwner {
                 self.checks.quarantine();
             }
             self.observe_installed_target();
+            if self.healthy_install().unwrap_or(false) {
+                return Ok((
+                    self._bundles.application.clone(),
+                    self.verified_target.take().ok_or(FAILED)?.1,
+                ));
+            }
             // No blocking socket read/write or channel wait on this native thread.
             // One command per turn leaves Foundation callbacks an opportunity to run.
             match commands.try_recv() {
@@ -1510,6 +1589,13 @@ impl NativeOwner {
 #[doc(hidden)]
 pub fn main_entry() -> Option<i32> {
     let arguments: Vec<_> = std::env::args_os().skip(1).collect();
+    if arguments.iter().any(|arg| arg == health::ENTRY) {
+        return Some(if arguments.len() == 1 && health::run().is_ok() {
+            0
+        } else {
+            2
+        });
+    }
     dispatch(&arguments, run)
 }
 fn dispatch(
@@ -1637,7 +1723,17 @@ fn run() -> Result<(), String> {
             configuration.clone(),
             cancel.clone(),
         ) {
-            native.retain_unknown_outcome(native_commands);
+            let (app, target) = native.retain_unknown_outcome(native_commands)?;
+            drop(profile);
+            target.recheck()?;
+            Command::new(app.join("Contents/MacOS/peerbrush"))
+                .current_dir(&app)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|_| FAILED)?;
+            return Ok(());
         }
         // Known-unstarted capture still cancels on parent loss. It does not
         // establish absence/cancellation of any previous Sparkle installer.

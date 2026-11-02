@@ -316,9 +316,10 @@ fn checkpoints(locations: &Locations) -> PathBuf {
 /// A Finder launch inside the preservation directory must never start the
 /// ordinary profile with an older editor, even if the journal was damaged.
 pub fn preserved_app(executable: &Path) -> bool {
-    executable
-        .ancestors()
-        .any(|dir| dir.ends_with("Library/Application Support/PeerBrush/Data/update-checkpoints"))
+    executable.ancestors().any(|dir| {
+        dir.ends_with("Library/Application Support/PeerBrush/Data/update-checkpoints")
+            || dir.ends_with("Library/Application Support/PeerBrush/Data/completed-updates")
+    })
 }
 
 // The default-profile owner may still be alive and holding settings.lock.
@@ -1748,8 +1749,11 @@ pub(super) fn owner_check_not_started(app: &Path, manifest: &[u8]) -> Result<(),
     record_unstarted(path, manifest)
 }
 
+pub(super) struct HealthProfile(Snapshot);
+
 // Constructed only by this process's actual arm/write/readback boundary.
 // This retained owner receipt is never deserialized from a status or marker.
+#[derive(Clone)]
 pub(super) struct ArmedCheck {
     app: PathBuf,
     manifest: Vec<u8>,
@@ -1814,6 +1818,70 @@ impl ArmedCheck {
     ) -> Result<(), String> {
         let path = self.check_records(profile)?;
         read_final_profile(&path, &self.manifest, self.owner_pid, binding)
+    }
+    pub(super) fn health_profile(
+        &self,
+        profile: &UpdateProfile,
+        binding: &FinalProfileBinding,
+        destination: &Path,
+    ) -> Result<HealthProfile, String> {
+        let path = self.check_records(profile)?;
+        self.check_seal(&path, binding)?;
+        let record: FinalProfileRecord = serde_json::from_slice(&read_private(
+            &path.join("final-profile.json"),
+            1024 * 1024,
+        )?)
+        .map_err(|_| HOLD)?;
+        let copy = copy_profile(profile, destination, &AtomicBool::new(false))?;
+        if copy.entries != record.profile {
+            return Err(HOLD.into());
+        }
+        check_copy(destination, &record.profile, &AtomicBool::new(false))?;
+        copy.authenticate_profile(&profile.locations.profile())?;
+        self.check_seal(&path, binding)?;
+        Ok(HealthProfile(copy))
+    }
+    fn check_seal(&self, path: &Path, binding: &FinalProfileBinding) -> Result<(), String> {
+        read_final_profile(path, &self.manifest, self.owner_pid, binding)?;
+        let sealed: FinalProfileBinding =
+            serde_json::from_slice(&read_marker(&path.join("sealed-parent-exit.json"))?)
+                .map_err(|_| HOLD)?;
+        if sealed != *binding {
+            return Err(HOLD.into());
+        }
+        Ok(())
+    }
+    pub(super) fn archive_healthy(
+        &self,
+        profile: &UpdateProfile,
+        binding: &FinalProfileBinding,
+        original: &HealthProfile,
+        target: &installed::Verified,
+    ) -> Result<(), String> {
+        let path = self.check_records(profile)?;
+        self.check_seal(&path, binding)?;
+        let root = profile.locations.data.join("completed-updates");
+        private(&root, true)?;
+        let destination = root.join(path.file_name().ok_or(HOLD)?);
+        let release = target.release.as_ref().ok_or(HOLD)?;
+        let receipt = serde_json::to_vec(&serde_json::json!({
+            "schema":1,"final_profile":binding,"installed":release,"cdhash":target.cdhash,
+            "intent_sha256":digest(&self.intent),"rendered_editor":true
+        }))
+        .map_err(|_| HOLD)?;
+        write_new(&path.join("installed-editor-verified.json"), &receipt)?;
+        if read_marker(&path.join("installed-editor-verified.json"))? != receipt {
+            return Err(HOLD.into());
+        }
+        original
+            .0
+            .authenticate_profile(&profile.locations.profile())?;
+        original.0.recheck()?;
+        target.recheck()?;
+        // Only this live owner may retire the barrier. Startup never trusts a receipt alone.
+        crate::settings::publish_directory(&path, &destination)?;
+        crate::server::sync_parent(&destination)?;
+        crate::server::sync_parent(&path)
     }
     pub(super) fn not_started(&self) -> Result<(), String> {
         owner_check_not_started(&self.app, &self.manifest)

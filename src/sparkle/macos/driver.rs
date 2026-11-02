@@ -65,7 +65,7 @@ struct HeldInstalled {
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct InstalledSelection {
     pub version: String,
-    generation: u64,
+    pub(super) generation: u64,
     revision: u64,
 }
 impl Default for State {
@@ -344,6 +344,15 @@ impl State {
             generation: self.held_generation()?,
             revision: self.lifecycle_revision.get(),
         })
+    }
+    pub(super) fn installed_acknowledgement(
+        &self,
+        selection: &InstalledSelection,
+    ) -> Option<RcBlock<dyn Fn()>> {
+        if self.installed_selection().as_ref() != Some(selection) {
+            return None;
+        }
+        Some(self.installed.borrow().as_ref()?.owner.handler.clone())
     }
     fn retain_found(&self, item: &AnyObject, reply: &Block<dyn Fn(isize)>, downloadable: bool) {
         if self.found.borrow().is_some() || self.choice_sent.get() || !self.has_owner() {
