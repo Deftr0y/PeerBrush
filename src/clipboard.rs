@@ -588,10 +588,11 @@ impl Session {
         self.image = None;
         if let Some(shared) = cut {
             let mut engine = shared.lock().unwrap();
-            if engine.doc.id != doc.id || engine.doc.revision != doc.revision {
+            let view = crate::engine::view::current(&engine);
+            if view.id() != doc.id || view.revision() != doc.revision {
                 return Err("Canvas changed before cut. Layers were copied; original layers remain unchanged".into());
             }
-            let commands = crate::layer_clipboard::cut_commands(&engine.doc, &ids)?;
+            let commands = crate::layer_clipboard::cut_commands(engine.resident()?, &ids)?;
             engine.edit("human", &commands, Some(doc.revision), None, "Cut layers")?;
             Ok("Layers cut; paste to place them again".into())
         } else {
@@ -736,11 +737,9 @@ impl Session {
                         ids.iter()
                             .filter_map(Value::as_str)
                             .filter(|id| {
-                                engine
-                                    .doc
-                                    .layers
-                                    .iter()
-                                    .any(|l| l.id == **id && l.kind == "paint")
+                                crate::engine::view::current(&engine)
+                                    .layers()
+                                    .any(|layer| layer.id() == *id && layer.kind() == "paint")
                             })
                             .map(String::from)
                             .collect::<Vec<_>>()
