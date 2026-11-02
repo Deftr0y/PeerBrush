@@ -13,7 +13,7 @@
 [![Rust](https://img.shields.io/badge/built_with-Rust-dea584.svg)](Cargo.toml)
 [![MCP](https://img.shields.io/badge/AI_interface-MCP-5aaaff.svg)](docs/mcp.md)
 
-[Website](https://peerbrush.com/) · [Watch the trailer](https://peerbrush.com/#demo) · [Download 0.25](https://peerbrush.com/#downloads) · [Release notes](docs/release-0.25.md) · [Get started](docs/getting-started.md) · [Connect your AI](docs/mcp.md) · [Development guide](docs/development-guide.md) · [Roadmap](FOLLOWUPS.MD)
+[Website](https://peerbrush.com/) · [Watch the trailer](https://peerbrush.com/#demo) · [Windows Store](https://apps.microsoft.com/detail/9PNR6T1Q2ZL9) · [macOS and Linux downloads](https://peerbrush.com/#downloads) · [Published releases](https://github.com/Deftr0y/PeerBrush/releases) · [Get started](docs/getting-started.md) · [Connect your AI](docs/mcp.md) · [Development guide](docs/development-guide.md) · [Roadmap](FOLLOWUPS.MD)
 
 </div>
 
@@ -62,7 +62,7 @@ You stay in control while AI works directly alongside you inside the same editin
 
 ## Run PeerBrush
 
-[Download PeerBrush 0.25 for Windows x64, Linux x64 or macOS Apple silicon](https://peerbrush.com/#downloads). Extract the archive, then run `peerbrush.exe` on Windows, `peerbrush` on Linux, or `PeerBrush.app` on macOS. **No Rust installation is needed to use it.** All 0.25 packages are unsigned; Windows/macOS may show publisher or security warnings. Open/import/drop an image, work in layers, save PSD, and export PNG.
+PeerBrush 0.30.0 is an unpublished release candidate. Windows users can install the earlier [Microsoft Store version](https://apps.microsoft.com/detail/9PNR6T1Q2ZL9) (MSIX 1.25.0.0). Apple silicon Mac and x64 Linux users can download [release 0.26.0](https://github.com/Deftr0y/PeerBrush/releases/tag/v0.26.0).
 
 To develop from source:
 

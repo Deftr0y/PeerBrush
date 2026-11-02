@@ -1,6 +1,6 @@
 # Getting started
 
-Run the portable `peerbrush` executable. Open the File menu for new/open/import/export and Save As. Keyboard undo/redo works on shared edits. Rust is only needed to develop PeerBrush, not to run a packaged build.
+PeerBrush 0.30.0 is an unpublished release candidate. For the earlier published builds, use the [Windows Store listing, MSIX 1.25.0.0](https://apps.microsoft.com/detail/9PNR6T1Q2ZL9) or [macOS and Linux release 0.26.0](https://github.com/Deftr0y/PeerBrush/releases/tag/v0.26.0). Launch PeerBrush and use the File menu to create, open, import, export or save a project.
 
 Unreleased: **File → About PeerBrush…** shows this running copy's version and source revision from its embedded build metadata. Development/prerelease, dirty local and unknown-source builds are identified. This information is independent of available downloads and does not check the network or change preferences, artwork or undo history.
 
