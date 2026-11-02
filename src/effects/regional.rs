@@ -722,7 +722,7 @@ mod tests {
                 };
                 if depth == 16 {
                     let before = reference.words.clone();
-                    peerbrush::depth16::color::apply_cpu(&mut reference, kind, &effect.settings)
+                    crate::depth16::color::apply_cpu(&mut reference, kind, &effect.settings)
                         .unwrap();
                     for (old, out) in before
                         .chunks_exact(4)
@@ -741,7 +741,7 @@ mod tests {
                         bytes: reference.words.iter().map(|v| project16(*v)).collect(),
                     };
                     let before = image.bytes.clone();
-                    peerbrush::effects::apply_cpu(&mut image, kind, &effect.settings).unwrap();
+                    crate::effects::apply_cpu(&mut image, kind, &effect.settings).unwrap();
                     for (old, out) in before.chunks_exact(4).zip(image.bytes.chunks_exact_mut(4)) {
                         let p = super::super::weighted_pixel(
                             old.try_into().map(|p: [u8; 4]| p.map(u16::from)).unwrap(),

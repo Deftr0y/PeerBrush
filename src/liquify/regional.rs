@@ -520,7 +520,7 @@ mod tests {
         .unwrap()
         .prepare(&mut || Ok(()), |_, _| panic!("No clips"))
         .unwrap();
-        let old_mapping = peerbrush::liquify::mapping16(w, h, &settings).unwrap();
+        let old_mapping = crate::liquify::mapping16(w, h, &settings).unwrap();
         for y in 0..h as i32 {
             for x in 0..w as i32 {
                 assert_eq!(
@@ -555,9 +555,9 @@ mod tests {
                 }
             }
             if depth == 8 {
-                peerbrush::liquify::apply(&mut eight, &settings).unwrap();
+                crate::liquify::apply(&mut eight, &settings).unwrap();
             } else {
-                peerbrush::depth16::color::apply_cpu(&mut sixteen, "liquify", &settings).unwrap();
+                crate::depth16::color::apply_cpu(&mut sixteen, "liquify", &settings).unwrap();
             }
             for y in 0..h as i32 {
                 for x in 0..w as i32 {
@@ -635,7 +635,7 @@ mod tests {
             "selection":[3,4,56,61],"polygon":[[3.,4.],[56.,4.],[52.5,61.],[9.25,61.]],
             "coverage":coverage}]});
         // Polygon extrema exactly match the retained continuous rectangle.
-        let old = peerbrush::liquify::mapping16(w, h, &settings).unwrap();
+        let old = crate::liquify::mapping16(w, h, &settings).unwrap();
         let mut pure = settings.clone();
         pure["strokes"][0]["coverage"] = Value::Null;
         assert!(Plan::new(
@@ -736,10 +736,10 @@ mod tests {
         let mut legacy = pure.clone();
         legacy["strokes"][0]["coverage"] = serde_json::to_value(&empty).unwrap();
         legacy["strokes"][1]["coverage"] = serde_json::to_value(&full).unwrap();
-        let broken = peerbrush::liquify::mapping16(w, h, &legacy).unwrap();
+        let broken = crate::liquify::mapping16(w, h, &legacy).unwrap();
         let mut second_only = legacy.clone();
         second_only["strokes"] = serde_json::json!([legacy["strokes"][1]]);
-        let expected = peerbrush::liquify::mapping16(w, h, &second_only).unwrap();
+        let expected = crate::liquify::mapping16(w, h, &second_only).unwrap();
         let pool = ResidentBudget::new(8 * 1024 * 1024).unwrap();
         let actual = Plan::new(
             Frame::new(w, h).unwrap(),
@@ -835,7 +835,7 @@ mod tests {
         let actual = mapping
             .sample(x, y, 16, |sx, sy| Ok(image.get(sx, sy)))
             .unwrap();
-        let expected = peerbrush::depth16::color::sample(
+        let expected = crate::depth16::color::sample(
             &image,
             f64::from(position[0]),
             f64::from(position[1]),

@@ -738,6 +738,7 @@ mod tests {
             let mask = doc.layers[0].mask.as_mut().unwrap();
             mask.steps
                 .retain(|s| ["fill", "paint", "invert", "levels"].contains(&s.kind.as_str()));
+            let mask = doc.layers[0].mask.as_ref().unwrap();
             assert!(!mask.needs_cache());
             let steps: Vec<_> = mask.steps.iter().map(Step::from).collect();
             for b in [[49, 43, 80, 76], [-11, -7, 19, 13], [120, 125, 146, 151]] {
@@ -749,10 +750,9 @@ mod tests {
                     &steps,
                 )
                 .unwrap();
-                let source = doc.layers[0].mask.as_ref().unwrap();
                 let result = plan
                     .render(&budget, &mut || Ok(()), |i, x, y| {
-                        Ok(source.steps[i].pixels.get16(x, y))
+                        Ok(mask.steps[i].pixels.get16(x, y))
                     })
                     .unwrap();
                 for y in b[1]..b[3] {
