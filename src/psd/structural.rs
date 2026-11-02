@@ -638,8 +638,14 @@ impl<R: Read + Seek, C: FnMut() -> Result<(), String>> Scanner<'_, R, C> {
                 }
             }
         }
-        if end - self.position()? > 1 {
-            return Err("Unframed Photoshop layer information".into());
+        let trailing = end - self.position()?;
+        if trailing > 1 {
+            // Photoshop also writes layer information rounded to four bytes.
+            // Preserve the existing one-byte padding convention separately.
+            if trailing > 3 || info.bytes % 4 != 0 {
+                return Err("Unframed Photoshop layer information".into());
+            }
+            self.zeros(end)?;
         }
         self.seek(end)?;
         Ok((layers, transparency))
@@ -938,6 +944,34 @@ pub(crate) mod tests {
             }
         }
         bytes
+    }
+
+    #[test]
+    fn photoshop_four_byte_layer_info_padding_requires_exact_zero_fill() {
+        for format in [Format::Psd, Format::Psb] {
+            let original = odd_raw_fixture(format, false);
+            let indexed = index(&mut Cursor::new(&original), Limits::current(), || Ok(())).unwrap();
+            let start = indexed.layer_and_mask.offset as usize - if format.large() { 8 } else { 4 };
+            for (tail, accept) in [
+                (&[0, 0][..], true),
+                (&[0, 1], false),
+                (&[0, 0, 0], false),
+                (&[0; 6], false),
+            ] {
+                let mut info = vec![0, 0]; // Empty layer-record list, with a separate merged composite.
+                info.extend_from_slice(tail);
+                let mut section = Vec::new();
+                block(&mut section, &info, format.large());
+                section.extend_from_slice(&0u32.to_be_bytes());
+                let mut bytes = original[..start].to_vec();
+                block(&mut bytes, &section, format.large());
+                bytes.extend_from_slice(&original[indexed.composite.span.offset as usize..]);
+                assert_eq!(
+                    index(&mut Cursor::new(bytes), Limits::current(), || Ok(())).is_ok(),
+                    accept
+                );
+            }
+        }
     }
 
     pub(crate) fn many_resources_fixture() -> Vec<u8> {
