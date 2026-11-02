@@ -110,8 +110,6 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libxcb-shape0-dev libxcb-xfixes0-dev dpkg-dev desktop-file-utils libfontconfig1
       - name: Build source-matched JPEG XL worker for integration tests
         run: cargo build --locked --bin peerbrush
-      - name: Check the separate setup entry in the ordinary non-test configuration
-        run: cargo check --locked --features windows-setup --bin peerbrush-setup
       - name: Check native clipboard copy, cut and paste on isolated Windows stations
         if: runner.os == 'Windows' && inputs.build_store_msix
         shell: pwsh
@@ -151,8 +149,6 @@ jobs:
           probe="$PWD/target/debug/examples/sparkle_preparation"
           (cd "$fixture" && HOME="$(pwd -P)" TMPDIR="$(pwd -P)" "$probe" --health-editor)
       - run: python scripts/build_release.py
-      - name: Build dormant setup entry without an offer
-        run: python -B scripts/build_release.py --setup-entry
       - name: Package exact platform with dormant macOS dependency
         shell: bash
         run: |

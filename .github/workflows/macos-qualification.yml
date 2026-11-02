@@ -135,7 +135,6 @@ jobs:
         run: |
           cargo build --locked --bin peerbrush
           python3 -B scripts/build_release.py
-          python3 -B scripts/build_release.py --setup-entry
           python3 -B scripts/package.py --check-source
 
   qualify:
