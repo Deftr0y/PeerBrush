@@ -5,6 +5,10 @@ CI are disabled; a small essential gate runs for version-to-production `main`
 candidates. Existing WIP branches preserve unfinished work and remain unqualified.
 See the [development guide](development-guide.md).
 
+The 0.30.0 release retains the existing canvas limits. The live 16000 × 16000
+editor (PB-068) moves to the next version. Its preserved work and measurements
+below remain available for that milestone.
+
 Native preview rows (unreleased) now retain admitted display stripes independently
 of their captured source session. The raw provider preserves the existing 8/16-bit
 preview sampling grid, target isolation and display projection; unsupported ICC,

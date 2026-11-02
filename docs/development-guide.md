@@ -46,8 +46,9 @@ validates the selection without executing application tests.
 Actual artifact identity, signatures, Store/notarization requirements, package
 installation, native feature acceptance and publication protections still apply.
 Release/signing producers build and validate their exact artifacts without
-repeating the broad code suite. Unfinished 16K integration and known failed checks
-remain release blockers; reducing test volume does not resolve those defects.
+repeating the broad code suite. Qualify 0.30.0 at the current canvas limits.
+The 16000 × 16000 editor (PB-068) is scheduled for the next version.
+Known failures affecting 0.30.0 still require a fix and a targeted recheck.
 
 Use Rust 1.92.0 and the [native JPEG XL prerequisites](jpeg-xl-build.md). For an
 explicit build use `python scripts/jxl_build.py -- build --locked --bin peerbrush`.
