@@ -5,6 +5,7 @@ import json
 import os
 import pathlib
 import plistlib
+import shutil
 import stat
 import subprocess
 import sys
@@ -77,6 +78,10 @@ class FinalImage(unittest.TestCase):
             return self.signer.real_run(command, **kwargs)
         self.calls.append(command)
         tool = pathlib.Path(command[0]).name
+        if tool == 'ditto':
+            self.assertEqual(pathlib.Path(command[1]), self.mount / dmg.APP)
+            shutil.copytree(command[1], command[2])
+            return subprocess.CompletedProcess(command, 0)
         if tool == 'hdiutil':
             if command[1] == 'verify':
                 self.attached_image = command[-1]
@@ -152,6 +157,12 @@ class FinalImage(unittest.TestCase):
 
     def inspect(self, **overrides):
         return dmg.inspect_final(**(self.kwargs | overrides))
+
+    def test_installed_acceptance_selects_app_from_verified_mount(self):
+        stage = self.base / 'mounted-editor'
+        result = self.inspect(copy_mounted_to=stage)
+        self.assertEqual(digest(stage / dmg.APP / 'Contents/MacOS/peerbrush'), result['executable_sha256'])
+        self.assertFalse(self.device_attached)
 
     def test_independent_exact_content_and_native_checks_emit_only_strict_public_facts(self):
         for suffix in ['.verification.json', '.sha256']:

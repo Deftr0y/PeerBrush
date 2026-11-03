@@ -74,6 +74,7 @@ jobs:
     timeout-minutes: 90
     permissions:
       contents: read
+      actions: read
     steps:
       - name: Require reviewed main invocation
         run: |
@@ -136,6 +137,36 @@ jobs:
           cargo build --locked --bin peerbrush
           python3 -B scripts/build_release.py
           python3 -B scripts/package.py --check-source
+
+      - name: Acquire the signed pair for the installed editor test
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          umask 077
+          python3 -B scripts/acquire_macos_qualification_inputs.py \
+            --source-root "$GITHUB_WORKSPACE" --commit "$SELECTED_COMMIT" \
+            --run-id "$SOURCE_RUN_ID" --artifact-id "$SELECTED_ARTIFACT_ID" --artifact-sha256 "$ARTIFACT_SHA256" \
+            --archive-name "$ARCHIVE_NAME" --archive-sha256 "$ARCHIVE_SHA256" --image-name "$IMAGE_NAME" \
+            --image-sha256 "$IMAGE_SHA256" --team-id "$SELECTED_TEAM" --output "$RUNNER_TEMP/installed-inputs"
+      - name: Install the verified DMG app over 0.26 and exercise interrupted relaunch
+        run: |
+          umask 077
+          python3 -B - <<'PY'
+          import os, sys, tomllib
+          from pathlib import Path
+          sys.path.insert(0, 'scripts')
+          from check_macos_editor_relaunch import exercise
+          from package_macos_dmg import inspect_final
+          root, temp = Path.cwd(), Path(os.environ['RUNNER_TEMP'])
+          inputs, stage = temp/'installed-inputs', temp/'mounted-editor'
+          team = os.environ['SELECTED_TEAM']
+          result = inspect_final(root, inputs/os.environ['ARCHIVE_NAME'], inputs/os.environ['IMAGE_NAME'],
+              commit=os.environ['SELECTED_COMMIT'], version=tomllib.loads((root/'Cargo.toml').read_text())['package']['version'],
+              archive_sha256=os.environ['ARCHIVE_SHA256'], image_sha256=os.environ['IMAGE_SHA256'],
+              team_id=team, work=temp/'installed-inspection', copy_mounted_to=stage)
+          exercise(stage/'PeerBrush.app', temp/'installed-editor', result['executable_sha256'],
+                   manual_upgrade=True, signed_team=team)
+          PY
 
   qualify:
     name: qualify

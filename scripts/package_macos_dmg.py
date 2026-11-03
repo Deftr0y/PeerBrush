@@ -159,7 +159,7 @@ def payload_inventory(root):
     return inventory
 
 
-def inspect_final(root, archive, image, *, commit, version, archive_sha256, image_sha256, team_id, work):
+def inspect_final(root, archive, image, *, commit, version, archive_sha256, image_sha256, team_id, work, copy_mounted_to=None):
     """Independently qualify pinned final bytes; never read a signer receipt.
 
     Native verification happens on private owned copies. Failures retain work,
@@ -250,7 +250,14 @@ def inspect_final(root, archive, image, *, commit, version, archive_sha256, imag
     from sign_macos import verify_native_image
     verify_native_image(copied_image, team_id, notarized=True)
     mount = work / 'mounted'
-    verify_image(copied_image, mount, expected, verify_app=lambda app: verify_native(app, team_id, notarized=True))
+    def verify_mounted(app):
+        verify_native(app, team_id, notarized=True)
+        if copy_mounted_to is not None:
+            stage = private_inspection_directory(copy_mounted_to, root, fresh=True)
+            stage.mkdir(mode=0o700)
+            run(['/usr/bin/ditto', str(app), str(stage / APP)])
+            verify_native(stage / APP, team_id, notarized=True)
+    verify_image(copied_image, mount, expected, verify_app=verify_mounted)
     if mount.is_mount():
         raise ValueError('DMG remains mounted; preserve inspection work')
     for path, checksum in [(archive, archive_sha256), (image, image_sha256),

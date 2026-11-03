@@ -13,10 +13,12 @@ from sign_macos import verify_native
 from test_deb_version_upgrade import PROJECT_SIZE, png_samples
 
 
-def exercise(app, work, executable_sha256, manual_upgrade=False):
+def exercise(app, work, executable_sha256, manual_upgrade=False, signed_team=None):
     if (sys.platform != 'darwin' or os.environ.get('RUNNER_ENVIRONMENT') != 'github-hosted'
             or os.environ.get('RUNNER_ARCH') != 'ARM64'):
         raise ValueError('The editor interruption exercise requires a disposable hosted Apple Silicon Mac.')
+    if signed_team and not manual_upgrade:
+        raise ValueError('Signed editor acceptance requires the installed upgrade path.')
     exe = app / 'Contents/MacOS/peerbrush'
     if digest(exe) != executable_sha256:
         raise ValueError('Staged editor differs from the verified archive executable.')
@@ -87,6 +89,8 @@ def exercise(app, work, executable_sha256, manual_upgrade=False):
         subprocess.run(['/usr/bin/ditto', app, installed], check=True, timeout=90, **options)
         if digest(exe) != executable_sha256:
             raise ValueError('Replacement in the disposable Applications folder changed the editor.')
+        if signed_team:
+            verify_native(installed, signed_team, notarized=True)
 
     profile = None
     for launch in ('first', 'restart'):
@@ -156,4 +160,6 @@ def exercise(app, work, executable_sha256, manual_upgrade=False):
                 proc.wait(timeout=10)
     if artwork.read_bytes() != source or digest(exe) != executable_sha256:
         raise ValueError('The packaged editor or the saved fixture changed during relaunch.')
+    if signed_team:
+        verify_native(installed, signed_team, notarized=True)
     print('Packaged macOS editor rendered twice. Native 16-bit PSD and brush settings survived abrupt process exit.', flush=True)
