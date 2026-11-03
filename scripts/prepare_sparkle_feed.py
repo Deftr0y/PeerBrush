@@ -44,7 +44,7 @@ def feed_bytes(version, record, notes, signature):
     return ET.tostring(root, encoding='utf-8', xml_declaration=True) + b'\n'
 
 
-def prepare(args, key_input):
+def prepare(args, key_input, *, private_loopback=False):
     root = Path(__file__).resolve().parents[1]
     if (sys.platform != 'darwin' or not re.fullmatch('[0-9a-f]{40}', args.commit)
             or git(root, 'rev-parse', 'HEAD').decode().strip() != args.commit
@@ -94,6 +94,15 @@ def prepare(args, key_input):
         signature = sign(image).decode('ascii')
         verify(image, signature)
         content = feed_bytes(args.version, record, notes, signature)
+        if private_loopback:
+            if (args.version not in ('0.29.99', '0.30.0') or os.environ.get('GITHUB_JOB') != 'sign'
+                    or os.environ.get('GITHUB_REF') != 'refs/heads/main'
+                    or os.environ.get('GITHUB_WORKFLOW_REF') != 'Deftr0y/PeerBrush/.github/workflows/macos-release-signing.yml@refs/heads/main'
+                    or os.environ.get('SELECTED_COMMIT') != os.environ.get('GITHUB_WORKFLOW_SHA')
+                    or os.environ.get('GITHUB_RUN_ATTEMPT') != '1'
+                    or content.count(DOWNLOAD.encode()) != 1):
+                raise ValueError('Private appcasts require the fixed reviewed signing workflow.')
+            content = content.replace(DOWNLOAD.encode(), b'http://localhost:38573/downloads/')
         ET.fromstring(content)  # Reject text containing XML-forbidden Unicode code points.
         xml = stage / 'appcast.xml'
         plain = stage / 'content'

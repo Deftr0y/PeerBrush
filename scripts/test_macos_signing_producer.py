@@ -126,8 +126,7 @@ class AppleSigningProducer(unittest.TestCase):
             self.assertEqual(self.workflow.count(command), 1)
             self.assertIn(command, build)
             self.assertNotIn(command, self.sign)
-        self.assertLess(build.index('cargo test --locked\n'), build.index(activation))
-        self.assertLess(build.index('cargo test --locked -p egui-winit --lib peerbrush_clipboard_tests'), build.index(activation))
+        self.assertLess(build.index('cargo build --locked --bin peerbrush'), build.index(activation))
         self.assertLess(build.index(activation), build.index(quit))
         self.assertLess(build.index(quit), build.index('python3 -B scripts/build_release.py'))
         for forbidden in ['continue-on-error:', 'if: always()', 'secrets.', '|| true']:

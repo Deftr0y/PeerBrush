@@ -45,7 +45,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ fromJSON(inputs.macos_recovery_only && '["macos-26"]' || '["windows-2025","macos-26","ubuntu-24.04"]') }}
+        os: ${{ fromJSON(inputs.macos_recovery_only && '["macos-15"]' || '["windows-2025","macos-26","ubuntu-24.04"]') }}
     runs-on: ${{ matrix.os }}
     env:
       EXPECTED_COMMIT: ${{ inputs.expected_commit || github.sha }}
@@ -78,6 +78,14 @@ jobs:
       - name: Pin existing Python for native packaging
         if: runner.os == 'macOS'
         run: python -I scripts/select_native_python.py
+      - name: Preflight the private upgrade fixture without signing
+        if: inputs.macos_recovery_only
+        shell: bash
+        run: |
+          python3 -B scripts/prepare_sparkle_baseline.py "$EXPECTED_COMMIT"
+          swiftc scripts/sparkle_lab_ui.swift -o "$RUNNER_TEMP/lab-ui"
+          cd "$RUNNER_TEMP/peerbrush-sparkle-baseline"
+          python3 -B scripts/package.py --check-source
       - name: Check exact release source
         shell: bash
         run: python scripts/release_gate.py --commit "$EXPECTED_COMMIT"

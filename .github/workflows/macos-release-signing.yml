@@ -6,6 +6,10 @@ run-name: Prepare signed Mac ZIP and DMG for the reviewed main source
 on:
   workflow_dispatch:
     inputs:
+      private_upgrade_test:
+        description: Also sign and exercise the private fixed 0.29.99 starting app
+        type: boolean
+        default: false
       expected_commit:
         description: Full reviewed stable main source and workflow SHA
         required: true
@@ -88,6 +92,14 @@ jobs:
               raise SystemExit('Apple release signing accepts stable Cargo versions only.')
           PY
           python3 -B scripts/package.py --check-source
+      - name: Require protected private qualification settings
+        if: inputs.private_upgrade_test
+        env:
+          NATIVE_ENABLED: ${{ vars.PEERBRUSH_NATIVE_QUALIFICATION_ENABLED }}
+          FEED_ENABLED: ${{ vars.PEERBRUSH_SPARKLE_FEED_ENABLED }}
+        run: |
+          test "$NATIVE_ENABLED" = true && test "$FEED_ENABLED" = true
+          python3 -I -c 'import tomllib; assert tomllib.load(open("Cargo.toml","rb"))["package"]["version"] == "0.30.0"'
       - name: Select existing native codec tools
         run: python3 -B scripts/jxl_build.py --github-env
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # Rust 1.92.0
@@ -149,10 +161,13 @@ jobs:
   sign:
     name: sign
     needs: build
+    permissions:
+      actions: read
+      contents: read
     if: vars.PEERBRUSH_APPLE_RELEASE_SIGNING_ENABLED == 'true' && github.repository == 'Deftr0y/PeerBrush' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && needs.build.result == 'success'
     environment: apple-signing
     runs-on: macos-26
-    timeout-minutes: 150
+    timeout-minutes: 240
     env:
       SELECTED_VERSION: ${{ needs.build.outputs.version }}
       UNSIGNED_SHA256: ${{ needs.build.outputs.unsigned_sha256 }}
@@ -223,6 +238,30 @@ jobs:
             "$RUNNER_TEMP/apple-credentials/DeveloperIDG2CA.cer" | shasum -a 256 -c -
       # Reuse reviewed credential setup/cleanup; only the temporary keychain's
       # lifetime differs for two formats. No remote settings are created here.
+      - name: Create signing runner transfer recipient
+        if: inputs.private_upgrade_test
+        run: |
+          python3 -B scripts/sparkle_lab_transport.py recipient signer
+      - name: Hand off recipient-signer
+        if: inputs.private_upgrade_test
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sparkle-recipient-signer-${{ github.run_id }}-1
+          path: ${{ runner.temp }}/signer.pem
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+      - name: Independently derive and verify the private starting input
+        if: inputs.private_upgrade_test
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "$SELECTED_VERSION" = 0.30.0
+          python3 -B scripts/prepare_sparkle_baseline.py "$SELECTED_COMMIT"
+          python3 -B scripts/sparkle_lab_transport.py fetch-cert editor
+          python3 -B scripts/sparkle_lab_transport.py decrypt signer "$RUNNER_TEMP/PeerBrush-0.29.99-macOS-arm64.zip"
+          cd "$RUNNER_TEMP/peerbrush-sparkle-baseline"
+          python3 -B scripts/sparkle_lab_pair.py unsigned
       - name: Import credentials only after environment approval
         env:
           APPLE_SIGNING_P12_BASE64: ${{ secrets.APPLE_SIGNING_P12_BASE64 }}
@@ -286,6 +325,16 @@ jobs:
             --commit "$SELECTED_COMMIT" --version "$SELECTED_VERSION" --expected-sha256 "$SIGNED_SHA" \
             --team-id "$APPLE_TEAM" --identity "$APPLE_IDENTITY_SHA1" --profile peerbrush-ci \
             --keychain "$RUNNER_TEMP/apple-credentials/signing.keychain-db" --revision "$DMG_REVISION"
+      - name: Sign the private 0.29.99 starting build
+        if: inputs.private_upgrade_test
+        run: |
+          cd "$RUNNER_TEMP/peerbrush-sparkle-baseline"
+          commit=$(git rev-parse HEAD)
+          unsigned="$RUNNER_TEMP/PeerBrush-0.29.99-macOS-arm64.zip"
+          signed="$RUNNER_TEMP/baseline-signed/PeerBrush-0.29.99-macOS-arm64-apple-signed-r1.zip"
+          common=(--output "$RUNNER_TEMP/baseline-signed" --commit "$commit" --version 0.29.99 --team-id "$APPLE_TEAM" --identity "$APPLE_IDENTITY_SHA1" --profile peerbrush-ci --keychain "$RUNNER_TEMP/apple-credentials/signing.keychain-db" --revision 1)
+          python3 -B scripts/sign_macos.py --format zip --archive "$unsigned" --work "$RUNNER_TEMP/baseline-zip-work" --expected-sha256 "$(shasum -a 256 "$unsigned" | cut -d ' ' -f1)" "${common[@]}"
+          python3 -B scripts/sign_macos.py --format dmg --archive "$signed" --work "$RUNNER_TEMP/baseline-dmg-work" --expected-sha256 "$(shasum -a 256 "$signed" | cut -d ' ' -f1)" "${common[@]}"
       - name: Delete temporary signing credentials before artifact upload
         if: always()
         run: |
@@ -305,6 +354,52 @@ jobs:
                       shutil.rmtree(root)
           PY
 
+      - name: Select the pinned Sparkle signer
+        if: inputs.private_upgrade_test
+        run: |
+          umask 077
+          cd "$RUNNER_TEMP"
+          curl --fail --location --proto '=https' --proto-redir '=https' --max-filesize 16319840 --max-time 120 --output sparkle-tools.tar.xz 'https://github.com/sparkle-project/Sparkle/releases/download/2.10.0/Sparkle-2.10.0.tar.xz'
+          echo 'c2bf58aa8387266ac179357b1415d6f2635f044da8be41042af32425dae6da0c  sparkle-tools.tar.xz' | shasum -a 256 --check
+          python3 -I - <<'PY'
+          import tarfile
+          from pathlib import Path
+          with tarfile.open('sparkle-tools.tar.xz','r:xz') as archive:
+              members = [m for m in archive if m.name.removeprefix('./') == 'bin/sign_update']
+              if len(members) != 1 or not members[0].isfile() or members[0].size != 1358624:
+                  raise SystemExit('Unexpected signer in Sparkle distribution.')
+              with open('sign_update','xb') as stream:
+                  stream.write(archive.extractfile(members[0]).read())
+          Path('sign_update').chmod(0o500)
+          PY
+      - name: Sign only the two private lab feeds
+        if: inputs.private_upgrade_test
+        env:
+          SPARKLE_ED25519_SEED: ${{ secrets.SPARKLE_ED25519_SEED }}
+        run: |
+          set +x
+          seed="${SPARKLE_ED25519_SEED:?Protected Sparkle key is unavailable}"
+          unset SPARKLE_ED25519_SEED
+          printf '%s\n' "$seed" | python3 -B scripts/sparkle_lab_pair.py feed
+          cd "$RUNNER_TEMP/peerbrush-sparkle-baseline"
+          printf '%s\n' "$seed" | python3 -B scripts/sparkle_lab_pair.py feed
+          unset seed
+      - name: Seal only the selected private files for the test Mac
+        if: inputs.private_upgrade_test
+        run: |
+          cd "$RUNNER_TEMP"
+          target="macos-signed/PeerBrush-0.30.0-macOS-arm64-apple-signed-r$ZIP_REVISION"
+          tar -cf lab.tar baseline-signed/PeerBrush-0.29.99-macOS-arm64-apple-signed-r1.zip baseline-signed/PeerBrush-0.29.99-macOS-arm64-apple-signed-r1-dmg-signed-r1.dmg lab-feed-0.29.99/appcast.xml lab-feed-0.30.0/appcast.xml "$target.zip" "$target-dmg-signed-r$DMG_REVISION.dmg"
+          python3 -B "$GITHUB_WORKSPACE/scripts/sparkle_lab_transport.py" encrypt editor "$RUNNER_TEMP/lab.tar"
+      - name: Hand off delivery-editor
+        if: inputs.private_upgrade_test
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sparkle-delivery-editor-${{ github.run_id }}-1
+          path: ${{ runner.temp }}/editor.cms
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
       - name: Prepare exact flat signed pair
         id: pair
         run: |
@@ -541,3 +636,72 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
           compression-level: 0
+
+  private-upgrade:
+    name: Private installed Sparkle upgrade
+    needs: build
+    if: inputs.private_upgrade_test && needs.build.outputs.version == '0.30.0' && vars.PEERBRUSH_NATIVE_QUALIFICATION_ENABLED == 'true' && github.ref == 'refs/heads/main' && github.run_attempt == 1
+    permissions:
+      actions: read
+      contents: read
+    runs-on: macos-15
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - run: python -I scripts/select_native_python.py
+      - name: Open private return channel on the credential-free test Mac
+        run: python3 -B scripts/sparkle_lab_transport.py recipient editor
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sparkle-recipient-editor-${{ github.run_id }}-1
+          path: ${{ runner.temp }}/editor.pem
+          if-no-files-found: error
+          retention-days: 1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          toolchain: 1.92.0
+          components: rust-docs
+      - name: Build the fixed starting app without credentials
+        run: |
+          python3 -B scripts/prepare_sparkle_baseline.py "$SELECTED_COMMIT"
+          cd "$RUNNER_TEMP/peerbrush-sparkle-baseline"
+          python3 -B scripts/package.py --check-source
+          python3 -B scripts/jxl_build.py --github-env
+      - name: Package private unsigned baseline
+        run: |
+          cd "$RUNNER_TEMP/peerbrush-sparkle-baseline"
+          curl --fail --location --proto '=https' --proto-redir '=https' -o "$RUNNER_TEMP/Sparkle-2.10.0.zip" 'https://github.com/sparkle-project/Sparkle/releases/download/2.10.0/Sparkle-for-Swift-Package-Manager.zip'
+          python3 -B scripts/prepare_sparkle.py --archive "$RUNNER_TEMP/Sparkle-2.10.0.zip" --verify-only
+          python3 -B scripts/build_release.py
+          python3 -B scripts/package.py --sparkle-archive "$RUNNER_TEMP/Sparkle-2.10.0.zip"
+      - name: Deliver unsigned fixture only to its protected signer
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 -B scripts/sparkle_lab_transport.py fetch-cert signer
+          python3 -B scripts/sparkle_lab_transport.py encrypt signer "$RUNNER_TEMP/peerbrush-sparkle-baseline/dist/PeerBrush-0.29.99-macOS-arm64.zip"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sparkle-delivery-signer-${{ github.run_id }}-1
+          path: ${{ runner.temp }}/signer.cms
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+      - name: Receive signed fixture on the disposable Mac
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -B scripts/sparkle_lab_transport.py decrypt editor "$RUNNER_TEMP/lab.tar"
+      - name: Exercise the two installed versions without signing credentials
+        run: |
+          swiftc scripts/sparkle_lab_ui.swift -o "$RUNNER_TEMP/lab-ui"
+          python3 -B scripts/check_sparkle_upgrade.py
+      - name: Retain the installed acceptance result
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: installed-sparkle-${{ github.run_id }}-1
+          path: ${{ runner.temp }}/installed-sparkle.json
+          if-no-files-found: error
+          retention-days: 30
