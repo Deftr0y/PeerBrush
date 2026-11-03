@@ -669,6 +669,10 @@ class StoreOnlyComposition(unittest.TestCase):
         import test_publish_release as publishing_tests
         service = publishing_tests.Service(manifest)
         publishing_tests.publishing._transfer(service, candidate.directory, manifest, 'Synthetic notes', readback=lambda m: dict(public_availability='verified'))
+        private = {name for name in final.validate_manifest(manifest) if '-Windows-x64.' in name}
+        self.assertEqual(len(private), 4)
+        self.assertTrue(private.isdisjoint(a['name'] for a in service.release('v' + manifest['version'])['assets']))
+        self.assertTrue(all(name.encode() not in final.checksum_bytes(manifest) for name in private))
         readback = publish_release.public_readback(manifest, service.public_get, notes='Synthetic notes')
         self.assertEqual(readback['public_availability'], 'verified')
         self.assertFalse(readback['production_ready'])

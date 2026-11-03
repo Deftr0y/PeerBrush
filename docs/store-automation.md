@@ -10,6 +10,10 @@ and the dormant direct Windows updater are not requirements of this channel.
 Store-only final composition binds the unsigned SDK submission package and its
 reports without an App Installer or direct signing dependency. Store-managed
 installation and upgrades still require genuine native acceptance.
+The publisher validates the Windows portable ZIP, MSIX and sidecars in its
+candidate directory. None is a public GitHub release download. Public checksums
+list downloadable assets; the complete final inventory still records the
+Windows hashes for the protected Store handoff.
 
 The final-input acquisition selector supports schema 2 for this channel. Its
 five roles are candidate, macos_signed, macos_native, linux_native and
@@ -112,16 +116,11 @@ hosted artifacts do not replace that contract.
 
 ## Missing integration gates
 
-1. Integrate and review the Windows Store packaging/runtime changes into the
-   active version branch, then promote through `version/0.3` → `dev` → `main`.
-   Do not blindly merge the historical Store candidate branch: it also contains
-   superseded signing/release changes. Preserve newer fixes and attribution.
-2. The actual release publisher must build the Windows MSIX from the same
-   reviewed commit as the other platforms and attach exactly one x64 `.msix`,
-   its matching `.msix.json` provenance report, and `.msix.sha256` checksum to
-   the GitHub release **before publishing it**. Use the reviewed MSIX packager;
-   do not fabricate these reports for arbitrary binaries. The current candidate
-   workflow does not publish releases or provide this end-to-end contract.
+1. Review the integrated Windows package on the `version/0.3` → `main` release candidate.
+2. Build the Windows MSIX from the same reviewed commit as macOS and Linux.
+   Select the SDK-qualified package, report, checksum and matching portable
+   input for the protected publisher. Revalidate their hashes immediately
+   before handing the MSIX to Partner Center.
 3. Review and qualify the publisher's same-invocation handoff described above.
    This separate workflow's retained
    `release` and reusable declarations are explicitly blocked by the job and

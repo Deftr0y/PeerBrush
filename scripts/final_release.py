@@ -187,8 +187,18 @@ def validate_manifest(value):
     return records
 
 
-def checksum_bytes(manifest):
+def public_records(manifest):
     records = dict(validate_manifest(manifest))
+    if manifest['format'] == STORE_FORMAT:
+        package = manifest['channels']['microsoft-store']['file']
+        portable = next(r['file'] for r in manifest['base_inventory']['assets'] if r.get('platform') == 'Windows')
+        for name in (portable, package, package + '.json', package + '.sha256'):
+            del records[name]
+    return records
+
+
+def checksum_bytes(manifest):
+    records = public_records(manifest)
     raw = encode(manifest)
     records[MANIFEST] = dict(file=MANIFEST, bytes=len(raw), sha256=hashlib.sha256(raw).hexdigest())
     return ''.join(records[name]['sha256'] + '  ' + name + '\n' for name in sorted(records)).encode('ascii')

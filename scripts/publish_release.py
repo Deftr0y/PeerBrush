@@ -13,7 +13,7 @@ import re
 import time
 from urllib.parse import quote, urlsplit
 
-from final_release import Candidate, LIMIT, MANIFEST, STORE_FORMAT, checksum_bytes, encode, read, validate_manifest
+from final_release import Candidate, LIMIT, MANIFEST, STORE_FORMAT, checksum_bytes, encode, public_records, read, validate_manifest
 from package import regular_file
 from package_macos_dmg import bounded_file
 from production_readiness import unique_fields
@@ -212,7 +212,8 @@ def local_files(directory, manifest):
     for name, record in records.items():
         if bounded_file(regular_file(directory, name), LIMIT) != (record['sha256'], record['bytes']):
             raise ValueError('Publication input differs from the immutable final manifest.')
-    return records
+    public = public_records(manifest)
+    return {name: record for name, record in records.items() if name in public or name in (MANIFEST, 'SHA256SUMS')}
 
 
 def release_identity(release, tag, commit, name, notes):
@@ -257,7 +258,7 @@ def public_readback(manifest, get=None, notes=None):
             or not isinstance(resolved, dict) or resolved.get('sha') != manifest['commit']
             or (notes is not None and release.get('body') != notes)):
         raise ValueError('Stable public release/tag is not verified.')
-    expected = dict(validate_manifest(manifest))
+    expected = public_records(manifest)
     for name, data in [(MANIFEST, encode(manifest)), ('SHA256SUMS', checksum_bytes(manifest))]:
         expected[name] = dict(file=name, bytes=len(data), sha256=hashlib.sha256(data).hexdigest())
     assets = release.get('assets')
@@ -414,14 +415,19 @@ def _store_handoff(candidate, provider, journal):
     records = validate_manifest(manifest)
     package = manifest['channels']['microsoft-store']['file']
     portable = next(r['file'] for r in manifest['base_inventory']['assets'] if r.get('platform') == 'Windows')
-    # Reopen actual published bytes against independent final inventory hashes.
-    name, data, report = store.released_assets('v' + manifest['version'], candidate.root,
-        records[portable]['sha256'], records[package]['sha256'])
-    if name != package:
-        raise ValueError('Published Store package differs from final composition.')
+    # The Windows ZIP and submission input are never GitHub release downloads.
+    data = read(candidate.directory / package, LIMIT, records[package]['sha256'])
+    report = json.loads(read(candidate.directory / (package + '.json'), 64 * 1024,
+        records[package + '.json']['sha256']), object_pairs_hook=unique_fields)
+    checksum = read(candidate.directory / (package + '.sha256'), 1024, records[package + '.sha256']['sha256'])
+    tag = 'v' + manifest['version']
+    version, store_version = store.release_version(tag)
+    store.validate_package(package, data, report, checksum.decode('ascii'), manifest['commit'], version, store_version,
+        source_root=candidate.root, portable_path=regular_file(candidate.directory, portable),
+        portable_sha256=records[portable]['sha256'], msix_sha256=records[package]['sha256'])
     candidate.verify()
-    journal.bind('v' + manifest['version'], name, report)
-    store.submit(provider, name, data, report, execute=True, journal=journal)
+    journal.bind(tag, package, report)
+    store.submit(provider, package, data, report, execute=True, journal=journal)
     return dict(submission_attempted=True, service_status=journal.state['service_status'],
                 public_availability='unverified')
 

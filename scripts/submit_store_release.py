@@ -129,7 +129,7 @@ def released_assets(tag, source_root, portable_sha256, msix_sha256):
     assets = release['assets']
     packages = [a for a in assets if a['name'].endswith('.msix')]
     if len(packages) != 1:
-        raise SafeError('Attach exactly one reviewed x64 MSIX and its .json/.sha256 reports to this release before submitting.')
+        raise SafeError('Historical asset preflight needs one public MSIX. Store-only releases use the protected publisher.')
     name = packages[0]['name']
     if name != f'PeerBrush-{store_version}-Windows-x64.msix':
         raise SafeError('Unexpected MSIX asset name.')
