@@ -962,7 +962,7 @@ fn exact_owned_child_exit_is_observed_and_reaped_once_without_interpreting_it_as
         assert!(Instant::now() < deadline);
         std::thread::sleep(Duration::from_millis(10));
     };
-    assert_eq!(observed, pid);
+    assert_eq!(observed, (pid, false));
     assert!(owner.pid().is_err());
     assert_eq!(owner.take_exited().unwrap(), None);
     assert_eq!(

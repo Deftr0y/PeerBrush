@@ -265,7 +265,7 @@ impl Panel {
                     if ui.add_enabled(enabled && !busy,egui::Button::new("Check app updates")).clicked() {
                         if let Err(error)=self.native_updater.check(ctx, _workspace) { self.message=error; }
                     }
-                    if !enabled { ui.label("App update checking is not available in this development build."); }
+                    if !enabled { ui.label("App updates require the default settings profile."); }
                     let phase=self.native_updater.view().phase;
                     match phase {
                         Phase::Verifying | Phase::Checking => {
@@ -278,7 +278,12 @@ impl Panel {
                             if !state.notes.is_empty() { egui::ScrollArea::vertical().id_salt("sparkle_notes").max_height(180.).show(ui,|ui| { ui.label(&state.notes); }); } else { ui.label("Plain-text release notes are not embedded in this update."); }
                             drop(state);
                             let generation=self.native_updater.owner_status().and_then(|status|status.found_generation);
-                            if ui.add_enabled(enabled && generation.is_some() && !self.native_updater.download_requested(),egui::Button::new("Download app update")).clicked() {
+                            if !self.native_updater.pending_installation() {
+                                if ui.button("Prepare app download").clicked() {
+                                    if let Err(error)=self.native_updater.prepare_download(ctx, _workspace) { self.message=error; }
+                                }
+                                if ui.button("Later").clicked() { self.native_updater.defer(); }
+                            } else if ui.add_enabled(enabled && generation.is_some() && !self.native_updater.download_requested(),egui::Button::new("Download app update")).clicked() {
                                 if let Some(generation)=generation {
                                     if let Err(error)=self.native_updater.download(generation) { self.message=error; }
                                 }
@@ -298,7 +303,7 @@ impl Panel {
                     if let Some(status)=self.native_updater.owner_status() {
                         if status.download_generation.is_some() {
                             if status.held_generation.is_some() {
-                                ui.label("Native update preparation is held. Installation and restart remain unavailable.");
+                                ui.label("The update is ready. Save your projects, then choose Quit to finish installing.");
                             } else if held || status.cancelled || status.quarantine {
                                 ui.label("App update progress is held; cancellation has not been confirmed.");
                             } else if let Some(progress)=status.extraction {
@@ -308,7 +313,12 @@ impl Panel {
                                     ui.label(format!("App update download: {} of {} bytes",status.received_bytes,expected));
                                 } else { ui.label(format!("App update download: {} bytes",status.received_bytes)); }
                             }
+                            if status.held_generation.is_none() && status.extraction.is_none() && !held
+                                && ui.button("Cancel download").clicked() { self.native_updater.defer(); }
                         }
+                    }
+                    if self.native_updater.can_offer_recovery() && ui.button("Open last-working app with separate settings").clicked() {
+                        if let Err(error) = self.native_updater.open_recovery() { self.message = error; }
                     }
                 }
                 ui.label("Official GitHub release notes and portable package metadata");
@@ -438,6 +448,18 @@ impl PeerBrush {
             return false;
         }
         let blocked = self.update_interaction_active();
+        if !blocked && self.updates.native_updater.can_offer_recovery() {
+            match self.flush_update_tool_profile().and_then(|()| {
+                self.updates
+                    .native_updater
+                    .quit_into_recovery(&self.workspace)
+            }) {
+                Ok(true) => self.exit_approved = true,
+                Ok(false) => {}
+                Err(error) => self.message = error.into(),
+            }
+            return true;
+        }
         if !blocked && self.updates.native_updater.may_finish_exit() {
             match self.flush_update_tool_profile().and_then(|()| {
                 self.updates
@@ -455,10 +477,7 @@ impl PeerBrush {
                     .native_updater
                     .prepare_final_control(&self.workspace, blocked)
             }) {
-                Ok(()) => {
-                    "App update preparation requested. Installation and restart remain unavailable."
-                        .into()
-                }
+                Ok(()) => "Waiting for the updater to confirm the saved settings.".into(),
                 Err(error) => error.into(),
             };
             return true;
@@ -470,10 +489,7 @@ impl PeerBrush {
                     .native_updater
                     .observe_final_profile(&self.workspace, blocked)
             }) {
-                Ok(()) => {
-                    "Settings observation requested. Installation and restart remain unavailable."
-                        .into()
-                }
+                Ok(()) => "Checking that all projects are saved before restarting.".into(),
                 Err(error) => error.into(),
             };
             return true;
@@ -563,6 +579,9 @@ impl PeerBrush {
             self.updates
                 .native_updater
                 .tick(ctx, &self.workspace, !idle);
+            if idle && self.updates.native_updater.continue_reviewed_quit() {
+                self.native_update_quit();
+            }
         }
         if self.update_exit_committed() {
             return;

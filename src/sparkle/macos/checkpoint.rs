@@ -419,11 +419,18 @@ fn recovery_workspace(
 
 /// Called only when an interactive default-profile launch failed.
 pub fn offer_recovery(locations: &Locations, files: &[PathBuf]) -> Result<bool, String> {
+    choose_recovery(locations, files, false).map(|choice| choice.is_some())
+}
+pub(super) fn choose_recovery(
+    locations: &Locations,
+    files: &[PathBuf],
+    quitting: bool,
+) -> Result<Option<bool>, String> {
     let Some(configuration) = crate::sparkle::check::compiled()? else {
-        return Ok(false);
+        return Ok(None);
     };
     let Some(path) = recovery_attempt(locations)? else {
-        return Ok(false);
+        return Ok(None);
     };
     let initial = read_private(&path.join("capture.json"), 1024 * 1024)?;
     let manifest: Manifest = serde_json::from_slice(&initial).map_err(|_| HOLD)?;
@@ -446,11 +453,16 @@ pub fn offer_recovery(locations: &Locations, files: &[PathBuf]) -> Result<bool, 
         installed::verify_preserved(app.clone(), configuration, &manifest.build_record, cancel)?;
     let version = &verified.release.as_ref().ok_or(HOLD)?.version;
     const OPEN: &str = "Open recovery workspace";
+    let action = if quitting {
+        "Open recovery and quit this editor"
+    } else {
+        OPEN
+    };
     let choice = rfd::MessageDialog::new().set_title("PeerBrush update recovery")
-        .set_description(format!("PeerBrush could not confirm that the update finished. Open the last-working version ({version}) with separate settings? Your preferences in this recovery workspace will be available the next time you open it."))
-        .set_buttons(rfd::MessageButtons::OkCancelCustom(OPEN.into(), "Quit".into())).show();
-    if choice != rfd::MessageDialogResult::Custom(OPEN.into()) {
-        return Ok(true);
+        .set_description(format!("PeerBrush could not confirm that the update finished. Open the last-working version ({version}) with separate settings? The original settings stay protected."))
+        .set_buttons(rfd::MessageButtons::OkCancelCustom(action.into(), "Cancel".into())).show();
+    if choice != rfd::MessageDialogResult::Custom(action.into()) {
+        return Ok(Some(false));
     }
     if recovery_attempt(locations)?.as_deref() != Some(&path) {
         return Err(HOLD.into());
@@ -466,7 +478,7 @@ pub fn offer_recovery(locations: &Locations, files: &[PathBuf]) -> Result<bool, 
         .args(files)
         .spawn()
         .map_err(|_| "The verified recovery editor could not start")?;
-    Ok(true)
+    Ok(Some(true))
 }
 fn entries(root: &Path) -> Result<Vec<PathBuf>, String> {
     let mut paths = Vec::new();
@@ -1109,11 +1121,22 @@ pub(super) struct Prepared {
     final_profile: Option<FinalCapture>,
 }
 impl Prepared {
-    pub(super) fn observe_owner_exit(&mut self) -> Result<bool, String> {
-        let Some(pid) = self._owner.take_exited()? else {
-            return Ok(false);
+    pub(super) fn observe_owner_exit(&mut self) -> Result<Option<bool>, String> {
+        let Some((pid, clean)) = self._owner.take_exited()? else {
+            return Ok(None);
         };
         self.check_identity()?;
+        if clean && inspect_unstarted_attempt(&self.path).is_ok() {
+            // The child cannot subsequently start. Retain the capture outside
+            // the active journal; never use socket EOF or a cancel reply here.
+            let root = self._profile.locations.data.join("completed-updates");
+            private(&root, true)?;
+            let destination = root.join(self.path.file_name().ok_or(HOLD)?);
+            crate::settings::publish_directory(&self.path, &destination)?;
+            crate::server::sync_parent(&destination)?;
+            crate::server::sync_parent(&self.path)?;
+            return Ok(Some(true));
+        }
         record_native_event(
             &self.path,
             &self.manifest,
@@ -1122,7 +1145,7 @@ impl Prepared {
             None,
         )?;
         self.check_identity()?;
-        Ok(true)
+        Ok(Some(false))
     }
     /// An advisory change detector, never current app/copy authentication.
     pub fn recheck_metadata(&self) -> Result<(), String> {
@@ -1707,10 +1730,11 @@ fn publish_profile_checkpoint(
     write_new(&path.join("checkpoint.json"), manifest)
 }
 
-/// A worker-verified mutable live NSBundle is not a captured native handoff.
-/// Keep this source boundary independent of public pins and startup_enabled.
+/// Unsigned editors and test runners never enter the native transport. The
+/// actual handoff additionally authenticates both running peers and their copies.
 pub(super) fn require_captured_handoff() -> Result<(), String> {
-    Err("App updating is not available in this development build.".into())
+    let config = crate::sparkle::check::compiled()?.ok_or(HOLD)?;
+    super::process_identity::authenticate_self(&config.publisher_team_id)
 }
 
 /// Only the copied owner may arm its own native startup. This is still blocked

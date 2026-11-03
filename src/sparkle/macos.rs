@@ -258,10 +258,19 @@ struct DelegateState {
     revision: Cell<u64>,
     invalidated: Cell<bool>,
     termination_inhibited: Cell<bool>,
+    sealed_generation: Cell<Option<u64>>,
     message: Cell<Option<&'static str>>,
 }
 
 impl DelegateState {
+    fn permits_sealed_install(&self, updater: &AnyObject) -> bool {
+        self.checks.owns(updater)
+            && !self.checks.view().cancelled
+            && self
+                .sealed_generation
+                .get()
+                .is_some_and(|g| self.checks.held_generation() == Some(g))
+    }
     fn changed(&self) {
         if let Some(revision) = self.revision.get().checked_add(1) {
             self.revision.set(revision);
@@ -405,6 +414,7 @@ define_class!(
 
         #[unsafe(method(updater:shouldPostponeRelaunchForUpdate:untilInvokingBlock:))]
         fn postpone_relaunch(&self, updater: &AnyObject, item: &AnyObject, block: &Block<dyn Fn()>) -> Bool {
+            if self.ivars().permits_sealed_install(updater) && self.ivars().checks.matches_ready_item(item) { return Bool::NO; }
             self.ivars().postpone(updater, item, ContinuationKind::Relaunch, block);
             Bool::YES
         }
@@ -458,7 +468,7 @@ define_class!(
         }
 
         #[unsafe(method(updaterShouldRelaunchApplication:))]
-        fn may_relaunch(&self, _updater: &AnyObject) -> Bool { Bool::NO }
+        fn may_relaunch(&self, updater: &AnyObject) -> Bool { Bool::new(self.ivars().permits_sealed_install(updater)) }
 
         #[unsafe(method(updaterShouldPromptForPermissionToCheckForUpdates:))]
         fn may_prompt(&self, _updater: &AnyObject) -> Bool { Bool::NO }
@@ -485,6 +495,8 @@ impl Probe {
             controller: Some(self),
             message: "Prepared updates remain disabled",
             configuration: None,
+            discovery: None,
+            selected_version: None,
             verification: None,
             profile: None,
             checkpoint: None,
@@ -1041,6 +1053,7 @@ fn construct_with_bundles(
         revision: Cell::new(0),
         invalidated: Cell::new(false),
         termination_inhibited: Cell::new(false),
+        sealed_generation: Cell::new(None),
         message: Cell::new(None),
     });
     let delegate: Retained<PreparationDelegate> = unsafe { msg_send![super(delegate), init] };
@@ -1079,6 +1092,8 @@ mod tests {
                 publisher_team_id: "ABCD123456".into(),
                 objects: std::collections::BTreeMap::new(),
             }),
+            discovery: None,
+            selected_version: None,
             verification: None,
             profile: None,
             checkpoint: None,
@@ -1137,8 +1152,7 @@ pub fn probe_bundled(app: &Path, configuration: &Configuration) -> Result<Probe,
     construct(&framework, marker)
 }
 
-/// Main-thread application owner. Configured native startup remains disabled
-/// until safe termination/cancellation/recovery is implemented and verified.
+/// Preparation work retains its profile until the worker has stopped.
 struct Verification {
     receiver: mpsc::Receiver<Result<checkpoint::Prepared, String>>,
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -1148,6 +1162,8 @@ pub struct Application {
     controller: Option<Probe>,
     message: &'static str,
     configuration: Option<crate::sparkle::check::ApprovedCheck>,
+    discovery: Option<mpsc::Receiver<Result<Option<super::discovery::Offer>, String>>>,
+    selected_version: Option<String>,
     verification: Option<Verification>,
     checks: Rc<driver::State>,
     profile: Option<crate::settings::UpdateProfile>,
@@ -1183,6 +1199,8 @@ impl Application {
                 "Automatic updates are unavailable on macOS 11. PeerBrush remains supported."
             },
             configuration,
+            discovery: None,
+            selected_version: None,
             verification: None,
             profile: None,
             checkpoint: None,
@@ -1204,9 +1222,7 @@ impl Application {
         self.configuration.is_some()
     }
     pub(crate) fn startup_enabled(&self) -> bool {
-        // Public feed/key/native facts cannot prove absence or safe cancellation
-        // of a prior installer. Complete termination/recovery must precede startup.
-        false
+        self.configuration.is_some() && self.profile.is_some()
     }
     pub(crate) fn view(&self) -> std::cell::Ref<'_, crate::sparkle::check::Session> {
         self.checks.view()
@@ -1228,6 +1244,9 @@ impl Application {
         checkpoint::require_captured_handoff()?;
         if self.checks.view().cancelled
             || self.checks.view().quarantine
+            || self.selected_version.is_none()
+            || self.owner_status.as_ref().and_then(|s| s.version.as_ref())
+                != self.selected_version.as_ref()
             || self
                 .owner_status
                 .as_ref()
@@ -1285,8 +1304,7 @@ impl Application {
             },
         )?;
         self.final_reply_processed = false;
-        self.message =
-            "Settings observation requested. Installation and restart remain unavailable.";
+        self.message = "Checking that all projects are saved before restarting.";
         Ok(())
     }
     pub(crate) fn may_prepare_final_control(&self) -> bool {
@@ -1326,15 +1344,16 @@ impl Application {
         self.final_control_processed = result.is_err();
         self.final_control_accepted = false;
         result?;
-        self.message =
-            "App update preparation requested. Installation and restart remain unavailable.";
+        self.message = "Waiting for the updater to confirm the saved settings.";
         Ok(())
     }
     pub(crate) fn may_finish_exit(&self) -> bool {
         self.startup_enabled() && self.final_control_accepted && !self.checks.view().cancelled
     }
-    /// Planned human Quit only. Native outcomes/recovery and unexpected target
-    /// death remain unfinished, so startup and captured handoff stay disabled.
+    pub(crate) fn continue_reviewed_quit(&self) -> bool {
+        !self.can_offer_recovery() && (self.may_prepare_final_control() || self.may_finish_exit())
+    }
+    /// Seal a human-requested Quit only after the copied owner accepted the final settings.
     pub(crate) fn finish_update_exit(
         &mut self,
         workspace: &crate::workspace::Registry,
@@ -1344,7 +1363,7 @@ impl Application {
             return Err("App update exit is not available in this development build.".into());
         }
         checkpoint::require_captured_handoff()?;
-        if !self.final_control_accepted || self.verification.is_some() {
+        if !std::mem::take(&mut self.final_control_accepted) || self.verification.is_some() {
             return Err("No confirmed final native update request is available".into());
         }
         let binding = self
@@ -1389,6 +1408,58 @@ impl Application {
                 .as_ref()
                 .is_some_and(|owner| owner.delegate.ivars().termination_inhibited.get())
     }
+    pub(crate) fn can_offer_recovery(&self) -> bool {
+        self.remote.is_some()
+            && self.pending_installation()
+            && (self
+                .remote
+                .as_ref()
+                .is_some_and(|r| r.require_active().is_err())
+                || self.checks.view().cancelled
+                || self.checks.view().quarantine
+                    && self.owner_status.as_ref().is_none_or(|s| {
+                        s.held_generation.is_none()
+                            || matches!(
+                                s.outcome,
+                                coordinator::NativeOutcome::Aborted
+                                    | coordinator::NativeOutcome::CycleEnded
+                            )
+                    }))
+    }
+    pub(crate) fn open_recovery(&self) -> Result<(), String> {
+        if !self.can_offer_recovery() {
+            return Err("No interrupted app update is available.".into());
+        }
+        let profile = self.profile.as_ref().ok_or("No default settings profile")?;
+        if !checkpoint::offer_recovery(&profile.locations, &[])? {
+            return Err(
+                "No verified recovery copy is available. Your projects remain open.".into(),
+            );
+        }
+        Ok(())
+    }
+    pub(crate) fn quit_into_recovery(
+        &self,
+        workspace: &crate::workspace::Registry,
+    ) -> Result<bool, String> {
+        if !self.can_offer_recovery() {
+            return Ok(false);
+        }
+        let reviewed = crate::workspace::lifecycle::update_readiness(workspace)?;
+        let profile = self.profile.as_ref().ok_or("No default settings profile")?;
+        if checkpoint::choose_recovery(&profile.locations, &[], true)? != Some(true) {
+            return Ok(false);
+        }
+        // Recheck all sources after the dialog. This exits the old editor but
+        // deliberately sends no install seal and never retires its checkpoint.
+        crate::workspace::lifecycle::finish_update_exit_with_profile(
+            workspace,
+            &reviewed,
+            |tools| tools.authenticate_update_profile(&profile.locations.profile()),
+        )?;
+        self.checks.close_after_update_exit();
+        Ok(true)
+    }
     /// Cancellation alone cannot release a verification worker's profile hold.
     pub(crate) fn profile_writer_active(&self) -> bool {
         self.verification.is_some()
@@ -1424,8 +1495,50 @@ impl Application {
     pub(crate) fn check(
         &mut self,
         ctx: &eframe::egui::Context,
+        _workspace: &crate::workspace::Registry,
+    ) -> Result<(), String> {
+        if !self.startup_enabled() {
+            return Err("App update checking is not available for this profile.".into());
+        }
+        if self.discovery.is_some() || self.verification.is_some() || self.pending_installation() {
+            return Err("The current app update check must finish first".into());
+        }
+        let config = self
+            .configuration
+            .clone()
+            .ok_or("Signed app update configuration unavailable")?;
+        let checks = Rc::new(driver::State::default());
+        checks.begin(ctx)?;
+        checks.session.borrow_mut().checking();
+        let (send, receive) = mpsc::channel();
+        let repaint = ctx.clone();
+        std::thread::Builder::new()
+            .name("peerbrush-signed-appcast".into())
+            .spawn(move || {
+                let _ = send.send(super::discovery::fetch(&config));
+                repaint.request_repaint();
+            })
+            .map_err(|_| "Could not start the signed release check")?;
+        self.selected_version = None;
+        self.message = "";
+        self.checks = checks;
+        self.discovery = Some(receive);
+        Ok(())
+    }
+
+    pub(crate) fn prepare_download(
+        &mut self,
+        ctx: &eframe::egui::Context,
         workspace: &crate::workspace::Registry,
     ) -> Result<(), String> {
+        if self.discovery.is_some()
+            || self.checks.view().phase != crate::sparkle::check::Phase::Found
+            || self.selected_version.is_none()
+            || self.checks.view().version.as_ref() != self.selected_version.as_ref()
+        {
+            return Err("Check the signed release before preparing an update.".into());
+        }
+        checkpoint::require_captured_handoff()?;
         if !self.startup_enabled() {
             return Err("App update checking is not available in this development build.".into());
         }
@@ -1485,10 +1598,45 @@ impl Application {
         workspace: &crate::workspace::Registry,
         ui_blocked: bool,
     ) {
+        if let Some(worker) = &self.discovery {
+            match worker.try_recv() {
+                Err(mpsc::TryRecvError::Empty) => {}
+                result => {
+                    self.discovery = None;
+                    let mut session = self.checks.session.borrow_mut();
+                    if !session.cancelled {
+                        match result {
+                            Ok(Ok(Some((version, notes))))
+                                if session.found(version.clone(), notes.clone()) =>
+                            {
+                                self.selected_version = Some(version)
+                            }
+                            Ok(Ok(None)) => session.not_found(),
+                            _ => session.fail(),
+                        }
+                    }
+                    session.finished();
+                }
+            }
+        }
         if self.remote.is_some() {
             if let Some(prepared) = self.checkpoint.as_mut() {
                 match prepared.observe_owner_exit() {
-                    Ok(false) => {}
+                    Ok(None) => {}
+                    Ok(Some(true)) => {
+                        self.remote = None;
+                        self.checkpoint = None;
+                        self.owner_status = None;
+                        let checks = Rc::new(driver::State::default());
+                        checks.session.borrow_mut().phase = if self.checks.view().cancelled {
+                            crate::sparkle::check::Phase::Cancelled
+                        } else {
+                            crate::sparkle::check::Phase::Failed
+                        };
+                        self.checks = checks;
+                        self.message =
+                            "The installer did not start. You can keep editing or check again.";
+                    }
                     result => {
                         self.final_control_accepted = false;
                         self.checks.quarantine();
@@ -1580,7 +1728,7 @@ impl Application {
                     if let Some(result) = result {
                         self.final_profile_accepted = result.is_ok();
                         self.message = if result.is_ok() {
-                            "Settings were observed for this request. Installation and restart remain unavailable."
+                            "Saved settings verified. Preparing to restart."
                         } else {
                             self.checks.quarantine();
                             "Settings or projects changed; the observation was refused. Installation and restart remain unavailable."
@@ -1631,7 +1779,7 @@ impl Application {
                     self.final_control_processed = true;
                     self.final_control_accepted = result.is_ok();
                     self.message = if result.is_ok() {
-                        "The app update request was prepared. Installation and restart remain unavailable."
+                        "The update is ready. Finishing the requested restart."
                     } else {
                         self.checks.quarantine();
                         "The update request could not be confirmed. Projects remain open."
@@ -1875,6 +2023,9 @@ impl Application {
 
 impl Drop for Application {
     fn drop(&mut self) {
-        self.defer();
+        if let Some(work) = &self.verification {
+            work.cancel
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
     }
 }

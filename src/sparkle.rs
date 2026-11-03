@@ -7,6 +7,8 @@ pub const CHECK_LAYOUT: u32 = 1;
 
 #[cfg(any(target_os = "macos", test))]
 pub(crate) mod check;
+#[cfg(any(target_os = "macos", test))]
+mod discovery;
 
 pub const PROPOSED_FEED_URL: &str = "https://peerbrush.com/updates/macos/stable/appcast.xml";
 

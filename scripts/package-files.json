@@ -536,6 +536,7 @@
     "src/source/stage_tests.rs",
     "src/sparkle.rs",
     "src/sparkle/check.rs",
+    "src/sparkle/discovery.rs",
     "src/sparkle/macos.rs",
     "src/sparkle/macos/checkpoint.rs",
     "src/sparkle/macos/checkpoint_tests.rs",

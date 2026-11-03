@@ -1,5 +1,5 @@
 //! App-owned user driver. Only an exact Found reply may start a download;
-//! Ready/install/relaunch continuations remain held and are never invoked.
+//! Main-thread Sparkle callback ownership and generation-bound install choices.
 use super::*;
 use crate::sparkle::check::{self, Phase, Session};
 use std::{cell::Ref, rc::Rc, time::Instant};
@@ -222,6 +222,22 @@ impl State {
     }
     pub(super) fn final_control_current(&self, generation: u64) -> bool {
         self.prepared_generation.get() == Some(generation) && self.held_is_current(generation)
+    }
+    pub(super) fn sealed_ready(&self, generation: u64) -> Option<RcBlock<dyn Fn(isize)>> {
+        if !self.final_control_current(generation) {
+            return None;
+        }
+        self.held_ready
+            .borrow()
+            .as_ref()
+            .map(|held| held._reply.clone())
+    }
+    pub(super) fn matches_ready_item(&self, item: &AnyObject) -> bool {
+        self.held_ready
+            .borrow()
+            .as_ref()
+            .and_then(|held| held._item.as_ref())
+            .is_some_and(|held| Retained::as_ptr(held) == item as *const AnyObject)
     }
     fn retain_native_lifecycle(&self, handler: &Block<dyn Fn()>) -> Option<OwnedNativeCallback> {
         // Native progress invalidates preparation; it never proves completion or
@@ -705,7 +721,7 @@ define_class!(
                 // as if that proved it could not install on ordinary termination.
                 state.quarantine(); return;
             }
-            let version: Option<Retained<NSString>>=unsafe { msg_send![item, displayVersionString] };
+            let version: Option<Retained<NSString>>=unsafe { msg_send![item, versionString] };
             let format: Option<Retained<NSString>>=unsafe { msg_send![item, itemDescriptionFormat] };
             let description: Option<Retained<NSString>>=unsafe { msg_send![item, itemDescription] };
             let format=text(format, 32);

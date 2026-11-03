@@ -140,11 +140,13 @@ jobs:
         shell: bash
         run: |
           cargo test --locked --lib -- --exact --test-threads=1 \
+            sparkle::discovery::tests::signed_offer_no_update_and_tampered_bytes \
+            sparkle::check::tests::only_an_owned_manual_check_gets_one_permission_and_cancel_discards_late_results \
             sparkle::macos::coordinator::tests::sealed_exit_notice_survives_disconnect_and_requires_the_reviewed_final_profile \
             sparkle::macos::checkpoint::tests::contradictory_and_orphan_native_markers_never_admit_profile_migration \
             sparkle::macos::checkpoint::tests::planned_update_exit_seals_current_joint_sources_only_after_final_owner_authentication \
             | tee "$RUNNER_TEMP/macos-recovery-checks.log"
-          grep -Fq 'test result: ok. 3 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/macos-recovery-checks.log"
+          grep -Fq 'test result: ok. 5 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/macos-recovery-checks.log"
           fixture=$(mktemp -d "$RUNNER_TEMP/peerbrush-health-fixture.XXXXXXXX")
           probe="$PWD/target/debug/examples/sparkle_preparation"
           (cd "$fixture" && HOME="$(pwd -P)" TMPDIR="$(pwd -P)" "$probe" --health-editor)

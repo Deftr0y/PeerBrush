@@ -118,6 +118,30 @@ pub(super) fn authenticate(socket: &UnixStream, expected: u32, team: &str) -> Re
     authenticate_peer(socket, expected, team, true, None)
 }
 
+fn signed_self(team: &str) -> Result<(OwnedCF, OwnedCF), String> {
+    if team.len() != 10
+        || !team
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+    {
+        return Err(FAILED.into());
+    }
+    let expression = NSString::from_str(&format!("identifier \"com.peerbrush.PeerBrush\" and anchor apple generic and certificate leaf[subject.OU] = \"{team}\" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists"));
+    let mut raw = std::ptr::null();
+    let status = unsafe {
+        SecRequirementCreateWithString((&*expression as *const NSString).cast(), 0, &mut raw)
+    };
+    let requirement = OwnedCF::returned(status, raw)?;
+    raw = std::ptr::null();
+    let status = unsafe { SecCodeCopySelf(0, &mut raw) };
+    let this = OwnedCF::returned(status, raw)?;
+    this.valid(&requirement)?;
+    Ok((this, requirement))
+}
+pub(super) fn authenticate_self(team: &str) -> Result<(), String> {
+    signed_self(team).map(|_| ())
+}
+
 // A replacement and its preservation owner legitimately have different code.
 // Pin the running replacement to the CodeDirectory from the verified signed bundle.
 pub(super) fn authenticate_peer(
@@ -136,21 +160,12 @@ pub(super) fn authenticate_peer(
     }
     let audit = peer_audit(socket, expected)?;
     objc2::rc::autoreleasepool(|_| {
-        let expression = NSString::from_str(&format!("identifier \"com.peerbrush.PeerBrush\" and anchor apple generic and certificate leaf[subject.OU] = \"{team}\" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists"));
-        let mut raw = std::ptr::null();
-        let status = unsafe {
-            SecRequirementCreateWithString((&*expression as *const NSString).cast(), 0, &mut raw)
-        };
-        let requirement = OwnedCF::returned(status, raw)?;
-        raw = std::ptr::null();
-        let status = unsafe { SecCodeCopySelf(0, &mut raw) };
-        let this = OwnedCF::returned(status, raw)?;
-        this.valid(&requirement)?;
+        let (this, requirement) = signed_self(team)?;
         let bytes = NSData::with_bytes(bytemuck::cast_slice(&audit));
         let key = unsafe { &*kSecGuestAttributeAudit.cast::<AnyObject>() };
         let attributes: Retained<AnyObject> =
             unsafe { msg_send![class!(NSDictionary), dictionaryWithObject: &*bytes, forKey: key] };
-        raw = std::ptr::null();
+        let mut raw = std::ptr::null();
         let status = unsafe {
             SecCodeCopyGuestWithAttributes(
                 std::ptr::null(),

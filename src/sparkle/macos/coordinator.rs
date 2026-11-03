@@ -1,9 +1,9 @@
-//! Authenticated copied capture/native lifetime. Native startup remains disabled.
+//! The copied updater owns Sparkle and the recovery checkpoint across editor exit.
 use super::{checkpoint, driver, process_identity, Probe};
 use crate::{settings::UpdateProfile, sparkle::check::ApprovedCheck};
 use objc2::{
-    class, define_class, msg_send, rc::Retained, runtime::AnyObject, MainThreadMarker,
-    MainThreadOnly,
+    class, define_class, msg_send, rc::Retained, runtime::AnyObject, DefinedClass,
+    MainThreadMarker, MainThreadOnly,
 };
 use objc2_foundation::{NSBundle, NSDate, NSObject, NSObjectProtocol};
 use serde::{Deserialize, Serialize};
@@ -389,11 +389,8 @@ impl RemoteCheck {
         self.download_requested.load(Ordering::Acquire)
     }
 }
-impl Drop for RemoteCheck {
-    fn drop(&mut self) {
-        self.cancel();
-    }
-}
+// Dropping the request sender ends observation. Only an explicit human
+// cancellation should send Cancel; a sealed editor exit must not send it.
 
 fn accept_check_command(
     socket: &mut UnixStream,
@@ -772,13 +769,13 @@ impl Owner {
             let _ = socket.send(binding.record_sha256.as_bytes());
         }
     }
-    pub(super) fn take_exited(&mut self) -> Result<Option<u32>, String> {
+    pub(super) fn take_exited(&mut self) -> Result<Option<(u32, bool)>, String> {
         let Some((child, _)) = self.child.as_mut() else {
             return Ok(None);
         };
-        match child.try_wait() {
+        let clean = match child.try_wait() {
             Ok(None) => return Ok(None),
-            Ok(Some(_)) => {}
+            Ok(Some(status)) => status.success(),
             Err(_) => {
                 // An unqueryable child remains owned by the existing waiter;
                 // stop retrying this failed observation without claiming death.
@@ -787,11 +784,11 @@ impl Owner {
                 }
                 return Err(FAILED.into());
             }
-        }
+        };
         let (child, reaper) = self.child.take().ok_or(FAILED)?;
         let pid = child.id();
         reaper.handoff(child);
-        Ok(Some(pid))
+        Ok(Some((pid, clean)))
     }
     pub(super) fn authenticate(&self, team: &str) -> Result<(), String> {
         process_identity::authenticate(&self.socket, self.pid()?, team)
@@ -808,7 +805,7 @@ impl Owner {
         team: String,
         ctx: &eframe::egui::Context,
     ) -> Result<RemoteCheck, String> {
-        // Public configuration cannot activate the unfinished native contract.
+        // Reject an unsigned caller before consuming its single reader grant.
         checkpoint::require_captured_handoff()?;
         // Consume the sole reader grant. A clone of the socket is not authority
         // to start another worker competing for the same framed byte stream.
@@ -1035,8 +1032,7 @@ fn received_sealed_exit(socket: &UnixDatagram, binding: &checkpoint::FinalProfil
             .is_ok_and(|n| &bytes[..n] == binding.record_sha256.as_bytes())
 }
 
-/// Main-thread lifetime for the copied native owner. Every check remains behind
-/// the independent source refusal; no install or successful retirement API exists.
+/// Main-thread lifetime for the authenticated copied updater.
 struct NativeOwner {
     _updater: Probe,
     _profile: UpdateProfile,
@@ -1052,6 +1048,7 @@ struct NativeOwner {
     configuration: ApprovedCheck,
     cancel: Arc<AtomicBool>,
     check_attempted: bool,
+    sdk_started: bool,
     armed: Option<checkpoint::ArmedCheck>,
     final_profile: Option<checkpoint::FinalProfileBinding>,
     final_control: Option<checkpoint::FinalProfileBinding>,
@@ -1081,8 +1078,7 @@ impl NativeOwner {
         configuration: ApprovedCheck,
         cancel: Arc<AtomicBool>,
     ) -> Result<Self, String> {
-        // Public pins/capture replies cannot replace the unfinished surviving
-        // native handoff/final exit/outcome/health/recovery contract.
+        // Verify our running code before loading Sparkle from the captured copy.
         checkpoint::require_captured_handoff()?;
         let marker = MainThreadMarker::new().ok_or(FAILED)?;
         process_identity::authenticate(&channel, parent, &configuration.publisher_team_id)?;
@@ -1169,6 +1165,7 @@ impl NativeOwner {
             configuration,
             cancel,
             check_attempted: false,
+            sdk_started: false,
             armed: None,
             final_profile: None,
             final_control: None,
@@ -1228,6 +1225,7 @@ impl NativeOwner {
             self.checks.native_start_failed();
             return Err(FAILED.into());
         }
+        self.sdk_started = true;
         unsafe {
             let _: () = msg_send![&*self._updater.controller, checkForUpdates];
         }
@@ -1468,15 +1466,17 @@ impl NativeOwner {
     fn retain_unknown_outcome(
         mut self,
         commands: mpsc::Receiver<NativeCommand>,
-    ) -> Result<(PathBuf, super::installed::Verified), String> {
+    ) -> Result<Option<(PathBuf, super::installed::Verified)>, String> {
         // Only a verified installed editor and intact final settings permit retirement;
         // parent EOF, deadline, NoUpdate and cycle finish cannot release this owner.
+        let mut parent_exit_time = None;
         loop {
             // Only kernel reparenting establishes this direct parent's exit.
             // Socket EOF/deadline alone can never stand in for process death.
             let parent = unsafe { libc::getppid() };
             if !self.parent_exit_recorded && parent > 0 && parent as u32 != self.parent {
                 self.parent_exit_recorded = true;
+                parent_exit_time = Some(Instant::now());
                 if let Some(armed) = &self.armed {
                     let _ = armed.record_event(
                         &self._profile,
@@ -1486,6 +1486,21 @@ impl NativeOwner {
                     if let Some(binding) = &self.final_control {
                         if received_sealed_exit(&self.sealed_exit, binding) {
                             self.sealed = armed.record_sealed_exit(&self._profile, binding).is_ok();
+                            if self.sealed {
+                                if let Some(ready) =
+                                    self.checks.sealed_ready(binding.ready_generation)
+                                {
+                                    // The exact parent is dead, its final settings and
+                                    // matching generation are sealed. Never invoke a
+                                    // replacement Ready block or retry this choice.
+                                    self._updater
+                                        .delegate
+                                        .ivars()
+                                        .sealed_generation
+                                        .set(Some(binding.ready_generation));
+                                    ready.call((1_isize,));
+                                }
+                            }
                         }
                     }
                 }
@@ -1507,15 +1522,29 @@ impl NativeOwner {
                     }
                 }
             }
-            if self.cancel.load(Ordering::Acquire) {
+            if self.cancel.load(Ordering::Acquire) && self.final_control.is_none() {
                 self.checks.quarantine();
             }
             self.observe_installed_target();
-            if self.healthy_install().unwrap_or(false) {
-                return Ok((
+            if self.healthy_install()? {
+                return Ok(Some((
                     self._bundles.application.clone(),
                     self.verified_target.take().ok_or(FAILED)?.1,
-                ));
+                )));
+            }
+            if self.parent_exit_recorded
+                && (!self.sealed || parent_exit_time.is_some_and(|time| time.elapsed() >= DEADLINE))
+            {
+                // Never leave an immortal owner after an unplanned exit. The
+                // durable intent still prevents the normal editor taking the profile.
+                return Err(FAILED.into());
+            }
+            if !self.sdk_started
+                && (self.cancel.load(Ordering::Acquire)
+                    || self.checks.view().cancelled
+                    || self.check_attempted)
+            {
+                return Ok(None);
             }
             // No blocking socket read/write or channel wait on this native thread.
             // One command per turn leaves Foundation callbacks an opportunity to run.
@@ -1569,7 +1598,10 @@ impl NativeOwner {
                         final_control,
                     });
                 }
-                Err(mpsc::TryRecvError::Disconnected) => self.checks.quarantine(),
+                Err(mpsc::TryRecvError::Disconnected) if self.final_control.is_none() => {
+                    self.checks.quarantine()
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {}
                 Err(mpsc::TryRecvError::Empty) => {}
             }
             objc2::rc::autoreleasepool(|_| {
@@ -1711,8 +1743,7 @@ fn run() -> Result<(), String> {
             deadline,
             &cancel,
         )?;
-        // The independent refusal in load keeps today's authenticated process
-        // capture-only. No NativeReady reply, start or installer action is sent.
+        // Loading the authenticated controller does not start a check.
         if let Ok(native) = NativeOwner::load(
             bundles,
             profile.clone(),
@@ -1723,7 +1754,9 @@ fn run() -> Result<(), String> {
             configuration.clone(),
             cancel.clone(),
         ) {
-            let (app, target) = native.retain_unknown_outcome(native_commands)?;
+            let Some((app, target)) = native.retain_unknown_outcome(native_commands)? else {
+                return Ok(());
+            };
             drop(profile);
             target.recheck()?;
             Command::new(app.join("Contents/MacOS/peerbrush"))
