@@ -283,6 +283,7 @@ def bind_dmg(root, archive, image, *, commit, version, archive_sha256, image_sha
             expected.update(schema=2, format='PeerBrushDmgQualificationV2',
                             installed_upgrade=validate(actual.get('installed_upgrade'), commit, version,
                                                        archive_sha256, image_sha256))
+            expected['limits']['upgrade-settings-and-unsaved-work'] = 'tested-by-private-signed-two-version-upgrade'
         # Canonical serialization distinguishes bool/int/float, unlike Python
         # equality. Only this exact bounded producer schema is supported.
         if json.dumps(actual, sort_keys=True, allow_nan=False) != json.dumps(expected, sort_keys=True):

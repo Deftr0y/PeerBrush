@@ -25,6 +25,7 @@ def qualify(root, archive, image, output, *, installed_upgrade=None, **inputs):
         result['installed_upgrade'] = validate(receipt, inputs['commit'], inputs['version'],
                                               inputs['archive_sha256'], inputs['image_sha256'], os.environ['SOURCE_RUN_ID'])
         result.update(schema=2, format='PeerBrushDmgQualificationV2')
+        result['limits']['upgrade-settings-and-unsaved-work'] = 'tested-by-private-signed-two-version-upgrade'
     data = (json.dumps(result, indent=2, sort_keys=True) + '\n').encode('utf-8')
     if len(data) > 8192:
         raise ValueError('Final DMG qualification exceeds its bounded public report contract')

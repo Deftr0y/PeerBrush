@@ -15,10 +15,33 @@ import urllib.request
 
 import prepare_site_release as site
 import readback_site_release as readback
+import readback_sparkle_feed
 import test_prepare_site_release
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+
+
+class SparkleReadback(unittest.TestCase):
+    def test_public_feed_and_enclosure_must_match_independent_hashes(self):
+        version = '0.30.0'
+        name = 'PeerBrush-0.30.0-macOS-arm64-apple-signed-r1-dmg-signed-r1.dmg'
+        url = site.DOWNLOAD + 'v0.30.0/' + name
+        feed = (f'<rss xmlns:s="http://www.andymatuschak.org/xml-namespaces/sparkle"><channel><item>'
+                f'<s:version>{version}</s:version><enclosure url="{url}" length="3"/></item></channel></rss>').encode()
+        def get(address, limit, *, destination=None, website=False):
+            if website:
+                self.assertEqual(address, site.WEBSITE + 'updates/macos/stable/appcast.xml')
+                self.assertTrue(site.public_url(address, website=True))
+                self.assertFalse(site.public_url(address + '?release=v0.30.0', website=True))
+                return feed
+            self.assertEqual((address, limit), (url, 3))
+            destination.write_bytes(b'dmg')
+        check = readback_sparkle_feed.check
+        self.assertEqual(check(version, site.sha(feed), site.sha(b'dmg'), get)['dmg'], name)
+        for hashes in [(site.sha(b'other feed'), site.sha(b'dmg')), (site.sha(feed), site.sha(b'other dmg'))]:
+            with self.assertRaises(ValueError):
+                check(version, *hashes, get)
 
 
 class Readback(unittest.TestCase):

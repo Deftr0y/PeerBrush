@@ -103,3 +103,7 @@ accepts exactly `4.4.5` alongside its previous reviewed versions; other platform
 allowlists, suffix refusal and all build/acceptance checks remain unchanged.
 This source review is not native build qualification; new exact-head CI must
 establish compilation and codec/application acceptance. No tool is downloaded.
+
+The macOS 15 Apple Silicon upgrade test uses Apple Clang 17.0.0, CMake 4.4.4
+and Ninja 1.13.2 from its [hosted image](https://github.com/actions/runner-images/blob/macos-15-arm64/20261028.0489/images/macos/macos-15-arm64-Readme.md).
+The macOS 26 release producer still requires Clang 21.0.0.

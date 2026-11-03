@@ -367,5 +367,9 @@ def authenticate(qualification, *, qualification_sha256, commit, version, bundle
                 public_availability='unverified', candidate_verified=False, ready=False, production_ready=False)
     if service is not None:
         result['native_service'] = service
+        if report['format'] == 'PeerBrushDmgQualificationV2':
+            from sparkle_upgrade_evidence import validate
+            validate(report['installed_upgrade'], commit, version, report['signed_zip']['sha256'], report['record']['sha256'])
+            result['installed_acceptance'] = 'verified-signed-two-version-sparkle-upgrade'
     return result
 

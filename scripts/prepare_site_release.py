@@ -66,6 +66,8 @@ def public_url(url, *, api=False, redirected=False, website=False):
                 or parsed.fragment or any(ord(c) < 33 for c in url)):
             return False
         if website:
+            if url == WEBSITE + 'updates/macos/stable/appcast.xml':
+                return not redirected
             if (len(url) > 512 or redirected or parsed.hostname != 'peerbrush.com'
                     or parsed.path not in {'/', *('/' + name for name in SITE_FILES)}):
                 return False

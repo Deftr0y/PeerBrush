@@ -404,9 +404,10 @@ exit $LASTEXITCODE
                                     selected['cmake'])
 
     def test_repeated_qualification_keeps_separate_unix_compilers_and_all_exact_paths(self):
-        cases = [('Linux', 'clang-18', 'clang++-18', '18.1.3', '3.31.6'),
-                 ('Darwin', 'clang', 'clang++', '21.0.0', '4.4.4')]
-        for system, cc_name, cxx_name, compiler_version, cmake_version in cases:
+        cases = [('Linux', '', 'clang-18', 'clang++-18', '18.1.3', '3.31.6'),
+                 ('Darwin', '26.0', 'clang', 'clang++', '21.0.0', '4.4.4'),
+                 ('Darwin', '15.8.2', 'clang', 'clang++', '17.0.0', '4.4.4')]
+        for system, mac_version, cc_name, cxx_name, compiler_version, cmake_version in cases:
             with self.subTest(system=system), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary).resolve()
                 cmake_directory, ninja_directory, compiler_directory, sdk_directory = [
@@ -439,6 +440,7 @@ exit $LASTEXITCODE
                     calls.append(arguments[0])
                     return subprocess.CompletedProcess(arguments, 0, Path(arguments[0]).read_bytes(), b'')
                 with mock.patch.object(jxl_build.platform, 'system', return_value=system), \
+                        mock.patch.object(jxl_build.platform, 'mac_ver', return_value=(mac_version, (), '')), \
                         mock.patch.object(jxl_build.subprocess, 'run', side_effect=version):
                     # A partial inherited selection must not be mixed with discovered tools.
                     environment, qualified = jxl_build.configure({'PATH': original, 'CC': 'ignored partial'})

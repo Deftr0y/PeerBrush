@@ -62,6 +62,9 @@ def configure(inherited=None, selected=None):
     system = platform.system()
     if system not in VERSIONS:
         raise ValueError('Native JPEG XL build is not configured on this platform')
+    versions = VERSIONS[system]
+    if system == 'Darwin' and platform.mac_ver()[0].split('.')[0] == '15':
+        versions = {'clang': {'17.0.0'}, 'cmake': {'4.4.4'}}
     if selected is not None:
         if system != 'Windows' or set(selected) != {'clang-cl', 'cmake', 'ninja'}:
             raise ValueError('Select all three Windows native tools together')
@@ -82,11 +85,11 @@ def configure(inherited=None, selected=None):
     compiler, cpp = {'Windows': ('clang-cl', 'clang-cl'),
                      'Linux': ('clang-18', 'clang++-18'),
                      'Darwin': ('clang', 'clang++')}[system]
-    cc, cc_version = tool(compiler, 'clang', VERSIONS[system]['clang'], environment, paths[0])
-    cxx, cxx_version = tool(cpp, 'clang', VERSIONS[system]['clang'], environment, paths[1])
+    cc, cc_version = tool(compiler, 'clang', versions['clang'], environment, paths[0])
+    cxx, cxx_version = tool(cpp, 'clang', versions['clang'], environment, paths[1])
     if cc_version != cxx_version:
         raise ValueError('Native C/C++ compiler versions differ')
-    cmake, cmake_version = tool('cmake', 'cmake', VERSIONS[system]['cmake'], environment, paths[2])
+    cmake, cmake_version = tool('cmake', 'cmake', versions['cmake'], environment, paths[2])
     ninja, ninja_version = tool('ninja', 'ninja', {'1.13.2'}, environment, paths[3])
     if system == 'Windows' and not all(environment.get(key) for key in ['INCLUDE', 'LIB']):
         raise ValueError('Initialize the existing MSVC/SDK developer environment first')

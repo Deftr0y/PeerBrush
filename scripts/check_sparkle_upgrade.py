@@ -142,8 +142,8 @@ def run_case(case, server, starting, final):
     connection = active / 'connection.json'
     processes = []
     extra_editors = set()
-    def launch():
-        process = subprocess.Popen([exe, '--open', artwork], env=env, cwd=home,
+    def launch(binary=None):
+        process = subprocess.Popen([binary or exe, '--open', artwork], env=env, cwd=home,
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         processes.append(process)
         return process
@@ -153,7 +153,7 @@ def run_case(case, server, starting, final):
         except (FileNotFoundError, KeyError, ValueError):
             return None
     def rpc(method, state=None, **params):
-        cmd = [exe, 'cli', method, json.dumps(dict(actor='human', **params))]
+        cmd = [starting / 'Contents/MacOS/peerbrush', 'cli', method, json.dumps(dict(actor='human', **params))]
         if state is not None:
             cmd.extend(['--state-dir', state])
         reply = json.loads(subprocess.check_output(cmd, env=env, cwd=home, timeout=20))
@@ -270,7 +270,8 @@ def run_case(case, server, starting, final):
                         raise ValueError('User-reviewed Quit failed.')
                 if case == 'success':
                     wait('real installed target and verified editor receipt', lambda:
-                         digest(exe) == final_hash and any((data / 'Data/completed-updates').glob('*/installed-editor-verified.json')), 240)
+                         any((data / 'Data/completed-updates').glob('*/installed-editor-verified.json'))
+                         and exe.is_file() and digest(exe) == final_hash, 240)
                     new_pid = wait('relaunched default workspace', lambda:
                                    (pid if (pid := pid_at(connection)) != before.pid else None))
                     extra_editors.add((new_pid, exe))
@@ -282,7 +283,12 @@ def run_case(case, server, starting, final):
                     if digest(saved_edit) != saved_edit_hash:
                         raise ValueError('Install changed the saved project containing the live edit.')
                 else:
-                    prompt = launch()
+                    # The installed path can be absent during a replacement; the preserved
+                    # app must authenticate itself before it can open the separate profile.
+                    preserved = intent.parent / 'PeerBrush.app/Contents/MacOS/peerbrush'
+                    if digest(preserved) != source_hash:
+                        raise ValueError('Interrupted install lost the exact last-working editor.')
+                    prompt = launch(preserved if case == 'interrupted-install' else exe)
                     ui(prompt.pid, 'click', 'Open recovery workspace')
                     state = config / 'update-recovery' / intent.parent.name
                     recovered_pid = wait('verified recovery workspace', lambda:
