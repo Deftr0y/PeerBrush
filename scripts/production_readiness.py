@@ -278,6 +278,11 @@ def bind_dmg(root, archive, image, *, commit, version, archive_sha256, image_sha
                     native_job_provenance='requires-trusted-native-job-at-consumption')
     try:
         actual = json.loads(qualification.decode('utf-8'), object_pairs_hook=unique_fields)
+        if isinstance(actual, dict) and actual.get('format') == 'PeerBrushDmgQualificationV2':
+            from sparkle_upgrade_evidence import validate
+            expected.update(schema=2, format='PeerBrushDmgQualificationV2',
+                            installed_upgrade=validate(actual.get('installed_upgrade'), commit, version,
+                                                       archive_sha256, image_sha256))
         # Canonical serialization distinguishes bool/int/float, unlike Python
         # equality. Only this exact bounded producer schema is supported.
         if json.dumps(actual, sort_keys=True, allow_nan=False) != json.dumps(expected, sort_keys=True):
@@ -291,7 +296,8 @@ def bind_dmg(root, archive, image, *, commit, version, archive_sha256, image_sha
                 qualification_binding='exact-schema-and-independent-digest-matched',
                 native_verification='not-performed-by-aggregate',
                 native_producer_authentication='unverified-requires-trusted-native-job',
-                installed_acceptance='not-established-by-aggregate')
+                installed_acceptance='not-established-by-aggregate',
+                **({'installed_upgrade': actual['installed_upgrade']} if 'installed_upgrade' in expected else {}))
 
 
 def handoff_path(path, new=False):

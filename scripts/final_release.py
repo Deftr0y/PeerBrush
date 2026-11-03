@@ -350,6 +350,10 @@ def compose(root, directory, output, *, commit, version, macos, maintainer,
     if (native['native_producer_authentication'] != 'verified-pinned-workflow-oidc-attestation'
             or native['native_job_conclusion'] != 'service-reconciled-success'):
         raise ValueError('Final Mac bytes lack authenticated successful native qualification.')
+    if 'installed_upgrade' in native:
+        native['installed_acceptance'] = 'verified-signed-two-version-sparkle-upgrade'
+    else:
+        report['blockers'].append('macos-signed-two-version-upgrade-not-established')
     receipt = read(linux_receipt, readiness.MAX_INSTALLATION_RECEIPT_BYTES, linux_receipt_sha256)
     linux = readiness.assess_deb(root, directory / portable['file'], directory / deb['file'], commit=commit,
         version=version, portable_sha256=portable['sha256'], package_sha256=deb['sha256'], maintainer=maintainer,

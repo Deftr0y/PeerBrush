@@ -141,6 +141,7 @@
     "scripts/sparkle_lab_transport.py",
     "scripts/sparkle_lab_pair.py",
     "scripts/sparkle_lab_ui.swift",
+    "scripts/sparkle_upgrade_evidence.py",
     "scripts/check_sparkle_upgrade.py",
     "scripts/build_windows_setup.py",
     "scripts/check_branch_policy.py",

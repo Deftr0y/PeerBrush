@@ -298,6 +298,8 @@ def authenticate(qualification, *, qualification_sha256, commit, version, bundle
         report = json.loads(qualification, object_pairs_hook=unique_fields)
         if (not isinstance(report, dict)
                 or not (report.get('format') == report_format
+                    or (not (_linux or _windows or _store) and report.get('format') == 'PeerBrushDmgQualificationV2'
+                        and type(report.get('schema')) is int and report['schema'] == 2)
                     or (_linux and report.get('format') == 'PeerBrushLinuxDebQualificationV2'
                         and type(report.get('schema')) is int and report['schema'] == 2))
                 or report.get('commit') != commit or report.get('version') != version):

@@ -224,6 +224,13 @@ jobs:
             --archive-name "$ARCHIVE_NAME" --archive-sha256 "$ARCHIVE_SHA256" \
             --image-name "$IMAGE_NAME" --image-sha256 "$IMAGE_SHA256" --team-id "$SELECTED_TEAM" \
             --output "$RUNNER_TEMP/peerbrush-native-inputs"
+      - name: Acquire successful installed test result from the exact signing run
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: installed-sparkle-${{ inputs.source_run_id }}-1
+          path: ${{ runner.temp }}/installed-test
+          run-id: ${{ inputs.source_run_id }}
+          github-token: ${{ github.token }}
       - name: Qualify selected final DMG
         run: |
           umask 077
@@ -232,7 +239,8 @@ jobs:
             --source-root "$GITHUB_WORKSPACE" --commit "$SELECTED_COMMIT" --version "$VERSION" \
             --archive "$RUNNER_TEMP/peerbrush-native-inputs/$ARCHIVE_NAME" --archive-sha256 "$ARCHIVE_SHA256" \
             --image "$RUNNER_TEMP/peerbrush-native-inputs/$IMAGE_NAME" --image-sha256 "$IMAGE_SHA256" --team-id "$SELECTED_TEAM" \
-            --work "$RUNNER_TEMP/peerbrush-native-inspection" --output "$RUNNER_TEMP/peerbrush-native-report"
+            --work "$RUNNER_TEMP/peerbrush-native-inspection" --output "$RUNNER_TEMP/peerbrush-native-report" \
+            --installed-upgrade "$RUNNER_TEMP/installed-test/installed-sparkle.json"
       - name: Attest generated native qualification
         id: attest
         uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1

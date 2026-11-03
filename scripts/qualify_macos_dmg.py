@@ -8,13 +8,23 @@ import sys
 from package_macos_dmg import inspect_final, private_inspection_directory
 
 
-def qualify(root, archive, image, output, **inputs):
+def qualify(root, archive, image, output, *, installed_upgrade=None, **inputs):
     output = private_inspection_directory(output, root, fresh=True)
     work = private_inspection_directory(inputs['work'], root, fresh=True)
     if (output.is_relative_to(work) or work.is_relative_to(output)
             or any(output.is_relative_to(pathlib.Path(path).absolute().parent) for path in [archive, image])):
         raise ValueError('Final DMG report output must be separate from work and input directories')
     result = inspect_final(root, archive, image, **inputs)
+    if installed_upgrade is not None:
+        from production_readiness import unique_fields
+        from sparkle_upgrade_evidence import validate
+        from final_release import read
+        if installed_upgrade.name != 'installed-sparkle.json':
+            raise ValueError('Missing installed two-version evidence.')
+        receipt = json.loads(read(installed_upgrade, 4096), object_pairs_hook=unique_fields)
+        result['installed_upgrade'] = validate(receipt, inputs['commit'], inputs['version'],
+                                              inputs['archive_sha256'], inputs['image_sha256'], os.environ['SOURCE_RUN_ID'])
+        result.update(schema=2, format='PeerBrushDmgQualificationV2')
     data = (json.dumps(result, indent=2, sort_keys=True) + '\n').encode('utf-8')
     if len(data) > 8192:
         raise ValueError('Final DMG qualification exceeds its bounded public report contract')
@@ -33,6 +43,7 @@ def main():
         parser.add_argument('--' + name, type=pathlib.Path, required=True)
     for name in ['commit', 'version', 'archive-sha256', 'image-sha256', 'team-id']:
         parser.add_argument('--' + name, required=True)
+    parser.add_argument('--installed-upgrade', type=pathlib.Path)
     arguments = vars(parser.parse_args())
     arguments['root'] = arguments.pop('source_root')
     try:

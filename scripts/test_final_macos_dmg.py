@@ -19,6 +19,20 @@ import test_sign_macos
 from package import digest
 
 
+class InstalledSparkleReceipt(unittest.TestCase):
+    def test_receipt_refuses_a_missing_case_different_artifact_or_another_run(self):
+        from sparkle_upgrade_evidence import CASES, validate
+        commit, archive, image = 'a' * 40, 'b' * 64, 'c' * 64
+        record = dict(schema=1, commit=commit, version='0.30.0', starting_version='0.29.99', run_id='123',
+                      cases=list(CASES), target_zip_sha256=archive, target_dmg_sha256=image,
+                      starting_zip_sha256='d' * 64, starting_dmg_sha256='e' * 64)
+        self.assertEqual(validate(record, commit, '0.30.0', archive, image, '123'), record)
+        for delta in [dict(cases=list(CASES[:-1])), dict(run_id='124'), dict(target_dmg_sha256='f' * 64),
+                      dict(starting_dmg_sha256=image), dict(commit='0' * 40), dict(schema=True)]:
+            with self.subTest(delta=delta), self.assertRaises(ValueError):
+                validate({**record, **delta}, commit, '0.30.0', archive, image, '123')
+
+
 class FinalImage(unittest.TestCase):
     def setUp(self):
         self.signer = test_sign_macos.Signing(methodName='test_success_final_hashes_source_preservation_and_native_validation')

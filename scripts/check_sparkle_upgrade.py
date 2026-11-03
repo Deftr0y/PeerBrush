@@ -14,6 +14,7 @@ import threading
 import time
 
 from package import digest
+from sparkle_upgrade_evidence import CASES, validate
 from test_deb_version_upgrade import PROJECT_SIZE, png_samples
 
 
@@ -172,6 +173,17 @@ def run_case(case, server, starting, final):
         if png_samples(output) != (width, height, 16, struct.pack('>4H', *rgb, 65535) * (width * height)):
             raise ValueError('The installed editor changed native PSD samples.')
         return True
+    def dirty_layer(create=False):
+        project, = [p for p in rpc('projects', action='list')['projects'] if p['path'] == str(artwork)]
+        guard = dict(project_id=project['project_id'], document_id=project['document_id'], expected_revision=project['revision'])
+        name = 'Unsaved upgrade test layer'
+        if create:
+            rpc('edit', **guard, commands=[{'op': 'layer.add', 'name': name}], feedback='request')
+            return dirty_layer()
+        state = rpc('observe', project_id=guard['project_id'], image=False, max_edge=32)['state']
+        if not state['dirty'] or not any(layer['name'] == name for layer in state['layers']):
+            raise ValueError('The updater discarded the test edit or marked it saved.')
+        return guard
     before = launch()
     try:
         wait('initial project', lambda: pid_at(connection) == before.pid and pixels())
@@ -180,6 +192,9 @@ def run_case(case, server, starting, final):
         ui(before.pid, 'click', 'File')
         ui(before.pid, 'click', 'Updates')
         ui(before.pid, 'see', 'Installed version ' + START)
+        dirty = None
+        if case in ('no-update', 'network-error', 'cancel-check'):
+            dirty = dirty_layer(create=True)
         server.current = START if case == 'no-update' else FINAL
         server.fail = case == 'network-error'
         server.requested.clear()
@@ -215,6 +230,7 @@ def run_case(case, server, starting, final):
             wait('native Sparkle enclosure download', download)
             intent = wait('armed install checkpoint', lambda: next(checkpoints.glob('*/native-start-intent.json'), None))
             if case == 'cancel-download':
+                dirty = dirty_layer(create=True)
                 ui(before.pid, 'click', 'Cancel download')
                 server.download_gate.set()
                 ui(before.pid, 'see', 'Open last-working app with separate settings')
@@ -226,6 +242,19 @@ def run_case(case, server, starting, final):
                     before.kill()
                     before.wait(timeout=10)
                 else:
+                    if case == 'success':
+                        guard = dirty_layer(create=True)
+                        ui(before.pid, 'quit', '')
+                        ui(before.pid, 'see', 'before restarting')
+                        if before.poll() is not None or dirty_layer() != guard or digest(exe) != source_hash:
+                            raise ValueError('Quit crossed the update boundary with unsaved changes.')
+                        # Save As preserves the actual edit without overwriting the original PSD.
+                        saved_edit = home / 'Saved work before update.psd'
+                        rpc('document', **guard, action='save_report')
+                        rpc('document', **guard, action='save', path=str(saved_edit), accept_editability_loss=True)
+                        wait('private edited PSD save', lambda: saved_edit.is_file() and
+                             any(not p['dirty'] and p['path'] == str(saved_edit) for p in rpc('projects', action='list')['projects']))
+                        saved_edit_hash = digest(saved_edit)
                     # Stop the exact copied updater only if the sealed real Quit is observed.
                     # The application must handle uncertainty without synthesizing an install result.
                     ui(before.pid, 'quit', '')
@@ -250,6 +279,8 @@ def run_case(case, server, starting, final):
                     wait('target renders native source', pixels)
                     if rpc('tool_settings', action='get', tool='brush')['profile'] != saved:
                         raise ValueError('Installed target lost the brush settings.')
+                    if digest(saved_edit) != saved_edit_hash:
+                        raise ValueError('Install changed the saved project containing the live edit.')
                 else:
                     prompt = launch()
                     ui(prompt.pid, 'click', 'Open recovery workspace')
@@ -267,6 +298,8 @@ def run_case(case, server, starting, final):
             raise ValueError('Installation, original settings or saved PSD unexpectedly changed.')
         if before.poll() is None and not pixels():
             raise ValueError('The editor lost the open project.')
+        if dirty is not None and dirty_layer() != dirty:
+            raise ValueError('Discovery or cancellation changed an unsaved edit.')
         print('Verified installed scenario: ' + case, flush=True)
     finally:
         server.feed_gate.set()
@@ -296,16 +329,15 @@ def main():
         server.feed_gate.set()
         server.download_gate.set()
         threading.Thread(target=server.serve_forever, daemon=True).start()
-        cases = ['no-update', 'network-error', 'cancel-check', 'cancel-download',
-                 'interrupted-before-quit', 'interrupted-install', 'success']
-        for case in cases:
+        for case in CASES:
             run_case(case, server, starting, target)
     receipt = dict(schema=1, commit=os.environ['SELECTED_COMMIT'], run_id=os.environ['GITHUB_RUN_ID'],
-                   version=FINAL, starting_version=START, cases=cases,
+                   version=FINAL, starting_version=START, cases=list(CASES),
                    target_zip_sha256=digest(packages[FINAL][0]), target_dmg_sha256=digest(packages[FINAL][1]),
                    starting_zip_sha256=digest(packages[START][0]), starting_dmg_sha256=digest(packages[START][1]))
     with (TEMP / 'installed-sparkle.json').open('x', encoding='utf-8') as file:
-        json.dump(receipt, file, indent=2)
+        json.dump(validate(receipt, receipt['commit'], FINAL, receipt['target_zip_sha256'],
+                           receipt['target_dmg_sha256'], receipt['run_id']), file, indent=2)
 
 
 if __name__ == '__main__':
