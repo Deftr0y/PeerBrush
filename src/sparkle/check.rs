@@ -283,7 +283,8 @@ mod tests {
     use serde_json::json;
     #[test]
     fn public_pins_and_reviewed_native_policy_are_both_required() {
-        assert!(compiled().unwrap().is_none());
+        let release = compiled().unwrap().expect("stable Mac update configuration");
+        assert_eq!(release.feed_url, PROPOSED_FEED_URL);
         assert!(configuration(
             br#"{"schema":1,"feed_url":null,"public_ed_key":null,"publisher_team_id":null}"#,
             b"not-read",

@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "feed_url": null,
-  "public_ed_key": null,
-  "publisher_team_id": null
+  "feed_url": "https://peerbrush.com/updates/macos/stable/appcast.xml",
+  "public_ed_key": "VU2CK61VxtZ1bRhbYKvQlCMuAlzzGiHWA5LphFyxoeg=",
+  "publisher_team_id": "KU3Q7F9Q84"
 }

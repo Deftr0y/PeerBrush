@@ -748,7 +748,7 @@ mod tests {
             assert!(!machine_version(invalid), "{invalid:?}");
         }
         assert!(machine_version(version));
-        assert!(crate::sparkle::check::compiled().unwrap().is_none());
+        assert!(crate::sparkle::check::compiled().unwrap().is_some());
         assert!(super::super::checkpoint::require_captured_handoff().is_err());
     }
 
