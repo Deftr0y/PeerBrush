@@ -1689,7 +1689,15 @@ impl Application {
                             // any request. Only the copied process owns SDK callbacks.
                             self.checks.session.borrow_mut().checking();
                             self.checks.native_starting()?;
-                            self.remote = Some(prepared.check_in_owner(ctx)?);
+                            match prepared.check_in_owner(ctx) {
+                                Ok(owner) => self.remote = Some(owner),
+                                // No request can have been sent: Owner::check returns
+                                // Err only before its sole transport worker is spawned.
+                                Err(error) => {
+                                    self.checks.session.borrow_mut().native_cycle = false;
+                                    return Err(error);
+                                }
+                            }
                             Ok(())
                         });
                         if result.is_err() {

@@ -74,6 +74,29 @@ fn read(bytes: &[u8], key: &str, installed: &str) -> Result<Option<Offer>, Strin
     let item = child(child(root, None, "channel")?, None, "item")?;
     let version = child(item, Some(NS), "version")?.text().ok_or(INVALID)?;
     let next = semver::Version::parse(version).map_err(|_| INVALID)?;
+    let enclosure = child(item, None, "enclosure")?;
+    let prefix = format!("https://github.com/Deftr0y/PeerBrush/releases/download/v{version}/PeerBrush-{version}-macOS-arm64-apple-signed-r");
+    let revisions = enclosure
+        .attribute("url")
+        .and_then(|url| url.strip_prefix(&prefix))
+        .and_then(|file| file.strip_suffix(".dmg"))
+        .and_then(|name| name.split_once("-dmg-signed-r"))
+        .ok_or(INVALID)?;
+    let revision =
+        |n: &str| n.len() <= 6 && n.parse::<u32>().is_ok_and(|v| v > 0 && v.to_string() == n);
+    if !revision(revisions.0)
+        || !revision(revisions.1)
+        || enclosure.attribute("type") != Some("application/octet-stream")
+        || !enclosure
+            .attribute("length")
+            .and_then(|n| n.parse::<u64>().ok())
+            .is_some_and(|n| (1..=512 * 1024 * 1024).contains(&n))
+        || !enclosure
+            .attribute((NS, "edSignature"))
+            .is_some_and(|s| STANDARD.decode(s).is_ok_and(|bytes| bytes.len() == 64))
+    {
+        return Err(INVALID.into());
+    }
     if !next.pre.is_empty()
         || !next.build.is_empty()
         || child(item, Some(NS), "minimumSystemVersion")?.text() != Some("12.0.0")
@@ -103,7 +126,8 @@ mod tests {
     fn signed_offer_no_update_and_tampered_bytes() {
         let pair = Ed25519KeyPair::from_seed_unchecked(&[17; 32]).unwrap();
         let xml = format!(
-            r#"<rss xmlns:s="{NS}"><channel><item><s:version>0.30.1</s:version><s:minimumSystemVersion>12.0.0</s:minimumSystemVersion><s:hardwareRequirements>arm64</s:hardwareRequirements><description s:format="plain-text">Brush &amp; pen</description></item></channel></rss>"#
+            r#"<rss xmlns:s="{NS}"><channel><item><s:version>0.30.1</s:version><s:minimumSystemVersion>12.0.0</s:minimumSystemVersion><s:hardwareRequirements>arm64</s:hardwareRequirements><description s:format="plain-text">Brush &amp; pen</description><enclosure url="https://github.com/Deftr0y/PeerBrush/releases/download/v0.30.1/PeerBrush-0.30.1-macOS-arm64-apple-signed-r1-dmg-signed-r2.dmg" length="300" type="application/octet-stream" s:edSignature="{}"/></item></channel></rss>"#,
+            STANDARD.encode([7; 64])
         );
         let signed = format!(
             "{xml}<!-- sparkle-signatures:\nedSignature: {}\nlength: {}\n-->\n",

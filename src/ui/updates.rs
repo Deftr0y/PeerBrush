@@ -282,7 +282,6 @@ impl Panel {
                                 if ui.button("Prepare app download").clicked() {
                                     if let Err(error)=self.native_updater.prepare_download(ctx, _workspace) { self.message=error; }
                                 }
-                                if ui.button("Later").clicked() { self.native_updater.defer(); }
                             } else if ui.add_enabled(enabled && generation.is_some() && !self.native_updater.download_requested(),egui::Button::new("Download app update")).clicked() {
                                 if let Some(generation)=generation {
                                     if let Err(error)=self.native_updater.download(generation) { self.message=error; }
@@ -303,7 +302,11 @@ impl Panel {
                     if let Some(status)=self.native_updater.owner_status() {
                         if status.download_generation.is_some() {
                             if status.held_generation.is_some() {
-                                ui.label("The update is ready. Save your projects, then choose Quit to finish installing.");
+                                if status.cancelled || self.native_updater.view().cancelled || !enabled {
+                                    ui.label("Native update preparation is held. Installation and restart remain unavailable.");
+                                } else {
+                                    ui.label("The update is ready. Save your projects, then choose Quit to finish installing.");
+                                }
                             } else if held || status.cancelled || status.quarantine {
                                 ui.label("App update progress is held; cancellation has not been confirmed.");
                             } else if let Some(progress)=status.extraction {
@@ -374,6 +377,11 @@ impl Panel {
                         }
                     }
                 }
+                #[cfg(target_os="macos")]
+                if self.native_updater.startup_enabled() {
+                    ui.label("App updates install only after you choose to download and quit.");
+                } else { ui.label("Automatic installation and restart are not available in this development build."); }
+                #[cfg(not(target_os="macos"))]
                 ui.label("Automatic installation and restart are not available in this development build.");
                 if let Some(reason) = &restart_blocker { ui.label(format!("Restart protection: {reason}")); }
                 if ui.button("Later").clicked() { later = true; }
