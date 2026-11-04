@@ -1,7 +1,7 @@
 name: PeerBrush final-input data preparation
 
-# Dormant data producer. Activation and independent offline-authority provisioning
-# require review; neither a variable nor the bundled selections can approve trust.
+# Data-only producer. Protected review and source-pinned public authority are
+# independent of the selected artifacts; this workflow cannot publish a release.
 on:
   workflow_dispatch:
     inputs:
@@ -28,10 +28,10 @@ concurrency:
 
 jobs:
   gate:
-    if: ${{ false }}
+    if: github.repository == 'Deftr0y/PeerBrush' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     steps:
-      - name: Require exact dormant data-producer invocation
+      - name: Require exact data-producer invocation
         run: |
           python -I - <<'PY'
           import os, re
@@ -55,11 +55,12 @@ jobs:
         run: python -B scripts/test_final_inputs.py
 
   prepare:
-    if: ${{ false }}
+    if: needs.gate.result == 'success'
     needs: gate
     runs-on: ubuntu-24.04
+    environment: production-preparation
     steps:
-      - name: Require exact dormant data-producer invocation
+      - name: Require exact data-producer invocation
         run: |
           python -I - <<'PY'
           import os, re
@@ -79,9 +80,8 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      # Independently approved public roots and Linux gh bytes must already exist
-      # under RUNNER_TEMP/peerbrush-final-trust/{macos,windows,linux}. No source,
-      # trust hash or credential is invented/provisioned by this workflow.
+      - name: Provision source-pinned public attestation authority
+        run: python -B scripts/provision_release_verifier.py --output "$RUNNER_TEMP/peerbrush-final-trust"
       - name: Acquire and assemble selected final-input bytes through actual consumers
         env:
           EXPECTED_COMMIT: ${{ inputs.expected_commit }}
