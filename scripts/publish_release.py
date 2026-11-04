@@ -462,10 +462,8 @@ class _StoreWrites:
         import submit_store_release as store
         if self.history is not None:
             self.history.check(pending_id=self.submission_id)
-        app = self.provider.call()
-        if (app.get('id') != store.STORE_ID or app.get('packageIdentityName') != store.IDENTITY
-                or app.get('publisherName') != store.PUBLISHER or app.get('packageFamilyName') != store.FAMILY
-                or app.get('lastPublishedApplicationSubmission') != self.baseline):
+        app = store.application(self.provider)
+        if app.get('lastPublishedApplicationSubmission') != self.baseline:
             raise store.SafeError('Store product or published baseline changed before mutation; reconcile without retry.')
         pending = app.get('pendingApplicationSubmission')
         if self.submission_id is None:

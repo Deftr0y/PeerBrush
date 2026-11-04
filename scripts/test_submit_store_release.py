@@ -172,6 +172,8 @@ class Tests(unittest.TestCase):
             for value, reason in [(None, 'missing'), (123, 'type'),
                                   ('SYNTHETIC_PRIVATE_VALUE', 'different'),
                                   (FakeStore().app[field].lower(), 'case-only')]:
+                if field == 'packageFamilyName' and value is None:
+                    continue  # Covered by the service-omission regression below.
                 store = FakeStore()
                 store.app[field] = value
                 with self.subTest(field=field, reason=reason), self.assertRaises(s.SafeError) as failure:
@@ -179,6 +181,26 @@ class Tests(unittest.TestCase):
                 self.assertEqual(str(failure.exception),
                                  'Partner Center product identity mismatch (' + field + ':' + reason + ').')
                 self.assertEqual(store.calls, [('', 'GET', None)])
+
+    def test_missing_family_is_derived_only_from_exact_product_identity(self):
+        for omitted in [True, False]:
+            store = FakeStore()
+            if omitted:
+                del store.app['packageFamilyName']
+            else:
+                store.app['packageFamilyName'] = None
+            self.assertEqual(s.check_account(store),
+                             dict(published_version='1.25.0.0', pending_submission=False))
+            for field in ['id', 'packageIdentityName', 'publisherName']:
+                saved = store.app[field]
+                store.app[field] = 'foreign'
+                with self.assertRaises(s.SafeError): s.application(store)
+                store.app[field] = saved
+            with patch.object(s.msix, 'derived_package_family', return_value='foreign_family'):
+                with self.assertRaises(s.SafeError): s.application(store)
+            store.app['packageFamilyName'] = ''
+            with self.assertRaises(s.SafeError): s.application(store)
+            self.assertTrue(all(method == 'GET' for _, method, _ in store.calls))
 
     @patch.object(s, 'request', return_value=b'')
     def test_preserve_metadata_and_upload_before_commit(self, upload):
