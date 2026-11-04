@@ -223,6 +223,16 @@ jobs:
           if-no-files-found: ignore
           retention-days: 90
 
+      - name: Retain private Store submission input for future reconciliation
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: store-submission-input-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/peerbrush-final-candidate/*-Windows-x64.msix
+          if-no-files-found: ignore
+          compression-level: 0
+          retention-days: 90
+
   site:
     # A review overlay/exclusion report only. No branch, Pages or Store mutation.
     if: ${{ false }}

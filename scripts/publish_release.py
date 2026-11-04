@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import tempfile
 import time
 from urllib.parse import quote, urlsplit
 
@@ -118,14 +119,27 @@ class GitHub:
         return self.request('GET', PREFIX + '/releases/tags/' + tag)
 
     def receipt_bytes(self, identifier, size):
-        import acquire_macos_qualification_inputs as transport
         from store_handoff_history import MAX_ZIP
-        if type(identifier) is not int or not 0 < identifier < 10 ** 20 or type(size) is not int or not 22 <= size <= MAX_ZIP:
+        return self._artifact_bytes(identifier, size, MAX_ZIP)
+
+    def package_bytes(self, identifier, size):
+        from store_handoff_history import MAX_PACKAGE_ZIP
+        return self._artifact_bytes(identifier, size, MAX_PACKAGE_ZIP)
+
+    def _artifact_bytes(self, identifier, size, limit):
+        import acquire_macos_qualification_inputs as transport
+        if type(identifier) is not int or not 0 < identifier < 10 ** 20 or type(size) is not int or not 22 <= size <= limit:
             raise ValueError('Store history requires an exact bounded artifact ID and size.')
         location = transport.request('api.github.com', transport.API + 'artifacts/' + str(identifier) + '/zip',
                                      8192, token=self._token, redirect=True)
         parsed = urlsplit(location)
-        return transport.request(parsed.hostname, parsed.path + ('?' + parsed.query if parsed.query else ''), size)
+        target = parsed.path + ('?' + parsed.query if parsed.query else '')
+        if size <= 1024 * 1024:
+            return transport.request(parsed.hostname, target, size)
+        with tempfile.TemporaryDirectory(prefix='peerbrush-store-history-') as temporary:
+            path = Path(temporary) / 'package-artifact.zip'
+            transport.request(parsed.hostname, target, size, destination=path)
+            return read(path, size)
 
     def commit(self, ref):
         return self.request('GET', PREFIX + '/commits/' + ref)

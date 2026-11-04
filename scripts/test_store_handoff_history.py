@@ -17,12 +17,12 @@ import submit_store_release as store
 from test_submit_store_release import FakeStore, fixture
 
 
-def zipped(value):
+def zipped(value, name='submission.json'):
     output = io.BytesIO()
     with zipfile.ZipFile(output, 'w', zipfile.ZIP_STORED) as archive:
-        entry = zipfile.ZipInfo('submission.json')
+        entry = zipfile.ZipInfo(name)
         entry.external_attr = (stat.S_IFREG | 0o400) << 16
-        archive.writestr(entry, json.dumps(value).encode())
+        archive.writestr(entry, value if isinstance(value, bytes) else json.dumps(value).encode())
     return output.getvalue()
 
 
@@ -48,9 +48,9 @@ class Protocol(unittest.TestCase):
         self.client = mock.Mock()
         self.client.request.side_effect = self.request
         self.client.receipt_bytes.side_effect = lambda identifier, size: self.raw
+        self.client.package_bytes.side_effect = lambda identifier, size: self.package_raw
         self.client.release.return_value = dict(draft=False, prerelease=False, published_at='2026-01-01T00:00:00Z',
-            tag_name='v0.26.0', target_commitish='a' * 40, assets=[dict(id=901, name=fixture()[0], state='uploaded',
-                size=len(fixture()[1]), digest='sha256:' + fixture()[2]['sha256'])])
+            tag_name='v0.26.0', target_commitish='a' * 40, assets=[dict(id=901, name='PeerBrush-0.26.0-source.zip')])
         self.client.commit.return_value = dict(sha='a' * 40)
         self.client.asset_hash.return_value = fixture()[2]['sha256']
         self.calls = []
@@ -66,6 +66,7 @@ class Protocol(unittest.TestCase):
         if route == prefix + 'runs/101/artifacts?per_page=100&page=1':
             return dict(total_count=len(self.artifacts), artifacts=copy.deepcopy(self.artifacts))
         if route == prefix + 'artifacts/501': return copy.deepcopy(self.artifact)
+        if route == prefix + 'artifacts/502': return copy.deepcopy(self.package_artifact)
         raise AssertionError('Unknown synthetic history GET')
 
     def record(self, phase='new'):
@@ -87,10 +88,16 @@ class Protocol(unittest.TestCase):
             archive_download_url='https://api.github.com' + history.transport.API + 'artifacts/501/zip',
             workflow_run=dict(id=101, repository_id=history.transport.REPOSITORY_ID,
                 head_repository_id=history.transport.REPOSITORY_ID, head_branch='main', head_sha='a' * 40))
-        self.artifacts = [self.artifact]
+        self.artifacts = [self.artifact] + ([self.package_artifact] if hasattr(self, 'package_artifact') else [])
 
     def published(self):
         self.record('committed')
+        self.package_raw = zipped(fixture()[1], fixture()[0])
+        self.package_artifact = dict(copy.deepcopy(self.artifact), id=502, name='store-submission-input-101-1',
+            size_in_bytes=len(self.package_raw), digest='sha256:' + hashlib.sha256(self.package_raw).hexdigest(),
+            url='https://api.github.com' + history.transport.API + 'artifacts/502',
+            archive_download_url='https://api.github.com' + history.transport.API + 'artifacts/502/zip')
+        self.artifacts.append(self.package_artifact)
         self.provider.app['lastPublishedApplicationSubmission'] = {'id': '456'}
         self.submission = dict(id='456', applicationPackages=[dict(fileName=fixture()[0], fileStatus='Uploaded',
             architecture='x64', version='1.26.0.0')])
@@ -118,11 +125,31 @@ class Protocol(unittest.TestCase):
     def test_genuine_service_observation_and_actual_package_bytes_are_required_and_rechecked(self):
         self.published()
         self.selected.check()
-        self.client.asset_hash.assert_called_once()
+        self.client.package_bytes.assert_called_once()
         self.selected.check()
-        self.client.asset_hash.assert_called_once()
+        self.client.package_bytes.assert_called_once()
+        self.client.asset_hash.assert_not_called()
         self.artifact['expired'] = True
         with self.assertRaises(store.SafeError): self.selected.check()
+
+    def test_private_package_requires_matching_origin_retention_and_actual_inner_bytes(self):
+        self.published()
+        original = copy.deepcopy(self.package_artifact)
+        for change in ['expired', 'source', 'missing', 'payload', 'name']:
+            self.package_artifact.clear()
+            self.package_artifact.update(copy.deepcopy(original))
+            self.artifacts = [self.artifact, self.package_artifact]
+            self.package_raw = zipped(fixture()[1], fixture()[0])
+            if change == 'expired': self.package_artifact['expired'] = True
+            elif change == 'source': self.package_artifact['workflow_run']['head_sha'] = 'f' * 40
+            elif change == 'missing': self.artifacts.pop()
+            else:
+                self.package_raw = zipped(b'foreign' if change == 'payload' else fixture()[1],
+                                          'foreign.msix' if change == 'name' else fixture()[0])
+                self.package_artifact.update(size_in_bytes=len(self.package_raw),
+                    digest='sha256:' + hashlib.sha256(self.package_raw).hexdigest())
+            with self.subTest(change=change), self.assertRaises(store.SafeError):
+                history.History(self.client, self.provider, self.env).check()
         self.assertTrue(all(method == 'GET' for _, method, _ in self.provider.calls))
 
     def test_crash_before_receipt_lost_create_response_and_expiry_hold_even_with_no_pending_draft(self):
@@ -162,19 +189,21 @@ class Protocol(unittest.TestCase):
     def test_nonterminal_store_status_competing_draft_or_changed_package_cannot_clear_history(self):
         self.published()
         original = copy.deepcopy(self.submission)
+        original_artifact = copy.deepcopy(self.package_artifact)
         for change in ['processing', 'rejected', 'pending', 'package', 'hash', 'source', 'bytes']:
             self.status, self.submission = 'Published', copy.deepcopy(original)
             self.provider.app.pop('pendingApplicationSubmission', None)
             self.client.commit.return_value = dict(sha='a' * 40)
-            self.client.asset_hash.return_value = fixture()[2]['sha256']
-            self.client.release.return_value['assets'][0]['digest'] = 'sha256:' + fixture()[2]['sha256']
+            self.package_artifact.clear()
+            self.package_artifact.update(copy.deepcopy(original_artifact))
+            self.package_raw = zipped(fixture()[1], fixture()[0])
             if change == 'processing': self.status = 'Release'
             elif change == 'rejected': self.status = 'CertificationFailed'
             elif change == 'pending': self.provider.app['pendingApplicationSubmission'] = {'id': '999'}
             elif change == 'package': self.submission['applicationPackages'][0]['fileName'] = 'foreign.msix'
-            elif change == 'hash': self.client.release.return_value['assets'][0]['digest'] = 'sha256:' + 'f' * 64
+            elif change == 'hash': self.package_artifact['digest'] = 'sha256:' + 'f' * 64
             elif change == 'source': self.client.commit.return_value = dict(sha='f' * 40)
-            else: self.client.asset_hash.return_value = 'f' * 64
+            else: self.package_raw += b'changed'
             with self.subTest(change=change), self.assertRaises(store.SafeError):
                 history.History(self.client, self.provider, self.env).check()
 
@@ -207,6 +236,23 @@ class Protocol(unittest.TestCase):
         self.record()
         with mock.patch.object(history.transport, 'request', side_effect=['https://results-receiver.actions.githubusercontent.com/selected', self.raw]) as get:
             self.assertEqual(client.receipt_bytes(501, len(self.raw)), self.raw)
+        self.assertEqual(get.call_args_list[0].kwargs, dict(token='SYNTHETIC_JOB_TOKEN', redirect=True))
+        self.assertNotIn('token', get.call_args_list[1].kwargs)
+
+    def test_large_private_package_download_uses_bounded_file_transport(self):
+        client = publisher.GitHub('SYNTHETIC_JOB_TOKEN')
+        data = b'x' * (1024 * 1024 + 1)
+        def download(host, route, limit, **kwargs):
+            if host == 'api.github.com':
+                return 'https://results-receiver.actions.githubusercontent.com/selected'
+            self.assertNotIn('token', kwargs)
+            self.assertEqual(limit, len(data))
+            with kwargs['destination'].open('xb') as stream:
+                stream.write(data)
+        with mock.patch.object(history.transport, 'request', side_effect=download):
+            self.assertEqual(client.package_bytes(502, len(data)), data)
+        with mock.patch.object(history.transport, 'request', side_effect=['https://results-receiver.actions.githubusercontent.com/selected', b'archive']) as get:
+            self.assertEqual(client.package_bytes(502, 100), b'archive')
         self.assertEqual(get.call_args_list[0].kwargs, dict(token='SYNTHETIC_JOB_TOKEN', redirect=True))
         self.assertNotIn('token', get.call_args_list[1].kwargs)
 
