@@ -644,7 +644,8 @@ jobs:
     permissions:
       actions: read
       contents: read
-    runs-on: macos-15
+    # Match the codesign normalization used to audit and sign the pinned framework.
+    runs-on: macos-26
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4

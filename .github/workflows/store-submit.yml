@@ -77,6 +77,7 @@ jobs:
     # Missing by default; this workflow is read-only. The protected publisher has a separate receipt/history contract.
     if: vars.MSSTORE_AUTOMATION_ENABLED == 'true' && github.repository == 'Deftr0y/PeerBrush' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && github.workflow_ref == 'Deftr0y/PeerBrush/.github/workflows/store-submit.yml@refs/heads/main'
     runs-on: ubuntu-24.04
+    environment: production-preparation
     timeout-minutes: 20
     steps:
       - name: Require reviewed manual main Store invocation

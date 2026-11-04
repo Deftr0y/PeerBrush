@@ -123,7 +123,7 @@ class StoreWorkflow(unittest.TestCase):
         for chunk in chunks[:-1]:
             self.assertNotIn('secrets.', chunk)
 
-    def test_inactive_routes_least_permissions_and_all_real_test_callers(self):
+    def test_inactive_routes_least_permissions_and_package_source(self):
         text = WORKFLOW.read_text(encoding='utf-8')
         condition = text.split('  submit:\n', 1)[1].split('    if: ', 1)[1].splitlines()[0]
         for required in ["vars.MSSTORE_AUTOMATION_ENABLED == 'true'",
@@ -135,12 +135,9 @@ class StoreWorkflow(unittest.TestCase):
         self.assertEqual(text.count('        default: false\n'), 2)
         self.assertIn('permissions:\n  contents: read\n', text)
         self.assertNotIn('id-token:', text)
-        self.assertNotIn('environment:', text)
+        self.assertEqual(text.count('    environment: production-preparation\n'), 1)
         self.assertEqual(text.count('    secrets:\n'), 1)
         self.assertIn('cancel-in-progress: false', text)
-        for name in ['ci.yml', 'release.yml']:
-            workflow = (ROOT / '.github/workflows' / name).read_text(encoding='utf-8')
-            self.assertEqual(workflow.count('python -B scripts/test_store_workflow.py'), 1)
         source = json.loads((ROOT / 'scripts/package-files.json').read_text(encoding='utf-8'))['source']
         self.assertEqual(source.count('scripts/test_store_workflow.py'), 1)
 

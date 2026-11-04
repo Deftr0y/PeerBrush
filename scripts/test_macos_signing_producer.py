@@ -2,6 +2,7 @@
 import hashlib
 import json
 import os
+import re
 import stat
 from pathlib import Path
 import tarfile
@@ -117,6 +118,14 @@ class AppleSigningProducer(unittest.TestCase):
                         exec(program, {})
         self.assertLess(self.build.index('name: Require stable exact source'), self.build.index('name: Test and build'))
         self.assertNotIn('secrets.', self.build)
+
+    def test_private_upgrade_uses_the_audited_signer_platform_without_credentials(self):
+        signer, upgrade = self.sign.split('\n  private-upgrade:\n', 1)
+        for job in [self.build, signer, upgrade]:
+            self.assertEqual(re.findall(r'^    runs-on: (.+)$', job, re.M), ['macos-26'])
+        self.assertNotIn('secrets.', upgrade)
+        self.assertNotIn('environment:', upgrade)
+        self.assertIn('python3 -B scripts/check_sparkle_upgrade.py', upgrade)
 
     def test_native_activation_and_quit_must_pass_in_guarded_unprivileged_build_before_signing(self):
         build = step(self.build, 'Test and build without Apple credentials')
