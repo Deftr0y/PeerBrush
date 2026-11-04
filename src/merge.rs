@@ -331,7 +331,7 @@ pub fn edit_guarded(
 ) -> Result<Value, String> {
     let doc = {
         let mut e = shared.lock().unwrap();
-        if document.is_some_and(|id| id != e.doc.id) {
+        if document.is_some_and(|id| id != crate::engine::view::current(&e).id()) {
             return Err("Project source changed before merging".into());
         }
         e.check(
@@ -341,10 +341,10 @@ pub fn edit_guarded(
                 rect: None,
             }],
         )?;
-        if expected.is_some_and(|r| r != e.doc.revision) {
+        if expected.is_some_and(|r| r != crate::engine::view::current(&e).revision()) {
             return Err("Conflicting document change. Observe the layers before merging.".into());
         }
-        e.doc.clone()
+        e.resident()?.clone()
     };
     let prepared = prepare(&doc, ids, name)?;
     let command = json!({"op":"layer.merge","layers":ids,"name":name});

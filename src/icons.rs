@@ -3,6 +3,7 @@ use eframe::egui::{self, Color32, Rect, Stroke, Vec2};
 #[derive(Clone, Copy)]
 pub enum Icon {
     Cursor,
+    Text,
     Move,
     Rotate,
     Scale,
@@ -93,7 +94,19 @@ fn selection_cell(icon: Icon) -> Option<usize> {
     }
 }
 pub fn paint_tinted(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
-    if let Some(cell) = tool_cell(icon) {
+    if matches!(icon, Icon::Text) {
+        let scale = rect.width().min(rect.height()) / 32.;
+        for [a, b] in [
+            [[-9., -10.], [9., -10.]],
+            [[0., -10.], [0., 10.]],
+            [[-4., 10.], [4., 10.]],
+        ] {
+            painter.line_segment(
+                [a, b].map(|[x, y]| rect.center() + Vec2::new(x, y) * scale),
+                Stroke::new(1.7 * scale, color),
+            );
+        }
+    } else if let Some(cell) = tool_cell(icon) {
         paint_atlas(painter, rect, cell, false, color);
     } else if let Some(cell) = selection_cell(icon) {
         paint_atlas(painter, rect, cell, true, color);
@@ -137,6 +150,7 @@ pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, enabled: bool) {
         );
     };
     match icon {
+        Icon::Text => paint_tinted(painter, rect, icon, color),
         Icon::Cursor => polygon(&[
             (-8., -11.),
             (-8., 8.),

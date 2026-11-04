@@ -1,4 +1,6 @@
 //! Disjoint preview rows use bounded CPU parallelism while effect workers retain headroom.
+pub(crate) mod native_preview;
+pub(crate) mod region;
 use crate::raster::{Pixel, Pixel16};
 pub(crate) fn rgba8(width: u32, height: u32, sample: impl Fn(u32, u32) -> Pixel + Sync) -> Vec<u8> {
     let mut bytes = vec![0; width as usize * height as usize * 4];

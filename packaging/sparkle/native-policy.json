@@ -1,0 +1,31 @@
+{
+  "schema": 1,
+  "archive_sha256": "17e28312b8e18ab7cdbbe09a6fb28cc55a5479ec6c371dbc07cdecd2a14fd959",
+  "objects": {
+    ".": {
+      "entitlements": {},
+      "identifier": "org.sparkle-project.Sparkle",
+      "unsigned_sha256": "4d5f7c8b6bf841777553126e2eab59c6c36c8b8913120ea54223b6ef1ac67c1d"
+    },
+    "Versions/B/Autoupdate": {
+      "entitlements": {},
+      "identifier": "Autoupdate-55554944f723d84042cd352fbb0485760ff7597a",
+      "unsigned_sha256": "2c733ca352b29429a847b4fdad1677b63b84dade1a59c7bbb6695078a5c61c20"
+    },
+    "Versions/B/Updater.app": {
+      "entitlements": {},
+      "identifier": "org.sparkle-project.Sparkle.Updater",
+      "unsigned_sha256": "4c873f1fbfee1e50ebd1d8ad872df6abb4837c6e93bb530aade441e484f5b956"
+    },
+    "Versions/B/XPCServices/Downloader.xpc": {
+      "entitlements": {},
+      "identifier": "org.sparkle-project.DownloaderService",
+      "unsigned_sha256": "afa4a66986c16be80936aed01966b87ead18cda4f654e09f07a36188b4e7383f"
+    },
+    "Versions/B/XPCServices/Installer.xpc": {
+      "entitlements": {},
+      "identifier": "org.sparkle-project.InstallerLauncher",
+      "unsigned_sha256": "b711c7b7c4faf72b100ac89ad5b124868cf3d2a44eaf9428e4b8eaf3ad5d3ba1"
+    }
+  }
+}

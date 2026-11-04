@@ -1,4 +1,8 @@
 //! Tile-wise foreground fills, clipped in document coordinates and committed by Engine.edit.
+#[path = "fill/input.rs"]
+pub(crate) mod input;
+#[path = "fill/native.rs"]
+pub(crate) mod native;
 use crate::{
     engine::{Document, Layer},
     raster::{blend, check_size, Pixel, Raster, TILE},
@@ -13,11 +17,28 @@ fn fill_tiles(
     origin: [i32; 2],
     polygon: Option<&[[f32; 2]]>,
 ) {
+    fill_tiles_mode(raster, area, color, origin, polygon, false)
+}
+fn fill_tiles_mode(
+    raster: &mut Raster,
+    area: [i32; 4],
+    color: Pixel,
+    origin: [i32; 2],
+    polygon: Option<&[[f32; 2]]>,
+    literal: bool,
+) {
     if raster.depth == 16 {
-        fill_tiles16(raster, area, color.map(|v| v as u16 * 257), origin, polygon);
+        fill_tiles16(
+            raster,
+            area,
+            color.map(|v| v as u16 * 257),
+            origin,
+            polygon,
+            literal,
+        );
         return;
     }
-    if color[3] == 0 {
+    if color[3] == 0 && !literal {
         return;
     }
     let area = [
@@ -50,7 +71,7 @@ fn fill_tiles(
                 && y1 == tile_y + TILE as i32;
             if polygon.is_none()
                 && full
-                && (color[3] == 255 || !raster.tiles.contains_key(&(tx, ty)))
+                && (literal || color[3] == 255 || !raster.tiles.contains_key(&(tx, ty)))
             {
                 raster.tiles.insert((tx, ty), constant.clone());
                 continue;
@@ -73,7 +94,7 @@ fn fill_tiles(
                     }
                     let at = (((y - tile_y) as u32 * TILE + (x - tile_x) as u32) * 4) as usize;
                     let old = pixels[at..at + 4].try_into().unwrap();
-                    let result = if color[3] == 255 {
+                    let result = if literal || color[3] == 255 {
                         color
                     } else {
                         blend(old, color, 1.0, "normal")
@@ -91,8 +112,9 @@ fn fill_tiles16(
     color: [u16; 4],
     origin: [i32; 2],
     polygon: Option<&[[f32; 2]]>,
+    literal: bool,
 ) {
-    if color[3] == 0 {
+    if color[3] == 0 && !literal {
         return;
     }
     let area = [
@@ -125,7 +147,7 @@ fn fill_tiles16(
                 && y1 == tile_y + TILE as i32;
             if polygon.is_none()
                 && full
-                && (color[3] == 65535 || !raster.samples16.contains_key(&(tx, ty)))
+                && (literal || color[3] == 65535 || !raster.samples16.contains_key(&(tx, ty)))
             {
                 raster.samples16.insert((tx, ty), constant.clone());
                 continue;
@@ -148,7 +170,7 @@ fn fill_tiles16(
                     }
                     let at = (((y - tile_y) as u32 * TILE + (x - tile_x) as u32) * 4) as usize;
                     let old = pixels[at..at + 4].try_into().unwrap();
-                    let result = if color[3] == 65535 {
+                    let result = if literal || color[3] == 65535 {
                         color
                     } else {
                         crate::raster::blend16(old, color, 1.0, "normal")
@@ -158,6 +180,77 @@ fn fill_tiles16(
             }
         }
     }
+}
+
+/// Prepare semantic fill pixels before native-original/selection baselines.
+/// The caller's existing outer transaction retains the complete original kind,
+/// source and pixels for one undo record; this helper never records history.
+pub(crate) fn prepare_visual_baseline(doc: &mut Document, command: &Value) -> Result<(), String> {
+    let op = command["op"].as_str().unwrap_or("");
+    if !matches!(op, "paint.fill" | "paint.clear_selection") || command["mask"] == true {
+        return Ok(());
+    }
+    if op == "paint.clear_selection" && doc.selection.is_none_or(|r| r[0] >= r[2] || r[1] >= r[3]) {
+        return Ok(());
+    }
+    if op == "paint.fill" {
+        let canvas = [0, 0, doc.width as i32, doc.height as i32];
+        let mut area = command
+            .get("rect")
+            .and_then(crate::engine::rect)
+            .or(doc.selection)
+            .unwrap_or(canvas);
+        if let Some(bounds) = doc.selection {
+            area = [
+                area[0].max(bounds[0]),
+                area[1].max(bounds[1]),
+                area[2].min(bounds[2]),
+                area[3].min(bounds[3]),
+            ];
+        }
+        if area[0].max(0) >= area[2].min(canvas[2]) || area[1].max(0) >= area[3].min(canvas[3]) {
+            return Ok(());
+        }
+    }
+    let Some(target) = command["layer"].as_str() else {
+        return Ok(());
+    };
+    let Some(layer) = doc.layers.iter().find(|l| l.id == target) else {
+        return Ok(());
+    };
+    let ids = if op == "paint.clear_selection" && layer.kind == "group" {
+        crate::transform::tree_ids(doc, &[target.into()])
+    } else {
+        vec![target.to_owned()]
+    };
+    for layer in &mut doc.layers {
+        if layer.kind != "fill" || !ids.contains(&layer.id) {
+            continue;
+        }
+        materialize_visual_layer(layer)?;
+    }
+    Ok(())
+}
+
+/// Preserve the procedural OLD logical extent before any storage expansion.
+/// This is also needed for mask edits: a larger kindfill frame would otherwise
+/// introduce visible color in space that was previously transparent.
+pub(crate) fn materialize_visual_layer(layer: &mut Layer) -> Result<(), String> {
+    if layer.kind != "fill" {
+        return Ok(());
+    }
+    if layer.locked {
+        return Err("A selected layer or folder child is locked".into());
+    }
+    if layer.source.is_some() {
+        return Err("Rasterize the editable source before modifying fill color pixels".into());
+    }
+    let mut pixels = Raster::new_depth(layer.pixels.width, layer.pixels.height, layer.pixels.depth);
+    let area = [0, 0, pixels.width as i32, pixels.height as i32];
+    fill_tiles_mode(&mut pixels, area, layer.color, [0, 0], None, true);
+    layer.pixels = pixels;
+    layer.kind = "paint".into();
+    Ok(())
 }
 
 pub fn apply(doc: &mut Document, command: &Value) -> Result<(), String> {

@@ -9,6 +9,7 @@ struct Picker {
     hex: String,
     field: Option<(u16, TextureHandle)>,
     hex_start: [f64; 4],
+    hex_control: Option<egui::Id>,
     last_control: Option<egui::Id>,
 }
 fn pixel(rgba: [f64; 4]) -> Pixel {
@@ -87,6 +88,7 @@ pub(super) fn control(
                     hex: color::format_hex(pixel(input)),
                     field: None,
                     hex_start: input,
+                    hex_control: None,
                     last_control: None,
                 })
             };
@@ -95,14 +97,21 @@ pub(super) fn control(
             ui.ctx().data_mut(|data| data.remove::<Picker>(state_id));
             return None;
         };
+        // A late shared preview must not replace text before HEX validation.
+        let editing_hex = picker
+            .hex_control
+            .is_some_and(|control| controls::number_editing(ui.ctx(), control));
         if picker.rgba != input {
             picker.rgba = input;
             picker.hsv = hsv(input);
-            picker.hex = color::format_hex(pixel(input));
+            if !editing_hex {
+                picker.hex = color::format_hex(pixel(input));
+            }
         }
         let before = picker.rgba;
         let mut open = true;
         let mut changed = None;
+        let mut cancelled_hex = None;
         let enabled = ui.is_enabled();
         egui::Window::new(format!("{label} color"))
             .id(state_id)
@@ -312,12 +321,13 @@ pub(super) fn control(
                         changed = Some(response);
                     }
                 });
-                if picker.rgba != before {
+                if picker.rgba != before && !editing_hex {
                     picker.hex = color::format_hex(pixel(picker.rgba));
                 }
                 ui.horizontal(|ui| {
                     controls::label(ui, "HEX");
                     let control = ui.id().with("hex");
+                    picker.hex_control = Some(control);
                     let editor = control.with("number");
                     let edit = ui.add(
                         egui::TextEdit::singleline(&mut picker.hex)
@@ -349,10 +359,10 @@ pub(super) fn control(
                         ui.ctx().data_mut(|data| data.remove::<String>(editor));
                         edit.surrender_focus();
                         if color::parse_hex(&picker.hex).is_none() {
-                            picker.rgba = picker.hex_start;
                             ui.ctx().data_mut(|data| {
                                 data.insert_temp(control.with("cancel parameter"), true)
                             });
+                            cancelled_hex = Some(control);
                             changed = Some(response.clone());
                         }
                     }
@@ -397,6 +407,12 @@ pub(super) fn control(
                     }
                 });
             });
+        if let Some(control) = cancelled_hex {
+            // Later precise controls cannot replace this gesture's cancellation.
+            picker.rgba = picker.hex_start;
+            picker.hsv = hsv(picker.rgba);
+            changed = Some(cancel_response(&button, control));
+        }
         if let Some(response) = &mut changed {
             if picker.rgba != before {
                 response.mark_changed();
@@ -436,7 +452,14 @@ mod tests {
     fn effect_color_hex_is_live_provisional_and_cancels_on_escape_invalid_input_and_source_changes()
     {
         for depth in [8, 16] {
-            for action in ["enter", "escape", "invalid", "source"] {
+            for action in [
+                "enter",
+                "escape",
+                "invalid",
+                "invalid_blur",
+                "invalid_channels",
+                "source",
+            ] {
                 let ctx = egui::Context::default();
                 let mut engine = crate::engine::Engine::new();
                 engine.doc = Document::new_depth(8, 8, depth).unwrap();
@@ -515,7 +538,29 @@ mod tests {
                 );
                 draw(&mut app, vec![button(at, false)]);
                 draw(&mut app, vec![]);
-                let output = draw(&mut app, vec![]);
+                let mut output = draw(&mut app, vec![]);
+                if action == "invalid_channels" {
+                    let at = output
+                        .shapes
+                        .iter()
+                        .find_map(|shape| match &shape.shape {
+                            egui::Shape::Text(text)
+                                if text.galley.job.text == "Precise channels" =>
+                            {
+                                Some(Rect::from_min_size(text.pos, text.galley.size()).center())
+                            }
+                            _ => None,
+                        })
+                        .expect("Actual precise-channel expander");
+                    draw(
+                        &mut app,
+                        vec![egui::Event::PointerMoved(at), button(at, true)],
+                    );
+                    draw(&mut app, vec![button(at, false)]);
+                    draw(&mut app, vec![]);
+                    draw(&mut app, vec![]);
+                    output = draw(&mut app, vec![]);
+                }
                 let hex = color::format_hex(p);
                 let at = output
                     .shapes
@@ -560,6 +605,14 @@ mod tests {
                     .expect("Source-bound HEX draft")
                     .commands
                     .clone();
+                let control = app.parameter_gesture.as_ref().unwrap().control;
+                let editor = control.with("number");
+                assert_eq!(ctx.memory(|memory| memory.focused()), Some(editor));
+                assert_eq!(
+                    ctx.data(|data| data.get_temp::<String>(editor)).as_deref(),
+                    Some("F0408080"),
+                    "{depth}/{action}: actual HEX text must own the draft"
+                );
                 let draft =
                     crate::engine::Engine::preview_edits(before.clone(), &commands).unwrap();
                 assert_ne!(draft.export_png().unwrap(), before.export_png().unwrap());
@@ -586,8 +639,14 @@ mod tests {
                 } else {
                     0
                 };
-                if action == "invalid" {
+                let mut blur_at = None;
+                if action.starts_with("invalid") {
+                    // Hold committed source in the settings while the actual
+                    // shared-engine result is pending, then deliver it only
+                    // after invalid text exists. No worker timing is assumed.
+                    app.parameter_gesture.as_mut().unwrap().preview = None;
                     draw(&mut app, vec![key(egui::Key::A, false, Default::default())]);
+                    app.parameter_gesture.as_mut().unwrap().preview = None;
                     draw(
                         &mut app,
                         vec![
@@ -603,20 +662,138 @@ mod tests {
                             egui::Event::Text("invalid".into()),
                         ],
                     );
+                    assert_eq!(ctx.memory(|memory| memory.focused()), Some(editor));
+                    assert_eq!(
+                        ctx.data(|data| data.get_temp::<String>(editor)).as_deref(),
+                        Some("invalid"),
+                        "{depth}: invalid text must reach the actual focused editor"
+                    );
+                    app.parameter_gesture.as_mut().unwrap().preview = Some(Ok(draft.clone()));
+                    let output = draw(&mut app, vec![]);
+                    assert!(
+                        output.shapes.iter().any(|shape| matches!(
+                            &shape.shape,
+                            egui::Shape::Text(text) if text.galley.job.text == "invalid"
+                        )),
+                        "{depth}: late preview must not replace the rendered HEX draft"
+                    );
+                    assert_eq!(
+                        ctx.data(|data| data.get_temp::<String>(editor)).as_deref(),
+                        Some("invalid")
+                    );
+                    assert_eq!(ctx.memory(|memory| memory.focused()), Some(editor));
+                    assert!(controls::number_editing(&ctx, control));
+                    assert_eq!(app.parameter_gesture.as_ref().unwrap().commands, commands);
+                    assert!(shared.lock().unwrap().undo.is_empty());
+                    assert_eq!(
+                        serde_json::to_value(&shared.lock().unwrap().doc).unwrap(),
+                        serde_json::to_value(&before).unwrap()
+                    );
+                    if action == "invalid_blur" {
+                        blur_at = Some(
+                            output
+                                .shapes
+                                .iter()
+                                .find_map(|shape| match &shape.shape {
+                                    egui::Shape::Mesh(mesh) => {
+                                        let rect = mesh.calc_bounds();
+                                        ((rect.width() - 160.).abs() < 0.01
+                                            && (rect.height() - 160.).abs() < 0.01)
+                                            .then_some(
+                                                rect.min + rect.size() * Vec2::new(0.13, 0.29),
+                                            )
+                                    }
+                                    _ => None,
+                                })
+                                .expect("Actual color-field control for invalid HEX blur"),
+                        );
+                    } else if action == "invalid_channels" {
+                        // Font centers need not coincide with the painted bar.
+                        // F0 from the valid HEX draft displays as 94.1176% red.
+                        let bars = output
+                            .shapes
+                            .iter()
+                            .filter_map(|bar| {
+                                let egui::Shape::Rect(shape) = &bar.shape else {
+                                    return None;
+                                };
+                                let rect = shape.rect;
+                                if shape.fill != Color32::from_rgb(54, 51, 58)
+                                    || (rect.height() - 22.).abs() >= 0.01
+                                {
+                                    return None;
+                                }
+                                let red_label = output.shapes.iter().any(|label| {
+                                    let egui::Shape::Text(text) = &label.shape else {
+                                        return false;
+                                    };
+                                    let label_rect =
+                                        Rect::from_min_size(text.pos, text.galley.size());
+                                    label.clip_rect == bar.clip_rect
+                                        && text.galley.job.text == "R"
+                                        && label_rect.right() < rect.left()
+                                        && rect.top() <= label_rect.center().y
+                                        && label_rect.center().y <= rect.bottom()
+                                });
+                                let red_value = output.shapes.iter().any(|value| {
+                                    let egui::Shape::Text(text) = &value.shape else {
+                                        return false;
+                                    };
+                                    value.clip_rect == bar.clip_rect
+                                        && text.galley.job.text == "94.1176%"
+                                        && rect.contains(
+                                            Rect::from_min_size(text.pos, text.galley.size())
+                                                .center(),
+                                        )
+                                });
+                                (red_label && red_value).then_some(rect)
+                            })
+                            .collect::<Vec<_>>();
+                        assert_eq!(
+                            bars.len(),
+                            1,
+                            "Unique actual precise red-channel bar for invalid HEX blur"
+                        );
+                        blur_at = Some(bars[0].center());
+                    }
                 }
-                draw(
-                    &mut app,
-                    vec![key(
-                        if action == "escape" {
-                            egui::Key::Escape
-                        } else {
-                            egui::Key::Enter
-                        },
-                        true,
-                        Default::default(),
-                    )],
-                );
+                if let Some(at) = blur_at {
+                    draw(
+                        &mut app,
+                        vec![egui::Event::PointerMoved(at), button(at, true)],
+                    );
+                    if action == "invalid_channels" {
+                        let response = ctx
+                            .memory(|memory| memory.focused())
+                            .and_then(|id| ctx.read_response(id))
+                            .expect("Precise red-channel control received actual focus");
+                        assert_ne!(response.id, editor);
+                        assert!(response.sense.senses_drag() && response.rect.contains(at));
+                        assert_eq!(
+                            response.layer_id,
+                            ctx.read_response(editor)
+                                .expect("HEX editor in the same picker")
+                                .layer_id
+                        );
+                    }
+                    draw(&mut app, vec![button(at, false)]);
+                } else {
+                    draw(
+                        &mut app,
+                        vec![key(
+                            if action == "escape" {
+                                egui::Key::Escape
+                            } else {
+                                egui::Key::Enter
+                            },
+                            true,
+                            Default::default(),
+                        )],
+                    );
+                }
                 draw(&mut app, vec![]);
+                assert!(!controls::number_editing(&ctx, control), "{depth}/{action}");
+                assert!(app.parameter_gesture.is_none(), "{depth}/{action}");
                 let mut engine = shared.lock().unwrap();
                 if action == "enter" {
                     assert_eq!(engine.undo.len(), 1);
@@ -634,6 +811,13 @@ mod tests {
                         before.export_png().unwrap()
                     );
                 } else {
+                    if engine.undo.len() != history {
+                        eprintln!(
+                            "\nPB_EFFECT_COLOR_HISTORY depth={depth} action={action} before={history} after={}",
+                            engine.undo.len(),
+                            action = if action.starts_with("invalid") { "invalid" } else { action }
+                        );
+                    }
                     assert_eq!(engine.undo.len(), history, "{depth}/{action}");
                     assert_eq!(
                         serde_json::to_value(&engine.doc).unwrap(),

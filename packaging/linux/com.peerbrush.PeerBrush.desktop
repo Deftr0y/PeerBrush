@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=PeerBrush
+Comment=You and your AI. Same canvas.
+Exec=/usr/bin/peerbrush -- %F
+TryExec=/usr/bin/peerbrush
+Icon=/usr/share/peerbrush/peerbrush-logo.png
+Terminal=false
+Categories=Graphics;2DGraphics;RasterGraphics;
+MimeType=image/vnd.adobe.photoshop;
+StartupNotify=true

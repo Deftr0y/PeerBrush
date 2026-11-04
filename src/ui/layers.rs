@@ -1,5 +1,8 @@
 use super::*;
-use crate::engine::Layer;
+use crate::engine::{
+    view::{DocumentView, LayerView},
+    Layer,
+};
 const TREE_INDENT: f32 = 22.0;
 #[derive(Default)]
 struct FolderSummary {
@@ -9,46 +12,77 @@ struct FolderSummary {
 }
 
 struct TreeInfo<'a> {
-    doc: &'a Document,
+    doc: DocumentView<'a>,
+    order: crate::tree::TreeOrder,
+    visibility: Option<(bool, HashSet<String>)>,
     folders: HashMap<String, FolderSummary>,
     paths: HashMap<String, String>,
 }
 impl<'a> TreeInfo<'a> {
-    fn new(doc: &'a Document, selected: &HashSet<String>) -> Self {
-        let layers: HashMap<_, _> = doc.layers.iter().map(|l| (l.id.as_str(), l)).collect();
-        let mut folders: HashMap<String, FolderSummary> = HashMap::new();
-        let mut paths = HashMap::new();
-        for layer in &doc.layers {
-            let mut names = vec![layer.name.as_str()];
-            let mut parent = layer.parent.as_deref();
+    fn new(doc: DocumentView<'a>, selected: &HashSet<String>) -> Self {
+        Self::ordered(doc, crate::tree::TreeOrder::original(doc), selected, None)
+    }
+    fn ordered(
+        doc: DocumentView<'a>,
+        order: crate::tree::TreeOrder,
+        selected: &HashSet<String>,
+        visibility: Option<(bool, HashSet<String>)>,
+    ) -> Self {
+        let mut result = Self {
+            doc,
+            order,
+            visibility,
+            folders: HashMap::new(),
+            paths: HashMap::new(),
+        };
+        for (index, layer) in doc.layers().enumerate() {
+            let mut names = vec![layer.name()];
+            let mut parent = result.order.parent(index, layer);
             for depth in 0..16 {
-                let Some(ancestor) = parent.and_then(|id| layers.get(id)) else {
+                let Some(ancestor) = parent.and_then(|id| doc.find_layer(id)) else {
                     break;
                 };
-                let summary = folders.entry(ancestor.id.clone()).or_default();
+                let summary = result.folders.entry(ancestor.id().to_owned()).or_default();
                 summary.direct += usize::from(depth == 0);
                 summary.descendants += 1;
-                summary.selected += usize::from(selected.contains(&layer.id));
-                names.push(&ancestor.name);
-                parent = ancestor.parent.as_deref();
+                summary.selected += usize::from(selected.contains(layer.id()));
+                names.push(ancestor.name());
+                let ordinal = doc
+                    .layers()
+                    .position(|candidate| candidate.id() == ancestor.id())
+                    .unwrap();
+                parent = result.order.parent(ordinal, ancestor);
             }
             names.reverse();
-            paths.insert(layer.id.clone(), names.join(" / "));
+            result
+                .paths
+                .insert(layer.id().to_owned(), names.join(" / "));
         }
-        Self {
-            doc,
-            folders,
-            paths,
-        }
+        result
+    }
+    fn parent(&self, layer: LayerView<'a>) -> Option<&str> {
+        let index = self
+            .doc
+            .layers()
+            .position(|candidate| candidate.id() == layer.id())
+            .unwrap();
+        self.order.parent(index, layer)
+    }
+    fn visible(&self, layer: LayerView<'a>) -> bool {
+        self.visibility
+            .as_ref()
+            .filter(|(_, ids)| ids.contains(layer.id()))
+            .map(|(visible, _)| *visible)
+            .unwrap_or(layer.visible())
     }
     fn path(&self, id: &str) -> &str {
         self.paths.get(id).map(String::as_str).unwrap_or("")
     }
-    fn tooltip(&self, layer: &Layer) -> String {
-        let mut text = self.path(&layer.id).to_owned();
-        if layer.kind == "group" {
+    fn tooltip(&self, layer: LayerView<'a>) -> String {
+        let mut text = self.path(layer.id()).to_owned();
+        if layer.kind() == "group" {
             let empty = FolderSummary::default();
-            let summary = self.folders.get(&layer.id).unwrap_or(&empty);
+            let summary = self.folders.get(layer.id()).unwrap_or(&empty);
             text.push_str(&format!(
                 "\n{} direct children · {} total descendants",
                 summary.direct, summary.descendants
@@ -67,18 +101,18 @@ struct TreeAnchor {
 }
 fn paint_tree_guides(
     painter: &egui::Painter,
-    doc: &Document,
+    tree: &TreeInfo<'_>,
     anchors: &HashMap<String, TreeAnchor>,
 ) {
-    for parent in doc.layers.iter().filter(|layer| layer.kind == "group") {
-        let Some(root) = anchors.get(&parent.id) else {
+    for parent in tree.doc.layers().filter(|l| l.kind() == "group") {
+        let Some(root) = anchors.get(parent.id()) else {
             continue;
         };
-        let children: Vec<_> = doc
-            .layers
-            .iter()
-            .filter(|layer| layer.parent.as_deref() == Some(&parent.id))
-            .filter_map(|layer| anchors.get(&layer.id).map(|anchor| (layer, anchor)))
+        let children: Vec<_> = tree
+            .doc
+            .layers()
+            .filter(|l| tree.parent(*l) == Some(parent.id()))
+            .filter_map(|l| anchors.get(l.id()).map(|anchor| (l, anchor)))
             .collect();
         let x = root.disclosure.center().x;
         let start = root.disclosure.bottom();
@@ -94,15 +128,15 @@ fn paint_tree_guides(
             };
             painter.line_segment(
                 [egui::pos2(x, start), egui::pos2(x, end)],
-                Stroke::new(1.0, color.gamma_multiply(root.opacity)),
+                Stroke::new(1., color.gamma_multiply(root.opacity)),
             );
         }
         for (layer, child) in children {
             let y = child.disclosure.center().y;
-            let end = if layer.kind == "group" {
-                child.disclosure.left() - 2.0
+            let end = if layer.kind() == "group" {
+                child.disclosure.left() - 2.
             } else {
-                child.disclosure.right() - 4.0
+                child.disclosure.right() - 4.
             };
             let color = if root.ai || child.ai {
                 AI_BLUE
@@ -111,7 +145,7 @@ fn paint_tree_guides(
             };
             painter.line_segment(
                 [egui::pos2(x, y), egui::pos2(end, y)],
-                Stroke::new(1.0, color.gamma_multiply(root.opacity.min(child.opacity))),
+                Stroke::new(1., color.gamma_multiply(root.opacity.min(child.opacity))),
             );
         }
     }
@@ -133,7 +167,8 @@ fn click_modifiers(ui: &egui::Ui) -> egui::Modifiers {
     })
 }
 fn rows(
-    doc: &Document,
+    doc: DocumentView<'_>,
+    order: &crate::tree::TreeOrder,
     parent: Option<&str>,
     depth: usize,
     collapsed: &HashSet<String>,
@@ -142,15 +177,14 @@ fn rows(
     if depth > 16 {
         return;
     }
-    for (index, l) in doc
-        .layers
-        .iter()
-        .enumerate()
-        .filter(|(_, l)| l.parent.as_deref() == parent)
-    {
+    for &index in order.indices() {
+        let layer = doc.layer(index).unwrap();
+        if order.parent(index, layer) != parent {
+            continue;
+        }
         out.push((index, depth));
-        if l.kind == "group" && !collapsed.contains(&l.id) {
-            rows(doc, Some(&l.id), depth + 1, collapsed, out);
+        if layer.kind() == "group" && !collapsed.contains(layer.id()) {
+            rows(doc, order, Some(layer.id()), depth + 1, collapsed, out);
         }
     }
 }
@@ -160,16 +194,16 @@ impl PeerBrush {
         self.solo_target = active.then(|| (self.selected.clone(), self.mask));
         self.last_preview = None;
     }
-    pub(super) fn sync_solo(&mut self, doc: &Document) {
+    pub(super) fn sync_solo<'a>(&mut self, doc: impl Into<DocumentView<'a>>) {
+        let doc = doc.into();
         if !self.isolate {
             self.solo_target = None;
             return;
         }
         let target = (self.selected.clone(), self.mask);
         let valid = doc
-            .layers
-            .iter()
-            .any(|l| l.id == target.0 && (!target.1 || l.mask.is_some()));
+            .layers()
+            .any(|l| l.id() == target.0 && (!target.1 || l.mask().is_some()));
         if !valid || self.solo_target.as_ref().is_some_and(|old| old != &target) {
             self.set_solo(false);
         } else {
@@ -184,15 +218,16 @@ impl PeerBrush {
         }
         self.mask = mask;
     }
-    pub(super) fn solo_caption(&self, doc: &Document) -> Option<String> {
+    pub(super) fn solo_caption<'a>(&self, doc: impl Into<DocumentView<'a>>) -> Option<String> {
+        let doc = doc.into();
         self.isolate
-            .then(|| doc.layers.iter().find(|l| l.id == self.selected))
+            .then(|| doc.find_layer(&self.selected))
             .flatten()
             .map(|l| {
                 format!(
                     "Solo {} · {}",
                     if self.mask { "Mask" } else { "Color" },
-                    l.name
+                    l.name()
                 )
             })
     }
@@ -203,16 +238,21 @@ impl PeerBrush {
             1.
         }
     }
-    pub(super) fn begin_rename(&mut self, _doc: &Document, id: &str) {
+    pub(super) fn begin_rename<'a>(&mut self, _doc: impl Into<DocumentView<'a>>, id: &str) {
         if self.rename_edit.is_some() {
             self.finish_rename();
         }
         let (document, revision, name) = {
             let e = self.shared.lock().unwrap();
-            let Some(layer) = e.doc.layers.iter().find(|l| l.id == id) else {
+            let view = crate::engine::view::current(&e);
+            let Some(layer) = view.find_layer(id) else {
                 return;
             };
-            (e.doc.id.clone(), e.doc.revision, layer.name.clone())
+            (
+                view.id().to_owned(),
+                view.revision(),
+                layer.name().to_owned(),
+            )
         };
         self.select_content(id);
         self.layer_clipboard = true;
@@ -251,7 +291,10 @@ impl PeerBrush {
                 )
             }
         };
-        self.message = result.map(|_| "Renamed layer".into()).unwrap_or_else(|e| e);
+        self.message = result
+            .map(|_| "Renamed layer".into())
+            .unwrap_or_else(|e| e)
+            .into();
         self.last_preview = None;
     }
     fn inline_rename(&mut self, ui: &mut egui::Ui, width: f32) {
@@ -311,24 +354,33 @@ impl PeerBrush {
         self.mask_step = None;
         self.last_preview = None;
     }
-    fn select_row(&mut self, ui: &egui::Ui, doc: &Document, id: &str) {
+    fn select_row(
+        &mut self,
+        ui: &egui::Ui,
+        doc: DocumentView<'_>,
+        order: &crate::tree::TreeOrder,
+        id: &str,
+    ) {
         let previous = (self.selected.clone(), self.mask);
         self.layer_clipboard = true;
         let mods = click_modifiers(ui);
         let command = mods.command || mods.ctrl;
         if mods.shift {
             let mut visible = vec![];
-            rows(doc, None, 0, &self.collapsed, &mut visible);
+            rows(doc, order, None, 0, &self.collapsed, &mut visible);
             let a = visible
                 .iter()
-                .position(|&(i, _)| doc.layers[i].id == self.selection_anchor);
-            let b = visible.iter().position(|&(i, _)| doc.layers[i].id == id);
+                .position(|&(i, _)| doc.layer(i).unwrap().id() == self.selection_anchor);
+            let b = visible
+                .iter()
+                .position(|&(i, _)| doc.layer(i).unwrap().id() == id);
             if let (Some(a), Some(b)) = (a, b) {
                 if !command {
                     self.selection_layers.clear();
                 }
                 for &(i, _) in &visible[a.min(b)..=a.max(b)] {
-                    self.selection_layers.insert(doc.layers[i].id.clone());
+                    self.selection_layers
+                        .insert(doc.layer(i).unwrap().id().to_owned());
                 }
                 self.selected = id.into();
             } else {
@@ -339,12 +391,11 @@ impl PeerBrush {
                 self.selection_layers.remove(id);
                 if self.selected == id {
                     self.selected = doc
-                        .layers
-                        .iter()
-                        .find(|l| self.selection_layers.contains(&l.id))
+                        .layers()
+                        .find(|l| self.selection_layers.contains(l.id()))
                         .unwrap()
-                        .id
-                        .clone();
+                        .id()
+                        .to_owned();
                 }
             } else {
                 self.selection_layers.insert(id.into());
@@ -393,7 +444,7 @@ impl PeerBrush {
     fn layer_contents(
         &mut self,
         ui: &mut egui::Ui,
-        l: &Layer,
+        l: LayerView<'_>,
         indent: f32,
         thumb: Option<&TextureHandle>,
         mask_thumb: Option<&TextureHandle>,
@@ -412,47 +463,47 @@ impl PeerBrush {
                     );
                 }
             }
-            let eye = eye_button(ui, l.visible);
-            self.eye_rects.insert(l.id.clone(), eye.rect);
+            let eye = eye_button(ui, tree.visible(l));
+            self.eye_rects.insert(l.id().to_owned(), eye.rect);
             if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
                 if eye.rect.contains(pos) && ui.clip_rect().contains(pos) {
                     if ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary)) {
-                        if !self.selection_layers.contains(&l.id) {
-                            self.select_content(&l.id);
+                        if !self.selection_layers.contains(l.id()) {
+                            self.select_content(l.id());
                         }
                         self.eye_sweep = Some(EyeSweep {
                             gesture: crate::engine::id(),
                             previous: pos,
-                            revision: doc.revision,
-                            visible: !l.visible,
-                            ids: [l.id.clone()].into_iter().collect(),
+                            revision: doc.revision(),
+                            visible: !tree.visible(l),
+                            ids: [l.id().to_owned()].into_iter().collect(),
                         });
                         self.layer_drag = None;
                     } else if ui.input(|i| i.pointer.primary_down()) {
                         if let Some(sweep) = &mut self.eye_sweep {
-                            sweep.ids.insert(l.id.clone());
+                            sweep.ids.insert(l.id().to_owned());
                         }
                     }
                 }
             }
             ui.add_space(indent);
-            let disclosure = if l.kind == "group" {
+            let disclosure = if l.kind() == "group" {
                 let response = icons::small_button(
                     ui,
-                    if self.collapsed.contains(&l.id) {
+                    if self.collapsed.contains(l.id()) {
                         Icon::Right
                     } else {
                         Icon::Down
                     },
-                    if self.collapsed.contains(&l.id) {
+                    if self.collapsed.contains(l.id()) {
                         "Expand folder"
                     } else {
                         "Collapse folder"
                     },
                 );
                 if response.clicked() {
-                    if !self.collapsed.remove(&l.id) {
-                        self.collapsed.insert(l.id.clone());
+                    if !self.collapsed.remove(l.id()) {
+                        self.collapsed.insert(l.id().to_owned());
                     }
                 }
                 response.rect
@@ -460,45 +511,45 @@ impl PeerBrush {
                 ui.allocate_exact_size(Vec2::new(20.0, 24.0), egui::Sense::hover())
                     .0
             };
-            if l.kind == "group" {
+            if l.kind() == "group" {
                 let (r, response) = ui.allocate_exact_size(Vec2::splat(30.0), egui::Sense::click());
                 icons::paint(ui.painter(), r, Icon::Folder, true);
                 if response.clicked() {
-                    self.select_row(ui, doc, &l.id);
+                    self.select_row(ui, doc, &tree.order, l.id());
                 }
-            } else if l.kind == "adjustment" {
+            } else if l.kind() == "adjustment" {
                 let (r, response) = ui.allocate_exact_size(Vec2::splat(30.), egui::Sense::click());
                 icons::paint(ui.painter(), r, Icon::Adjust, true);
                 if response.clicked() {
-                    self.select_row(ui, doc, &l.id);
+                    self.select_row(ui, doc, &tree.order, l.id());
                 }
             } else if self
                 .thumb_button(
                     ui,
                     thumb,
-                    self.selection_layers.contains(&l.id) && !self.mask,
+                    self.selection_layers.contains(l.id()) && !self.mask,
                     "Edit layer content",
                 )
                 .clicked()
             {
-                self.select_row(ui, doc, &l.id);
+                self.select_row(ui, doc, &tree.order, l.id());
             }
-            if l.clip_to.is_some() {
+            if l.clip_to().is_some() {
                 ui.label(RichText::new("↳").color(MUTED))
                     .on_hover_text("Clipped to the base below");
             }
-            let reserved = self.ai_reserved(&l.id);
+            let reserved = self.ai_reserved(l.id());
             if reserved {
                 ui.label(RichText::new("AI").size(10.).color(AI_BLUE))
                     .on_hover_text(
                         "AI has reserved this layer or a region; visibility stays available",
                     );
             }
-            let mask_width = if l.mask.is_some() { 60.0 } else { 0.0 };
-            let summary = if l.kind == "group" {
+            let mask_width = if l.mask().is_some() { 60.0 } else { 0.0 };
+            let summary = if l.kind() == "group" {
                 let empty = FolderSummary::default();
-                let counts = tree.folders.get(&l.id).unwrap_or(&empty);
-                Some(if self.collapsed.contains(&l.id) && counts.selected > 0 {
+                let counts = tree.folders.get(l.id()).unwrap_or(&empty);
+                Some(if self.collapsed.contains(l.id()) && counts.selected > 0 {
                     (
                         format!("{} · {} selected", counts.descendants, counts.selected),
                         true,
@@ -522,22 +573,22 @@ impl PeerBrush {
             let name_width = (ui.available_width()
                 - mask_width
                 - summary_width
-                - if l.locked { 21.0 } else { 0.0 })
+                - if l.locked() { 21.0 } else { 0.0 })
             .max(25.0);
             if self
                 .rename_edit
                 .as_ref()
-                .is_some_and(|edit| edit.layer == l.id)
+                .is_some_and(|edit| edit.layer == l.id())
             {
                 self.inline_rename(ui, name_width);
             } else {
                 let name = filename::click_label(
                     ui,
-                    &l.name,
+                    l.name(),
                     name_width,
                     egui::FontId::new(
                         12.,
-                        if l.kind == "group" {
+                        if l.kind() == "group" {
                             egui::FontFamily::Name("semibold".into())
                         } else {
                             egui::FontFamily::Proportional
@@ -545,7 +596,7 @@ impl PeerBrush {
                     ),
                     if reserved {
                         AI_BLUE
-                    } else if l.visible {
+                    } else if tree.visible(l) {
                         Color32::WHITE
                     } else {
                         MUTED
@@ -553,7 +604,7 @@ impl PeerBrush {
                 )
                 .on_hover_text(tree.tooltip(l));
                 if name.clicked() {
-                    self.select_row(ui, doc, &l.id);
+                    self.select_row(ui, doc, &tree.order, l.id());
                     let time = ui.input(|i| i.time);
                     let modifiers = click_modifiers(ui);
                     let pointer = name.interact_pointer_pos().unwrap_or(name.rect.center());
@@ -561,7 +612,7 @@ impl PeerBrush {
                     // egui counts rapid clicks globally, including clicks on different rows.
                     // Rename requires two unmodified clicks on this same name at the same spot.
                     let same_name = self.name_click.as_ref().is_some_and(|(id, point, at)| {
-                        id == &l.id
+                        id == l.id()
                             && time - at < options.max_double_click_delay
                             && point.distance(pointer) <= options.max_click_dist
                     });
@@ -572,9 +623,9 @@ impl PeerBrush {
                         && !modifiers.shift
                         && !modifiers.alt
                     {
-                        self.begin_rename(doc, &l.id);
+                        self.begin_rename(doc, l.id());
                     }
-                    self.name_click = Some((l.id.clone(), pointer, time));
+                    self.name_click = Some((l.id().to_owned(), pointer, time));
                 }
             }
             if let Some((text, hidden_selection)) = summary {
@@ -604,51 +655,48 @@ impl PeerBrush {
                         tree.tooltip(l)
                     });
                 if response.clicked() {
-                    self.collapsed.remove(&l.id);
+                    self.collapsed.remove(l.id());
                     for child in doc
-                        .layers
-                        .iter()
-                        .filter(|child| self.selection_layers.contains(&child.id))
+                        .layers()
+                        .filter(|child| self.selection_layers.contains(child.id()))
                     {
                         let mut chain = vec![];
-                        let mut parent = child.parent.as_deref();
+                        let mut parent = tree.parent(child);
                         for _ in 0..16 {
-                            let Some(ancestor) = parent.and_then(|id| {
-                                doc.layers.iter().find(|candidate| candidate.id == id)
-                            }) else {
+                            let Some(ancestor) = parent.and_then(|id| doc.find_layer(id)) else {
                                 break;
                             };
-                            chain.push(ancestor.id.clone());
-                            if ancestor.id == l.id {
+                            chain.push(ancestor.id().to_owned());
+                            if ancestor.id() == l.id() {
                                 for id in chain {
                                     self.collapsed.remove(&id);
                                 }
                                 break;
                             }
-                            parent = ancestor.parent.as_deref();
+                            parent = tree.parent(ancestor);
                         }
                     }
                 }
             }
-            if l.mask.is_some() {
+            if l.mask().is_some() {
                 self.mask_link_button(ui, doc, l);
                 if self
                     .thumb_button(
                         ui,
                         mask_thumb,
-                        self.selected == l.id && self.mask,
+                        self.selected == l.id() && self.mask,
                         "Paint mask · Alt isolate · Shift toggle",
                     )
                     .clicked()
                 {
-                    let was_solo_mask = self.isolate && self.selected == l.id && self.mask;
+                    let was_solo_mask = self.isolate && self.selected == l.id() && self.mask;
                     self.layer_clipboard = false;
                     self.mask_step = None;
                     if ui.input(|i| i.modifiers.shift) {
-                        self.select_content(&l.id);
+                        self.select_content(l.id());
                         self.layer_cmd("mask.toggle", json!({}), "Toggle mask");
                     } else {
-                        self.select_target(&l.id, true);
+                        self.select_target(l.id(), true);
                         if ui.input(|i| i.modifiers.alt) {
                             self.set_solo(!was_solo_mask);
                         }
@@ -656,7 +704,7 @@ impl PeerBrush {
                     }
                 }
             }
-            if l.locked {
+            if l.locked() {
                 let (_, r) = ui.allocate_space(Vec2::splat(16.0));
                 icons::paint(ui.painter(), r, Icon::Lock, true);
             }
@@ -664,13 +712,15 @@ impl PeerBrush {
         })
         .inner
     }
-    pub(super) fn mask_link_button(
+    pub(super) fn mask_link_button<'a>(
         &mut self,
         ui: &mut egui::Ui,
-        doc: &Document,
-        layer: &Layer,
+        doc: impl Into<DocumentView<'a>>,
+        layer: impl Into<LayerView<'a>>,
     ) -> egui::Response {
-        let mut linked = layer.mask.as_ref().unwrap().linked;
+        let doc = doc.into();
+        let layer = layer.into();
+        let mut linked = layer.mask().unwrap().linked();
         let tip = if linked {
             "Mask linked · transform Color and Mask together · Click to unlink"
         } else {
@@ -678,24 +728,20 @@ impl PeerBrush {
         };
         let response = ui
             .add_enabled_ui(
-                !doc.read_only && !self.busy && !layer.locked && !self.ai_reserved(&layer.id),
+                !doc.read_only() && !self.busy && !layer.locked() && !self.ai_reserved(layer.id()),
                 |ui| icons::small_button(ui, Icon::Connect, tip),
             )
             .inner;
         if response.clicked() {
-            self.edit(vec![json!({"op":"mask.link","layer":layer.id,"linked":!linked,"document_id":doc.id,"source_revision":doc.revision})], if linked { "Unlink mask" } else { "Link mask" });
-            if let Some(mask) = self
-                .shared
-                .lock()
-                .unwrap()
-                .doc
-                .layers
-                .iter()
-                .find(|current| current.id == layer.id)
-                .and_then(|current| current.mask.as_ref())
+            self.edit(vec![json!({"op":"mask.link","layer":layer.id(),"linked":!linked,"document_id":doc.id(),"source_revision":doc.revision()})], if linked { "Unlink mask" } else { "Link mask" });
+            let engine = self.shared.lock().unwrap();
+            if let Some(mask) = crate::engine::view::current(&engine)
+                .find_layer(layer.id())
+                .and_then(|current| current.mask())
             {
-                linked = mask.linked;
+                linked = mask.linked();
             }
+            drop(engine);
             ui.ctx().request_repaint();
         }
         if !linked {
@@ -726,6 +772,8 @@ impl PeerBrush {
         response
     }
     pub(super) fn layer_list(&mut self, ui: &mut egui::Ui, doc: &Document) {
+        let view = DocumentView::Resident(doc);
+        let original_order = crate::tree::TreeOrder::original(view);
         let mut context_menu = self
             .layer_context
             .take()
@@ -777,73 +825,73 @@ impl PeerBrush {
         let reserve = (ui.available_height() * 0.58).clamp(280.0, 480.0);
         let height = (ui.available_height() - reserve).max(46.0);
         egui::ScrollArea::vertical().max_height(height).auto_shrink([false,true]).show(ui,|ui| {
-            let mut original=vec![];rows(doc,None,0,&self.collapsed,&mut original);
+            let mut original=vec![];rows(view,&original_order,None,0,&self.collapsed,&mut original);
             let base=ui.cursor().min;let width=ui.available_width();
             let pointer=ui.input(|i|i.pointer.interact_pos());
-            let mut preview=doc.clone();let mut open=self.collapsed.clone();let mut drop_folder=None;
+            let mut preview=crate::tree::TreeOrder::original(view);let mut open=self.collapsed.clone();let mut drop_folder=None;
             let mut drop_hint=None;
             if let (Some(drag),Some(pointer))=(&mut self.layer_drag,pointer) {
                 let slot=((pointer.y-base.y)/46.0).floor().max(0.0) as usize;
-                let target=original.get(slot).map(|&(i,depth)|(&doc.layers[i],depth));
+                let target=original.get(slot).map(|&(i,depth)|(view.layer(i).unwrap(),depth));
                 let (parent,before)=if let Some((target,depth))=target {
                     let y=pointer.y-(base.y+slot as f32*46.0);
-                    if target.kind=="group" && (10.0..32.0).contains(&y) && !drag.ids.contains(&target.id) {
-                        drop_folder=Some(target.id.clone());open.remove(&target.id);
-                        (Some(target.id.as_str()),doc.layers.iter().find(|l|l.parent.as_deref()==Some(&target.id)&&!drag.ids.contains(&l.id)).map(|l|l.id.as_str()))
+                    if target.kind()=="group" && (10.0..32.0).contains(&y) && !drag.ids.iter().any(|id|id==target.id()) {
+                        drop_folder=Some(target.id().to_owned());open.remove(target.id());
+                        (Some(target.id()),view.layers().find(|l|l.parent()==Some(target.id())&&!drag.ids.iter().any(|id|id==l.id())).map(|l|l.id()))
                     } else {
-                        let parent=if depth>0 && pointer.x<base.x+45.0 {None}else{target.parent.as_deref()};
-                        let before=if y<21.0 && !drag.ids.contains(&target.id) {Some(target.id.as_str())}else{
-                            original.iter().skip(slot+1).map(|&(i,_)|&doc.layers[i]).find(|l|l.parent.as_deref()==parent&&!drag.ids.contains(&l.id)).map(|l|l.id.as_str())
+                        let parent=if depth>0 && pointer.x<base.x+45.0 {None}else{target.parent()};
+                        let before=if y<21.0 && !drag.ids.iter().any(|id|id==target.id()) {Some(target.id())}else{
+                            original.iter().skip(slot+1).map(|&(i,_)|view.layer(i).unwrap()).find(|l|l.parent()==parent&&!drag.ids.iter().any(|id|id==l.id())).map(|l|l.id())
                         };
                         (parent,before)
                     }
                 } else {(None,None)};
-                match crate::tree::reparent(doc,&drag.ids,parent,before) {
+                match crate::tree::reparent_view(view,&drag.ids,parent,before) {
                     Ok((p,commands))=>{
-                        let info=TreeInfo::new(doc,&self.selection_layers);
+                        let info=TreeInfo::new(view,&self.selection_layers);
                         let destination=parent.map(|id|info.path(id)).unwrap_or("Top level");
                         drop_hint=Some(if let Some(id)=before {
-                            let name=doc.layers.iter().find(|l|l.id==id).map(|l|l.name.as_str()).unwrap_or("");
+                            let name=view.layers().find(|l|l.id()==id).map(|l|l.name()).unwrap_or("");
                             format!("{} · before {}",destination,name)
                         } else {format!("{} · at end",destination)});
-                        drag.target=p.layers.iter().position(|l|l.id==drag.id).unwrap_or(0);drag.commands=commands;preview=p;
+                        drag.target=p.indices().iter().position(|&i|view.layer(i).unwrap().id()==drag.id).unwrap_or(0);drag.commands=commands;preview=p;
                     }
-                    Err(e)=>{drag.commands.clear();self.message=e;}
+                    Err(e)=>{drag.commands.clear();self.message=e.into();}
                 }
             }
-            if let Some(sweep)=&self.eye_sweep {for l in &mut preview.layers {if sweep.ids.contains(&l.id){l.visible=sweep.visible;}}}
-            let mut ordered=vec![];rows(&preview,None,0,&open,&mut ordered);
-            let tree=TreeInfo::new(&preview,&self.selection_layers);
+            let visibility=self.eye_sweep.as_ref().map(|sweep|(sweep.visible,sweep.ids.clone()));
+            let tree=TreeInfo::ordered(view,preview,&self.selection_layers,visibility);
+            let mut ordered=vec![];rows(view,&tree.order,None,0,&open,&mut ordered);
             let mut floating=None;
             let mut anchors=HashMap::new();
             for (slot,(index,depth)) in ordered.iter().copied().enumerate() {
-                let l=&preview.layers[index];let target=slot as f32*46.0;
+                let l=view.layer(index).unwrap();let target=slot as f32*46.0;
                 let time=ui.input(|i| i.time);
-                let ai=self.ai_layer(&l.id,time);
+                let ai=self.ai_layer(l.id(),time);
                 let duration=if ai {0.36}else{0.12};
-                let offset=ui.ctx().animate_value_with_time(ui.id().with((&doc.id,&l.id,"position")),target,duration);
-                let indent=ui.ctx().animate_value_with_time(ui.id().with((&doc.id,&l.id,"indent")),depth as f32*TREE_INDENT,duration);
-                let arrival=self.animation.arrival(&l.id,time);
-                let solo_opacity = self.solo_row_opacity(&l.id);
+                let offset=ui.ctx().animate_value_with_time(ui.id().with((&doc.id,l.id(),"position")),target,duration);
+                let indent=ui.ctx().animate_value_with_time(ui.id().with((&doc.id,l.id(),"indent")),depth as f32*TREE_INDENT,duration);
+                let arrival=self.animation.arrival(l.id(),time);
+                let solo_opacity = self.solo_row_opacity(l.id());
                 let row_opacity = arrival * solo_opacity;
                 let rect=Rect::from_min_size(base+Vec2::new((1.0-arrival)*14.0,offset),Vec2::new(width,42.0));
-                self.layer_rects.insert(l.id.clone(),rect);
-                let held=self.layer_drag.as_ref().is_some_and(|d|d.ids.contains(&l.id));
-                let response=ui.interact(rect,ui.id().with((&doc.id,&l.id,"row")),egui::Sense::click_and_drag());
-                if response.drag_started() && self.eye_sweep.is_none() && !self.rename_edit.as_ref().is_some_and(|edit| edit.layer == l.id) {
-                    if !self.selection_layers.contains(&l.id) {self.select_content(&l.id);}
+                self.layer_rects.insert(l.id().to_owned(),rect);
+                let held=self.layer_drag.as_ref().is_some_and(|d|d.ids.iter().any(|id|id==l.id()));
+                let response=ui.interact(rect,ui.id().with((&doc.id,l.id(),"row")),egui::Sense::click_and_drag());
+                if response.drag_started() && self.eye_sweep.is_none() && !self.rename_edit.as_ref().is_some_and(|edit| edit.layer == l.id()) {
+                    if !self.selection_layers.contains(l.id()) {self.select_content(l.id());}
                     let start=ui.input(|i|i.pointer.press_origin()).unwrap_or(rect.center());
-                    self.layer_drag=Some(LayerDrag {gesture:crate::engine::id(),id:l.id.clone(),revision:doc.revision,offset:start.y-rect.top(),target:index,ids:crate::tree::roots(doc,&self.selection_layers),commands:vec![]});
+                    self.layer_drag=Some(LayerDrag {gesture:crate::engine::id(),id:l.id().to_owned(),revision:doc.revision,offset:start.y-rect.top(),target:index,ids:crate::tree::roots_view(view,&self.selection_layers),commands:vec![]});
                 }
-                if response.clicked(){self.select_row(ui,doc,&l.id);}
-                let thumb=if l.kind=="group"{None}else{self.thumbnail(ui,doc,&l.id,false)};
-                let mask_thumb=if l.mask.is_some(){self.thumbnail(ui,doc,&l.id,true)}else{None};
+                if response.clicked(){self.select_row(ui,view,&original_order,l.id());}
+                let thumb=if l.kind()=="group"{None}else{self.thumbnail(ui,doc,l.id(),false)};
+                let mask_thumb=if l.mask().is_some(){self.thumbnail(ui,doc,l.id(),true)}else{None};
                 if held {
                     let gap=Rect::from_min_size(base+Vec2::new(0.0,target),Vec2::new(width,42.0));
                     ui.painter().line_segment([gap.left_top(),gap.right_top()],Stroke::new(2.0_f32,ACCENT));
-                    if self.layer_drag.as_ref().is_some_and(|d|d.id==l.id){floating=Some((l.clone(),thumb,depth));}
+                    if self.layer_drag.as_ref().is_some_and(|d|d.id==l.id()){floating=Some((l,thumb,depth));}
                 } else {
-                    let selected=self.selection_layers.contains(&l.id);
+                    let selected=self.selection_layers.contains(l.id());
                     let hover=ui.ctx().animate_bool_with_time(response.id.with("hover"),response.hovered(),0.08);
                     if selected {ui.painter().rect_filled(rect,5,Color32::from_rgb(74,48,71).gamma_multiply(solo_opacity));
                         ui.painter().rect_filled(Rect::from_min_size(rect.min+Vec2::new(0.0,5.0),Vec2::new(2.0,32.0)),1,ACCENT.gamma_multiply(solo_opacity));}
@@ -853,12 +901,12 @@ impl PeerBrush {
                         ui.painter().rect_filled(rect,5,AI_BLUE.gamma_multiply(pulse*solo_opacity));
                         ui.painter().rect_filled(Rect::from_min_size(rect.min+Vec2::new(0.0,4.0),Vec2::new(2.0,34.0)),1,AI_BLUE.gamma_multiply(solo_opacity));
                     }
-                    if drop_folder.as_deref()==Some(&l.id){ui.painter().rect_stroke(rect,4,Stroke::new(1.0_f32,ACCENT),egui::StrokeKind::Inside);}
-                    let disclosure=ui.scope_builder(egui::UiBuilder::new().id_salt(&l.id).max_rect(rect.shrink2(Vec2::new(4.0,4.0))),|ui| {
+                    if drop_folder.as_deref()==Some(l.id()){ui.painter().rect_stroke(rect,4,Stroke::new(1.0_f32,ACCENT),egui::StrokeKind::Inside);}
+                    let disclosure=ui.scope_builder(egui::UiBuilder::new().id_salt(l.id()).max_rect(rect.shrink2(Vec2::new(4.0,4.0))),|ui| {
                         ui.set_opacity(row_opacity);
                         self.layer_contents(ui,l,indent,thumb.as_ref(),mask_thumb.as_ref(),&tree)
                     }).inner;
-                    anchors.insert(l.id.clone(),TreeAnchor {disclosure,ai,opacity:row_opacity});
+                    anchors.insert(l.id().to_owned(),TreeAnchor {disclosure,ai,opacity:row_opacity});
                 }
                 // Child controls own their primary interactions. Test the clipped row
                 // directly for secondary clicks, including over those controls.
@@ -871,9 +919,9 @@ impl PeerBrush {
                 }
                 context_visible |= context_menu.as_ref().is_some_and(|root|root.id==response.id);
                 let response=response.on_hover_text(format!("{}\nClick to select · Ctrl/Cmd or Shift for multiple · Drag into folders · Drag left to move out · Right-click anywhere for options",tree.tooltip(l)));
-                context_menu.show(&response,|ui|self.layer_menu(ui,doc,l));
+                context_menu.show(&response,|ui|self.layer_menu(ui,doc,&doc.layers[index]));
             }
-            paint_tree_guides(ui.painter(),&preview,&anchors);
+            paint_tree_guides(ui.painter(),&tree,&anchors);
             if let (Some((layer,thumb,depth)),Some(pointer),Some(drag))=(floating,pointer,&self.layer_drag) {
                 let painter=ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Tooltip,ui.id().with("held layer")));
                 let rect=Rect::from_min_size(egui::pos2(base.x,pointer.y-drag.offset),Vec2::new(width,42.0));
@@ -882,9 +930,9 @@ impl PeerBrush {
                 painter.line_segment([rect.left_top(),rect.left_bottom()],Stroke::new(2.0_f32,ACCENT));
                 let x=rect.left()+75.0+depth as f32*TREE_INDENT;
                 let image_rect=Rect::from_min_size(egui::pos2(x,rect.top()+6.0),Vec2::splat(30.0));
-                if layer.kind=="group"{icons::paint(&painter,image_rect,Icon::Folder,true);}
+                if layer.kind()=="group"{icons::paint(&painter,image_rect,Icon::Folder,true);}
                 else if let Some(t)=thumb {painter.image(t.id(),image_rect,Rect::from_min_max(Pos2::ZERO,Pos2::new(1.0,1.0)),Color32::WHITE);}
-                let label=if drag.ids.len()>1 {format!("{}  +{}",layer.name,drag.ids.len()-1)}else{layer.name};
+                let label=if drag.ids.len()>1 {format!("{}  +{}",layer.name(),drag.ids.len()-1)}else{layer.name().to_owned()};
                 painter.text(egui::pos2(x+38.0,rect.center().y),egui::Align2::LEFT_CENTER,label,egui::FontId::proportional(12.0),Color32::WHITE);
                 if let Some(hint)=drop_hint {
                     let galley=painter.layout_no_wrap(hint,egui::FontId::proportional(11.0),ACCENT);
@@ -897,14 +945,14 @@ impl PeerBrush {
                 if let Some(drag)=self.layer_drag.take() {
                     if pointer.is_some_and(|p|ui.clip_rect().contains(p)) && !drag.commands.is_empty() {
                         let result=self.shared.lock().unwrap().edit("human",&drag.commands,Some(drag.revision),None,"Move layers");
-                        self.message=result.map(|_|"Move layers".into()).unwrap_or_else(|e|e);self.last_preview=None;
+                        self.message=result.map(|_|"Move layers".into()).unwrap_or_else(|e|e).into();self.last_preview=None;
                         if let Some(id)=drop_folder {self.collapsed.remove(&id);}
                     }
                 }
                 if let Some(sweep)=self.eye_sweep.take() {
                     let commands=sweep.ids.iter().map(|id|json!({"op":"layer.update","layer":id,"visible":sweep.visible})).collect::<Vec<_>>();
                     let result=self.shared.lock().unwrap().edit("human",&commands,Some(sweep.revision),None,"Layer visibility sweep");
-                    self.message=result.map(|_|"Layer visibility".into()).unwrap_or_else(|e|e);self.last_preview=None;
+                    self.message=result.map(|_|"Layer visibility".into()).unwrap_or_else(|e|e).into();self.last_preview=None;
                 }
             }
             ui.advance_cursor_after_rect(Rect::from_min_size(base,Vec2::new(width,ordered.len() as f32*46.0)));
@@ -1181,6 +1229,100 @@ mod tests {
                     assert_eq!(e.doc.export_png().unwrap(), before.export_png().unwrap());
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod native_metadata_tests {
+    use super::*;
+    #[test]
+    fn native_owned_tree_rows_and_metadata_controls_use_the_same_borrowed_snapshot() {
+        for depth in [8, 16] {
+            let ctx = egui::Context::default();
+            let mut doc = Document::new_depth(9, 7, depth).unwrap();
+            let folder = Layer::new("Native folder", "group", 9, 7);
+            doc.layers[0].name = "Native child".into();
+            doc.layers[0].parent = Some(folder.id.clone());
+            let child = doc.layers[0].id.clone();
+            doc.layers.insert(0, folder);
+            doc.ensure_depth();
+            let shared = Arc::new(std::sync::Mutex::new(crate::engine::Engine::new()));
+            shared.lock().unwrap().doc = doc.clone();
+            let mut app = PeerBrush::init(
+                &ctx,
+                shared,
+                crate::server::Connection {
+                    port: 0,
+                    token: String::new(),
+                    state_dir: Default::default(),
+                    instance_lock: None,
+                    availability: Default::default(),
+                },
+            );
+            app.selected = child.clone();
+            app.selection_layers = [child.clone()].into_iter().collect();
+            let pool = crate::large_document::ResidentBudget::new(16 * 1024 * 1024).unwrap();
+            let snapshot = crate::engine::view::DocumentSnapshot::from(
+                crate::tree::presentation_tests::native(&doc, &pool),
+            );
+            let owner = snapshot.clone();
+            let view = owner.view();
+            let admitted = pool.used();
+            let tree = TreeInfo::new(view, &app.selection_layers);
+            let mut visible = vec![];
+            rows(view, &tree.order, None, 0, &HashSet::new(), &mut visible);
+            assert_eq!(visible, vec![(0, 0), (1, 1)]);
+            assert_eq!(
+                tree.tooltip(view.layer(0).unwrap()),
+                "Native folder\n1 direct children · 1 total descendants\n1 selected inside"
+            );
+            assert_eq!(tree.path(&child), "Native folder / Native child");
+            app.set_solo(true);
+            app.sync_solo(view);
+            assert_eq!(
+                app.solo_caption(view).as_deref(),
+                Some("Solo Color · Native child")
+            );
+            app.begin_rename(view, &child);
+            assert_eq!(app.rename_edit.as_ref().unwrap().original, "Native child");
+            app.rename_edit = None;
+            app.selection_gesture_source = Some(app.selection_source(view));
+            assert!(!app.selection_gesture_stale(view));
+            let foreign = Document::new_depth(9, 7, depth).unwrap();
+            assert!(app.selection_gesture_stale(&foreign));
+            app.selection_gesture_source = None;
+            app.tool = Tool::Clone;
+            app.retouch_source = Some(super::super::retouch::Anchor {
+                project: view.id().to_owned(),
+                layer: child.clone(),
+                mask: false,
+                point: [2., 2.],
+                destination: None,
+            });
+            assert!(app.begin_retouch(view, [4., 3.]));
+            assert_eq!(app.retouch_revision, Some(view.revision()));
+            app.retouch_source.as_mut().unwrap().layer = "foreign layer".into();
+            assert!(!app.begin_retouch(view, [4., 3.]));
+            assert!(app.retouch_source.is_none());
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    for &(index, depth) in &visible {
+                        app.layer_contents(
+                            ui,
+                            view.layer(index).unwrap(),
+                            depth as f32 * TREE_INDENT,
+                            None,
+                            None,
+                            &tree,
+                        );
+                    }
+                    app.layer_footer(ui, view.layer(1).unwrap());
+                });
+            });
+            assert_eq!(pool.used(), admitted);
+            assert_eq!(view.depth(), depth);
+            assert_eq!(view.revision(), 0);
         }
     }
 }

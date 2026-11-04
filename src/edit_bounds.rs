@@ -1,4 +1,10 @@
 //! Raster edits use document coordinates, independently of transformed content bounds.
+#[path = "edit_bounds/input.rs"]
+pub(crate) mod input;
+#[path = "edit_bounds/native.rs"]
+pub(crate) mod native;
+#[path = "edit_bounds/output.rs"]
+pub(crate) mod output;
 use crate::{engine::Document, raster::check_size};
 use serde_json::Value;
 
@@ -114,6 +120,7 @@ pub(crate) fn prepare(doc: &mut Document, c: &Value) -> Result<(), String> {
         }
         pixels
     };
+    crate::fill::materialize_visual_layer(&mut doc.layers[index])?;
     let layer = &mut doc.layers[index];
     layer.pixels = shift(&layer.pixels);
     if let Some(mask) = &mut layer.mask {
@@ -123,13 +130,14 @@ pub(crate) fn prepare(doc: &mut Document, c: &Value) -> Result<(), String> {
         }
     }
     if let Some(source) = &mut layer.source {
+        let source = std::sync::Arc::make_mut(source);
         source.prepend([1., 0., 0., 1., dx as f32, dy as f32]);
     }
     for effect in &mut layer.effects {
         if effect.kind == "liquify" {
             crate::geometry::map_effect(
                 &effect.kind,
-                &mut effect.settings,
+                std::sync::Arc::make_mut(&mut effect.settings),
                 [1., 1.],
                 [dx, dy],
                 true,

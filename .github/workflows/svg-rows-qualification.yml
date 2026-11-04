@@ -1,0 +1,38 @@
+name: SVG row renderer qualification
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  exact-primitive-oracle:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-26, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      SVG_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Require exact candidate source head
+        shell: bash
+        run: |
+          python -I - <<'PY'
+          import os, re, subprocess
+          expected = os.environ['SVG_SOURCE_SHA']
+          if not re.fullmatch('[0-9a-f]{40}', expected):
+              raise SystemExit('Require an exact candidate source SHA.')
+          actual = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          if actual != expected:
+              raise SystemExit('Renderer qualification checkout differs from the candidate source.')
+          print('Renderer qualification source: ' + actual)
+          PY
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # Rust1.92.0
+        with:
+          toolchain: 1.92.0
+      - name: Compare independent registry renderer and bounded rows exactly
+        run: python -B scripts/test_svg_rows.py

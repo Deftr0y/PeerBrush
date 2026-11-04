@@ -7,8 +7,9 @@ import pathlib
 import plistlib
 import re
 import shutil
+import stat
 import zipfile
-from package import source_files, portable_files, architecture_from_stream, git, relative_path, validate_binary, equivalent_build_inputs, policy_from_sources
+from package import source_files, portable_files, architecture_from_stream, git, relative_path, validate_binary, equivalent_build_inputs, policy_from_sources, MACOS_RESOURCES, macos_info, binary_build_info, macos_sparkle_required, macos_installed_release_required, macos_installed_release, MACOS_INSTALLED_RELEASE
 
 
 MACOS_SIGNING_FILES = frozenset({
@@ -91,8 +92,11 @@ def inspect_archive(path, commit, version, source_root=None, selected_sources=No
             raise ValueError('Ambiguous duplicate release entries')
         for item in archive.infolist():
             name = relative_path(item.filename)
-            if item.external_attr >> 16 & 0o170000 not in [0, 0o100000]:
-                raise ValueError('Release entries must be regular files')
+            if item.external_attr >> 16 & 0o170000 == 0o120000:
+                from sparkle_bundle import validate_link
+                validate_link(item.filename[len(prefix):], archive.read(item), expected_source)
+            elif item.external_attr >> 16 & 0o170000 not in [0, 0o100000]:
+                raise ValueError('Release entries must be regular files or exact pinned Sparkle links')
             if not item.filename.startswith(prefix) or '..' in name.parts or '\\' in item.filename:
                 raise ValueError('Invalid release archive path')
             if name.name in ['connection.json', 'recovery.psd', '.env'] or '.git' in name.parts or '.runtime' in name.parts:
@@ -129,6 +133,29 @@ def inspect_archive(path, commit, version, source_root=None, selected_sources=No
                 raise ValueError('Launcher differs from selected source')
         if platform == 'macOS':
             expected_entries.add('PeerBrush.app/Contents/Info.plist')
+            if 'assets/peerbrush.icns' in expected_source and manifest.get('macos_bundle_resources') != 1:
+                raise ValueError('Missing required installed macOS resources')
+            if manifest.get('macos_bundle_resources') is not None:
+                if manifest['macos_bundle_resources'] != 1:
+                    raise ValueError('Unsupported macOS bundle resource layout')
+                expected_entries.update(MACOS_RESOURCES + name for name in ['PeerBrush.icns', 'LICENSE', 'THIRD_PARTY_NOTICES.md', *notices])
+            installed_source = macos_installed_release_required(selected_sources)
+            if installed_source != (type(manifest.get('macos_installed_release')) is int
+                                    and manifest['macos_installed_release'] == 1) or (
+                    'macos_installed_release' in manifest and not installed_source):
+                raise ValueError('Installed macOS source layout must match the committed source')
+            if installed_source:
+                expected_entries.update(MACOS_RESOURCES + name for name in [MACOS_INSTALLED_RELEASE, manifest['source']])
+        sparkle_required = platform == 'macOS' and macos_sparkle_required(selected_sources)
+        if sparkle_required != (type(manifest.get('macos_sparkle_layout')) is int and manifest.get('macos_sparkle_layout') == 1):
+            raise ValueError('macOS Sparkle layout must match the exact committed source contract')
+        if manifest.get('macos_sparkle_layout') is not None:
+            if not sparkle_required or manifest['macos_sparkle_layout'] != 1:
+                raise ValueError('Unsupported macOS Sparkle layout')
+            from sparkle_bundle import inspect_members, NOTICE
+            expected_entries.update(inspect_members(archive, prefix, expected_source, bool(signing_suffix)))
+            if notices.get(NOTICE) != sha(expected_source['packaging/sparkle/LICENSE']):
+                raise ValueError('Missing exact Sparkle upstream/external notice')
         expected_entries.update(validate_signing_metadata(manifest, archive, prefix, signing_suffix))
         if set(archive.namelist()) != {prefix + name for name in expected_entries}:
             raise ValueError('Unexpected or missing release entries')
@@ -145,19 +172,45 @@ def inspect_archive(path, commit, version, source_root=None, selected_sources=No
             raise ValueError('Missing executable permissions')
         if platform == 'macOS':
             info = plistlib.loads(archive.read(prefix + 'PeerBrush.app/Contents/Info.plist'))
-            if info.get('CFBundleShortVersionString') != version or info.get('CFBundleExecutable') != 'peerbrush' or info.get('CFBundleIdentifier') != 'com.peerbrush.PeerBrush' or info.get('CFBundlePackageType') != 'APPL':
+            short_version = macos_info(version)['CFBundleShortVersionString'] if manifest.get('macos_bundle_resources') == 1 else version
+            if info.get('CFBundleShortVersionString') != short_version or info.get('CFBundleExecutable') != 'peerbrush' or info.get('CFBundleIdentifier') != 'com.peerbrush.PeerBrush' or info.get('CFBundlePackageType') != 'APPL':
                 raise ValueError('macOS app bundle version or executable mismatch')
+            if manifest.get('macos_bundle_resources') == 1:
+                from sparkle_bundle import CHECK_MARKER, check_pins
+                pins = check_pins(expected_source, version) if sparkle_required else None
+                check_layout = CHECK_MARKER in expected_source.get('src/sparkle.rs', b'')
+                if info != macos_info(version, sparkle=sparkle_required, check_pins=pins, check_layout=check_layout):
+                    raise ValueError('macOS document consent, icon or bundle metadata differs from source')
+                if archive.read(prefix + MACOS_RESOURCES + 'PeerBrush.icns') != expected_source['assets/peerbrush.icns']:
+                    raise ValueError('macOS icon differs from committed artwork')
+                for name in ['LICENSE', 'THIRD_PARTY_NOTICES.md', *notices]:
+                    if archive.read(prefix + MACOS_RESOURCES + name) != archive.read(prefix + name):
+                        raise ValueError('macOS installed license/notices differ from the verified distribution')
         if 'GNU GENERAL PUBLIC LICENSE' not in archive.read(prefix + 'LICENSE').decode('utf-8'):
             raise ValueError('Missing GPL license')
         if not any(n.startswith(prefix + 'licenses/') for n in archive.namelist()):
             raise ValueError('Missing third-party license notices')
         executable = archive.read(prefix + manifest['executable'])
         validate_binary(executable)
+        if platform == 'Windows':
+            from windows_version import check
+            check(executable, version, selected_sources, manifest)
+        if policy_from_sources(selected_sources)['version'] == 2:
+            info = binary_build_info(executable, version, original_commit)
+            if manifest.get('build_info') != info:
+                raise ValueError('Release manifest differs from actual embedded build provenance')
         if architecture_from_stream(io.BytesIO(executable), platform) != expected_arch[platform]:
             raise ValueError('Executable architecture does not match the release manifest')
         source = archive.read(prefix + manifest['source'])
         if sha(executable) != manifest['executable_sha256'] or sha(source) != manifest['source_sha256']:
             raise ValueError('Executable/source checksum mismatch')
+        if platform == 'macOS' and installed_source:
+            identity = archive.read(prefix + MACOS_RESOURCES + MACOS_INSTALLED_RELEASE)
+            enclosed = archive.getinfo(prefix + MACOS_RESOURCES + manifest['source'])
+            if (len(identity) > 4096 or enclosed.file_size > 128 * 1024 * 1024
+                    or identity != (json.dumps(macos_installed_release(manifest), indent=2) + '\n').encode()
+                    or archive.read(enclosed) != source):
+                raise ValueError('Installed macOS identity/source differs from the verified distribution')
         with zipfile.ZipFile(io.BytesIO(source)) as sources:
             if sum(i.file_size for i in sources.infolist()) > 512 * 1024 * 1024:
                 raise ValueError('Source archive exceeds the inspection budget')
@@ -217,7 +270,7 @@ def verify(directory, commit, version, output, source_root=None):
     source_name = f'PeerBrush-{version}-source{correction}.zip'
     (output / source_name).write_bytes(source_bytes)
     records.append({'file': source_name, 'bytes': len(source_bytes), 'sha256': sha(source_bytes)})
-    (output / ('SHA256SUMS' + correction)).write_text(''.join(f"{r['sha256']}  {r['file']}\n" for r in records), encoding='utf-8')
+    (output / ('SHA256SUMS' + correction)).write_text(''.join(f"{r['sha256']}  {r['file']}\n" for r in records), encoding='utf-8', newline='\n')
     (output / ('release-inventory' + correction + '.json')).write_text(json.dumps({'schema': 1, 'version': version, 'commit': commit, 'binary_source_commit': binary_commit, 'packaging_correction': correction or None, 'assets': records}, indent=2) + '\n', encoding='utf-8')
     print(f'Verified three matching PeerBrush {version} archives and source from {commit}')
 

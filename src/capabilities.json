@@ -3,17 +3,53 @@
   "coordinates": "Document pixels. rect=[left,top,right,bottom], right/bottom exclusive.",
   "brush_library": {
     "tool": "peerbrush_brushes",
-    "actions": ["list", "preview", "save", "delete"],
+    "actions": [
+      "list",
+      "preview",
+      "save",
+      "delete"
+    ],
     "presets": "26 original procedural presets, with Basic first: Hard Round, Soft Round, Pencil, Ink Pen and Airbrush; followed by Sketch, Ink, Paint, Airbrush, Texture and Blend. List returns stable IDs and complete shared settings. Paint/smudge/clone/heal accepts preset:ID; explicit settings override it before reservation scopes are checked.",
     "custom": "Instance-local brushes.json, outside document history and PSD sources. save without id creates a custom brush; id updates only an existing custom brush. Curated brushes are immutable. Maximum 256 custom brushes/4 MiB; invalid or externally changed files are preserved and writes refused.",
-    "preview": "Actual shared-engine pressure stroke PNG, 64–512 by 24–128, coordinate_space brush_preview and rect [0,0,width,height]. This rectangle is not a document placement.",
-    "pressure_gamma": "0.1–4, default 1 (linear). response = clamp((pressure-pressure_min)/(pressure_max-pressure_min),0,1)^gamma before size/opacity and taper. pressure_min/max are 0–1, default 0/1, minimum gap 0.01. Below 1 responds more at light force; above 1 needs more force. Native16 and mouse taper remain unchanged.",
-    "example": {"op":"paint","layer":"ID","preset":"brush-pen","radius":12,"points":[[20,30],[100,50]],"pressures":[0.2,0.9],"color":[240,100,30,255]},
+    "preview": "Actual shared-engine pressure stroke PNG, 64\u2013512 by 24\u2013128, coordinate_space brush_preview and rect [0,0,width,height]. This rectangle is not a document placement.",
+    "pressure_gamma": "0.1\u20134, default 1 (linear). response = clamp((pressure-pressure_min)/(pressure_max-pressure_min),0,1)^gamma before size/opacity and taper. pressure_min/max are 0\u20131, default 0/1, minimum gap 0.01. Below 1 responds more at light force; above 1 needs more force. Native16 and mouse taper remain unchanged.",
+    "example": {
+      "op": "paint",
+      "layer": "ID",
+      "preset": "brush-pen",
+      "radius": 12,
+      "points": [
+        [
+          20,
+          30
+        ],
+        [
+          100,
+          50
+        ]
+      ],
+      "pressures": [
+        0.2,
+        0.9
+      ],
+      "color": [
+        240,
+        100,
+        30,
+        255
+      ]
+    },
     "limits": "Five procedural tips; no proprietary brush assets or .brush/.brushset import. Blend settings operate on existing pigment through smudge; ordinary paint uses the same tip/coverage settings."
   },
   "ai_proposals": {
     "tool": "peerbrush_proposal",
-    "actions": ["create", "list", "preview", "accept", "reject"],
+    "actions": [
+      "create",
+      "list",
+      "preview",
+      "accept",
+      "reject"
+    ],
     "behavior": "Optional frozen native-depth drafts. Direct peerbrush_edit remains available. Create requires document_id and expected_revision. Preview returns actual PNG content, document_rect and preview_only:true. Human acceptance commits the reviewed result as one AI-authored history step; changed sources, reservations and ended tasks reject acceptance.",
     "limits": "Four pending drafts, 256 MiB additional unique native raster tiles, 100 commands/8 MiB per draft, 15-minute expiry, 16 transient metadata records. No proposals are saved in PSD or recovery files. Task-bound drafts require their reservation to remain active.",
     "task_recovery": "peerbrush_task action recovery returns active tasks and up to 100 recent ended/expired/taken-over task records with scopes. Committed edits remain; no automatic rollback or reservation restart. Use selective task undo for an explicit compensation."
@@ -71,7 +107,8 @@
       "SVGZ"
     ],
     "export": [
-      "PNG"
+      "PNG",
+      "WebP"
     ]
   },
   "commands": [
@@ -867,7 +904,7 @@
     ],
     "empty": "Active zero-coverage selection; selection=null means deselected.",
     "object_region": "Deterministic perimeter-color extraction. Use peerbrush_segment for learned subject/object confidence.",
-    "refinement": "selection.refine and mask.refine accept smooth 0–32 px, feather 0–64 px, shift -32–32 px, contrast 0–100%, edge 0–100% and edge_radius 1–32 px. Image-guided feathering uses merged colors by default; sample_merged:false and layer select one source. Native16 mask words and original mask steps remain intact. source_revision/document_id protect snapshot-dependent results.",
+    "refinement": "selection.refine and mask.refine accept smooth 0\u201332 px, feather 0\u201364 px, shift -32\u201332 px, contrast 0\u2013100%, edge 0\u2013100% and edge_radius 1\u201332 px. Image-guided feathering uses merged colors by default; sample_merged:false and layer select one source. Native16 mask words and original mask steps remain intact. source_revision/document_id protect snapshot-dependent results.",
     "mask_from_selection": "mask.from_selection on a layer maps document coverage into its native local mask frame. mode replace/add/subtract/intersect; one undoable editable paint step.",
     "confidence_import": "selection.import accepts one PNG path or base64 png, an explicit in-canvas document rect, channel luma/alpha and selection mode. Bilinear confidence resampling preserves soft edges. Maximum document/mask size 16 megapixels; original image channels stay unchanged.",
     "preview": "peerbrush_observe selection_view cutout/mask/overlay returns presentation-only PNG feedback with actual document coordinates."
@@ -890,7 +927,7 @@
       ],
       "mode": "replace"
     },
-    "limits": "One inference at a time, 2048-pixel preview edge, 16-megapixel document, 16 MiB JSON input/output and configurable 1–180 second timeout. Source revision/project changes cancel the result; leases and history use the shared engine."
+    "limits": "One inference at a time, 2048-pixel preview edge, 16-megapixel document, 16 MiB JSON input/output and configurable 1\u2013180 second timeout. Source revision/project changes cancel the result; leases and history use the shared engine."
   },
   "retouch": {
     "commands": [
@@ -901,7 +938,7 @@
     "guards": "Optional document_id and exact source_revision reject stale or different source documents. Shared expected_revision, task reservations and locks apply.",
     "mask": "mask:true writes the active paint mask step. Source is evaluated layer mask or explicit source_step paint ID. No merged artwork into masks.",
     "precision": "Native16 source samples, premultiplied fractional interpolation and grayscale values remain native16. Heal preserves destination alpha and transparent hidden pixels.",
-    "limits": "Merged sampling 16 MP; heal_radius integer 1–64 (default brush radius clamped 1–32). Brush work budgets apply.",
+    "limits": "Merged sampling 16 MP; heal_radius integer 1\u201364 (default brush radius clamped 1\u201332). Brush work budgets apply.",
     "algorithm": "Clone copies sampled color/alpha through brush coverage. Heal transfers texture with local average color adaptation; not full Photoshop healing."
   },
   "document_geometry": {
@@ -933,12 +970,84 @@
       "transform",
       "move"
     ],
-    "behavior": "Whole-layer rotation/scaling accumulate affine placement and regenerate current raster/mask projections from retained native originals, avoiding repeated filtering across gestures. Move does not resample. Hidden folder descendants share the pivot.",
-    "observation": "Layer and mask step transform_source contain original width/height/bit_depth/bytes and matrix=[a,b,c,d,tx,ty] mapping original local coordinates to the current frame, or null. No tile samples in observations.",
+    "behavior": "Whole-layer rotation/scaling/skew and explicit projective placement accumulate one map and regenerate current native raster/mask projections from retained originals, avoiding repeated filtering across gestures. Move does not resample. Hidden folder descendants share the map and pivot.",
+    "observation": "Layer and mask step transform_source contain original width/height/bit_depth/bytes and matrix=[a,b,c,d,tx,ty], or null. Optional projective is a row-major nine-coefficient original-local homography applied before matrix. Optional warp_stages is the bounded exact before-homography/grid chain applied before that final placement. Absent nonlinear maps retain the exact affine schema. No tile samples in observations.",
     "pixel_edits": "Painting, clone/heal, fill, direct adjustments, image replacement and selected-pixel edits establish a new baseline for only the changed raster. Other mask/color originals and effects remain editable. Image resize and explicit channel-depth conversion establish raster baselines; crop/canvas retain sources.",
-    "psd": "Supplementary format 9 retains originals alongside current standard raster/mask channels and merged composite. Older readers protect newer sources. Photoshop receives raster layers, not Smart Objects.",
+    "psd": "Supplementary format 9 retains affine originals; format 32 is required for any projective Color or mask original, format 33 for any retained Warp stage. Current standard raster/mask channels and merged composite remain present. Older readers protect newer sources. Photoshop receives raster layers, not Smart Objects.",
     "limits": "Current plus original tiles count against 512 MiB document memory. 8192 per edge, 32 MP, 128 million output samples per layer command; singular/nonfinite/out-of-range/nested sources refused atomically.",
-    "guards": "Shared engine/UI/MCP/CLI reservations, locks, document_id/source_revision and one undo per gesture. Use selection_only:false for whole-layer transforms when a selection exists."
+    "guards": "Shared engine/UI/MCP/CLI reservations, locks, document_id/source_revision and one undo per gesture. Use selection_only:false for whole-layer transforms when a selection exists.",
+    "translation": {
+      "fields": [
+        "dx",
+        "dy"
+      ],
+      "pixels": [
+        -100000,
+        100000
+      ],
+      "default": 0,
+      "rounding": "Round to whole document pixels by default; snap:true uses the existing 8-pixel grid. A strict boolean fractional_translation:true opts transform commands into fractional dx/dy within the same bounds; absent/false preserves legacy arithmetic and move remains integer.",
+      "behavior": "Translation follows the affine placement in the same source-sampling pass, including selected coverage, masks and editable sources; no separate selected-pixel cut."
+    },
+    "skew": {
+      "fields": [
+        "skew_x",
+        "skew_y"
+      ],
+      "degrees": [
+        -80,
+        80
+      ],
+      "default": 0,
+      "order": "Horizontal shear then vertical shear, then scale/reflection and rotation, around the document-space pivot. Each angle contributes tan(degrees); positive X moves the bottom right, positive Y moves the right edge down.",
+      "snap": "Explicit skew fields snap to the existing 15-degree grid when snap:true; raw bounds still apply.",
+      "targets": "Whole or selected raster layer/folder, linked/unlinked painted masks and exact scalar coverage; current editable-source and mask-effect restrictions apply.",
+      "selection_pixels": true,
+      "selection": "Selected color/mask pixels and soft/hole coverage use one original-sampling pass with the same horizontal-then-vertical shear, scale/reflection, rotation and posttranslation. Omit selection_only or pass true for selected pixels; false keeps selection geometry unchanged while transforming the whole target.",
+      "limits": "Skew is affine; explicit projective placement and coarse control-grid Warp are separate shared command fields."
+    },
+    "projective": {
+      "field": "Optional strict transform.projective={rect:[left,top,right,bottom],quad:[[TLx,TLy],[TRx,TRy],[BRx,BRy],[BLx,BLy]]}; document pixels, no unknown fields.",
+      "order": "The source rect maps to the convex same-winding quad first, then existing affine skew/scale/mirrors/rotation and posttranslation apply once. Missing pivot defaults to rect center for nonidentity projective commands; explicit pivot is shared by all targets. Quad coordinates are exact; snap only resolves existing affine fields.",
+      "targets": "Whole or selected native raster Color, linked/unlinked painted masks, explicit paint steps and hidden raster folder descendants. Editable text/vector and adjustment children require explicit native-precision rasterization; existing editable-source mask and mask-effect restrictions remain.",
+      "guards": "Full composed retained-original frame must avoid the projective horizon, including hidden RGB/off-frame samples. Folded, unstable, nonfinite, oversized and over-budget maps reject atomically. Shared source/revision, locks, reservations, preview and undo rules apply.",
+      "precision": "One inverse sample of each original at native8/16; selected feather/hole coverage uses the same inverse as scalar coverage. Selected edits establish a raster baseline as before. Omitted/exact identity projective preserves legacy affine arithmetic and serialization.",
+      "source_format": 32,
+      "limits": "Shared native UI/engine/MCP/CLI operation. Native desktop/receiving-application acceptance remains pending. No Photoshop projective metadata equivalence is claimed."
+    },
+    "warp": {
+      "field": "Optional strict transform.warp={rect:[left,top,right,bottom],points:[[x0,y0],...,[x8,y8]]}, nine row-major 3x3 control points in document pixels; or exactly {rect,preset,amount} with preset arc/bulge/flag and amount -0.25..0.25. No unknown fields. move rejects Warp.",
+      "geometry": "Coarse continuous piecewise-affine grid: each of four cells has the fixed top-left to bottom-right diagonal, eight triangles total. Positive conditioned triangles, non-overlapping topology and complete interpolation-support coverage are required. This is not a smooth Bezier/Photoshop Warp model.",
+      "order": "One shared A*P*W command: grid first, then projective, then existing affine/translation. Explicit pivot wins; otherwise projective rect center, then Warp rect center. Snap affects existing affine values, not grid points. Distort/Perspective guides use their explicit projection frame when Warp is active.",
+      "targets": "Native8/16 whole or selected raster Color, linked/unlinked painted masks, an explicit paint step and hidden raster folder descendants. Editable sources and adjustment children retain explicit native-precision rasterize guidance and existing mask-effect restrictions.",
+      "retention": "Whole targets retain one original plus at most 16 exact grid stages, with each preceding placement and a final affine/projective placement. Ordinary affine/projective changes do not consume stages. All inverses run before one original sample. At the limit, undo an earlier Warp or cancel; no silent baking. Selected edits establish their existing raster baseline.",
+      "selection": "Polygon edges split at every crossed fixed-grid seam before transformation; scalar feather/hole coverage uses the same inverse as native Color/masks. Outside-grid or horizon failure stays invalid through the whole inverse chain, becoming transparent only at final sampling.",
+      "guards": "Grid must cover full retained original and bilinear support, including off-frame masks/hidden samples. Per polygon 8192 vertices and 131072 seam candidates; mapping cost area*rasters*(1+9*stages+vertices) <=128 million before output allocation. Existing 8192-edge/32MP/native memory/locks/source/revision/reservations/atomic batch guards remain. Omitted/exact identity Warp uses the unchanged legacy path.",
+      "source_format": 33,
+      "limits": "Bounded coarse grid, not arbitrary mesh topology, Bezier controls or Photoshop preset/metadata equivalence. The mapping budget is a work bound, not total process RAM. Native interaction and platform acceptance remain separate."
+    }
+  },
+  "free_transform": {
+    "native_ui": "Layer > Free Transform or Ctrl/Cmd+T; right-click the unobscured canvas for modes and flips",
+    "modes": [
+      "move",
+      "scale",
+      "rotate",
+      "skew",
+      "mirror",
+      "distort",
+      "perspective",
+      "grid_warp"
+    ],
+    "commands": "One guarded shared transform per target combines grid Warp, projective corners, affine values and dx/dy in one A*P*W original sample. Pure movement stays move, including saved text with unavailable fonts.",
+    "preview": "Actual shared-engine native8/16 result; Apply/Enter commits one undo only after the current preview is rendered. Handle release and mode changes remain pending.",
+    "cancellation": "Cancel/Escape, focus loss, changed source or target cancel the draft without rebasing; Save/close/update restart require Apply or Cancel.",
+    "reference_point": "Enter or drag before or after an adjustment. Moving only the reference preserves exact commands and rendered pixels; later affine values use the chosen document-space reference in one original-sampling command, with explicit fractional posttranslation when needed. User values snap before reference compensation; Reset clears the pending transform.",
+    "skew_handles": "The compact Skew mode exposes X handles at the top/bottom edge centers and Y handles at the left/right centers. Drag changes the corresponding shared horizontal-then-vertical shear about the current reference, including existing rotation, scale and mirrors. Shift uses fifteen-degree snapping. Release and switching back to Move/Rotate/Scale keep the same pending command and actual rendered preview; no new engine operation or source format.",
+    "projective_handles": "Distort drags one corner; Shift constrains its axis. Perspective drags a symmetric edge pair; Shift selects the vertical pair. Exact document X/Y corner entry is independent. Existing affine fields apply after the quad; mode changes and release retain one pending command. Invalid quads remain editable with Apply disabled. The controls scroll vertically on short windows.",
+    "limits": "Selected raster transforms follow the current selection by default; Whole target (keep selection) is explicit. Editable text/vector projective or Warp changes require native-precision rasterization. Grid Warp is a bounded coarse grid, without Bezier or Photoshop preset/metadata equivalence. Native visible interaction acceptance remains pending.",
+    "context_menu": "Right-click the canvas for Move/Scale/Rotate/Skew/Distort/Perspective/Grid Warp and horizontal/vertical flips in the same pending session. Mode changes preserve exact commands. Escape closes this menu first; outside dismissal cannot start a transform. Alt/Space/middle navigation, numeric typing and floating-window occlusion retain their input guards.",
+    "warp_controls": "Coarse 3 by 3 grid with straight segments between nodes, Arc/Bulge/Flag presets and exact document X/Y fields. Nodes use inverse A*P, not inverse Warp. Ordinary guides use full seam-split A*P*W; Distort/Perspective controls retain their A(quad) projection plane. Folded grids remain repairable with Apply disabled. Whole target retains the exact Grid/A/P and shared admission may reject insufficient coverage; Reset Warp fits a fresh current-target grid while preserving other transform settings."
   },
   "editable_sources": {
     "commands": [
@@ -947,22 +1056,36 @@
       "source.rasterize"
     ],
     "observation": "Each layer exposes its complete source definition or null. Preserve current width/height/matrix when editing content.",
-    "text": "Bundled Ubuntu Sans regular/medium/semibold, explicit multiline plain text, kerning, size, line_height, left/center/right alignment, native RGBA16 color. Missing glyphs or scripts needing shaping/bidi are refused.",
+    "text": "Text/T retains editable fields, bundled Ubuntu Sans or exact installed static-outline fonts, explicit newlines, size/line_height/letter_spacing, alignment and native RGBA16. Omitted layout is legacy and never silently reflows; explicit layout:shaped enables exact-font ligatures/combining/script+bidi layout through native outlines. No automatic wrapping or font substitution. Loading/missing/changed/unsupported states are explicit.",
     "shapes": "Rectangle, ellipse, or straight-segment path with editable points, even-odd fill, open/closed flag, stroke and stroke_width. Native RGBA16 fill/stroke colors.",
     "svg": "Self-contained static UTF-8 SVG/SVGZ retains original markup and editable affine placement. Paths/curves, basic shapes, groups, solid colors, linear/radial gradients, local use and clip paths are supported. Text must be outlined; raster images, filters, masks, patterns, stylesheets, scripts/animation, external resources and unknown visual properties reject. SVG coverage/colors project through RGBA8, promoted for native16 projects; existing native16 raster channels remain exact. image.import retains the definition; image.place and external image-file paste rasterize it.",
-    "coordinates": "Source width/height define original local frame. x/y on add are document origins. Optional matrix=[a,b,c,d,tx,ty] maps original coordinates to current raster frame, identity by default.",
-    "precision": "Native text/shapes use colors 0–65535 regardless of document depth; native16 projections preserve words and sub-byte antialias coverage. 8-bit documents project at their own boundary. SVG uses the explicitly described RGBA8 projection while retaining its original markup.",
+    "coordinates": "Source width/height define local frame. x/y on add are document origins. Optional matrix=[a,b,c,d,tx,ty] maps local coordinates to current raster frame, identity by default. source.update may resize a Text field, preserving document placement, native masks and effects; the projection retains its previous extent. Read the updated source/frame from observation. Other source kinds keep their fixed-frame update restriction.",
+    "precision": "Native text/shapes use colors 0\u201365535 regardless of document depth; native16 projections preserve words and sub-byte antialias coverage. 8-bit documents project at their own boundary. SVG uses the explicitly described RGBA8 projection while retaining its original markup.",
     "guards": "Complete-layer transforms preserve definitions; selected-pixel/mask transforms require explicit rasterization. Color painting/placement refuses source layers. Mask painting and effects remain editable. Shared stale/revision/lock/reservation guards are atomic.",
-    "psd": "Private source format 8 supports native text/shapes; SVG requires format 12. Both supplement current standard raster/mask channels and merged composite. Photoshop receives raster layers, not native type/vector objects. Unsupported imported Photoshop features remain protected.",
-    "limits": "4 MP original source frame. Native text/shapes: 4096 characters / 96 lines, size 1–1024, line_height 0.5–4, 128 path points, stroke_width 0–256, 32 million outline/path work budget. SVG: 512 KiB UTF-8 markup, 1 MiB compressed SVGZ, 4096 XML nodes, bounded reference expansion, geometry, nesting, render work and memory. External resource resolvers are disabled."
+    "psd": "Private source format 8 supports native text/shapes; SVG requires format 12; nonzero text letter_spacing requires format 30; installed-font references require format 31; explicit shaped text requires format 34. All supplement current standard raster/mask channels and merged composite. Photoshop receives raster layers, not native type/vector objects. Unsupported imported Photoshop features remain protected.",
+    "limits": "4 MP original source frame. Native text/shapes: 4096 characters / 96 lines / 16384 shaped glyphs, shaped coordinates \u00b1100000, size 1\u20131024, line_height 0.5\u20134, letter_spacing -1024\u20131024, 128 path points, stroke_width 0\u2013256, 32 million outline/path work budget. Text field resizing additionally enforces raster, coordinate, mask and native work budgets. SVG: 512 KiB UTF-8 markup, 1 MiB compressed SVGZ, 4096 XML nodes, bounded reference expansion, geometry, nesting, render work and memory. External resource resolvers are disabled.",
+    "text_layout": {
+      "default": "legacy",
+      "values": [
+        "legacy",
+        "shaped"
+      ],
+      "ui": "Ligatures and joining",
+      "shaped": "Horizontal bidi visual runs with resolved script itemization, exact face-index font bytes, font-unit advances/offsets scaled by native font height; left/center/right align full advances including spaces. Cluster tracking keeps ligatures/marks; joining/complex scripts require zero letter spacing. Join controls/default ignorables shape invisibly; unsupported actual glyph/outline/variation, explicit bidi formatting controls, non-newline controls and over-budget output reject.",
+      "limits": "No automatic paragraph wrapping, language override, vertical text, rich text or Photoshop type objects; native installed-font and visible interaction acceptance remain pending."
+    }
   },
   "large_documents": {
     "document_actions": [
       "open",
       "open_async",
-      "cancel_open"
+      "cancel_open",
+      "save",
+      "save_async",
+      "cancel_save"
     ],
-    "progress": "observe state.loading stage/completed/total and state.file_status; no partial editable document is exposed",
+    "progress": "Observe state.loading stage/completed/total and state.file_status; no partial editable document is exposed. Working Save exposes state.saving run/document_id/revision/stage/completed/total/can_cancel/cancel_requested/finished/error; retained terminal status belongs to that exact run.",
+    "save": "save remains synchronous. save_async requires observed document_id/expected_revision; cancel_save requires the exact observed run. Cooperative cancellation is accepted before atomic publication, preserving current work and destination; late cancellation returns cancel_accepted:false while publication/readback completes. Existing full effect/composite preparation, backup and OS operations may finish before cancellation is observed. Native UI Save and close-save use the same shared control.",
     "decoder": "Row-to-native-tile raw/RLE/ZIP/predicted composites and color channels, cancellable section reads, bounded saved-image preview, direct validated PeerBrush source restoration",
     "rendering": "Coarse shared-engine frame before detailed native preview; revision/view guards; native sources remain 8/16-bit",
     "disk_cache": {
@@ -975,8 +1098,8 @@
   "channel_clamp": {
     "settings": {
       "channel": "r, g, b or o (opacity); default r",
-      "minimum": "0–1, default 0",
-      "maximum": "0–1, default 1; must be at least minimum"
+      "minimum": "0\u20131, default 0",
+      "maximum": "0\u20131, default 1; must be at least minimum"
     },
     "processing": "Clamp one channel at native 8/16-bit precision; in-range values and other channels remain exact; stack instances for independent bounds",
     "sources": "Layer and isolated folder color stacks; original pixels retained; shared preview, strength, bypass, removal, undo and source/reservation guards",
@@ -985,7 +1108,7 @@
   },
   "posterize": {
     "settings": {
-      "levels": "Integer 2–256, default 4"
+      "levels": "Integer 2\u2013256, default 4"
     },
     "channels": "RGB only; alpha and editable source pixels are preserved",
     "processing": "Nearest evenly spaced channel levels at native 8/16-bit depth; strength interpolates before/after at native precision",
@@ -1021,5 +1144,20 @@
     "coworking": "Blue scopes and description appear before execution. Scope/lock/reservation/task checks repeat before one commit. Native AI tasks Cancel, protocol cancel, expiry and human takeover discard unfinished work without reacquiring tasks.",
     "isolation": "No files/network/OS/module/eval API, mutable presets, lock changes or direct live storage access. A native engine operation completes before cancellation/deadline rejection; no OS process sandbox is claimed.",
     "documentation": "docs/live-code.md"
+  },
+  "document_fonts": {
+    "tool": "peerbrush_fonts",
+    "actions": [
+      "list",
+      "prepare",
+      "refresh"
+    ],
+    "discovery": "Native DirectWrite/CoreText/Fontconfig available-font inventory on a worker; list returns exact path-free references and explicit unsupported rows. Search128 characters, default 32/max128 rows, offset0\u20138192. Catalog status and generation distinguish loading/unavailable from ready.",
+    "reference": "Legacy bundled regular/medium/semibold strings, or exact object: family,postscript,style(normal/italic/oblique),weight(1\u20131000),stretch(1\u20139),index(0\u2013255),sha256(lowercase64). Use the unmodified returned record. No paths or font bytes in documents or protocol.",
+    "prepare": "Cache-only on UI/render callers. prepare queues an exact SHA/index-verified owned snapshot; retry ready:false/loading/busy. Shared source.add/update render with one snapshot and enforce existing atomic revision/lock/reservation guards.",
+    "preservation": "Missing/changed/unsupported fonts retain saved text metadata and native raster/masks/composite; ordinary move/effects/masks/hierarchy/clipboard/save and unrelated edits remain available. Text re-render, frame resize, scale/rotation and image resize refuse until exact resolution or explicit replacement. UI replacement previews before one Apply/undo; explicit rasterization keeps saved pixels.",
+    "limits": "8192 native descriptors,256collectionfaces,8MiBmetadata,32MiBfontfile,8queuedrequests,64MiBcache plus caller-held in-flight snapshots. Static TrueType/OpenType outline faces only; variable/simulated/color/bitmap/SVG faces explicit unavailable. Legacy layout retains plain Latin/Greek/Cyrillic/Han/precomposedHangul/Hiragana/Katakana/Bopomofo/Common limits. Explicit shaped layout supports exact-font joining, combining and bidi subject to glyph/outline/work limits; no automatic wrapping or fallback.",
+    "source_format": 31,
+    "shaped_source_format": 34
   }
 }

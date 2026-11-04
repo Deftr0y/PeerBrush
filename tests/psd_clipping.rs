@@ -300,7 +300,7 @@ fn plain_photoshop_pattern_import_retains_native_tiles_sources_and_editable_save
                 let effect = doc.layers[0].effects[0].id.clone();
                 let mut engine = Engine::new();
                 engine.doc = doc;
-                let mut settings = engine.doc.layers[0].effects[0].settings.clone();
+                let mut settings = engine.doc.layers[0].effects[0].settings.as_ref().clone();
                 settings["phase_x"] = json!(1.);
                 engine.edit("human",&[json!({"op":"effect.update","layer":layer,"effect":effect,"settings":settings})],None,None,"Pattern phase").unwrap();
                 assert_eq!(engine.doc.layers[0].pixels.rgba16(), source);
@@ -411,7 +411,7 @@ fn transparent_photoshop_patterns_retain_native_sources_blends_guards_and_workin
                         e.doc = doc;
                         let id = e.doc.layers[0].id.clone();
                         let effect = e.doc.layers[0].effects[0].id.clone();
-                        let mut settings = e.doc.layers[0].effects[0].settings.clone();
+                        let mut settings = e.doc.layers[0].effects[0].settings.as_ref().clone();
                         settings["phase_x"] = json!(1.);
                         e.edit("human",&[json!({"op":"effect.update","layer":id,"effect":effect,"settings":settings})],None,None,"Transparent phase").unwrap();
                         assert_eq!(e.undo.len(), 1);
@@ -2472,7 +2472,7 @@ fn normalized_photoshop_rgb_style_colors_retain_native_samples_definitions_histo
                     assert_eq!(rendered(&doc), expected);
                     assert_eq!(doc.bit_depth, depth);
                     assert_eq!(doc.layers[0].pixels.rgba16(), source);
-                    let settings = &doc.layers[0].effects[0].settings;
+                    let settings = doc.layers[0].effects[0].settings.as_ref();
                     assert_eq!(doc.layers[0].effects[0].enabled, flags == 3);
                     for (index, color) in if family == "gradient" {
                         vec![(0, FLOAT_COLOR), (1, FLOAT_COLOR2)]
@@ -3134,7 +3134,7 @@ fn photoshop_gradient_clamped_stops_preserve_native_sources_controls_and_standar
                         let source = SAVED.map(|p| p.map(|v| native(v, depth))).concat();
                         assert_eq!(doc.layers[0].pixels.rgba16(), source);
                         assert_eq!(rendered(&doc), merged.concat());
-                        let settings = doc.layers[0].effects[0].settings.clone();
+                        let settings = doc.layers[0].effects[0].settings.as_ref().clone();
                         let color_stops = settings["color_stops"].as_array().unwrap();
                         assert_eq!(
                             color_stops.len(),
@@ -3185,7 +3185,7 @@ fn photoshop_gradient_clamped_stops_preserve_native_sources_controls_and_standar
                             let reopened = psd::decode(&output).unwrap();
                             assert!(!reopened.read_only);
                             assert_eq!(reopened.layers[0].pixels.rgba16(), source);
-                            assert_eq!(reopened.layers[0].effects[0].settings, settings);
+                            assert_eq!(*reopened.layers[0].effects[0].settings, settings);
                             assert_eq!(reopened.export_png().unwrap(), current);
                             let standard = psd::decode(&ordinary(&output)).unwrap();
                             assert!(!standard.read_only);
@@ -3417,7 +3417,7 @@ fn photoshop_gradient_midpoints_retain_native_sources_independent_coverage_and_s
                             "{depth} {color} {alpha} {reverse} {flags:?} {opacity}: {:?}",
                             doc.warnings
                         );
-                        let settings = &doc.layers[0].effects[0].settings;
+                        let settings = doc.layers[0].effects[0].settings.as_ref();
                         assert_eq!(
                             settings["color_stops"][0]["midpoint"],
                             f64::from(color) / 100.
@@ -3437,7 +3437,7 @@ fn photoshop_gradient_midpoints_retain_native_sources_independent_coverage_and_s
                             let reopened = psd::decode(&output).unwrap();
                             assert!(!reopened.read_only);
                             assert_eq!(reopened.layers[0].pixels.rgba16(), source);
-                            assert_eq!(reopened.layers[0].effects[0].settings, *settings);
+                            assert_eq!(*reopened.layers[0].effects[0].settings, *settings);
                             assert_eq!(reopened.export_png().unwrap(), current);
                             assert_eq!(
                                 psd::decode(&ordinary(&output))
@@ -3761,7 +3761,7 @@ fn mixed_photoshop_overlays_retain_order_disabled_sources_undo_and_native_saves(
                 engine.doc = doc;
                 let layer = engine.doc.layers[0].id.clone();
                 let effect = engine.doc.layers[0].effects[0].id.clone();
-                let mut settings = engine.doc.layers[0].effects[0].settings.clone();
+                let mut settings = engine.doc.layers[0].effects[0].settings.as_ref().clone();
                 settings["phase_x"] = json!(1.);
                 engine.edit("human", &[json!({"op":"effect.update","layer":layer,"effect":effect,"settings":settings})], None, None, "Mixed pattern phase").unwrap();
                 assert_eq!(engine.undo.len(), 1);
@@ -4420,7 +4420,7 @@ fn assert_photoshop_style_blends(
                         let source = pixels.map(|p| p.map(|v| native(v, depth))).concat();
                         assert_eq!(doc.layers[0].pixels.rgba16(), source);
                         let current = doc.export_png().unwrap();
-                        let settings = doc.layers[0].effects[0].settings.clone();
+                        let settings = doc.layers[0].effects[0].settings.as_ref().clone();
                         let mut engine = Engine::new();
                         engine.doc = doc;
                         let layer = engine.doc.layers[0].id.clone();
@@ -6046,7 +6046,7 @@ fn photoshop_pixel_aligned_hard_shadows_retain_angles_sources_undo_and_standard_
                             (angle + 360.).rem_euclid(360.) - 180.
                         );
                         assert_eq!(effect.settings["distance"], distance);
-                        let settings = effect.settings.clone();
+                        let settings = effect.settings.as_ref().clone();
                         let layer = doc.layers[0].id.clone();
                         let effect = effect.id.clone();
                         let current = doc.export_png().unwrap();
@@ -6081,7 +6081,7 @@ fn photoshop_pixel_aligned_hard_shadows_retain_angles_sources_undo_and_standard_
                             let reopened = psd::decode(&output).unwrap();
                             assert!(!reopened.read_only);
                             assert_eq!(reopened.layers[0].pixels.rgba16(), source.concat());
-                            assert_eq!(reopened.layers[0].effects[0].settings, settings);
+                            assert_eq!(*reopened.layers[0].effects[0].settings, settings);
                             assert_eq!(reopened.export_png().unwrap(), current);
                             let standard = psd::decode(&ordinary(&output)).unwrap();
                             assert!(!standard.read_only);
@@ -6241,6 +6241,7 @@ fn photoshop_partial_alpha_hard_drop_shadows_retain_explicit_knockout_sources_an
                                     .last()
                                     .unwrap()
                                     .settings
+                                    .as_ref()
                                     .clone();
                                 changed["source_knockout"] = json!(!knockout);
                                 engine.edit("human",&[json!({"op":"effect.update","layer":layer,"effect":effect,"settings":changed})],None,None,"Imported knockout toggle").unwrap();
@@ -7159,7 +7160,7 @@ fn photoshop_hard_shadows_fade_with_layer_opacity_after_casting_and_retain_nativ
                         assert_eq!(doc.layers[0].effects[0].enabled, enabled);
                         assert_eq!(rendered(&doc), merged.concat());
                         let current = doc.export_png().unwrap();
-                        let settings = doc.layers[0].effects[0].settings.clone();
+                        let settings = doc.layers[0].effects[0].settings.as_ref().clone();
                         let layer = doc.layers[0].id.clone();
                         let mut engine = Engine::new();
                         engine.doc = doc;
@@ -7173,7 +7174,7 @@ fn photoshop_hard_shadows_fade_with_layer_opacity_after_casting_and_retain_nativ
                             )
                             .unwrap();
                         assert_eq!(engine.doc.layers[0].pixels.rgba16(), source.concat());
-                        assert_eq!(engine.doc.layers[0].effects[0].settings, settings);
+                        assert_eq!(*engine.doc.layers[0].effects[0].settings, settings);
                         assert_eq!(engine.undo.len(), 1);
                         engine.undo("human").unwrap();
                         assert_eq!(engine.doc.export_png().unwrap(), current);
@@ -7191,7 +7192,7 @@ fn photoshop_hard_shadows_fade_with_layer_opacity_after_casting_and_retain_nativ
                             assert!(!reopened.read_only);
                             assert_eq!(reopened.layers[0].pixels.rgba16(), source.concat());
                             assert_eq!(reopened.layers[0].opacity, f32::from(opacity) / 255.);
-                            assert_eq!(reopened.layers[0].effects[0].settings, settings);
+                            assert_eq!(*reopened.layers[0].effects[0].settings, settings);
                             assert_eq!(reopened.export_png().unwrap(), current);
                         }
                         // Opacity does not weaken descriptor protection, even
@@ -7295,7 +7296,7 @@ fn bounded_hard_photoshop_shadows_retain_native_sources_orientation_bypass_undo_
                                 assert!(!reopened.read_only);
                                 assert_eq!(reopened.export_png().unwrap(), current);
                                 assert_eq!(reopened.layers[0].pixels.rgba16(), source);
-                                let settings = &reopened.layers[0].effects[0].settings;
+                                let settings = reopened.layers[0].effects[0].settings.as_ref();
                                 for key in
                                     ["angle", "distance", "opacity", "size", "spread", "contour"]
                                 {

@@ -40,13 +40,19 @@ impl PeerBrush {
             Tool::Brush | Tool::Eraser | Tool::Smudge | Tool::Clone | Tool::Heal
         )
     }
-    pub(super) fn straight_click(&mut self, doc: &Document, point: [f32; 2], shift: bool) {
+    pub(super) fn straight_click<'a>(
+        &mut self,
+        doc: impl Into<DocumentView<'a>>,
+        point: [f32; 2],
+        shift: bool,
+    ) {
+        let doc = doc.into();
         if !shift || !self.brush_tool() {
             return;
         }
         let Some(last) = self.straight.last.as_ref().filter(|v| {
-            v.document == doc.id
-                && v.revision == doc.revision
+            v.document == doc.id()
+                && v.revision == doc.revision()
                 && v.layer == self.selected
                 && v.mask == self.mask
                 && v.step == self.mask_step
@@ -60,9 +66,9 @@ impl PeerBrush {
         }
         self.straight.cancel();
         self.straight.line = true;
-        self.straight.document = Some(doc.id.clone());
+        self.straight.document = Some(doc.id().to_owned());
         self.drag_start = Some(point);
-        self.drag_revision = Some(doc.revision);
+        self.drag_revision = Some(doc.revision());
         self.points = vec![start, point];
         self.stroke_pressures = vec![pressure, self.current_pressure.unwrap_or(1.)];
         self.stroke_has_pressure = self.current_pressure.is_some() || pressure != 1.;
@@ -293,15 +299,17 @@ impl PeerBrush {
             });
         let (document, revision) = {
             let e = self.shared.lock().unwrap();
-            (e.doc.id.clone(), e.doc.revision)
+            let view = crate::engine::view::current(&e);
+            (view.id().to_owned(), view.revision())
         };
         self.edit(vec![command], label);
         let e = self.shared.lock().unwrap();
+        let view = crate::engine::view::current(&e);
         self.straight.last = last
-            .filter(|_| e.doc.id == document && e.doc.revision == revision + 1)
+            .filter(|_| view.id() == document && Some(view.revision()) == revision.checked_add(1))
             .map(|(point, pressure)| Last {
                 document,
-                revision: e.doc.revision,
+                revision: view.revision(),
                 layer: self.selected.clone(),
                 mask: self.mask,
                 step: self.mask_step.clone(),
@@ -335,8 +343,8 @@ impl PeerBrush {
             command["document_id"] = json!(self
                 .straight
                 .document
-                .as_ref()
-                .unwrap_or(&self.doc_snapshot.id));
+                .as_deref()
+                .unwrap_or(self.doc_snapshot.view().id()));
         }
         self.retouch_command(&mut command, &sampled_points);
         command
@@ -772,7 +780,7 @@ impl PeerBrush {
                         self.brush_preset = None;
                         self.shared.lock().unwrap().status = "Custom brush deleted".into();
                     }
-                    Err(e) => self.shared.lock().unwrap().status = e,
+                    Err(e) => self.shared.lock().unwrap().status = e.into(),
                 }
             }
         });
@@ -812,7 +820,7 @@ impl PeerBrush {
                 self.select_brush_preset(&preset);
                 self.shared.lock().unwrap().status = "Custom brush saved".into();
             }
-            Err(error) => self.shared.lock().unwrap().status = error,
+            Err(error) => self.shared.lock().unwrap().status = error.into(),
         }
     }
 }

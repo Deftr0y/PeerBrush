@@ -49,6 +49,9 @@ impl PeerBrush {
     }
 
     fn transform_toolbar_action(&mut self, doc: &Document, parameters: Value, label: &str) {
+        if self.free_transform_action(&parameters) {
+            return;
+        }
         let roots = crate::tree::roots(doc, &self.selection_layers.iter().cloned().collect());
         let bounds = doc
             .selection
@@ -83,7 +86,7 @@ impl PeerBrush {
                 .lock()
                 .unwrap()
                 .edit("human", &commands, Some(doc.revision), None, label);
-        self.message = result.map(|_| label.into()).unwrap_or_else(|e| e);
+        self.message = result.map(|_| label.into()).unwrap_or_else(|e| e).into();
         self.last_preview = None;
     }
 }

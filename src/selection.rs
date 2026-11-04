@@ -1,10 +1,27 @@
 //! Document-space selection geometry. The public rectangle stays its bounding box.
 use crate::engine::Document;
+pub mod backed;
+mod contours;
+mod coverage_writer;
+pub(crate) use coverage_writer::stage_rows;
 pub mod display;
+mod flood;
+pub(crate) mod image_source;
 pub mod import;
 pub mod masks;
+mod native_tiles;
+pub(crate) use native_tiles::Writer as NativeTileWriter;
 pub mod refine;
+pub mod regional_import;
+pub mod regional_masks;
+pub mod regional_refine;
+mod rows;
+mod source;
+pub mod worker;
+pub use source::{PreparedSelection, SelectionSource};
 mod system;
+#[cfg(test)]
+mod visited;
 pub use system::*;
 
 pub fn rectangle(area: [i32; 4]) -> Vec<[f32; 2]> {

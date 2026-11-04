@@ -1,5 +1,6 @@
 use eframe::egui::{self, Pos2, Rect, Vec2};
 use peerbrush::controls;
+use std::ops::RangeInclusive;
 
 struct Fixture {
     ctx: egui::Context,
@@ -7,16 +8,42 @@ struct Fixture {
     rect: Rect,
     outside: Pos2,
     editor: egui::Id,
+    slider: egui::Id,
+    limits: RangeInclusive<f32>,
+    width: f32,
+    logarithmic: bool,
+    native_handle: Option<egui::style::HandleShape>,
+    enabled: bool,
+    reported_value: Option<f64>,
     time: f64,
 }
 impl Fixture {
     fn new(value: f32) -> Self {
+        Self::configured(value, 0.0..=100.0, 200.0, false, None, 1.0)
+    }
+    fn configured(
+        value: f32,
+        limits: RangeInclusive<f32>,
+        width: f32,
+        logarithmic: bool,
+        native_handle: Option<egui::style::HandleShape>,
+        scale: f32,
+    ) -> Self {
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(scale);
         let mut fixture = Self {
-            ctx: egui::Context::default(),
+            ctx,
             value,
             rect: Rect::NOTHING,
             outside: Pos2::ZERO,
             editor: egui::Id::NULL,
+            slider: egui::Id::NULL,
+            limits,
+            width,
+            logarithmic,
+            native_handle,
+            enabled: true,
+            reported_value: None,
             time: 0.0,
         };
         fixture.draw(vec![]);
@@ -25,7 +52,7 @@ impl Fixture {
     fn draw(&mut self, events: Vec<egui::Event>) -> bool {
         self.time += 0.05;
         let mut changed = false;
-        let _ = self.ctx.run(
+        let output = self.ctx.run(
             egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(400., 200.))),
                 time: Some(self.time),
@@ -34,23 +61,49 @@ impl Fixture {
             },
             |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    let response = controls::range(
-                        ui,
-                        "number",
-                        &mut self.value,
-                        0.0..=100.0,
-                        200.0,
-                        "%",
-                        2,
-                        false,
-                    );
+                    let response = ui
+                        .add_enabled_ui(self.enabled, |ui| {
+                            if let Some(handle) = self.native_handle {
+                                ui.spacing_mut().slider_width = self.width.max(50.0);
+                                ui.spacing_mut().interact_size.y = 22.0;
+                                ui.add(
+                                    egui::Slider::new(&mut self.value, self.limits.clone())
+                                        .clamping(egui::SliderClamping::Edits)
+                                        .show_value(false)
+                                        .handle_shape(handle)
+                                        .logarithmic(self.logarithmic)
+                                        .max_decimals(2),
+                                )
+                            } else {
+                                controls::range(
+                                    ui,
+                                    "number",
+                                    &mut self.value,
+                                    self.limits.clone(),
+                                    self.width,
+                                    "%",
+                                    2,
+                                    self.logarithmic,
+                                )
+                            }
+                        })
+                        .inner;
                     self.rect = response.rect;
+                    self.slider = response.id;
                     self.editor = response.id.with("number");
                     changed = response.changed();
                     self.outside = ui.button("Outside").rect.center();
                 });
             },
         );
+        self.reported_value = output
+            .platform_output
+            .events
+            .iter()
+            .map(|event| event.widget_info())
+            .filter(|info| info.typ == egui::WidgetType::Slider)
+            .filter_map(|info| info.value)
+            .next_back();
         changed
     }
     fn click(&mut self, pos: Pos2) -> bool {
@@ -67,6 +120,12 @@ impl Fixture {
             .ctx
             .data(|data| data.get_temp::<String>(self.editor))
             .is_some());
+    }
+    fn press(&mut self, fraction: f32) -> Pos2 {
+        self.time += 1.0;
+        let pos = self.rect.left_center() + Vec2::new(self.rect.width() * fraction, 0.0);
+        self.draw(vec![egui::Event::PointerMoved(pos), pointer(pos, true)]);
+        pos
     }
 }
 fn pointer(pos: Pos2, pressed: bool) -> egui::Event {
@@ -99,16 +158,16 @@ fn double_click_typing_selects_exact_value_and_accepts_enter_or_blur() {
             .unwrap(),
         "73.12345"
     );
-    assert!(!fixture.draw(vec![egui::Event::Text("37.25".into())]));
+    assert!(!fixture.draw(vec![egui::Event::Text("37.125".into())]));
     assert_eq!(
         fixture
             .ctx
             .data(|data| data.get_temp::<String>(fixture.editor))
             .unwrap(),
-        "37.25"
+        "37.125"
     );
     assert!(fixture.draw(vec![key(egui::Key::Enter)]));
-    assert_eq!(fixture.value, 37.25);
+    assert_eq!(fixture.value, 37.125);
     assert!(fixture
         .ctx
         .data(|data| data.get_temp::<String>(fixture.editor))
@@ -140,6 +199,138 @@ fn escape_and_invalid_input_preserve_values_and_drag_still_updates() {
     assert!(fixture.draw(vec![egui::Event::PointerMoved(end)]));
     assert!(fixture.value < 40.0);
     fixture.draw(vec![pointer(end, false)]);
+}
+
+#[test]
+fn full_bar_mapping_reduces_pointer_gain_and_reports_actual_values() {
+    for width in [15.0, 50.0, 130.0, 200.0] {
+        for scale in [1.0, 2.0] {
+            let mut compact = Fixture::configured(50.0, 0.0..=100.0, width, false, None, scale);
+            let mut circle = Fixture::configured(
+                50.0,
+                0.0..=100.0,
+                width,
+                false,
+                Some(egui::style::HandleShape::Circle),
+                scale,
+            );
+            let mut full = Fixture::configured(
+                50.0,
+                0.0..=100.0,
+                width,
+                false,
+                Some(egui::style::HandleShape::Rect { aspect_ratio: 0.0 }),
+                scale,
+            );
+            for fixture in [&mut compact, &mut circle, &mut full] {
+                let start = fixture.press(0.5);
+                let end = start + Vec2::new(fixture.rect.width() * 0.2, 0.0);
+                assert!(fixture.draw(vec![egui::Event::PointerMoved(end)]));
+                assert_eq!(fixture.reported_value, Some(f64::from(fixture.value)));
+            }
+            assert_eq!(compact.rect.width(), width.max(50.0));
+            assert_eq!(compact.value, full.value);
+            assert!(
+                compact.value > 50.0 && compact.value < circle.value,
+                "width={width}, scale={scale}: full bar={}, circle={}",
+                compact.value,
+                circle.value
+            );
+        }
+    }
+}
+
+#[test]
+fn logarithmic_mapping_batching_and_regrip_keep_native_full_ranges() {
+    for (limits, logarithmic) in [
+        (0.0..=100.0, false),
+        (0.01..=8.0, true),
+        (1.0..=1024.0, true),
+        (0.0..=1024.0, true),
+    ] {
+        for width in [50.0, 130.0] {
+            for scale in [1.0, 1.5, 2.0] {
+                let value = (*limits.start() + *limits.end()) * 0.5;
+                let make = |handle| {
+                    Fixture::configured(value, limits.clone(), width, logarithmic, handle, scale)
+                };
+                let mut compact = make(None);
+                let mut batched = make(None);
+                let mut native = make(Some(egui::style::HandleShape::Rect { aspect_ratio: 0.0 }));
+                for fixture in [&mut compact, &mut batched, &mut native] {
+                    fixture.press(0.5);
+                }
+                let middle =
+                    compact.rect.left_center() + Vec2::new(compact.rect.width() * 0.7, 0.0);
+                let end = compact.rect.left_center() + Vec2::new(compact.rect.width() * 0.85, 0.0);
+                compact.draw(vec![egui::Event::PointerMoved(middle)]);
+                compact.draw(vec![egui::Event::PointerMoved(end)]);
+                batched.draw(vec![
+                    egui::Event::PointerMoved(middle),
+                    egui::Event::PointerMoved(end),
+                ]);
+                native.draw(vec![egui::Event::PointerMoved(end)]);
+                assert_eq!(compact.value, native.value);
+                assert_eq!(batched.value, native.value);
+                assert_eq!(compact.reported_value, Some(f64::from(compact.value)));
+                compact.draw(vec![pointer(end, false)]);
+                for endpoint in [*limits.start(), *limits.end()] {
+                    let before = compact.value;
+                    compact.press(0.5);
+                    assert_eq!(compact.value, before, "regrip must not jump");
+                    let end = if endpoint == *limits.start() {
+                        compact.rect.left_center() - Vec2::X
+                    } else {
+                        compact.rect.right_center() + Vec2::X
+                    };
+                    compact.draw(vec![egui::Event::PointerMoved(end)]);
+                    assert_eq!(compact.value, endpoint);
+                    compact.draw(vec![pointer(end, false)]);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn keyboard_external_values_and_disabled_controls_keep_native_semantics() {
+    let mut compact = Fixture::new(50.12345);
+    let mut native = Fixture::configured(
+        50.12345,
+        0.0..=100.0,
+        200.0,
+        false,
+        Some(egui::style::HandleShape::Rect { aspect_ratio: 0.0 }),
+        1.0,
+    );
+    for fixture in [&mut compact, &mut native] {
+        fixture.value = 60.12345;
+        assert!(!fixture.draw(vec![]));
+        assert_eq!(fixture.value, 60.12345);
+        fixture
+            .ctx
+            .memory_mut(|memory| memory.request_focus(fixture.slider));
+        assert!(fixture.draw(vec![key(egui::Key::ArrowRight)]));
+        assert_eq!(fixture.reported_value, Some(f64::from(fixture.value)));
+    }
+    assert_eq!(compact.value, native.value);
+    assert!(compact.value > 60.12345);
+    for fixture in [&mut compact, &mut native] {
+        fixture.value = 100.0;
+        assert!(!fixture.draw(vec![key(egui::Key::ArrowRight)]));
+        assert_eq!(fixture.value, 100.0);
+        fixture.enabled = false;
+        fixture.draw(vec![]);
+        let before = fixture.value;
+        let start = fixture.press(0.5);
+        let end = start - Vec2::new(40.0, 0.0);
+        assert!(!fixture.draw(vec![
+            egui::Event::PointerMoved(end),
+            key(egui::Key::ArrowLeft)
+        ]));
+        assert_eq!(fixture.value, before);
+        fixture.draw(vec![pointer(end, false)]);
+    }
 }
 
 #[test]

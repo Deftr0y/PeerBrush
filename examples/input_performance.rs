@@ -1,7 +1,9 @@
 //! Blank-canvas input cadence, without GPU presentation. Run with --release.
 use peerbrush::{
+    brush::{Session, Settings},
     engine::{Document, Engine},
     preview::Cache,
+    raster::Raster,
 };
 use serde_json::json;
 use std::time::Instant;
@@ -66,5 +68,45 @@ fn main() {
                 assert_eq!(doc.revision, 0);
             }
         }
+        changed_tail(depth);
     }
+}
+
+fn changed_tail(depth: u16) {
+    let source = Raster::new_depth(2048, 96, depth);
+    let settings = Settings {
+        radius: 18.,
+        smoothing: 0.35,
+        flow: 0.4,
+        opacity: 0.7,
+        taper_end: 30.,
+        ..Default::default()
+    };
+    let points = (0..120)
+        .map(|i| [40. + i as f32 * 14., 48. + (i as f32 * 0.1).sin() * 12.])
+        .collect::<Vec<_>>();
+    let mut retained =
+        Session::new(&source, settings, [233, 84, 32, 255], false, None, None).unwrap();
+    let mut full = Vec::new();
+    let mut regional = Vec::new();
+    let mut full_replayed = 0;
+    let mut replayed = 0;
+    for count in 1..=points.len() {
+        // A changed tail previously discarded the entire preceding stroke.
+        let mut reference =
+            Session::new(&source, settings, [233, 84, 32, 255], false, None, None).unwrap();
+        let start = Instant::now();
+        let expected = reference.update(&points[..count], None).unwrap();
+        full.push(start.elapsed().as_secs_f64() * 1000.);
+        let start = Instant::now();
+        let actual = retained.update(&points[..count], None).unwrap();
+        regional.push(start.elapsed().as_secs_f64() * 1000.);
+        assert_eq!(actual, expected);
+        full_replayed += reference.last_update_dabs();
+        replayed += retained.last_update_dabs();
+    }
+    full.sort_by(f64::total_cmp);
+    regional.sort_by(f64::total_cmp);
+    println!("2048x96 native{depth}, smoothed+tapered 120-point stroke: full replay median {:.2}ms / p95 {:.2}ms; changed-tail median {:.2}ms / p95 {:.2}ms; {replayed}/{full_replayed} contributing dabs (CPU brush replay only)", full[60], full[114], regional[60], regional[114]);
+    assert!(source.tiles.is_empty() && source.samples16.is_empty());
 }

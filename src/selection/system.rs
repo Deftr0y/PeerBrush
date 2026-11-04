@@ -451,8 +451,6 @@ pub fn apply(doc: &mut Document, c: &Value) -> Result<(), String> {
                     }
                 }
             } else {
-                let mut visited = vec![0u32; (w * h) as usize];
-                let mut queue = VecDeque::new();
                 let seeds: Vec<[f32; 2]> = serde_json::from_value(c["points"].clone())
                     .unwrap_or_else(|_| vec![[at[0] as f32, at[1] as f32]]);
                 let radius = if kind == "quick" {
@@ -463,48 +461,14 @@ pub fn apply(doc: &mut Document, c: &Value) -> Result<(), String> {
                 if seeds.len() > 8192 {
                     return Err("Use at most 8192 selection brush seeds".into());
                 }
-                let mut work = 0usize;
-                for (seed_number, seed) in seeds.into_iter().enumerate() {
-                    let stamp = seed_number as u32 + 1;
-                    let seed = [seed[0].floor() as i32, seed[1].floor() as i32];
-                    if !valid(seed[0], seed[1]) {
-                        continue;
-                    }
-                    let si = ((seed[1] as u32 * w + seed[0] as u32) * 4) as usize;
-                    let seed_color = &pixels[si..si + 4];
-                    queue.push_back(seed);
-                    visited[(seed[1] as u32 * w + seed[0] as u32) as usize] = stamp;
-                    while let Some([x, y]) = queue.pop_front() {
-                        let i = (y as u32 * w + x as u32) as usize;
-                        work += 1;
-                        if work > 64_000_000 {
-                            return Err(
-                                "Selection brush work limit exceeded; use a shorter gesture".into(),
-                            );
-                        }
-                        if difference(&pixels[i * 4..i * 4 + 4], seed_color, color_similarity)
-                            > tolerance
-                        {
-                            continue;
-                        }
-                        // Quick Selection grows only around the painted region; Wand floods its component.
-                        if kind == "quick"
-                            && (x - seed[0]).pow(2) + (y - seed[1]).pow(2) > radius * radius
-                        {
-                            continue;
-                        }
-                        mask.set(x, y, [255; 4]);
-                        for [nx, ny] in [[x - 1, y], [x + 1, y], [x, y - 1], [x, y + 1]] {
-                            if valid(nx, ny) {
-                                let ni = (ny as u32 * w + nx as u32) as usize;
-                                if visited[ni] != stamp {
-                                    visited[ni] = stamp;
-                                    queue.push_back([nx, ny]);
-                                }
-                            }
-                        }
-                    }
-                }
+                flood_mask(
+                    &pixels,
+                    &mut mask,
+                    &seeds,
+                    radius,
+                    tolerance,
+                    color_similarity,
+                )?;
             }
         }
     } else {
@@ -649,6 +613,81 @@ pub fn apply(doc: &mut Document, c: &Value) -> Result<(), String> {
     };
     put(doc, mask)?;
     doc.wand_source = source;
+    Ok(())
+}
+/// Existing resident admission only. The worker-facing flood core accepts
+/// caller-owned charged buffers; this legacy path keeps its unchanged 16MP cap.
+fn flood_mask(
+    pixels: &[u8],
+    mask: &mut Raster,
+    seeds: &[[f32; 2]],
+    radius: i32,
+    tolerance: f32,
+    color_similarity: bool,
+) -> Result<(), String> {
+    use super::flood::{Flood, Layout, MAX_FRONTIER};
+    let (w, h) = (mask.width, mask.height);
+    if (w as usize)
+        .checked_mul(h as usize)
+        .and_then(|n| n.checked_mul(4))
+        != Some(pixels.len())
+    {
+        return Err("Selection source dimensions differ".into());
+    }
+    let shape = Layout::new(w, h).map_err(str::to_owned)?;
+    let allocate = |length: usize| -> Result<Vec<u8>, String> {
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(length)
+            .map_err(|_| "Selection workspace allocation failed")?;
+        bytes.resize(length, 0);
+        Ok(bytes)
+    };
+    let mut states = allocate(shape.states)?;
+    let mut generations = allocate(shape.generations)?;
+    let mut frontier = allocate(MAX_FRONTIER * 4)?;
+    let points: Vec<_> = seeds
+        .iter()
+        .map(|seed| {
+            let [x, y] = seed.map(|v| v.floor() as i32);
+            if x >= 0 && y >= 0 && x < w as i32 && y < h as i32 {
+                [x as u32, y as u32]
+            } else {
+                [u32::MAX; 2]
+            }
+        })
+        .collect();
+    let mut flood = Flood::new(
+        shape,
+        &mut states,
+        &mut generations,
+        &mut frontier,
+        64_000_000,
+    )
+    .map_err(str::to_owned)?;
+    flood
+        .run(
+            &points,
+            (radius > 0).then_some(radius as u32),
+            || Ok::<_, String>(()),
+            |seed, x, y| {
+                let point = points[seed];
+                let base = ((point[1] * w + point[0]) * 4) as usize;
+                let at = ((y * w + x) * 4) as usize;
+                Ok(difference(
+                    &pixels[at..at + 4],
+                    &pixels[base..base + 4],
+                    color_similarity,
+                ) <= tolerance)
+            },
+            |y, left, right| {
+                for x in left..right {
+                    mask.set(x as i32, y as i32, [255; 4]);
+                }
+                Ok(())
+            },
+        )
+        .map_err(|error| error.to_string())?;
     Ok(())
 }
 pub fn restrict_raster(after: &mut Raster, before: &Raster, coverage: &Coverage, origin: [i32; 2]) {
@@ -826,5 +865,81 @@ impl Coverage {
             return Err("Invalid or oversized selection coverage".into());
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod flood_tests {
+    use super::*;
+
+    #[test]
+    fn actual_resident_flood_mask_matches_independent_bfs_at_tile_edges_and_multiple_seed_colors() {
+        let (width, height) = (257u32, 259u32);
+        let pixels: Vec<u8> = (0..height)
+            .flat_map(|y| {
+                (0..width).flat_map(move |x| {
+                    let value = if x < 128 {
+                        [17, 179, 71, 255]
+                    } else if y < 130 {
+                        [91, 37, 203, 255]
+                    } else {
+                        [19, 181, 73, 127]
+                    };
+                    value
+                })
+            })
+            .collect();
+        let seeds = [
+            [-1., 4.],
+            [2., 2.],
+            [256., 258.],
+            [130., 2.],
+            [500., 500.],
+            [2., 2.],
+        ];
+        for radius in [0, 3, 256] {
+            for similar in [false, true] {
+                for tolerance in [0., 32., 255.] {
+                    let mut expected = vec![false; (width * height) as usize];
+                    for point in seeds {
+                        let [sx, sy] = point.map(|p: f32| p.floor() as i32);
+                        if sx < 0 || sy < 0 || sx >= width as i32 || sy >= height as i32 {
+                            continue;
+                        }
+                        let at = ((sy as u32 * width + sx as u32) * 4) as usize;
+                        let reference = &pixels[at..at + 4];
+                        let mut seen = vec![false; expected.len()];
+                        let mut queue = VecDeque::from([[sx, sy]]);
+                        while let Some([x, y]) = queue.pop_front() {
+                            let index = (y as u32 * width + x as u32) as usize;
+                            if seen[index] {
+                                continue;
+                            }
+                            seen[index] = true;
+                            if difference(&pixels[index * 4..index * 4 + 4], reference, similar)
+                                > tolerance
+                                || (radius > 0
+                                    && (x - sx).pow(2) + (y - sy).pow(2) > radius * radius)
+                            {
+                                continue;
+                            }
+                            expected[index] = true;
+                            for [nx, ny] in [[x - 1, y], [x + 1, y], [x, y - 1], [x, y + 1]] {
+                                if nx >= 0 && ny >= 0 && nx < width as i32 && ny < height as i32 {
+                                    queue.push_back([nx, ny]);
+                                }
+                            }
+                        }
+                    }
+                    let mut actual = Raster::new(width, height);
+                    flood_mask(&pixels, &mut actual, &seeds, radius, tolerance, similar).unwrap();
+                    for y in 0..height {
+                        for x in 0..width {
+                            assert_eq!(actual.get(x as i32,y as i32),if expected[(y*width+x) as usize] {[255;4]} else {[0;4]},"radius={radius},similar={similar},tolerance={tolerance},pixel={x},{y}");
+                        }
+                    }
+                }
+            }
+        }
     }
 }

@@ -1,5 +1,27 @@
 # macOS Developer ID signing and notarization
 
+Current-source packages also place `installed-release.json` and the matching
+GPL source ZIP inside `PeerBrush.app/Contents/Resources` before signing. The
+small installed identity binds the source checksum, application version and
+clean embedded build provenance. These resource bytes remain unchanged through
+signing, notarization, stapling and DMG creation, and travel with an app dragged
+to Applications. The original outer source ZIP and final `release.json` remain
+available in the distribution. The outer manifest includes final signing and
+executable hashes; it is not itself covered by the app signature and is never
+copied back into the signed resources.
+
+After an actual retained Sparkle Installed callback, the copied native owner
+can inspect the local target in a worker. It requires the retained signed
+appcast item's `versionString`, the exact installed bundle version, approved
+Developer ID Team ID and bundle identifier, existing pinned framework policy,
+and the signed installed identity/source and actual executable build record.
+Changed files, callbacks or selected generations invalidate the observation.
+The old same-code-hash control-channel authentication is unchanged. This verifies
+local code/source identity only: it does not establish launch health, permit
+profile migration, release the old application/settings copy, or authorize
+installation. Activation remains disabled pending the remaining source work,
+approved feed/public key, signing configuration and installed acceptance tests.
+
 This is a prepared, explicit native workflow for direct distribution of the arm64 `PeerBrush.app`. It does not create an Apple account, install credentials, configure a runner, publish a release, or prove that any existing download is signed. Running it requires a separately authorized Mac and Apple submission. Portable tests use synthetic packages and mocked subprocesses; real signing, notarization, Gatekeeper and native launch tests remain release gates.
 
 ## Prerequisites and secure setup
@@ -45,7 +67,7 @@ python3 -B scripts/sign_macos.py \
   --output "${SIGNED_OUTPUT:?select a separate directory outside the checkout}"
 ```
 
-The signer verifies the input against the exact committed source policy, then performs these steps:
+The signer accepts only a canonical stable `A.B.C` release version; every prerelease/internal development candidate fails before any provider access, signing or resumable work. It verifies the input against the exact committed source policy, then performs these steps. Unreleased v0.3 bundles include the icon, document declarations and installed license/notices described in [macOS integration](macos-integration.md) before sealing. Signing must preserve these bytes; do not add them to an already signed app. Historical 0.26 artifacts and protected signing workflow pins retain their existing source/layout.
 
 - Confirm a valid existing Developer ID Application identity belonging to the explicit team, and validate the existing notary profile's access.
 - Sign the `.app` with hardened runtime and a secure timestamp. Only the reviewed single-executable bundle is supported. There is no `--deep` signing and no entitlement exception such as debugger access, disabled library validation or unsigned executable memory.
@@ -81,7 +103,43 @@ After scripted checks, use a fresh user profile or clean Mac/VM to download the 
 
 Signing and notarization address unidentified-developer and unnotarized-software blocks; they cannot promise that macOS will never show a normal first-open confirmation, permission request, revocation warning or device-policy restriction. Publish only after the actual native evidence and separately authorized release steps in [release maintenance](release-maintenance.md) are complete.
 
-## Portable regression checks
+## DMG preparation and remaining release gates
+
+On an actual Mac, use `scripts/package_macos_dmg.py` with an already verified signed/notarized/stapled ZIP and the exact source checkout used by that ZIP:
+
+```sh
+python3 -B scripts/package_macos_dmg.py \
+  --archive /absolute/candidates/PeerBrush-VERSION-macOS-arm64-apple-signed-r1.zip \
+  --expected-sha256 VERIFIED_SIGNED_ZIP_SHA256 \
+  --commit FULL_SOURCE_SHA --version VERSION \
+  --output /absolute/dmg-candidates --revision 1
+```
+
+Output must be outside the checkout. The original signed ZIP/app remains unchanged. The DMG contains the app and drag-to-Applications shortcut, with original source, licenses and support files retained separately in `Documentation and source`. Its mounted app receives the same Developer ID/Team ID, hardened runtime, secure timestamp, entitlement, ticket and Gatekeeper verification as the original ZIP. The DMG itself is an **unsigned, unnotarized preparation candidate**, not a published installer; app notarization is not recorded as image notarization.
+
+`sign_macos.py --format dmg` implements image signing and notarization through the same preflight, existing-keychain selection, submission journal, accepted log/digest verification and resume logic as ZIP signing. ZIP remains the default. Both formats reject prereleases before any provider call, including on resume. With separately authorized provider access, take the independently verified original signed ZIP as input:
+
+```sh
+python3 -B scripts/sign_macos.py --format dmg \
+  --archive /absolute/candidates/PeerBrush-VERSION-macOS-arm64-apple-signed-r1.zip \
+  --expected-sha256 VERIFIED_SIGNED_ZIP_SHA256 \
+  --commit FULL_SOURCE_SHA --version VERSION \
+  --output /absolute/signed-dmg --work /absolute/dmg-signing-work \
+  --team-id APPLE_TEAM_ID --identity DEVELOPER_ID_CERTIFICATE_SHA1 \
+  --profile EXISTING_NOTARY_PROFILE --revision 1
+```
+
+The tool prepares the original app/source payload, signs and timestamps `submission.dmg`, records its exact hash before upload, and retains the returned submission ID. It requires Accepted status and a matching issue-free notarization log. Timeout, rejection or finalization failure preserves the submitted bytes; `--resume` checks the same configuration, prepared inputs and image hash, then checks the existing submission without resigning or uploading again. Ambiguous submission failures without an ID require manual history reconciliation, never automatic re-submission.
+
+Finalization staples a separate copy, verifies its Developer ID/Team ID, identifier, secure timestamp, ticket and Gatekeeper primary image signature, then verifies `hdiutil` integrity and the complete read-only mounted payload plus the app's signature/ticket/Gatekeeper result. Only afterward are immutable `-dmg-signed-rN.dmg`, final SHA-256 and provenance written. Failed mounted work is retained rather than recursively removed. No second signing system, current 0.26 signing pin, credential, protected approval or publication setting is changed. Actual provider execution remains separately gated; synthetic tests establish the code path, not real Apple acceptance.
+
+Signed image receipts still say `release_ready: false` while drag/install and quarantined-download acceptance remain open. A signed DMG is not automatically accepted by the existing ZIP-only release/website inventory. Public integration must verify the final signed image and checksums, actual platform acceptance and public downloads. Do not rename an unsigned preparation candidate as signed or reuse a pre-signing checksum.
+
+Native acceptance still requires a fresh quarantined browser download, Finder drag to Applications, first/offline launch, upgrade/replacement with unsaved-work protection, settings retention, MCP launch path and PSD/PSB opening. Unreleased v0.3 includes the committed icon and verified installed license/notices in `Contents/Resources` before sealing; exact archive inspection requires and verifies them. Corresponding source and public support guides remain alongside the app in the distribution, as described in [installed integration](macos-integration.md). Historical 0.26 bundles retain their original layout. Never insert files into an already sealed app; source implementation and synthetic tests do not establish installed acceptance.
+
+`python3 -B scripts/test_macos_dmg.py` and `scripts/test_sign_macos_dmg.py` use synthetic signed ZIP fixtures and mocked Apple commands, including rejected/pending/interrupted notarization, hash/signature/payload failures, finalization retries and same-submission resume. `python3 -B scripts/test_macos_dmg_native.py` runs actual image creation, verification and read-only mounting on macOS using synthetic unsigned bytes that are never executed. CI and release-candidate tests run the native smoke without credentials. These tests do not claim a real signed image or a completed installation.
+
+## Portable signing regression checks
 
 ```sh
 python3 -B scripts/test_package.py
@@ -97,3 +155,48 @@ These cover exact archive/source preservation, narrow signed inventories, hashes
 - [Migrating to the latest notarization tool](https://developer.apple.com/documentation/technotes/tn3147-migrating-to-the-latest-notarization-tool)
 - [Code-signing requirements](https://developer.apple.com/documentation/technotes/tn3127-inside-code-signing-requirements)
 - [Apple DTS: resolving Gatekeeper problems and checking the submission SHA-256](https://developer.apple.com/forums/thread/706379)
+
+
+## Independent final-DMG qualification (unreleased)
+
+After an explicitly approved signing job produces a signed/notarized/stapled ZIP and final DMG, a separate native consumer can qualify those exact files without signing, submitting, installing or running the app. Independently select the stable source SHA/version, both file SHA256 values and public publisher Team ID. Use absolute paths and a private owned parent outside every Git checkout for fresh work/report directories:
+
+```sh
+python scripts/qualify_macos_dmg.py --source-root "$REVIEWED_SOURCE" \
+  --archive "$SELECTED_SIGNED_ZIP" --image "$SELECTED_FINAL_DMG" \
+  --archive-sha256 "$VERIFIED_ZIP_SHA256" --image-sha256 "$VERIFIED_DMG_SHA256" \
+  --commit "$REVIEWED_COMMIT" --version "$STABLE_VERSION" --team-id "$PUBLIC_TEAM_ID" \
+  --work "$PRIVATE_PARENT/check-NEW" --output "$PRIVATE_PARENT/report-NEW"
+```
+
+The consumer checks committed corresponding source and embedded executable identity, reconstructs every expected app/support file, mode and Applications shortcut directly from the selected ZIP, then rechecks actual app/image publisher trust, timestamps, hardened runtime, tickets and Gatekeeper. Read-only image mounting must expose exactly one selected volume. Cleanup binds the entire BSD device to that exact image, detaches it and confirms removal. Ambiguous/extra volumes or failed cleanup fail qualification and retain work; do not recursively delete unresolved mounts. Both original and private input copies are hashed again after native inspection.
+
+The exclusive `dmg-qualification.json` contains a strict sanitized asset record and factual check results, with installation/public/production readiness still false or unverified. It contains no local paths, private signing information or arbitrary signer-sidecar fields. Native execution authority still needs a successful trusted native job when consumed; matching JSON alone does not authenticate a producer. This leaf consumer is not yet wired into the aggregate/website final-installer adapter. Select the verified signed ZIP as the Mac portable asset before first publication; existing published files remain immutable. No existing Apple workflow source pin or activation setting is changed.
+
+
+### Prepared current-source workflow caller (disabled)
+
+The separate `macos-release-signing.yml` workflow can prepare both existing
+signer formats for the same reviewed stable main source. See the
+[current-source producer contract](production-automation.md#current-source-mac-signing-producer-unreleased-dormant)
+before activation. It preserves the historical 0.26 source/identity pins, uses
+the existing protected `apple-signing` approval boundary and remains disabled
+without its explicit enable variable. No workflow was dispatched and no remote
+credential, trust or protection setting was changed by this preparation.
+
+The signing functions still own native verification, immutable output and
+same-submission resume. The new caller's flat pair artifact deliberately omits
+sidecar receipts; downstream native qualification reopens the actual ZIP/DMG
+bytes and authenticates its own separate report. A separate credentials-free
+recovery archive retains selected journal/payload files with modes; it does not
+include the keychain, P12 or account secrets, and never walks retained mounts.
+Seven-day artifact retention and best-effort failure steps do not guarantee
+recovery. Never rerun or resubmit after uncertainty without reconciling the
+original notarization and preserving its exact work. Native issuance, installed
+drag/quarantine/update acceptance and all publication gates remain open.
+
+### Dormant Sparkle preparation (unreleased)
+
+New source-defined dormant Sparkle layouts preserve nine exact framework links and five nested objects. The signer refuses them before provider preflight while packaging/sparkle/native-policy.json lacks independently reviewed native facts. Signing is explicit inside-out and all final objects must pass publisher/runtime/timestamp/identifier/exact-entitlement checks plus exact owned-copy unsigned normalization. Recovery, stapling and mounted image inspection preserve controlled link targets and modes. Historical source/layouts retain their original contract. See [the dependency audit, setup and pending native acceptance](sparkle-preparation.md); no new signing/installation result is claimed.
+
+PB-147 remains open. This prepares dormant packaging and a guarded native component, not a working application updater. Remaining source work includes trusted configured app-owned framework loading, an actual update cycle and progress/release-notes/cancellation UI, verified installation and relaunch outcome, the complete update-specific native termination handoff, and failed/interrupted installation with last-working-app recovery. The final handoff must use the existing atomic finish_update_exit contract; this preparation never calls it, closes a project or invokes an installer block. Supplying a feed, public key or native object policy cannot activate these missing implementations.

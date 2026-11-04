@@ -1,4 +1,4 @@
-"""Validate PeerBrush branch names and pull-request promotion destinations."""
+"""Validate retained branch names and direct version-to-production promotion."""
 
 import argparse
 import json
@@ -11,7 +11,7 @@ TOPIC = r"[a-z0-9]+(?:[.-][a-z0-9]+)*(?:/[a-z0-9]+(?:[.-][a-z0-9]+)*)*"
 
 def validate_name(name):
     if name.lower().split("/", 1)[0] == "codex":
-        raise ValueError("Branches under codex/ are prohibited; use feature/<version>/<topic> or fix/<version>/<topic>.")
+        raise ValueError("Branches under codex/ are prohibited; develop on the appropriate version/<version> branch.")
     if name in {"main", "dev", "site-content"}:
         return
     if re.fullmatch(rf"version/{VERSION}", name):
@@ -26,17 +26,11 @@ def validate_name(name):
 def validate_pull_request(head, base):
     validate_name(head)
     validate_name(base)
-    if base == "main" and head == "dev":
+    if base == "main" and re.fullmatch(rf"version/{VERSION}", head):
         return
-    if base == "dev" and re.fullmatch(rf"version/{VERSION}", head):
-        return
-    if base.startswith("version/"):
-        version = base.removeprefix("version/")
-        if head.startswith((f"feature/{version}/", f"fix/{version}/")):
-            return
     if base == "site-content" and head.startswith("maintenance/site-"):
         return
-    raise ValueError("Incorrect PR destination; promote feature/fix → matching version → dev → main, or maintenance/site-* → site-content.")
+    raise ValueError("Develop directly on version/<version>; promote that candidate to main, or maintenance/site-* to site-content.")
 
 
 def validate_event(event, ref):

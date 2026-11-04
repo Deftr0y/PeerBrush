@@ -1,7 +1,11 @@
 //! Bounded procedural editing. Scripts see frozen sources and emit shared commands;
 //! only the ordinary atomic engine transaction can change a live document.
 use crate::{
-    engine::{self, Document, Engine, Scope},
+    engine::{
+        self,
+        view::{self, DocumentView},
+        Document, Engine, Scope,
+    },
     server::Shared,
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -81,26 +85,19 @@ fn script_error(error: &EvalAltResult) -> String {
         _ => error.to_string(),
     }
 }
-fn descendant(doc: &Document, child: &str, ancestor: &str) -> bool {
-    let mut parent = doc
-        .layers
-        .iter()
-        .find(|l| l.id == child)
-        .and_then(|l| l.parent.as_deref());
+fn descendant(doc: DocumentView<'_>, child: &str, ancestor: &str) -> bool {
+    let mut parent = doc.find_layer(child).and_then(|layer| layer.parent());
     for _ in 0..16 {
         let Some(id) = parent else { return false };
         if id == ancestor {
             return true;
         }
-        parent = doc
-            .layers
-            .iter()
-            .find(|l| l.id == id)
-            .and_then(|l| l.parent.as_deref());
+        parent = doc.find_layer(id).and_then(|layer| layer.parent());
     }
     false
 }
-fn covers(doc: &Document, outer: &Scope, inner: &Scope) -> bool {
+
+fn covers(doc: DocumentView<'_>, outer: &Scope, inner: &Scope) -> bool {
     let target = match outer.target.as_deref() {
         None => true,
         Some(a) => inner.target.as_deref().is_some_and(|b| {
@@ -115,7 +112,7 @@ fn covers(doc: &Document, outer: &Scope, inner: &Scope) -> bool {
             _ => false,
         }
 }
-fn contained(doc: &Document, declared: &[Scope], actual: &[Scope]) -> Result<(), String> {
+fn contained(doc: DocumentView<'_>, declared: &[Scope], actual: &[Scope]) -> Result<(), String> {
     if actual
         .iter()
         .all(|s| declared.iter().any(|d| covers(doc, d, s)))
@@ -131,10 +128,10 @@ fn guard(e: &mut Engine, job: &Job, source: &Document) -> Result<(), String> {
     if job.cancel.load(Ordering::Relaxed) {
         return Err("Code run canceled; no edits committed".into());
     }
-    if e.doc.id != source.id || e.doc.revision != source.revision {
+    if view::current(e).id() != source.id || view::current(e).revision() != source.revision {
         return Err("Code source changed; current work preserved".into());
     }
-    if e.doc.read_only {
+    if view::current(e).read_only() {
         return Err("This document is read-only".into());
     }
     let lease = e
@@ -142,15 +139,16 @@ fn guard(e: &mut Engine, job: &Job, source: &Document) -> Result<(), String> {
         .iter()
         .find(|l| l.id == job.task && l.owner == job.actor)
         .ok_or("Code task ended, expired or was taken over; do not silently reacquire")?;
-    contained(&e.doc, &lease.scopes, &job.scopes)?;
+    contained(view::current(e), &lease.scopes, &job.scopes)?;
     e.check(&job.actor, &job.scopes)?;
-    for layer in &e.doc.layers {
-        if layer.locked
+    for layer in view::current(e).layers() {
+        if layer.locked()
             && job.scopes.iter().any(|s| {
                 s.target.is_none()
-                    || s.target.as_deref() == Some(&layer.id)
+                    || s.target.as_deref() == Some(layer.id())
                     || s.target.as_ref().is_some_and(|id| {
-                        descendant(&e.doc, &layer.id, id) || descendant(&e.doc, id, &layer.id)
+                        descendant(view::current(e), layer.id(), id)
+                            || descendant(view::current(e), id, layer.id())
                     })
             })
         {
@@ -217,7 +215,7 @@ pub fn dispatch(shared: &Shared, actor: &str, p: &Value) -> Result<Value, String
             let revision = p["expected_revision"]
                 .as_u64()
                 .ok_or("Code needs exact expected_revision")?;
-            if e.doc.id != document || e.doc.revision != revision {
+            if view::current(&e).id() != document || view::current(&e).revision() != revision {
                 return Err("Code needs the current source identity/revision".into());
             }
             let script = p["script"]
@@ -248,7 +246,7 @@ pub fn dispatch(shared: &Shared, actor: &str, p: &Value) -> Result<Value, String
             }
             for scope in &scopes {
                 if let Some(id) = &scope.target {
-                    if id != "@selection" && !e.doc.layers.iter().any(|l| l.id == *id) {
+                    if id != "@selection" && view::current(&e).find_layer(id).is_none() {
                         return Err("Unknown declared layer".into());
                     }
                 }
@@ -277,7 +275,7 @@ pub fn dispatch(shared: &Shared, actor: &str, p: &Value) -> Result<Value, String
                 cancel: Arc::new(AtomicBool::new(false)),
                 result: Arc::new(Mutex::new(None)),
             };
-            let source = e.doc.clone();
+            let source = e.resident()?.clone();
             guard(&mut e, &job, &source)?;
             if e.code_jobs
                 .iter()
@@ -453,7 +451,7 @@ fn run(
                 return Err(fail("Pixel rectangle must be inside the document"));
             }
             contained(
-                &c.doc,
+                DocumentView::from(&c.doc),
                 &c.scopes,
                 &[Scope {
                     target: Some(layer.to_string()),
@@ -559,10 +557,10 @@ fn run(
             let mut e = shared.lock().unwrap();
             guard(&mut e, job, &source)?;
         }
-        let mut inspector = Engine::new();
-        inspector.doc = draft.clone();
+        let inspector = Engine::from_document(draft);
         let actual = inspector.scopes(command);
-        contained(&draft, &job.scopes, &actual)?;
+        draft = inspector.into_resident_document()?;
+        contained(DocumentView::from(&draft), &job.scopes, &actual)?;
         if let Some(target) = command["layer"].as_str() {
             crate::placement::unlocked(&draft, target)?;
         }
@@ -588,6 +586,25 @@ fn run(
 /// Native rectangular replacement is shared by UI/protocol/code, with source guards,
 /// selection confidence, locks, reservations and rollback supplied by the engine.
 pub(crate) fn replace_pixels(doc: &mut Document, c: &Value) -> Result<(), String> {
+    replacement_shape(doc, c)?;
+    let bytes = c["rgba"]
+        .as_str()
+        .filter(|s| s.len() <= MAX_PIXELS * 8 * 4 / 3 + 4)
+        .ok_or("Invalid bounded base64 RGBA data")?;
+    let bytes = STANDARD
+        .decode(bytes)
+        .map_err(|_| "Invalid base64 RGBA data")?;
+    replace_pixels_bytes(doc, c, &bytes, SampleOrder::Little)
+}
+
+/// Canonical backing is BE; the existing JSON protocol remains LE.
+#[derive(Clone, Copy)]
+pub(crate) enum SampleOrder {
+    Little,
+    Big,
+}
+
+fn replacement_shape(doc: &Document, c: &Value) -> Result<([i32; 4], usize), String> {
     if c["mask"] == true {
         return Err("Native pixel replacement targets layer color".into());
     }
@@ -610,13 +627,16 @@ pub(crate) fn replace_pixels(doc: &mut Document, c: &Value) -> Result<(), String
     if count > MAX_PIXELS {
         return Err("Native pixel patch exceeds 262144 pixels".into());
     }
-    let bytes = c["rgba"]
-        .as_str()
-        .filter(|s| s.len() <= MAX_PIXELS * 8 * 4 / 3 + 4)
-        .ok_or("Invalid bounded base64 RGBA data")?;
-    let bytes = STANDARD
-        .decode(bytes)
-        .map_err(|_| "Invalid base64 RGBA data")?;
+    Ok((r, count))
+}
+
+pub(crate) fn replace_pixels_bytes(
+    doc: &mut Document,
+    c: &Value,
+    bytes: &[u8],
+    order: SampleOrder,
+) -> Result<(), String> {
+    let (r, count) = replacement_shape(doc, c)?;
     let stride = if doc.bit_depth == 16 { 8 } else { 4 };
     if bytes.len() != count * stride {
         return Err("Native RGBA length does not match rectangle/depth".into());
@@ -642,8 +662,13 @@ pub(crate) fn replace_pixels(doc: &mut Document, c: &Value) -> Result<(), String
             }
             let at = ((y - r[1]) as usize * (r[2] - r[0]) as usize + (x - r[0]) as usize) * stride;
             if doc.bit_depth == 16 {
-                let pixel = std::array::from_fn(|i| {
-                    u16::from_le_bytes([bytes[at + i * 2], bytes[at + i * 2 + 1]])
+                let pixel = std::array::from_fn(|i| match order {
+                    SampleOrder::Little => {
+                        u16::from_le_bytes([bytes[at + i * 2], bytes[at + i * 2 + 1]])
+                    }
+                    SampleOrder::Big => {
+                        u16::from_be_bytes([bytes[at + i * 2], bytes[at + i * 2 + 1]])
+                    }
                 });
                 layer.pixels.set16(x - layer.x, y - layer.y, pixel);
             } else {

@@ -1,5 +1,7 @@
 //! Bounded RGB matrix/TRC and classic LUT ICC conversion. Source samples stay in their profile;
 //! only display previews and an explicitly requested sRGB copy are converted.
+#[path = "color_profile/prepared.rs"]
+pub(crate) mod prepared;
 use moxcms::{
     ColorProfile, DataColorSpace, Layout, ProfileClass, RenderingIntent, Transform16BitExecutor,
     Transform8BitExecutor, TransformOptions,
@@ -10,7 +12,7 @@ use std::{
 };
 
 pub const MAX_PROFILE_BYTES: usize = 4 * 1024 * 1024;
-struct Transforms {
+pub(crate) struct Transforms {
     bytes: Arc<Transform8BitExecutor>,
     words: Arc<Transform16BitExecutor>,
 }
@@ -85,6 +87,12 @@ fn classic_lut(data: &[u8]) -> Result<bool, String> {
 }
 
 fn parse(bytes: &[u8]) -> Result<ColorProfile, String> {
+    parse_observing(bytes, &mut |_| {})
+}
+fn parse_observing(
+    bytes: &[u8],
+    native_error: &mut dyn FnMut(&moxcms::CmsError),
+) -> Result<ColorProfile, String> {
     if bytes.len() > MAX_PROFILE_BYTES || bytes.len() < 132 {
         return Err("ICC profile exceeds the supported size or is truncated".into());
     }
@@ -193,7 +201,10 @@ fn parse(bytes: &[u8]) -> Result<ColorProfile, String> {
             max_allowed_trc_size: 65536,
         },
     )
-    .map_err(|e| format!("Invalid ICC profile: {e}"))?;
+    .map_err(|e| {
+        native_error(&e);
+        format!("Invalid ICC profile: {e}")
+    })?;
     if profile.color_space != DataColorSpace::Rgb
         || !matches!(profile.pcs, DataColorSpace::Xyz | DataColorSpace::Lab)
         || !matches!(
@@ -227,7 +238,7 @@ fn parse(bytes: &[u8]) -> Result<ColorProfile, String> {
     Ok(profile)
 }
 
-fn transforms(bytes: &[u8]) -> Result<Arc<Transforms>, String> {
+pub(crate) fn transforms(bytes: &[u8]) -> Result<Arc<Transforms>, String> {
     if bytes.len() > MAX_PROFILE_BYTES {
         return Err("ICC profile exceeds the 4 MiB limit".into());
     }
@@ -274,37 +285,47 @@ fn transforms(bytes: &[u8]) -> Result<Arc<Transforms>, String> {
 pub fn supported(bytes: &[u8]) -> Result<(), String> {
     transforms(bytes).map(|_| ())
 }
+impl Transforms {
+    pub(crate) fn convert8(&self, pixels: &mut [u8]) -> Result<(), String> {
+        if pixels.len() % 4 != 0 {
+            return Err("Invalid RGBA sample length".into());
+        }
+        let mut output = vec![0; pixels.len()];
+        self.bytes
+            .transform(pixels, &mut output)
+            .map_err(|e| e.to_string())?;
+        for (source, target) in pixels.chunks_exact(4).zip(output.chunks_exact_mut(4)) {
+            target[3] = source[3];
+        }
+        pixels.copy_from_slice(&output);
+        Ok(())
+    }
+    pub(crate) fn convert16(&self, pixels: &mut [u16]) -> Result<(), String> {
+        if pixels.len() % 4 != 0 {
+            return Err("Invalid RGBA sample length".into());
+        }
+        let mut output = vec![0; pixels.len()];
+        self.words
+            .transform(pixels, &mut output)
+            .map_err(|e| e.to_string())?;
+        for (source, target) in pixels.chunks_exact(4).zip(output.chunks_exact_mut(4)) {
+            target[3] = source[3];
+        }
+        pixels.copy_from_slice(&output);
+        Ok(())
+    }
+}
 pub fn convert8(profile: &[u8], pixels: &mut [u8]) -> Result<(), String> {
     if pixels.len() % 4 != 0 {
         return Err("Invalid RGBA sample length".into());
     }
-    let transform = transforms(profile)?;
-    let mut output = vec![0; pixels.len()];
-    transform
-        .bytes
-        .transform(pixels, &mut output)
-        .map_err(|e| e.to_string())?;
-    for (source, target) in pixels.chunks_exact(4).zip(output.chunks_exact_mut(4)) {
-        target[3] = source[3];
-    }
-    pixels.copy_from_slice(&output);
-    Ok(())
+    transforms(profile)?.convert8(pixels)
 }
 pub fn convert16(profile: &[u8], pixels: &mut [u16]) -> Result<(), String> {
     if pixels.len() % 4 != 0 {
         return Err("Invalid RGBA sample length".into());
     }
-    let transform = transforms(profile)?;
-    let mut output = vec![0; pixels.len()];
-    transform
-        .words
-        .transform(pixels, &mut output)
-        .map_err(|e| e.to_string())?;
-    for (source, target) in pixels.chunks_exact(4).zip(output.chunks_exact_mut(4)) {
-        target[3] = source[3];
-    }
-    pixels.copy_from_slice(&output);
-    Ok(())
+    transforms(profile)?.convert16(pixels)
 }
 pub fn summary(profile: Option<&[u8]>) -> serde_json::Value {
     match profile {

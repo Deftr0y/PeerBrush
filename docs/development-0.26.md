@@ -1,8 +1,8 @@
 # PeerBrush 0.26 development
 
-Unreleased development on `version/0.26`, starting from the published 0.25 source and its documentation updates. Focused work uses `feature/0.26/<topic>` or `fix/0.26/<topic>` and follows the [development guide](development-guide.md). Published downloads remain 0.25. This queue supplements the acceptance criteria in [FOLLOWUPS.MD](../FOLLOWUPS.MD); an existing implementation is not evidence that outstanding acceptance work passed.
+Historical implementation and acceptance record for 0.26, developed from published 0.25 on `version/0.26`. Version 0.26.0 Mac/Linux downloads and the website are published; Windows Store delivery remains pending. All remaining feature and acceptance work is now planned for [v0.3](development-0.3.md), with full original criteria in [FOLLOWUPS.MD](../FOLLOWUPS.MD). The separate high-priority installation/release foundations have no assigned release version. Preserve the evidence below; it does not establish that outstanding acceptance passed.
 
-Work proceeds in this priority order, updated after the 2026-10-15 responsiveness report:
+The original 0.26 priority order below is retained as historical context. Continue its unfinished work through the v0.3 queue, where PB-108 remains priority #1:
 
 1. **PB-108 / PB-036 / PB-072:** investigate overall input-to-display delay first. Painting also lags on a blank canvas; the report describes a constant slight delay across the application, not just expensive brush tools. Measure input handling, preview replay/render, navigation and presentation separately. Physical pen-to-display and driver measurements require actual hardware.
 2. **PB-122 / PB-136:** expand conservative Photoshop style import, preserving native channels and requiring an exact match with the standard saved composite. Keep unsupported documents protected. First slice: connect the existing integer pixel-grid gradient renderer to bounded gradient import without changing previously accepted source placement.

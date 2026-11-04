@@ -1,4 +1,8 @@
 //! Deterministic wet pigment reservoir. The Engine owns locks, undo and gesture previews.
+#[path = "smudge/input.rs"]
+pub(crate) mod input;
+#[path = "smudge/native.rs"]
+pub(crate) mod native;
 use crate::{
     brush::{self, Settings, Tip},
     raster::{Pixel, Raster, TILE},

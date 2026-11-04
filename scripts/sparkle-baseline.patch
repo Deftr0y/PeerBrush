@@ -1,0 +1,72 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -1,6 +1,6 @@
+ [package]
+ name = "peerbrush"
+-version = "0.30.0"
++version = "0.29.99"
+ edition = "2021"
+ rust-version = "1.92"
+ license = "GPL-3.0-only"
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2295,7 +2295,7 @@
+ 
+ [[package]]
+ name = "peerbrush"
+-version = "0.30.0"
++version = "0.29.99"
+ dependencies = [
+  "ab_glyph",
+  "arboard",
+--- a/src/sparkle/discovery.rs
++++ b/src/sparkle/discovery.rs
+@@ -15,7 +15,7 @@
+         .redirects(0)
+         .timeout(Duration::from_secs(20))
+         .build()
+-        .get(&config.feed_url)
++        .get("http://localhost:38573/stable/appcast.xml")
+         .call()
+         .map_err(|_| "The PeerBrush release feed is unavailable.")?;
+     if response.status() != 200 {
+@@ -75,7 +75,7 @@
+     let version = child(item, Some(NS), "version")?.text().ok_or(INVALID)?;
+     let next = semver::Version::parse(version).map_err(|_| INVALID)?;
+     let enclosure = child(item, None, "enclosure")?;
+-    let prefix = format!("https://github.com/Deftr0y/PeerBrush/releases/download/v{version}/PeerBrush-{version}-macOS-arm64-apple-signed-r");
++    let prefix = format!("http://localhost:38573/downloads/v{version}/PeerBrush-{version}-macOS-arm64-apple-signed-r");
+     let revisions = enclosure
+         .attribute("url")
+         .and_then(|url| url.strip_prefix(&prefix))
+@@ -126,7 +126,7 @@
+     fn signed_offer_no_update_and_tampered_bytes() {
+         let pair = Ed25519KeyPair::from_seed_unchecked(&[17; 32]).unwrap();
+         let xml = format!(
+-            r#"<rss xmlns:s="{NS}"><channel><item><s:version>0.30.1</s:version><s:minimumSystemVersion>12.0.0</s:minimumSystemVersion><s:hardwareRequirements>arm64</s:hardwareRequirements><description s:format="plain-text">Brush &amp; pen</description><enclosure url="https://github.com/Deftr0y/PeerBrush/releases/download/v0.30.1/PeerBrush-0.30.1-macOS-arm64-apple-signed-r1-dmg-signed-r2.dmg" length="300" type="application/octet-stream" s:edSignature="{}"/></item></channel></rss>"#,
++            r#"<rss xmlns:s="{NS}"><channel><item><s:version>0.30.1</s:version><s:minimumSystemVersion>12.0.0</s:minimumSystemVersion><s:hardwareRequirements>arm64</s:hardwareRequirements><description s:format="plain-text">Brush &amp; pen</description><enclosure url="http://localhost:38573/downloads/v0.30.1/PeerBrush-0.30.1-macOS-arm64-apple-signed-r1-dmg-signed-r2.dmg" length="300" type="application/octet-stream" s:edSignature="{}"/></item></channel></rss>"#,
+             STANDARD.encode([7; 64])
+         );
+         let signed = format!(
+--- a/src/sparkle/macos.rs
++++ b/src/sparkle/macos.rs
+@@ -464,7 +464,7 @@
+ 
+         #[unsafe(method_id(feedURLStringForUpdater:))]
+         fn feed_url(&self, updater: &AnyObject) -> Option<Retained<NSString>> {
+-            self.ivars().checks.owns(updater).then(|| NSString::from_str(crate::sparkle::PROPOSED_FEED_URL))
++            self.ivars().checks.owns(updater).then(|| NSString::from_str("http://localhost:38573/stable/appcast.xml"))
+         }
+ 
+         #[unsafe(method(updaterShouldRelaunchApplication:))]
+--- a/scripts/package.py
++++ b/scripts/package.py
+@@ -91,7 +91,7 @@
+         if check_pins is not None:
+             if not check_layout:
+                 raise ValueError('Configured manual-check pins require the corrected source layout')
+-            info.update(SUFeedURL=check_pins['feed_url'], SUPublicEDKey=check_pins['public_ed_key'])
++            info.update(SUFeedURL=check_pins['feed_url'], SUPublicEDKey=check_pins['public_ed_key'], NSAppTransportSecurity={'NSAllowsLocalNetworking': True})
+     if parsed[2]:
+         info['PeerBrushDevelopmentVersion'] = version
+     return info

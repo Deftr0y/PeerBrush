@@ -113,6 +113,30 @@ fn ambiguous_missing_closed_and_stale_targets_never_edit_another_project() {
     assert_eq!(root.lock().unwrap().doc.layers.len(), 1);
 }
 #[test]
+fn invalid_new_dimensions_preserve_the_open_canvas_and_project_list() {
+    let (root, second) = fixture();
+    edit(&root, &second, "Keep my work");
+    let before = second.lock().unwrap().state();
+    let tabs = w::state(&root);
+    for (axis, value) in [
+        ("width", json!(4294967308u64)),
+        ("height", json!(-2)),
+        ("width", json!("12")),
+    ] {
+        let mut params = target(&second);
+        params["action"] = json!("new");
+        params["discard"] = json!(true);
+        params[axis] = value;
+        for method in ["document", "projects"] {
+            assert!(server::dispatch(&root, method, &params)
+                .unwrap_err()
+                .contains("Invalid canvas size"));
+        }
+    }
+    assert_eq!(before, second.lock().unwrap().state());
+    assert_eq!(tabs, w::state(&root));
+}
+#[test]
 fn targeted_mutations_need_the_observed_document_and_revision() {
     let (root, second) = fixture();
     let mut p = target(&second);
@@ -235,7 +259,7 @@ fn transfer_preview_and_paste_preserve_native_tree_masks_effects_and_standard_ps
             id: peerbrush::engine::id(),
             kind: "invert".into(),
             enabled: true,
-            settings: json!({}),
+            settings: json!({}).into(),
         });
         e.doc.layers = vec![folder, child];
     }

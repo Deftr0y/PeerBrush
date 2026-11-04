@@ -72,6 +72,12 @@ fn raster_tiles(r: &Raster, out: &mut HashMap<usize, usize>) {
         out.insert(Arc::as_ptr(tile) as usize, tile.len() * 2);
     }
     if let Some(original) = &r.retained {
+        if !original.warps.is_empty() {
+            out.insert(
+                original.warps.as_ptr() as usize,
+                original.warps.capacity() * std::mem::size_of::<crate::warp::Stage>(),
+            );
+        }
         raster_tiles(&original.pixels, out);
     }
 }
@@ -187,7 +193,8 @@ impl Engine {
             return Err("Proposals need explicit human acceptance".into());
         }
         self.expire();
-        if self.doc.id != document || self.doc.revision != revision {
+        let view = engine::view::current(self);
+        if view.id() != document || view.revision() != revision {
             return Err("The project changed; review a fresh proposal before accepting".into());
         }
         let p = self
@@ -212,7 +219,8 @@ impl Engine {
     }
     fn queue_proposal(&mut self, p: Proposal) -> Result<Value, String> {
         self.expire();
-        if p.document != self.doc.id || p.revision != self.doc.revision {
+        let view = engine::view::current(self);
+        if p.document != view.id() || p.revision != view.revision() {
             return Err(
                 "The project changed while preparing the proposal; current work preserved".into(),
             );
@@ -228,7 +236,7 @@ impl Engine {
             return Err("Four proposals are already pending. Review or reject one first".into());
         }
         let mut base = HashMap::new();
-        doc_tiles(&self.doc, &mut base);
+        doc_tiles(self.resident()?, &mut base);
         let mut pending = HashMap::new();
         for old in self.proposals.iter().chain(std::iter::once(&p)) {
             if let Some(d) = &old.draft {
@@ -285,18 +293,15 @@ pub fn propose(shared: &Shared, actor: &str, p: &Value) -> Result<Value, String>
         return Err("Choose a proposal label of 1–160 characters".into());
     }
     let task = p["task"].as_str();
-    let mut draft = Engine::new();
-    {
+    let mut draft = {
         let mut e = shared.lock().unwrap();
         e.expire();
-        if e.doc.id != document || e.doc.revision != revision {
+        let view = engine::view::current(&e);
+        if view.id() != document || view.revision() != revision {
             return Err("The proposal source changed. Observe the current project again".into());
         }
-        draft.doc = e.doc.clone();
-        draft.leases = e.leases.clone();
-        draft.brush_library = e.brush_library.clone();
-        draft.filter_library = e.filter_library.clone();
-    }
+        e.resident_draft()?
+    };
     let commands = draft
         .filter_library
         .lock()
@@ -308,15 +313,15 @@ pub fn propose(shared: &Shared, actor: &str, p: &Value) -> Result<Value, String>
         .unwrap()
         .resolve_commands(&commands)?;
     let result = draft.edit(actor, &commands, Some(revision), task, label)?;
-    if draft.doc.id != document {
+    if engine::view::current(&draft).id() != document {
         return Err("Proposals edit the current project; new/open are document actions".into());
     }
     let scopes = draft
-        .undo
-        .last()
+        .history_entries()
+        .next_back()
         .ok_or("Missing proposal scope")?
-        .scopes
-        .clone();
+        .scopes()
+        .to_vec();
     let proposal = Proposal {
         id: engine::id(),
         actor: actor.into(),
@@ -326,7 +331,7 @@ pub fn propose(shared: &Shared, actor: &str, p: &Value) -> Result<Value, String>
         revision,
         commands: commands.clone(),
         scopes,
-        draft: Some(draft.doc),
+        draft: Some(draft.into_resident_document()?),
         expires: engine::now() + 900,
         status: "pending".into(),
         reason: String::new(),
@@ -385,6 +390,41 @@ mod tests {
                 .sum::<usize>(),
             2 * 256 * 256 * 4 * 2
         );
+    }
+    #[test]
+    fn warp_metadata_is_counted_for_each_owned_chain_while_original_tiles_stay_shared() {
+        for depth in [8, 16] {
+            let mut doc = Document::new_depth(16, 16, depth).unwrap();
+            doc.layers[0]
+                .pixels
+                .set16(1, 1, [12347, 23459, 34571, 65535]);
+            let mut original = crate::retained::Original::from(&doc.layers[0].pixels);
+            original.warps.push(crate::warp::Stage {
+                before: crate::projective::Map::IDENTITY.matrix(),
+                grid: crate::warp::Grid::identity([-2., -2., 18., 18.]).unwrap(),
+            });
+            original.validate(depth).unwrap();
+            let metadata = original.warps.capacity() * std::mem::size_of::<crate::warp::Stage>();
+            let tiles = original.pixels.bytes();
+            doc.layers[0].pixels.retained = Some(Box::new(original));
+            assert_eq!(doc.layers[0].pixels.stored_bytes(), 2 * tiles + metadata);
+            let clone = doc.clone();
+            let cloned_metadata = clone.layers[0]
+                .pixels
+                .retained
+                .as_ref()
+                .unwrap()
+                .warps
+                .capacity()
+                * std::mem::size_of::<crate::warp::Stage>();
+            let mut shared = HashMap::new();
+            doc_tiles(&doc, &mut shared);
+            doc_tiles(&clone, &mut shared);
+            assert_eq!(
+                shared.values().sum::<usize>(),
+                tiles + metadata + cloned_metadata
+            );
+        }
     }
     #[test]
     fn proposal_expiry_drops_sources_without_history_or_document_changes() {

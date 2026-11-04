@@ -613,7 +613,7 @@ mod tests {
                         .doc
                         .layers
                         .iter()
-                        .find_map(|l| match &l.source {
+                        .find_map(|l| match l.source.as_deref() {
                             Some(crate::source::Source {
                                 content: crate::source::Content::Bezier { nodes, .. },
                                 ..

@@ -17,7 +17,7 @@ fn identity_effect() -> Effect {
         id: id(),
         kind: "hsl".into(),
         enabled: true,
-        settings: json!({}),
+        settings: json!({}).into(),
     }
 }
 
@@ -189,7 +189,7 @@ fn prepared_folder_uses_child_effects_and_offsets_before_its_own_effect() {
         id: id(),
         kind: "invert".into(),
         enabled: true,
-        settings: json!({}),
+        settings: json!({}).into(),
     });
     let mut child = Layer::new("Offset child", "paint", 4, 3);
     child.parent = Some(folder.id.clone());
@@ -206,7 +206,7 @@ fn prepared_folder_uses_child_effects_and_offsets_before_its_own_effect() {
         id: id(),
         kind: "hsl".into(),
         enabled: true,
-        settings: json!({"hue":40}),
+        settings: json!({"hue":40}).into(),
     });
     let mut background = Layer::new("Background", "fill", 9, 7);
     background.parent = Some(folder.id.clone());

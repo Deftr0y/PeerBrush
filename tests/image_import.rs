@@ -260,6 +260,24 @@ fn animations_require_explicit_frames_and_preserve_composited_color() {
             expected,
             "{ext}"
         );
+        if ext == "webp" {
+            let shared = Arc::new(Mutex::new(Engine::new()));
+            let before = serde_json::to_value(&shared.lock().unwrap().doc).unwrap();
+            assert!(server::open(&shared, &file.0)
+                .unwrap_err()
+                .contains("frame"));
+            assert_eq!(
+                serde_json::to_value(&shared.lock().unwrap().doc).unwrap(),
+                before
+            );
+            server::open_options(&shared, &file.0, &Default::default(), &json!({"frame":1}))
+                .unwrap();
+            assert_eq!(shared.lock().unwrap().doc.bit_depth, 8);
+            assert_eq!(
+                shared.lock().unwrap().doc.layers[0].pixels.get(0, 0),
+                expected
+            );
+        }
     }
     assert!(Encoded::png(apng(16))
         .err()

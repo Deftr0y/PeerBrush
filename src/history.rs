@@ -850,7 +850,7 @@ impl Engine {
             self.changes.remove(0);
         }
         self.mark_ai(actor, &label, "history", inverse.scopes.clone());
-        self.status = label;
+        self.status = label.into();
         Ok(
             json!({"revision":revision,"task":task,"actor":owner,"reverted_batches":reverted,"scopes":inverse.scopes}),
         )

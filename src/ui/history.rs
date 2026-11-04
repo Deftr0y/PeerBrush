@@ -12,8 +12,8 @@ impl PeerBrush {
             .iter()
             .filter(|l| l.expires > crate::engine::now())
             .any(|l| {
-                self.message == format!("Reserved by {}: {}", l.owner, l.description)
-                    || self.message
+                self.message.as_str() == format!("Reserved by {}: {}", l.owner, l.description)
+                    || self.message.as_str()
                         == format!(
                             "Reserved by {}: {}. Release the reservation or edit elsewhere.",
                             l.owner, l.description
@@ -45,10 +45,20 @@ impl PeerBrush {
         }
     }
     pub(super) fn task_history_menu(&mut self, ui: &mut egui::Ui) {
-        let (tasks, proposals, recovery, code) = {
+        let (tasks, proposals, recovery, code, names) = {
             let mut e = self.shared.lock().unwrap();
             let p = e.proposals_state();
-            (e.task_history(), p, e.task_recovery(), e.code_states())
+            let names: HashMap<String, String> = crate::engine::view::current(&e)
+                .layers()
+                .map(|layer| (layer.id().to_owned(), layer.name().to_owned()))
+                .collect();
+            (
+                e.task_history(),
+                p,
+                e.task_recovery(),
+                e.code_states(),
+                names,
+            )
         };
         let pending = proposals
             .as_array()
@@ -65,7 +75,7 @@ impl PeerBrush {
             for run in code.as_array().unwrap().iter().rev() {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(format!("{} · {}",run["status"].as_str().unwrap(),run["description"].as_str().unwrap())).color(AI_BLUE))
-                        .on_hover_text(run["error"].as_str().map(str::to_owned).unwrap_or_else(||scope_text(&run["scopes"],&self.shared.lock().unwrap().doc)));
+                        .on_hover_text(run["error"].as_str().map(str::to_owned).unwrap_or_else(||scope_text_with(&run["scopes"],|id|names.get(id).map(String::as_str))));
                     if run["running"]==true && ui.button("Cancel").clicked() {
                         self.shared.lock().unwrap().cancel_code(run["run"].as_str().unwrap());
                         self.message="Canceling AI work · current canvas preserved".into();
@@ -83,10 +93,10 @@ impl PeerBrush {
                 }
             }
             for task in recovery["active"].as_array().unwrap() {
-                ui.label(RichText::new(format!("Working · {} · {}",task["owner"].as_str().unwrap(),task["description"].as_str().unwrap())).color(AI_BLUE)).on_hover_text(scope_text(&task["scopes"],&self.shared.lock().unwrap().doc));
+                ui.label(RichText::new(format!("Working · {} · {}",task["owner"].as_str().unwrap(),task["description"].as_str().unwrap())).color(AI_BLUE)).on_hover_text(scope_text_with(&task["scopes"],|id|names.get(id).map(String::as_str)));
             }
             for task in recovery["recent"].as_array().unwrap().iter().rev().take(8) {
-                ui.label(format!("{} · {} · {}",task["actor"].as_str().unwrap(),task["status"].as_str().unwrap().replace('_'," "),task["description"].as_str().unwrap())).on_hover_text(format!("{}\nCommitted edits remain. Review task history below; no automatic rollback or reservation restart.",scope_text(&task["scopes"],&self.shared.lock().unwrap().doc)));
+                ui.label(format!("{} · {} · {}",task["actor"].as_str().unwrap(),task["status"].as_str().unwrap().replace('_'," "),task["description"].as_str().unwrap())).on_hover_text(format!("{}\nCommitted edits remain. Review task history below; no automatic rollback or reservation restart.",scope_text_with(&task["scopes"],|id|names.get(id).map(String::as_str))));
             }
             if tasks.as_array().unwrap().is_empty() {
                 ui.label("No agent tasks in history");
@@ -104,18 +114,18 @@ impl PeerBrush {
                     .on_hover_text(task["task"].as_str().unwrap())
                     .clicked()
                 {
-                    let result = self.shared.lock().unwrap().inspect_task_undo(
-                        "human",
-                        task["actor"].as_str().unwrap(),
-                        task["task"].as_str().unwrap(),
-                    );
+                    let result = {
+                        let mut engine = self.shared.lock().unwrap();
+                        let document = crate::engine::view::current(&engine).id().to_owned();
+                        engine.inspect_task_undo("human",task["actor"].as_str().unwrap(),task["task"].as_str().unwrap())
+                            .map(|mut result| {result["document"]=json!(document);result})
+                    };
                     match result {
                         Ok(mut result) => {
-                            result["document"] = json!(self.shared.lock().unwrap().doc.id);
                             result["label"] = task["label"].clone();
                             self.task_undo_review = Some(result);
                         }
-                        Err(error) => self.message = error,
+                        Err(error) => self.message = error.into(),
                     }
                     ui.close_menu();
                 }
@@ -127,7 +137,12 @@ impl PeerBrush {
             );
         });
     }
-    pub(super) fn task_history_review(&mut self, ctx: &egui::Context, doc: &Document) {
+    pub(super) fn task_history_review<'a>(
+        &mut self,
+        ctx: &egui::Context,
+        doc: impl Into<DocumentView<'a>>,
+    ) {
+        let doc = doc.into();
         let Some(review) = self.task_undo_review.clone() else {
             return;
         };
@@ -136,19 +151,19 @@ impl PeerBrush {
         egui::Window::new("Undo AI task").id(egui::Id::new("task undo review")).open(&mut open).collapsible(false).default_width(430.).show(ctx,|ui| {
             ui.label(RichText::new(review["label"].as_str().unwrap_or("Agent task")).color(AI_BLUE));
             ui.label(format!("{} · {} batches",review["actor"].as_str().unwrap(),review["batches"].as_array().unwrap().len()));
-            let stale=review["revision"]!=doc.revision||review["document"]!=doc.id;
+            let stale=review["revision"]!=doc.revision()||review["document"]!=doc.id();
             if stale {ui.label("The project changed. Close and review the task again.");}
             egui::ScrollArea::vertical().max_height(260.).show(ui,|ui| {
                 for scope in review["scopes"].as_array().unwrap() {
                     let target=scope["target"].as_str();
-                    let name=target.and_then(|id|doc.layers.iter().find(|l|l.id==id.strip_prefix("@visibility:").unwrap_or(id))).map(|l|l.name.as_str()).unwrap_or_else(||if target==Some("@selection"){"Selection"}else{"Document"});
+                    let name=target.and_then(|id|doc.find_layer(id.strip_prefix("@visibility:").unwrap_or(id))).map(|l|l.name()).unwrap_or_else(||if target==Some("@selection"){"Selection"}else{"Document"});
                     let region=scope["rect"].as_array().map(|r|format!(" · ({}, {}) to ({}, {})",r[0],r[1],r[2],r[3])).unwrap_or_default();
                     ui.label(format!("{name}{region}"));
                 }
                 for conflict in review["conflicts"].as_array().unwrap() {
                     let field=conflict["field"].as_str().unwrap();let reason=conflict["reason"].as_str().unwrap();
-                    let target=conflict["target"].as_str().and_then(|id|doc.layers.iter().find(|l|l.id==id));
-                    let name=target.map(|l|l.name.as_str()).unwrap_or("Document");
+                    let target=conflict["target"].as_str().and_then(|id|doc.find_layer(id));
+                    let name=target.map(|l|l.name()).unwrap_or("Document");
                     let label=if field=="pixels" {"Color pixels".into()}else if field.starts_with("mask.") {"Mask source".into()}else if field.starts_with("layer.effects.") {format!("Color effect · {}",field.rsplit('.').next().unwrap().replace('_'," "))}else{field.strip_prefix("layer.").unwrap_or(field).replace('_'," ")};
                     let region=conflict["rect"].as_array().map(|r|format!(" · ({}, {}) to ({}, {})",r[0],r[1],r[2],r[3])).unwrap_or_default();
                     ui.label(RichText::new(format!("{name} · {label}{region}: {reason}")).color(ACCENT));
@@ -169,7 +184,11 @@ impl PeerBrush {
     }
 }
 
-fn scope_text(scopes: &Value, doc: &Document) -> String {
+fn scope_text<'a>(scopes: &Value, doc: impl Into<DocumentView<'a>>) -> String {
+    let doc = doc.into();
+    scope_text_with(scopes, |id| doc.find_layer(id).map(|layer| layer.name()))
+}
+fn scope_text_with<'a>(scopes: &Value, name: impl Fn(&str) -> Option<&'a str>) -> String {
     scopes
         .as_array()
         .unwrap()
@@ -177,12 +196,7 @@ fn scope_text(scopes: &Value, doc: &Document) -> String {
         .map(|s| {
             let target = s["target"].as_str();
             let name = target
-                .and_then(|id| {
-                    doc.layers
-                        .iter()
-                        .find(|l| l.id == id.strip_prefix("@visibility:").unwrap_or(id))
-                })
-                .map(|l| l.name.as_str())
+                .and_then(|id| name(id.strip_prefix("@visibility:").unwrap_or(id)))
                 .unwrap_or_else(|| {
                     if target == Some("@selection") {
                         "Selection"
@@ -214,7 +228,12 @@ impl PeerBrush {
             self.canvas_selection = None;
         }
     }
-    pub(super) fn proposal_window(&mut self, ctx: &egui::Context, doc: &Document) {
+    pub(super) fn proposal_window<'a>(
+        &mut self,
+        ctx: &egui::Context,
+        doc: impl Into<DocumentView<'a>>,
+    ) {
+        let doc = doc.into();
         let Some(id) = self.proposal_review.clone() else {
             return;
         };
@@ -291,8 +310,8 @@ impl PeerBrush {
                         let result = self.shared.lock().unwrap().accept_proposal(
                             "human",
                             &id,
-                            &doc.id,
-                            doc.revision,
+                            &doc.id(),
+                            doc.revision(),
                         );
                         match result {
                             Ok(_) => {
@@ -316,7 +335,8 @@ impl PeerBrush {
                         let result = self.shared.lock().unwrap().reject_proposal("human", &id);
                         self.message = result
                             .map(|_| "Proposal discarded · current work preserved".into())
-                            .unwrap_or_else(|e| e);
+                            .unwrap_or_else(|e| e)
+                            .into();
                         close = true;
                     }
                     if ui.button("Close").clicked() {
@@ -326,6 +346,38 @@ impl PeerBrush {
             });
         if !open || close || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.close_proposal();
+        }
+    }
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+    #[test]
+    fn native_task_scope_names_match_resident_metadata_without_rendering_or_document_copies() {
+        for depth in [8, 16] {
+            let mut doc = Document::new_depth(9, 7, depth).unwrap();
+            doc.layers[0].name = "Artwork tree".into();
+            let pool = crate::large_document::ResidentBudget::new(8 * 1024 * 1024).unwrap();
+            let owner = crate::engine::view::DocumentSnapshot::from(
+                crate::tree::presentation_tests::native(&doc, &pool),
+            );
+            let admitted = pool.used();
+            let scopes = json!([{"target":format!("@visibility:{}",doc.layers[0].id),"rect":[1,2,3,4]},
+                {"target":"@selection"},{"target":"missing"},{}]);
+            let expected = "Artwork tree · (1, 2) to (3, 4)\nSelection\nLayer\nDocument";
+            assert_eq!(scope_text(&scopes, &doc), expected);
+            assert_eq!(scope_text(&scopes, owner.view()), expected);
+            let names: HashMap<String, String> = owner
+                .view()
+                .layers()
+                .map(|l| (l.id().to_owned(), l.name().to_owned()))
+                .collect();
+            assert_eq!(
+                scope_text_with(&scopes, |id| names.get(id).map(String::as_str)),
+                expected
+            );
+            assert_eq!(pool.used(), admitted);
         }
     }
 }

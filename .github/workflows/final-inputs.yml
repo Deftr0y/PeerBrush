@@ -1,0 +1,120 @@
+name: PeerBrush final-input data preparation
+
+# Dormant data producer. Activation and independent offline-authority provisioning
+# require review; neither a variable nor the bundled selections can approve trust.
+on:
+  workflow_dispatch:
+    inputs:
+      expected_commit:
+        description: Exact independently reviewed stable main source SHA
+        required: true
+        type: string
+      upstream_selection_json:
+        description: Reviewed bounded public upstream artifacts and existing final authority selectors
+        required: true
+        type: string
+      upstream_selection_sha256:
+        description: Independent SHA256 of the exact UTF8 public upstream selection
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: final-inputs-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    if: ${{ false }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require exact dormant data-producer invocation
+        run: |
+          python -I - <<'PY'
+          import os, re
+          commit = os.environ['EXPECTED_COMMIT']
+          if (not re.fullmatch('[0-9a-f]{40}', commit)
+                  or os.environ.get('GITHUB_REPOSITORY') != 'Deftr0y/PeerBrush'
+                  or os.environ.get('GITHUB_REF') != 'refs/heads/main'
+                  or os.environ.get('GITHUB_EVENT_NAME') != 'workflow_dispatch'
+                  or os.environ.get('GITHUB_SHA') != commit or os.environ.get('GITHUB_WORKFLOW_SHA') != commit
+                  or os.environ.get('GITHUB_WORKFLOW_REF') != 'Deftr0y/PeerBrush/.github/workflows/final-inputs.yml@refs/heads/main'
+                  or os.environ.get('GITHUB_RUN_ATTEMPT') != '1'):
+              raise SystemExit('Require exact reviewed first-attempt main data preparation.')
+          PY
+        env:
+          EXPECTED_COMMIT: ${{ inputs.expected_commit }}
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Check final-input contracts
+        run: python -B scripts/test_final_inputs.py
+
+  prepare:
+    if: ${{ false }}
+    needs: gate
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require exact dormant data-producer invocation
+        run: |
+          python -I - <<'PY'
+          import os, re
+          commit = os.environ['EXPECTED_COMMIT']
+          if (not re.fullmatch('[0-9a-f]{40}', commit)
+                  or os.environ.get('GITHUB_REPOSITORY') != 'Deftr0y/PeerBrush'
+                  or os.environ.get('GITHUB_REF') != 'refs/heads/main'
+                  or os.environ.get('GITHUB_EVENT_NAME') != 'workflow_dispatch'
+                  or os.environ.get('GITHUB_SHA') != commit or os.environ.get('GITHUB_WORKFLOW_SHA') != commit
+                  or os.environ.get('GITHUB_WORKFLOW_REF') != 'Deftr0y/PeerBrush/.github/workflows/final-inputs.yml@refs/heads/main'
+                  or os.environ.get('GITHUB_RUN_ATTEMPT') != '1'):
+              raise SystemExit('Require exact reviewed first-attempt main data preparation.')
+          PY
+        env:
+          EXPECTED_COMMIT: ${{ inputs.expected_commit }}
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      # Independently approved public roots and Linux gh bytes must already exist
+      # under RUNNER_TEMP/peerbrush-final-trust/{macos,windows,linux}. No source,
+      # trust hash or credential is invented/provisioned by this workflow.
+      - name: Acquire and assemble selected final-input bytes through actual consumers
+        env:
+          EXPECTED_COMMIT: ${{ inputs.expected_commit }}
+          UPSTREAM_SELECTION_JSON: ${{ inputs.upstream_selection_json }}
+          UPSTREAM_SELECTION_SHA256: ${{ inputs.upstream_selection_sha256 }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          umask 077
+          python -B scripts/release_gate.py --commit "$EXPECTED_COMMIT"
+          python -I - <<'PY'
+          import hashlib, os, pathlib, re
+          data = os.environ['UPSTREAM_SELECTION_JSON'].encode('utf-8')
+          expected = os.environ['UPSTREAM_SELECTION_SHA256']
+          if (not 0 < len(data) <= 65536 or not re.fullmatch('[0-9a-f]{64}', expected)
+                  or hashlib.sha256(data).hexdigest() != expected):
+              raise SystemExit('Reviewed bounded upstream selection differs from its independent digest.')
+          with (pathlib.Path(os.environ['RUNNER_TEMP']) / 'peerbrush-final-upstream-selection.json').open('xb') as stream:
+              stream.write(data)
+          PY
+          set +e
+          python -B scripts/assemble_final_inputs.py --source-root "$GITHUB_WORKSPACE" \
+            --selection "$RUNNER_TEMP/peerbrush-final-upstream-selection.json" --selection-sha256 "$UPSTREAM_SELECTION_SHA256" \
+            --output "$RUNNER_TEMP/peerbrush-final-selected" --work "$RUNNER_TEMP/peerbrush-final-upstream-work" \
+            --artifact-output "$RUNNER_TEMP/peerbrush-final-input-artifact"
+          result=$?
+          set -e
+          if [ "$result" -ne 2 ]; then exit 1; fi
+      - name: Retain selected final-input data only
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: final-inputs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/peerbrush-final-input-artifact/final-inputs.zip
+            ${{ runner.temp }}/peerbrush-final-input-artifact/final-inputs.json
+          if-no-files-found: error
+          compression-level: 0

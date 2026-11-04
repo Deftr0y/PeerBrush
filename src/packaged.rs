@@ -4,6 +4,135 @@ use std::path::{Path, PathBuf};
 
 pub const MCP_ALIAS: &str = "peerbrush-mcp.exe";
 
+/// Public, read-only process observations for installed qualification. This is
+/// not a signature verifier, installation receipt, or an update permission.
+pub fn installation_info() -> Result<serde_json::Value, String> {
+    #[cfg(windows)]
+    let package = installation_package()?;
+    #[cfg(not(windows))]
+    let package = None::<serde_json::Value>;
+    let build: serde_json::Value = serde_json::from_str(crate::build_info::json())
+        .map_err(|_| "Cannot identify this build")?;
+    let observation = serde_json::json!({
+        "schema": 1,
+        "format": "PeerBrushInstallationObservationV1",
+        "platform": std::env::consts::OS,
+        "build": build,
+        "package": package,
+        "installed_acceptance": "not-established",
+        "update_eligible": false
+    });
+    if serde_json::to_vec(&observation)
+        .map_err(|_| "Cannot encode installation observation")?
+        .len()
+        > 16 * 1024
+    {
+        return Err("Installation observation exceeds its bounded output".into());
+    }
+    Ok(observation)
+}
+
+#[cfg(any(windows, test))]
+fn installation_route(
+    kind: &str,
+    associated: bool,
+    development: bool,
+    non_main: bool,
+) -> &'static str {
+    if development || non_main {
+        "ineligible"
+    } else if kind == "store" {
+        "microsoft-store"
+    } else if matches!(kind, "developer" | "enterprise") {
+        if associated {
+            "legacy-appinstaller"
+        } else {
+            "verified-local-candidate"
+        }
+    } else {
+        "ineligible"
+    }
+}
+
+#[cfg(windows)]
+fn installation_package() -> Result<Option<serde_json::Value>, String> {
+    use windows::{
+        ApplicationModel::{Package, PackageSignatureKind},
+        Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED},
+    };
+    let Some(family) = package_family()? else {
+        return Ok(None);
+    };
+    let native_error = |_| "Cannot read the current Windows package observation".to_owned();
+    unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok() }.map_err(native_error)?;
+    struct Apartment;
+    impl Drop for Apartment {
+        fn drop(&mut self) {
+            unsafe { CoUninitialize() };
+        }
+    }
+    let _apartment = Apartment;
+    let package = Package::Current().map_err(native_error)?;
+    let id = package.Id().map_err(native_error)?;
+    if id.FamilyName().map_err(native_error)?.to_string() != family {
+        return Err("Current Windows package identities disagree".into());
+    }
+    let signature = package.SignatureKind().map_err(native_error)?;
+    let kind = match signature {
+        PackageSignatureKind::Developer => "developer",
+        PackageSignatureKind::Enterprise => "enterprise",
+        PackageSignatureKind::Store => "store",
+        PackageSignatureKind::System => "system",
+        _ => "untrusted-or-unknown",
+    };
+    let associated = appinstaller_association(&package)
+        .map_err(native_error)?
+        .is_some();
+    let development = package.IsDevelopmentMode().map_err(native_error)?;
+    let non_main = package.IsFramework().map_err(native_error)?
+        || package.IsResourcePackage().map_err(native_error)?
+        || package.IsOptional().map_err(native_error)?;
+    let version = id.Version().map_err(native_error)?;
+    Ok(Some(serde_json::json!({
+        "name": id.Name().map_err(native_error)?.to_string(),
+        "publisher": id.Publisher().map_err(native_error)?.to_string(),
+        "family": family,
+        "full_name": id.FullName().map_err(native_error)?.to_string(),
+        "version": [version.Major, version.Minor, version.Build, version.Revision],
+        "signature_kind": kind,
+        "appinstaller_association": associated,
+        "development_mode": development,
+        "non_main": non_main,
+        "candidate_route": installation_route(kind, associated, development, non_main)
+    })))
+}
+
+// The WinRT projection maps successful NULL to an error. Preserve native
+// successful absence separately from failed queries, without exposing a URI.
+#[cfg(windows)]
+pub(crate) fn appinstaller_association(
+    package: &windows::ApplicationModel::Package,
+) -> windows::core::Result<Option<windows::ApplicationModel::AppInstallerInfo>> {
+    use windows::{
+        core::Interface,
+        ApplicationModel::{AppInstallerInfo, IPackage6},
+    };
+    let interface: IPackage6 = package.cast()?;
+    let mut pointer = std::ptr::null_mut();
+    unsafe {
+        (Interface::vtable(&interface).GetAppInstallerInfo)(
+            Interface::as_raw(&interface),
+            &mut pointer,
+        )
+        .ok()?;
+    }
+    Ok(if pointer.is_null() {
+        None
+    } else {
+        Some(unsafe { AppInstallerInfo::from_raw(pointer) })
+    })
+}
+
 /// Installed state must be writable, upgrade-stable, and visible to external
 /// local agents reading the discovery manifest. Keep portable defaults intact.
 pub fn default_state_dir(portable: PathBuf) -> Result<PathBuf, String> {
@@ -247,7 +376,7 @@ pub fn is_app_execution_alias(path: &Path) -> bool {
 }
 
 #[cfg(windows)]
-fn package_family() -> Result<Option<String>, String> {
+pub(crate) fn package_family() -> Result<Option<String>, String> {
     #[link(name = "kernel32")]
     extern "system" {
         fn GetCurrentPackageFamilyName(length: *mut u32, name: *mut u16) -> i32;
@@ -276,6 +405,43 @@ fn package_family() -> Result<Option<String>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn package_route_observations_never_grant_installation_or_update_authority() {
+        for kind in ["developer", "enterprise"] {
+            assert_eq!(
+                installation_route(kind, false, false, false),
+                "verified-local-candidate"
+            );
+            assert_eq!(
+                installation_route(kind, true, false, false),
+                "legacy-appinstaller"
+            );
+        }
+        assert_eq!(
+            installation_route("store", false, false, false),
+            "microsoft-store"
+        );
+        for kind in [
+            "developer",
+            "enterprise",
+            "store",
+            "system",
+            "untrusted-or-unknown",
+        ] {
+            assert_eq!(installation_route(kind, false, true, false), "ineligible");
+            assert_eq!(installation_route(kind, false, false, true), "ineligible");
+        }
+        assert_eq!(
+            installation_route("untrusted-or-unknown", false, false, false),
+            "ineligible"
+        );
+        let observation = installation_info().unwrap();
+        assert_eq!(observation["format"], "PeerBrushInstallationObservationV1");
+        assert_eq!(observation["installed_acceptance"], "not-established");
+        assert_eq!(observation["update_eligible"], false);
+        assert!(observation["package"].is_null()); // Test runner is unpackaged.
+    }
 
     #[test]
     fn portable_command_stays_unchanged() {

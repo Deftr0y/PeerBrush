@@ -9,7 +9,7 @@ pub(super) enum SaveIntent {
 pub(super) struct SaveReview {
     project: String,
     name: String,
-    report: crate::compatibility::SaveReport,
+    report: crate::compatibility::PreparedReport,
     intent: SaveIntent,
     pub(super) buttons: [Option<Rect>; 2],
 }
@@ -17,13 +17,13 @@ impl SaveReview {
     pub(super) fn new(
         project: String,
         name: String,
-        report: crate::compatibility::SaveReport,
+        report: impl Into<crate::compatibility::PreparedReport>,
         intent: SaveIntent,
     ) -> Self {
         Self {
             project,
             name,
-            report,
+            report: report.into(),
             intent,
             buttons: [None; 2],
         }
@@ -45,8 +45,8 @@ impl PeerBrush {
                 let result = match shared.try_lock() {
                     Ok(engine) => crate::workspace::guard(
                         &engine,
-                        &review.report.document_id,
-                        review.report.revision,
+                        &review.report.data().document_id,
+                        review.report.data().revision,
                     )
                     .map(|_| true),
                     Err(_) => Ok(false),
@@ -75,14 +75,14 @@ impl PeerBrush {
         let mut cancelled = false;
         review.buttons = [None; 2];
         let modal = egui::Modal::new(egui::Id::new("PSD save loss review")).show(ctx, |ui| {
-            ui.set_max_width(540.);
-            ui.heading("Review PSD / PSB output");
+            dialogs::body(ui, 540.);
+            dialogs::heading(ui, "Review PSD / PSB output", true);
             ui.label(RichText::new(&review.name).strong());
-            ui.label(format!("{} bit · {} standard layers/folders · current merged image", review.report.bit_depth, review.report.standard_layer_count));
+            ui.label(format!("{} bit · {} standard layers/folders · current merged image", review.report.data().bit_depth, review.report.data().standard_layer_count));
             ui.label("The saved appearance and native channel depth are preserved. Some settings require PeerBrush sources to stay editable; other editors receive the standard rendered result.");
-            egui::ScrollArea::vertical().id_salt("save loss details").max_height(330.).show(ui, |ui| {
-                for loss in &review.report.losses {
-                    if let Some(layer) = loss.layer_id.as_ref().and_then(|id| review.report.layers.iter().find(|layer| &layer.id == id)) {
+            egui::ScrollArea::vertical().id_salt("save loss details").max_height((ctx.screen_rect().height() - 280.).clamp(80., 330.)).show(ui, |ui| {
+                for loss in &review.report.data().losses {
+                    if let Some(layer) = loss.layer_id.as_ref().and_then(|id| review.report.data().layers.iter().find(|layer| &layer.id == id)) {
                         ui.label(RichText::new(&layer.name).strong());
                     }
                     ui.label(RichText::new(loss.message).color(ACCENT));
@@ -91,7 +91,7 @@ impl PeerBrush {
             });
             if !ready { ui.label("Waiting for the current document operation…"); }
             ui.horizontal(|ui| {
-                let save = ui.add_enabled(ready, egui::Button::new("Save with these changes"));
+                let save = ui.add_enabled(ready, dialogs::primary("Save with these changes"));
                 review.buttons[0] = Some(save.rect);
                 accepted = save.clicked();
                 let cancel = ui.button("Cancel");
@@ -106,14 +106,17 @@ impl PeerBrush {
             match review.intent {
                 SaveIntent::Save { save_as } => self.save_frozen(
                     save_as,
-                    review.report.document_id,
-                    review.report.revision,
+                    review.report.data().document_id.clone(),
+                    review.report.data().revision,
                     true,
                 ),
                 SaveIntent::Close { save_as } => self.save_for_close_with_acceptance(
                     ctx,
                     save_as,
-                    Some((&review.report.document_id, review.report.revision)),
+                    Some((
+                        &review.report.data().document_id,
+                        review.report.data().revision,
+                    )),
                 ),
             }
         } else {
@@ -122,17 +125,24 @@ impl PeerBrush {
         }
     }
     pub(super) fn open_save_report(&mut self) {
-        let result = crate::compatibility::report(&self.shared.lock().unwrap().doc);
+        let snapshot = self.shared.lock().unwrap().doc_snapshot();
+        let result = crate::compatibility::report_snapshot(&snapshot);
         match result {
             Ok(report) => self.save_report = Some(report),
-            Err(error) => self.message = error,
+            Err(error) => self.message = error.into(),
         }
     }
-    pub(super) fn compatibility_window(&mut self, ctx: &egui::Context, doc: &Document) {
+    pub(super) fn compatibility_window<'a>(
+        &mut self,
+        ctx: &egui::Context,
+        doc: impl Into<DocumentView<'a>>,
+    ) {
+        let doc = doc.into();
         let Some(report) = self.save_report.as_ref() else {
             return;
         };
-        if report.document_id != doc.id || report.revision != doc.revision {
+        let report = report.data();
+        if report.document_id != doc.id() || report.revision != doc.revision() {
             self.save_report = None;
             self.message =
                 "Document changed · reopen PSD compatibility to review current sources".into();

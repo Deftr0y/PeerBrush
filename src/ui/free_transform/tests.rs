@@ -1,0 +1,3792 @@
+use super::super::workspace_tests as workspace;
+use super::*;
+
+fn independent_coverage_eq(
+    actual: Option<&crate::selection::Coverage>,
+    expected: Option<&crate::selection::Coverage>,
+) -> bool {
+    let canonical = |contours: &[Vec<[f32; 2]>]| {
+        let mut paths = contours
+            .iter()
+            .map(|points| {
+                let mut path = points
+                    .iter()
+                    .map(|point| point.map(f32::to_bits))
+                    .collect::<Vec<_>>();
+                let start = (0..path.len())
+                    .min_by(|&a, &b| {
+                        path[a..]
+                            .iter()
+                            .chain(&path[..a])
+                            .cmp(path[b..].iter().chain(&path[..b]))
+                    })
+                    .unwrap_or(0);
+                path.rotate_left(start);
+                path
+            })
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths
+    };
+    match (actual, expected) {
+        (Some(a), Some(b)) => {
+            a.mask == b.mask
+                && a.bounds == b.bounds
+                && a.origin == b.origin
+                && canonical(&a.contours) == canonical(&b.contours)
+        }
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+#[test]
+fn independent_coverage_comparison_changes_only_closed_loop_start_and_order() {
+    let base = crate::selection::Coverage {
+        mask: crate::raster::Raster::new(4, 4),
+        bounds: [0, 0, 4, 4],
+        origin: [0, 0],
+        contours: vec![
+            vec![[0., 0.], [4., 0.], [4., 4.], [0., 4.]],
+            vec![[1., 1.], [1., 2.], [2., 2.], [2., 1.]],
+            vec![[0., 0.], [1., 0.], [0., 0.], [0., 1.]],
+        ],
+    };
+    let mut rotated = base.clone();
+    for (index, path) in rotated.contours.iter_mut().enumerate() {
+        path.rotate_left(index + 1);
+    }
+    rotated.contours.reverse();
+    assert!(independent_coverage_eq(Some(&base), Some(&rotated)));
+    assert!(independent_coverage_eq(None, None));
+    assert!(!independent_coverage_eq(Some(&base), None));
+    for change in 0..7 {
+        let mut different = base.clone();
+        match change {
+            0 => different.mask.set(0, 0, [1; 4]),
+            1 => different.bounds[2] -= 1,
+            2 => different.origin[0] += 1,
+            3 => different.contours[0][0][0] = -0.,
+            4 => different.contours[0].reverse(),
+            5 => {
+                different.contours.pop();
+            }
+            6 => different.contours[0].swap(1, 2),
+            _ => unreachable!(),
+        }
+        assert!(
+            !independent_coverage_eq(Some(&base), Some(&different)),
+            "Preserve difference {change}"
+        );
+    }
+}
+
+const SIZE: Vec2 = Vec2::new(1360., 900.);
+fn frame(app: &mut PeerBrush, ctx: &egui::Context, events: Vec<egui::Event>) -> egui::FullOutput {
+    workspace::draw(app, ctx, SIZE, events)
+}
+fn key_event(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+    egui::Event::Key {
+        key,
+        physical_key: Some(key),
+        pressed: true,
+        repeat: false,
+        modifiers,
+    }
+}
+fn pointer(pos: Pos2, pressed: bool) -> egui::Event {
+    egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: Default::default(),
+    }
+}
+fn open(app: &mut PeerBrush, ctx: &egui::Context) {
+    frame(app, ctx, vec![]);
+    workspace::key(app, ctx, SIZE, egui::Key::T, egui::Modifiers::COMMAND);
+    assert!(app.free_transform.is_some(), "{}", app.message);
+}
+fn settle(app: &mut PeerBrush, ctx: &egui::Context) -> egui::FullOutput {
+    settle_size(app, ctx, SIZE)
+}
+fn settle_size(app: &mut PeerBrush, ctx: &egui::Context, size: Vec2) -> egui::FullOutput {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        workspace::draw(app, ctx, size, vec![]);
+        let ready = app.free_transform.as_ref().is_some_and(|editor| {
+            editor
+                .key()
+                .ok()
+                .is_some_and(|key| editor.rendered.as_ref() == Some(&key))
+        });
+        if ready && !app.pending && app.canvas_preview == app.last_preview {
+            return workspace::draw(app, ctx, size, vec![]);
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Free Transform preview did not finish: {}",
+            app.message
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+fn actual_preview(app: &PeerBrush, output: &egui::FullOutput) {
+    let doc = app.shared.lock().unwrap().doc.clone();
+    let editor = app.free_transform.as_ref().unwrap();
+    let commands = editor.commands().unwrap();
+    assert_eq!(commands.len(), editor.roots.len());
+    let expected = crate::engine::Engine::preview_edits(doc, &commands).unwrap();
+    let (w, h, bytes, _) = expected.preview(None, 1536, None, false).unwrap();
+    assert_eq!(app.canvas_pixels.as_ref(), Some(&(w, h, bytes)));
+    let texture = app.texture.as_ref().unwrap().id();
+    assert!(
+        output.shapes.iter().any(
+            |shape| matches!(&shape.shape,egui::Shape::Mesh(mesh) if mesh.texture_id==texture)
+        ),
+        "Shared-engine result must be painted into the actual canvas mesh"
+    );
+}
+
+#[test]
+fn affine_session_uses_actual_controls_pixels_and_one_native_commit_across_modes() {
+    for depth in [8, 16] {
+        let (mut app, ctx) = workspace::fixture(depth);
+        let before = workspace::source(&app);
+        let prior_undo = app.shared.lock().unwrap().undo.len();
+        open(&mut app, &ctx);
+        settle(&mut app, &ctx);
+        // Real unboxed numeric editing; Enter completes the field, not the session.
+        let at = app.free_transform.as_ref().unwrap().inputs[0]
+            .unwrap()
+            .center();
+        workspace::click(&mut app, &ctx, SIZE, at);
+        workspace::click(&mut app, &ctx, SIZE, at);
+        frame(
+            &mut app,
+            &ctx,
+            vec![
+                key_event(egui::Key::A, egui::Modifiers::COMMAND),
+                egui::Event::Text("6".into()),
+            ],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![key_event(egui::Key::Enter, Default::default())],
+        );
+        assert!(app.free_transform.is_some(), "Numeric Enter must not Apply");
+        assert_eq!(workspace::source(&app), before);
+        assert_eq!(app.free_transform.as_ref().unwrap().values.offset[0], 6.);
+        let output = settle(&mut app, &ctx);
+        actual_preview(&app, &output);
+        workspace::key(&mut app, &ctx, SIZE, egui::Key::E, Default::default());
+        assert!(app.free_transform.as_ref().unwrap().mode == Tool::Rotate);
+        workspace::key(&mut app, &ctx, SIZE, egui::Key::R, Default::default());
+        assert!(app.free_transform.as_ref().unwrap().mode == Tool::Scale);
+        let editor = app.free_transform.as_ref().unwrap();
+        let corner = editor.corners()[2];
+        let pivot = editor.point(editor.pivot);
+        let start = app.view.point(
+            corner.map(|v| v as f32),
+            app.view_rect.unwrap(),
+            app.view_rect.unwrap().width() / 32.,
+        );
+        let end_doc = [
+            pivot[0] + (corner[0] - pivot[0]) * 1.2,
+            pivot[1] + (corner[1] - pivot[1]) * 1.2,
+        ];
+        let end = app.view.point(
+            end_doc.map(|v| v as f32),
+            app.view_rect.unwrap(),
+            app.view_rect.unwrap().width() / 32.,
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerMoved(start), pointer(start, true)],
+        );
+        frame(&mut app, &ctx, vec![egui::Event::PointerMoved(end)]);
+        frame(&mut app, &ctx, vec![pointer(end, false)]);
+        assert!(app.free_transform.as_ref().unwrap().values.scale[0] > 1.);
+        assert_eq!(
+            workspace::source(&app),
+            before,
+            "Handle release must retain a pending session"
+        );
+        let output = settle(&mut app, &ctx);
+        actual_preview(&app, &output);
+        let flip = workspace::label(&output, "Flip H");
+        workspace::click(&mut app, &ctx, SIZE, flip);
+        let output = settle(&mut app, &ctx);
+        actual_preview(&app, &output);
+        let commands = app.free_transform.as_ref().unwrap().commands().unwrap();
+        assert_eq!(
+            commands.len(),
+            1,
+            "All mode changes must retain one original-sampling command"
+        );
+        assert_eq!(commands[0]["op"], "transform");
+        assert_eq!(commands[0]["dx"], 6.);
+        let expected =
+            crate::engine::Engine::preview_edits(app.shared.lock().unwrap().doc.clone(), &commands)
+                .unwrap();
+        workspace::click(&mut app, &ctx, SIZE, workspace::label(&output, "Apply"));
+        assert!(app.free_transform.is_none(), "{}", app.message);
+        let mut engine = app.shared.lock().unwrap();
+        assert_eq!(engine.undo.len(), prior_undo + 1);
+        assert_eq!(engine.doc.bit_depth, depth);
+        assert_eq!(
+            engine.doc.export_png().unwrap(),
+            expected.export_png().unwrap()
+        );
+        engine.undo("human").unwrap();
+        assert_eq!(
+            engine.doc.layers[0].pixels.rgba16(),
+            serde_json::from_value::<Document>(before["document"].clone())
+                .unwrap()
+                .layers[0]
+                .pixels
+                .rgba16()
+        );
+        assert_eq!(
+            engine.doc.export_png().unwrap(),
+            before["png"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_u64().unwrap() as u8)
+                .collect::<Vec<_>>()
+        );
+        engine.redo("human").unwrap();
+        assert_eq!(
+            engine.doc.export_png().unwrap(),
+            expected.export_png().unwrap()
+        );
+    }
+}
+
+#[test]
+fn actual_menu_cancel_and_held_pointer_escape_do_not_replay_brush_or_destructive_keys() {
+    for depth in [8, 16] {
+        let (mut app, ctx) = workspace::fixture(depth);
+        let before = workspace::source(&app);
+        let output = frame(&mut app, &ctx, vec![]);
+        workspace::click(&mut app, &ctx, SIZE, workspace::label(&output, "Layer"));
+        let output = frame(&mut app, &ctx, vec![]);
+        workspace::click(
+            &mut app,
+            &ctx,
+            SIZE,
+            workspace::label(&output, "Free Transform..."),
+        );
+        let output = settle(&mut app, &ctx);
+        workspace::click(&mut app, &ctx, SIZE, workspace::label(&output, "Cancel"));
+        assert!(app.free_transform.is_none());
+        assert_eq!(workspace::source(&app), before);
+        open(&mut app, &ctx);
+        app.free_transform.as_mut().unwrap().values.offset = [3., 0.];
+        let output = settle(&mut app, &ctx);
+        actual_preview(&app, &output);
+        let editor = app.free_transform.as_ref().unwrap();
+        let point = editor.point([
+            editor.bounds[0] + (editor.bounds[2] - editor.bounds[0]) * 0.7,
+            editor.bounds[1] + (editor.bounds[3] - editor.bounds[1]) * 0.7,
+        ]);
+        let point = app.view.point(
+            point.map(|v| v as f32),
+            app.view_rect.unwrap(),
+            app.view_rect.unwrap().width() / 32.,
+        );
+        let screen_bounds = Rect::from_points(&editor.corners().map(|corner| {
+            app.view.point(
+                corner.map(|value| value as f32),
+                app.view_rect.unwrap(),
+                app.view_rect.unwrap().width() / 32.,
+            )
+        }));
+        assert!(
+            screen_bounds.contains(point),
+            "Drag fixture must press inside the artwork"
+        );
+        assert_eq!(
+            ctx.layer_id_at(point).map(|layer| layer.order),
+            Some(egui::Order::Background),
+            "Drag fixture must choose visible canvas outside floating controls"
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerMoved(point), pointer(point, true)],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerMoved(point + Vec2::new(20., 10.))],
+        );
+        assert!(app.free_transform.as_ref().unwrap().drag.is_some());
+        frame(
+            &mut app,
+            &ctx,
+            vec![
+                key_event(egui::Key::Escape, Default::default()),
+                key_event(egui::Key::Delete, Default::default()),
+            ],
+        );
+        assert!(app.free_transform.is_none());
+        frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerMoved(point + Vec2::new(30., 20.))],
+        );
+        frame(&mut app, &ctx, vec![pointer(point, false)]);
+        assert_eq!(
+            workspace::source(&app),
+            before,
+            "Cancel through release must not paint, clear or commit the draft"
+        );
+        let mut repeat = key_event(egui::Key::Delete, Default::default());
+        if let egui::Event::Key { repeat, .. } = &mut repeat {
+            *repeat = true;
+        }
+        frame(&mut app, &ctx, vec![repeat]);
+        assert_eq!(
+            workspace::source(&app),
+            before,
+            "A held destructive key requires a fresh retry"
+        );
+    }
+}
+
+#[test]
+fn stale_preview_focus_target_source_and_reserved_apply_keep_exact_human_work() {
+    for depth in [8, 16] {
+        let (mut app, ctx) = workspace::fixture(depth);
+        open(&mut app, &ctx);
+        app.free_transform.as_mut().unwrap().values.offset = [5., 0.];
+        settle(&mut app, &ctx);
+        let before = workspace::source(&app);
+        let id = app.selected.clone();
+        app.shared
+            .lock()
+            .unwrap()
+            .reserve(
+                "other",
+                "Human artwork",
+                vec![crate::engine::Scope::layer(&id)],
+            )
+            .unwrap();
+        let output = frame(&mut app, &ctx, vec![]);
+        workspace::click(&mut app, &ctx, SIZE, workspace::label(&output, "Apply"));
+        assert!(
+            app.free_transform.is_some(),
+            "Reservation failure must retain pending values"
+        );
+        assert_eq!(workspace::source(&app), before);
+        app.shared.lock().unwrap().leases.clear();
+        let editor = app.free_transform.as_mut().unwrap();
+        editor.values.angle = 15.;
+        editor.changed();
+        app.transient = editor.commands().unwrap();
+        let doc = app.shared.lock().unwrap().doc.clone();
+        let live = app.live_key();
+        while app.preview_rx.try_recv().is_ok() {}
+        app.pending = true;
+        app.preview_tx
+            .send(Preview {
+                job: app.preview_job,
+                parameter: None,
+                parameter_document: None,
+                parameter_replayed: false,
+                coarse: false,
+                error: None,
+                live,
+                revision: doc.revision,
+                doc_id: doc.id.clone(),
+                w: 1,
+                h: 1,
+                bytes: vec![1, 2, 3, 255],
+                dirty: None,
+                selection: doc.selection,
+                selection_polygon: doc.selection_polygon.clone(),
+                selection_coverage: doc.selection_coverage.clone(),
+                target: "old-session-parameters".into(),
+                mask: false,
+            })
+            .unwrap();
+        app.request_preview(&ctx, &doc);
+        assert!(
+            app.free_transform.as_ref().unwrap().rendered.is_none(),
+            "An older same-session result cannot enable Apply"
+        );
+        assert_ne!(
+            app.canvas_pixels.as_ref().map(|v| &v.2),
+            Some(&vec![1, 2, 3, 255])
+        );
+        app.shared
+            .lock()
+            .unwrap()
+            .edit(
+                "human",
+                &[json!({"op":"layer.update","layer":id,"name":"Later human work"})],
+                None,
+                None,
+                "Later human work",
+            )
+            .unwrap();
+        let later = workspace::source(&app);
+        frame(
+            &mut app,
+            &ctx,
+            vec![key_event(egui::Key::Enter, Default::default())],
+        );
+        assert!(app.free_transform.is_none());
+        assert_eq!(
+            workspace::source(&app),
+            later,
+            "Source changes must cancel without rebasing or committing"
+        );
+        open(&mut app, &ctx);
+        let before = workspace::source(&app);
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, SIZE)),
+                focused: false,
+                events: vec![
+                    egui::Event::WindowFocused(false),
+                    key_event(egui::Key::Enter, Default::default()),
+                ],
+                ..Default::default()
+            },
+            |ctx| app.draw(ctx),
+        );
+        assert!(app.free_transform.is_none());
+        assert_eq!(workspace::source(&app), before);
+    }
+}
+
+#[test]
+fn pending_session_blocks_save_close_update_and_ime_shortcuts_without_source_changes() {
+    for depth in [8, 16] {
+        let (mut app, ctx) = workspace::fixture(depth);
+        open(&mut app, &ctx);
+        settle(&mut app, &ctx);
+        let before = workspace::source(&app);
+        app.save(false);
+        assert!(!app.busy && app.message.contains("Apply or cancel"));
+        app.request_close(lifecycle::Intent::Exit);
+        assert!(app.lifecycle.is_none() && !app.exit_approved);
+        assert!(app.update_restart_blocker().is_some());
+        let at = app.free_transform.as_ref().unwrap().inputs[0]
+            .unwrap()
+            .center();
+        workspace::click(&mut app, &ctx, SIZE, at);
+        workspace::click(&mut app, &ctx, SIZE, at);
+        frame(
+            &mut app,
+            &ctx,
+            vec![
+                egui::Event::Ime(egui::ImeEvent::Enabled),
+                egui::Event::Ime(egui::ImeEvent::Preedit("6".into())),
+                key_event(egui::Key::Enter, Default::default()),
+                key_event(egui::Key::Delete, Default::default()),
+                key_event(egui::Key::Z, egui::Modifiers::COMMAND),
+                key_event(egui::Key::W, Default::default()),
+            ],
+        );
+        assert!(
+            app.free_transform.is_some(),
+            "IME/text Enter must not Apply or run tools"
+        );
+        assert_eq!(workspace::source(&app), before);
+        app.cancel_free_transform();
+        assert_eq!(workspace::source(&app), before);
+    }
+}
+
+#[test]
+fn selection_choice_pivot_reset_and_pure_move_keep_one_command_and_explicit_bounds() {
+    for depth in [8, 16] {
+        let (mut app, ctx) = workspace::fixture(depth);
+        {
+            let mut engine = app.shared.lock().unwrap();
+            engine
+                .edit(
+                    "human",
+                    &[json!({"op":"selection","rect":[4,4,13,13],"feather":1.})],
+                    None,
+                    None,
+                    "Selection",
+                )
+                .unwrap();
+        }
+        open(&mut app, &ctx);
+        let before = workspace::source(&app);
+        let editor = app.free_transform.as_mut().unwrap();
+        editor.values.offset = [4., 0.];
+        assert_eq!(
+            editor.commands().unwrap()[0]["op"],
+            "move",
+            "Pure movement must not rerender missing fonts"
+        );
+        editor.values.skew = [15., 0.];
+        assert_eq!(editor.commands().unwrap()[0]["selection_only"], true);
+        let output = frame(&mut app, &ctx, vec![]);
+        workspace::click(
+            &mut app,
+            &ctx,
+            SIZE,
+            workspace::label(&output, "Whole target (keep selection)"),
+        );
+        let output = settle(&mut app, &ctx);
+        actual_preview(&app, &output);
+        let editor = app.free_transform.as_ref().unwrap();
+        let commands = editor.commands().unwrap();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0]["op"], "transform");
+        assert_eq!(commands[0]["selection_only"], false);
+        assert!(editor.values != Parameters::default());
+        let reference = editor.pivot;
+        workspace::click(
+            &mut app,
+            &ctx,
+            SIZE,
+            workspace::label(&output, "Reset transform"),
+        );
+        settle(&mut app, &ctx);
+        assert_eq!(app.free_transform.as_ref().unwrap().pivot, reference);
+        assert!(app.free_transform.as_ref().unwrap().values == Parameters::default());
+        app.cancel_free_transform();
+        assert_eq!(workspace::source(&app), before);
+    }
+}
+
+#[test]
+fn space_navigation_does_not_also_transform_pending_artwork() {
+    for depth in [8, 16] {
+        let (mut app, ctx) = workspace::fixture(depth);
+        open(&mut app, &ctx);
+        app.free_transform.as_mut().unwrap().values.offset = [3., 0.];
+        settle(&mut app, &ctx);
+        let before = workspace::source(&app);
+        let values = app.free_transform.as_ref().unwrap().values.clone();
+        let at = app.view_rect.unwrap().center() + Vec2::new(10., 10.);
+        frame(
+            &mut app,
+            &ctx,
+            vec![
+                key_event(egui::Key::Space, Default::default()),
+                egui::Event::PointerMoved(at),
+                pointer(at, true),
+            ],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerMoved(at + Vec2::new(40., 20.))],
+        );
+        frame(&mut app, &ctx, vec![pointer(at, false)]);
+        let mut released = key_event(egui::Key::Space, Default::default());
+        if let egui::Event::Key { pressed, .. } = &mut released {
+            *pressed = false;
+        }
+        frame(&mut app, &ctx, vec![released]);
+        assert!(app.free_transform.as_ref().unwrap().values == values);
+        assert!(app.free_transform.as_ref().unwrap().drag.is_none());
+        assert_eq!(workspace::source(&app), before);
+    }
+}
+
+#[test]
+fn existing_live_tool_and_file_loading_guards_refuse_session_without_discarding_work() {
+    for depth in [8, 16] {
+        let (mut app, ctx) = workspace::fixture(depth);
+        frame(&mut app, &ctx, vec![]);
+        let doc = app.shared.lock().unwrap().doc.clone();
+        let before = workspace::source(&app);
+        app.live_gesture = Some("existing-tool-gesture".into());
+        app.open_free_transform(&ctx, &doc);
+        assert!(app.free_transform.is_none());
+        assert_eq!(app.live_gesture.as_deref(), Some("existing-tool-gesture"));
+        app.live_gesture = None;
+        app.load_control = Some(crate::loading::Control::default());
+        app.open_free_transform(&ctx, &doc);
+        assert!(app.free_transform.is_none() && app.load_control.is_some());
+        assert_eq!(workspace::source(&app), before);
+    }
+}
+
+#[test]
+fn selected_skew_numeric_control_previews_native_result_then_applies_once_and_undo_restores_coverage(
+) {
+    for depth in [8, 16] {
+        let (mut app, ctx) = workspace::fixture(depth);
+        app.shared
+            .lock()
+            .unwrap()
+            .edit(
+                "human",
+                &[json!({"op":"selection","rect":[4,4,13,13],"feather":1.})],
+                None,
+                None,
+                "Soft selection",
+            )
+            .unwrap();
+        let before = app.shared.lock().unwrap().doc.clone();
+        let history = app.shared.lock().unwrap().undo.len();
+        open(&mut app, &ctx);
+        settle(&mut app, &ctx);
+        let at = app.free_transform.as_ref().unwrap().inputs[5]
+            .unwrap()
+            .center();
+        workspace::click(&mut app, &ctx, SIZE, at);
+        workspace::click(&mut app, &ctx, SIZE, at);
+        frame(
+            &mut app,
+            &ctx,
+            vec![
+                key_event(egui::Key::A, egui::Modifiers::COMMAND),
+                egui::Event::Text("45".into()),
+            ],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![key_event(egui::Key::Enter, Default::default())],
+        );
+        assert!(
+            app.free_transform.is_some(),
+            "A numeric Enter does not Apply"
+        );
+        assert_eq!(app.free_transform.as_ref().unwrap().values.skew[0], 45.);
+        let output = settle(&mut app, &ctx);
+        actual_preview(&app, &output);
+        let commands = app.free_transform.as_ref().unwrap().commands().unwrap();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0]["selection_only"], true);
+        let expected = crate::engine::Engine::preview_edits(before.clone(), &commands).unwrap();
+        assert_eq!(
+            app.shared.lock().unwrap().doc.layers[0].pixels,
+            before.layers[0].pixels
+        );
+        workspace::click(&mut app, &ctx, SIZE, workspace::label(&output, "Apply"));
+        assert!(app.free_transform.is_none(), "{}", app.message);
+        let mut engine = app.shared.lock().unwrap();
+        assert_eq!(engine.doc.bit_depth, depth);
+        assert_eq!(engine.undo.len(), history + 1);
+        assert_eq!(engine.doc.layers[0].pixels, expected.layers[0].pixels);
+        assert!(independent_coverage_eq(
+            engine.doc.selection_coverage.as_ref(),
+            expected.selection_coverage.as_ref()
+        ));
+        let applied_coverage = engine.doc.selection_coverage.clone();
+        assert_eq!(
+            engine.doc.export_png().unwrap(),
+            expected.export_png().unwrap()
+        );
+        engine.undo("human").unwrap();
+        assert_eq!(engine.doc.layers[0].pixels, before.layers[0].pixels);
+        assert_eq!(engine.doc.selection_coverage, before.selection_coverage);
+        assert_eq!(
+            engine.doc.export_png().unwrap(),
+            before.export_png().unwrap()
+        );
+        engine.redo("human").unwrap();
+        assert_eq!(engine.doc.layers[0].pixels, expected.layers[0].pixels);
+        assert_eq!(engine.doc.selection_coverage, applied_coverage);
+        assert!(independent_coverage_eq(
+            engine.doc.selection_coverage.as_ref(),
+            expected.selection_coverage.as_ref()
+        ));
+    }
+}
+
+fn enter_reference_value(app: &mut PeerBrush, ctx: &egui::Context, index: usize, text: &str) {
+    let at = app.free_transform.as_ref().unwrap().inputs[index]
+        .unwrap()
+        .center();
+    workspace::click(app, ctx, SIZE, at);
+    workspace::click(app, ctx, SIZE, at);
+    frame(
+        app,
+        ctx,
+        vec![
+            key_event(egui::Key::A, egui::Modifiers::COMMAND),
+            egui::Event::Text(text.into()),
+        ],
+    );
+    frame(
+        app,
+        ctx,
+        vec![key_event(egui::Key::Enter, Default::default())],
+    );
+    assert!(app.free_transform.is_some(), "Numeric Enter must not Apply");
+}
+
+fn reference_mask_eq(actual: &Option<crate::engine::Mask>, expected: &Option<crate::engine::Mask>) {
+    let (actual, expected) = (actual.as_ref().unwrap(), expected.as_ref().unwrap());
+    assert_eq!(
+        (actual.enabled, actual.linked),
+        (expected.enabled, expected.linked)
+    );
+    assert_eq!(actual.steps.len(), expected.steps.len());
+    for (a, b) in actual.steps.iter().zip(&expected.steps) {
+        assert_eq!(
+            (
+                &a.id,
+                &a.kind,
+                a.enabled,
+                a.weight.to_bits(),
+                a.value.to_bits(),
+                &a.settings
+            ),
+            (
+                &b.id,
+                &b.kind,
+                b.enabled,
+                b.weight.to_bits(),
+                b.value.to_bits(),
+                &b.settings
+            )
+        );
+        assert_eq!(a.pixels, b.pixels);
+    }
+}
+
+#[test]
+fn moved_reference_preserves_exact_command_then_anchors_the_next_affine_change() {
+    let (mut app, ctx) = workspace::fixture(16);
+    open(&mut app, &ctx);
+    let editor = app.free_transform.as_mut().unwrap();
+    editor.pivot = [0., 0.];
+    editor.values.scale = [2., 1.];
+    let original = editor.commands().unwrap();
+    let point = editor.point([3.25, 4.5]);
+    editor.set_reference([0.5, 0.5]).unwrap();
+    assert_eq!(editor.commands().unwrap(), original);
+    assert_eq!(
+        editor.point([3.25, 4.5]).map(f64::to_bits),
+        point.map(f64::to_bits)
+    );
+    editor.values.scale = [1., 1.];
+    let command = editor.commands().unwrap().pop().unwrap();
+    assert_eq!(
+        command["op"], "transform",
+        "Identity plus fractional placement is not an integer Move"
+    );
+    assert_eq!(command["fractional_translation"], true);
+    assert_eq!(command["dx"], 0.25);
+    assert_eq!(command["dy"], 0.);
+    assert_eq!(editor.point([0.25, 0.5]), [0.5, 0.5]);
+
+    editor.reference = None;
+    editor.pivot = [13., 9.];
+    editor.values = Parameters {
+        offset: [4., -2.],
+        scale: [1.3, 0.8],
+        angle: 27.,
+        skew: [9., -4.],
+        mirror: [true, false],
+        projective: None,
+        warp: None,
+    };
+    for reference in [[9.125, 11.5], [12.25, 7.75]] {
+        let commands = editor.commands().unwrap();
+        let key = editor.key().unwrap();
+        let points = [[-3., 8.], [0., 0.], [24., 20.]].map(|p| editor.point(p).map(f64::to_bits));
+        editor.set_reference(reference).unwrap();
+        assert_eq!(editor.commands().unwrap(), commands);
+        assert_eq!(editor.key().unwrap(), key);
+        assert_eq!(
+            [[-3., 8.], [0., 0.], [24., 20.]].map(|p| editor.point(p).map(f64::to_bits)),
+            points
+        );
+    }
+    let anchor = editor.reference.as_ref().unwrap();
+    let [a, b, c, d, tx, ty] = anchor.matrix;
+    let [qx, qy] = anchor.point;
+    let det = a * d - b * c;
+    let source = [
+        (d * (qx - tx) - c * (qy - ty)) / det,
+        (-b * (qx - tx) + a * (qy - ty)) / det,
+    ];
+    editor.values.angle += 19.;
+    editor.values.scale = [0.7, 1.6];
+    let mapped = editor.point(source);
+    assert!((mapped[0] - qx).abs() < 1e-10 && (mapped[1] - qy).abs() < 1e-10);
+    assert_eq!(editor.commands().unwrap().len(), 1);
+    editor.values.offset[0] += 3.;
+    assert_eq!(editor.reference_point(), [qx + 3., qy]);
+    let commands = editor.commands().unwrap();
+    assert!(editor.set_reference([100001., 0.]).is_err());
+    assert_eq!(editor.commands().unwrap(), commands);
+}
+
+#[test]
+fn actual_reference_fields_keep_painted_result_then_rotate_once_with_native_masks_and_selection() {
+    for depth in [8, 16] {
+        for selected in [false, true] {
+            let (mut app, ctx) = workspace::fixture(depth);
+            {
+                let mut engine = app.shared.lock().unwrap();
+                let id = app.selected.clone();
+                engine
+                    .edit(
+                        "human",
+                        &[json!({"op":"mask.add","layer":id})],
+                        None,
+                        None,
+                        "Mask",
+                    )
+                    .unwrap();
+                engine.doc.layers[0].mask.as_mut().unwrap().steps[1]
+                    .pixels
+                    .set16(8, 8, [23459, 23459, 23459, 65535]);
+                if selected {
+                    engine
+                        .edit(
+                            "human",
+                            &[json!({"op":"selection","rect":[4,4,13,13],"feather":1.})],
+                            None,
+                            None,
+                            "Soft selection",
+                        )
+                        .unwrap();
+                }
+            }
+            let before = workspace::source(&app);
+            let original = app.shared.lock().unwrap().doc.clone();
+            let history = app.shared.lock().unwrap().undo.len();
+            open(&mut app, &ctx);
+            app.free_transform.as_mut().unwrap().values.scale = [1.2, 0.9];
+            let output = settle(&mut app, &ctx);
+            actual_preview(&app, &output);
+            let commands = app.free_transform.as_ref().unwrap().commands().unwrap();
+            let key = app.free_transform.as_ref().unwrap().key().unwrap();
+            let pixels = app.canvas_pixels.clone();
+            let generation = app.canvas_generation;
+            enter_reference_value(&mut app, &ctx, 7, "12.25");
+            enter_reference_value(&mut app, &ctx, 8, "12.5");
+            let output = settle(&mut app, &ctx);
+            actual_preview(&app, &output);
+            let editor = app.free_transform.as_ref().unwrap();
+            assert_eq!(editor.reference_point(), [12.25, 12.5]);
+            assert_eq!(editor.commands().unwrap(), commands);
+            assert_eq!(editor.key().unwrap(), key);
+            assert_eq!(editor.rendered.as_ref(), Some(&key));
+            assert_eq!(app.canvas_pixels, pixels);
+            assert_eq!(app.canvas_generation, generation);
+            assert_eq!(workspace::source(&app), before);
+            let [a, b, c, d, tx, ty] = Editor::matrix(&commands[0]).unwrap();
+            let det = a * d - b * c;
+            let [qx, qy] = [12.25, 12.5];
+            let source = [
+                (d * (qx - tx) - c * (qy - ty)) / det,
+                (-b * (qx - tx) + a * (qy - ty)) / det,
+            ];
+            enter_reference_value(&mut app, &ctx, 4, "23");
+            let output = settle(&mut app, &ctx);
+            actual_preview(&app, &output);
+            let editor = app.free_transform.as_ref().unwrap();
+            let point = editor.point(source);
+            assert!((point[0] - qx).abs() < 1e-10 && (point[1] - qy).abs() < 1e-10);
+            let commands = editor.commands().unwrap();
+            assert_eq!(commands.len(), 1);
+            assert_eq!(commands[0]["selection_only"], selected);
+            assert_eq!(commands[0]["fractional_translation"], true);
+            assert_eq!(workspace::source(&app), before);
+            let expected =
+                crate::engine::Engine::preview_edits(original.clone(), &commands).unwrap();
+            workspace::click(&mut app, &ctx, SIZE, workspace::label(&output, "Apply"));
+            assert!(app.free_transform.is_none(), "{}", app.message);
+            let mut engine = app.shared.lock().unwrap();
+            assert_eq!(engine.undo.len(), history + 1);
+            assert_eq!(engine.doc.bit_depth, depth);
+            assert_eq!(engine.doc.layers[0].pixels, expected.layers[0].pixels);
+            reference_mask_eq(&engine.doc.layers[0].mask, &expected.layers[0].mask);
+            assert!(independent_coverage_eq(
+                engine.doc.selection_coverage.as_ref(),
+                expected.selection_coverage.as_ref()
+            ));
+            assert_eq!(
+                engine.doc.export_png().unwrap(),
+                expected.export_png().unwrap()
+            );
+            let applied = engine.doc.clone();
+            engine.undo("human").unwrap();
+            assert_eq!(engine.doc.layers[0].pixels, original.layers[0].pixels);
+            reference_mask_eq(&engine.doc.layers[0].mask, &original.layers[0].mask);
+            assert_eq!(engine.doc.selection_coverage, original.selection_coverage);
+            assert_eq!(
+                engine.doc.export_png().unwrap(),
+                original.export_png().unwrap()
+            );
+            engine.redo("human").unwrap();
+            assert_eq!(engine.doc.layers[0].pixels, applied.layers[0].pixels);
+            reference_mask_eq(&engine.doc.layers[0].mask, &applied.layers[0].mask);
+            assert_eq!(engine.doc.selection_coverage, applied.selection_coverage);
+        }
+    }
+}
+
+#[test]
+fn actual_reference_handle_after_affine_is_presentation_only_and_escape_preserves_human_work() {
+    for depth in [8, 16] {
+        let (mut app, ctx) = workspace::fixture(depth);
+        let before = workspace::source(&app);
+        open(&mut app, &ctx);
+        app.free_transform.as_mut().unwrap().values.angle = 15.;
+        settle(&mut app, &ctx);
+        // The reference may be outside the artwork; choose visible, unoccluded canvas.
+        let rect = app.view_rect.unwrap();
+        let scale = rect.width() / 32.;
+        let start_doc = [24., 18.];
+        app.free_transform
+            .as_mut()
+            .unwrap()
+            .set_reference(start_doc)
+            .unwrap();
+        settle(&mut app, &ctx);
+        let start = app.view.point(start_doc.map(|v| v as f32), rect, scale);
+        let end = app.view.point([25., 19.], rect, scale);
+        assert!(rect.contains(start) && rect.contains(end));
+        assert_eq!(
+            ctx.layer_id_at(start).map(|layer| layer.order),
+            Some(egui::Order::Background)
+        );
+        let commands = app.free_transform.as_ref().unwrap().commands().unwrap();
+        let pixels = app.canvas_pixels.clone();
+        let generation = app.canvas_generation;
+        frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerMoved(start), pointer(start, true)],
+        );
+        assert!(matches!(
+            app.free_transform
+                .as_ref()
+                .unwrap()
+                .drag
+                .as_ref()
+                .map(|drag| drag.handle),
+            Some(Handle::Pivot)
+        ));
+        frame(&mut app, &ctx, vec![egui::Event::PointerMoved(end)]);
+        let editor = app.free_transform.as_ref().unwrap();
+        assert_eq!(editor.reference_point(), [25., 19.]);
+        assert_eq!(editor.commands().unwrap(), commands);
+        assert_eq!(app.canvas_pixels, pixels);
+        assert_eq!(app.canvas_generation, generation);
+        assert_eq!(workspace::source(&app), before);
+        frame(
+            &mut app,
+            &ctx,
+            vec![
+                key_event(egui::Key::Escape, Default::default()),
+                key_event(egui::Key::Delete, Default::default()),
+            ],
+        );
+        assert!(app.free_transform.is_none());
+        frame(&mut app, &ctx, vec![pointer(end, false)]);
+        assert_eq!(workspace::source(&app), before);
+    }
+}
+
+#[test]
+fn scale_crossing_uses_signed_axes_about_the_reference_with_rotation_skew_and_prior_mirrors() {
+    let cases = [
+        ([-1.25, 0.75], false, false, [true, true], [-1.25, 0.75]),
+        ([1.25, -0.75], false, false, [true, true], [1.25, -0.75]),
+        ([-1.25, -0.75], false, false, [true, true], [-1.25, -0.75]),
+        ([-0.75, 1.5], true, false, [true, true], [-1.5, 1.5]),
+        ([-1.25, 1.], false, true, [true, false], [-1.25, 1.25]),
+    ];
+    for depth in [8, 16] {
+        let (mut app, ctx) = workspace::fixture(depth);
+        let before = workspace::source(&app);
+        open(&mut app, &ctx);
+        for mirrors in [[false, false], [true, false], [false, true], [true, true]] {
+            for (input, proportional, shift, axes, expected) in cases {
+                let expected: [f64; 2] = expected;
+                let editor = app.free_transform.as_mut().unwrap();
+                editor.reference = None;
+                editor.values = Parameters {
+                    scale: [1.6, 0.8],
+                    angle: 30.,
+                    skew: [17., -9.],
+                    mirror: mirrors,
+                    ..Default::default()
+                };
+                editor.proportional = proportional;
+                editor.snap = false;
+                editor.set_reference([5.25, 21.75]).unwrap();
+                let start = editor.values.clone();
+                let key = editor.key().unwrap();
+                let center = editor.reference_point();
+                let origin = editor.corners()[2];
+                let (sin, cos) = start.angle.to_radians().sin_cos();
+                let [dx, dy] = [origin[0] - center[0], origin[1] - center[1]];
+                let local = [dx * cos + dy * sin, -dx * sin + dy * cos];
+                let position = |f: [f64; 2]| {
+                    [
+                        center[0] + cos * local[0] * f[0] - sin * local[1] * f[1],
+                        center[1] + sin * local[0] * f[0] + cos * local[1] * f[1],
+                    ]
+                };
+                editor.drag = Some(Drag {
+                    origin,
+                    start: start.clone(),
+                    handle: Handle::Scale(axes[0], axes[1]),
+                });
+                editor.drag_to(position(input), shift);
+                for i in 0..2 {
+                    assert_eq!(editor.values.mirror[i], mirrors[i] ^ (expected[i] < 0.));
+                    assert!(
+                        (editor.values.scale[i] - start.scale[i] * expected[i].abs()).abs() < 1e-10
+                    );
+                    assert!((editor.corners()[2][i] - position(expected)[i]).abs() < 1e-7);
+                }
+                assert_eq!(editor.reference_point(), center);
+                assert!(editor.commands().is_ok());
+                editor.drag_to(origin, false);
+                assert_eq!(
+                    editor.key().unwrap(),
+                    key,
+                    "Crossing back must restore the starting command exactly"
+                );
+            }
+        }
+        assert_eq!(workspace::source(&app), before);
+    }
+}
+
+#[test]
+fn real_corner_crossing_previews_one_native_flip_then_commits_and_roundtrips_once() {
+    for depth in [8, 16] {
+        let (mut app, ctx) = workspace::fixture(depth);
+        let before = workspace::source(&app);
+        let original = app.shared.lock().unwrap().doc.clone();
+        let undo = app.shared.lock().unwrap().undo.len();
+        open(&mut app, &ctx);
+        settle(&mut app, &ctx);
+        workspace::key(&mut app, &ctx, SIZE, egui::Key::R, Default::default());
+        let editor = app.free_transform.as_ref().unwrap();
+        let corner = editor.corners()[2];
+        let center = editor.reference_point();
+        let reflected = [2. * center[0] - corner[0], corner[1]];
+        let rect = app.view_rect.unwrap();
+        let screen = |point: [f64; 2]| {
+            app.view
+                .point(point.map(|v| v as f32), rect, rect.width() / 32.)
+        };
+        let start = screen(corner);
+        let end = screen(reflected);
+        frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::PointerMoved(start), pointer(start, true)],
+        );
+        frame(&mut app, &ctx, vec![egui::Event::PointerMoved(end)]);
+        assert_eq!(
+            app.free_transform.as_ref().unwrap().values.mirror,
+            [true, false]
+        );
+        frame(&mut app, &ctx, vec![egui::Event::PointerMoved(start)]);
+        assert_eq!(
+            app.free_transform.as_ref().unwrap().values.mirror,
+            [false, false]
+        );
+        frame(&mut app, &ctx, vec![egui::Event::PointerMoved(end)]);
+        frame(&mut app, &ctx, vec![pointer(end, false)]);
+        assert_eq!(
+            workspace::source(&app),
+            before,
+            "Crossing and release stay pending"
+        );
+        let output = settle(&mut app, &ctx);
+        actual_preview(&app, &output);
+        let commands = app.free_transform.as_ref().unwrap().commands().unwrap();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0]["mirror_x"], true);
+        assert_eq!(commands[0]["mirror_y"], false);
+        let expected = crate::engine::Engine::preview_edits(original.clone(), &commands).unwrap();
+        workspace::click(&mut app, &ctx, SIZE, workspace::label(&output, "Apply"));
+        assert!(app.free_transform.is_none(), "{}", app.message);
+        let mut engine = app.shared.lock().unwrap();
+        assert_eq!(engine.undo.len(), undo + 1);
+        assert_eq!(engine.doc.bit_depth, depth);
+        assert_eq!(
+            engine.doc.export_png().unwrap(),
+            expected.export_png().unwrap()
+        );
+        for encoded in [
+            crate::psd::encode(&engine.doc).unwrap(),
+            crate::psd::encode_psb(&engine.doc).unwrap(),
+        ] {
+            let reopened = crate::psd::decode(&encoded).unwrap();
+            assert!(!reopened.read_only, "Roundtrip must retain editability");
+            assert_eq!(reopened.bit_depth, depth);
+            assert_eq!(
+                reopened.export_png().unwrap(),
+                engine.doc.export_png().unwrap()
+            );
+            assert_eq!(
+                reopened.layers[0].pixels.rgba16(),
+                engine.doc.layers[0].pixels.rgba16()
+            );
+        }
+        engine.undo("human").unwrap();
+        assert_eq!(
+            engine.doc.export_png().unwrap(),
+            original.export_png().unwrap()
+        );
+        assert_eq!(
+            engine.doc.layers[0].pixels.rgba16(),
+            original.layers[0].pixels.rgba16()
+        );
+    }
+}
+
+#[test]
+fn proportional_zero_magnitude_preserves_the_other_axis_crossing_and_never_flips_zero() {
+    for depth in [8, 16] {
+        let (mut app, ctx) = workspace::fixture(depth);
+        let before = workspace::source(&app);
+        open(&mut app, &ctx);
+        for (ratio, mirror) in [
+            ([-0.5, 0.], [true, false]),
+            ([0., -0.5], [false, true]),
+            ([-0., 0.], [false, false]),
+            ([-0.5, -0.], [true, false]),
+        ] {
+            let editor = app.free_transform.as_mut().unwrap();
+            editor.reference = None;
+            editor.values = Parameters::default();
+            editor.proportional = true;
+            editor.snap = false;
+            let origin = editor.corners()[2];
+            let center = editor.reference_point();
+            editor.drag = Some(Drag {
+                origin,
+                start: editor.values.clone(),
+                handle: Handle::Scale(true, true),
+            });
+            editor.drag_to(
+                [
+                    center[0] + (origin[0] - center[0]) * ratio[0],
+                    center[1] + (origin[1] - center[1]) * ratio[1],
+                ],
+                false,
+            );
+            assert_eq!(editor.values.scale, [0.05; 2]);
+            assert_eq!(editor.values.mirror, mirror);
+            assert!(editor.commands().is_ok());
+        }
+        assert_eq!(workspace::source(&app), before);
+    }
+}
+
+#[test]
+fn edge_skew_follows_the_actual_sheared_axes_and_reference_and_restores_exact_commands() {
+    for depth in [8, 16] {
+        let (mut app, ctx) = workspace::fixture(depth);
+        open(&mut app, &ctx);
+        let before = workspace::source(&app);
+        for mirrored in [[false, false], [true, false], [false, true], [true, true]] {
+            for axis in [0, 1] {
+                for snap in [false, true] {
+                    let editor = app.free_transform.as_mut().unwrap();
+                    editor.reference = None;
+                    editor.values = Parameters {
+                        offset: [3., -2.],
+                        scale: [1.6, 0.8],
+                        angle: 30.,
+                        skew: [15., -15.],
+                        mirror: mirrored,
+                        projective: None,
+                        warp: None,
+                    };
+                    editor.snap = snap;
+                    editor.set_reference([5.25, 21.75]).unwrap();
+                    let start = editor.values.clone();
+                    let key = editor.key().unwrap();
+                    let b = editor.whole_bounds;
+                    let point = if axis == 0 {
+                        [(b[0] + b[2]) * 0.5, b[1]]
+                    } else {
+                        [b[2], (b[1] + b[3]) * 0.5]
+                    };
+                    let origin = editor.point(point);
+                    let center = editor.reference_point();
+                    let old = Editor::matrix(&editor.command("", snap).unwrap()).unwrap();
+                    let [a, b, c, d, tx, ty] = old;
+                    let det = a * d - b * c;
+                    // Independently recover the source point at the fixed reference.
+                    let anchor = [
+                        (d * (center[0] - tx) - c * (center[1] - ty)) / det,
+                        (-b * (center[0] - tx) + a * (center[1] - ty)) / det,
+                    ];
+                    let mut values = start.clone();
+                    values.skew[axis] = if axis == 0 { 30. } else { -30. };
+                    let (sin, cos) = values.angle.to_radians().sin_cos();
+                    let signed = [
+                        if mirrored[0] {
+                            -values.scale[0]
+                        } else {
+                            values.scale[0]
+                        },
+                        if mirrored[1] {
+                            -values.scale[1]
+                        } else {
+                            values.scale[1]
+                        },
+                    ];
+                    let [kx, ky] = values.skew.map(|angle| angle.to_radians().tan());
+                    let [mut u, mut v] = [point[0] - anchor[0], point[1] - anchor[1]];
+                    u += kx * v;
+                    v += ky * u;
+                    let target = [
+                        center[0] + cos * signed[0] * u - sin * signed[1] * v,
+                        center[1] + sin * signed[0] * u + cos * signed[1] * v,
+                    ];
+                    editor.drag = Some(Drag {
+                        origin,
+                        start: start.clone(),
+                        handle: Handle::Skew(axis),
+                    });
+                    editor.drag_to(target, false);
+                    assert!((editor.values.skew[axis] - values.skew[axis]).abs() < 1e-10);
+                    assert_eq!(editor.reference_point(), center);
+                    for i in 0..2 {
+                        assert!((editor.point(point)[i] - target[i]).abs() < 1e-7);
+                    }
+                    assert_eq!(editor.values.mirror, mirrored);
+                    assert_eq!(editor.values.scale, start.scale);
+                    editor.drag_to(origin, false);
+                    assert_eq!(
+                        editor.key().unwrap(),
+                        key,
+                        "Returning the handle restores exact pending commands"
+                    );
+                }
+            }
+        }
+        let editor = app.free_transform.as_mut().unwrap();
+        editor.reference = None;
+        editor.values = Parameters::default();
+        editor.snap = false;
+        let [l, t, r, _] = editor.whole_bounds;
+        let origin = [(l + r) * 0.5, t];
+        let key = editor.key().unwrap();
+        editor.drag = Some(Drag {
+            origin,
+            start: editor.values.clone(),
+            handle: Handle::Skew(0),
+        });
+        let pivot = editor.reference_point();
+        editor.drag_to(
+            [
+                origin[0] + (origin[1] - pivot[1]) * 38_f64.to_radians().tan(),
+                origin[1],
+            ],
+            true,
+        );
+        assert_eq!(
+            editor.values.skew[0], 45.,
+            "Shift uses the shared fifteen-degree shear snap"
+        );
+        assert_eq!(editor.commands().unwrap()[0]["skew_x"], 45.);
+        editor.drag_to([origin[0] + 1e6, origin[1]], false);
+        assert_eq!(editor.values.skew[0].abs(), crate::transform::SKEW_LIMIT);
+        editor.drag_to(origin, false);
+        assert_eq!(editor.key().unwrap(), key);
+        assert_eq!(workspace::source(&app), before);
+    }
+}
+
+fn skew_edge_drag(app: &mut PeerBrush, ctx: &egui::Context, axis: usize) {
+    let output = frame(app, ctx, vec![]);
+    workspace::click(app, ctx, SIZE, workspace::label(&output, "Skew"));
+    assert!(app.free_transform.as_ref().unwrap().skew_mode);
+    assert!(app.free_transform.as_ref().unwrap().mode().is_none());
+    let editor = app.free_transform.as_ref().unwrap();
+    let corners = editor.corners();
+    let rect = app.view_rect.unwrap();
+    let start = [axis, axis + 2]
+        .into_iter()
+        .map(|edge| {
+            let point = [
+                (corners[edge][0] + corners[(edge + 1) % 4][0]) * 0.5,
+                (corners[edge][1] + corners[(edge + 1) % 4][1]) * 0.5,
+            ];
+            app.view
+                .point(point.map(|v| v as f32), rect, rect.width() / 32.)
+        })
+        .find(|point| {
+            rect.contains(*point)
+                && ctx
+                    .layer_id_at(*point)
+                    .is_some_and(|layer| layer.order == egui::Order::Background)
+        })
+        .expect("An actual skew edge handle must be visible outside the floating controls");
+    let end = start
+        + if axis == 0 {
+            Vec2::new(18., 0.)
+        } else {
+            Vec2::new(0., 18.)
+        };
+    frame(
+        app,
+        ctx,
+        vec![egui::Event::PointerMoved(start), pointer(start, true)],
+    );
+    assert!(
+        matches!(app.free_transform.as_ref().unwrap().drag.as_ref().map(|drag| drag.handle), Some(Handle::Skew(value)) if value == axis)
+    );
+    frame(app, ctx, vec![egui::Event::PointerMoved(end)]);
+    frame(app, ctx, vec![pointer(end, false)]);
+    assert!(app.free_transform.as_ref().unwrap().drag.is_none());
+}
+
+fn skew_structure_eq(actual: &Document, expected: &Document) {
+    assert_eq!(actual.layers.len(), expected.layers.len());
+    for (actual, expected) in actual.layers.iter().zip(&expected.layers) {
+        assert_eq!(
+            (&actual.id, &actual.parent, actual.visible, &actual.kind),
+            (
+                &expected.id,
+                &expected.parent,
+                expected.visible,
+                &expected.kind
+            )
+        );
+        assert_eq!(actual.mask.is_some(), expected.mask.is_some());
+        if let (Some(actual), Some(expected)) = (&actual.mask, &expected.mask) {
+            assert_eq!(
+                (actual.enabled, actual.linked, actual.steps.len()),
+                (expected.enabled, expected.linked, expected.steps.len())
+            );
+            for (actual, expected) in actual.steps.iter().zip(&expected.steps) {
+                assert_eq!(
+                    (
+                        &actual.id,
+                        &actual.kind,
+                        actual.enabled,
+                        actual.weight.to_bits(),
+                        actual.value.to_bits(),
+                        &actual.settings
+                    ),
+                    (
+                        &expected.id,
+                        &expected.kind,
+                        expected.enabled,
+                        expected.weight.to_bits(),
+                        expected.value.to_bits(),
+                        &expected.settings
+                    )
+                );
+            }
+        }
+    }
+}
+fn skew_native_layers_eq(actual: &Document, expected: &Document) {
+    skew_structure_eq(actual, expected);
+    for (actual, expected) in actual.layers.iter().zip(&expected.layers) {
+        assert_eq!((actual.x, actual.y), (expected.x, expected.y));
+        assert_eq!(actual.pixels, expected.pixels);
+        assert_eq!(actual.source, expected.source);
+        if actual.mask.is_some() {
+            reference_mask_eq(&actual.mask, &expected.mask);
+        }
+    }
+}
+
+#[test]
+fn real_skew_handles_share_selected_masks_folders_preview_storage_and_one_guarded_undo() {
+    for depth in [8, 16] {
+        for target in [
+            "linked-color",
+            "unlinked-color",
+            "unlinked-mask",
+            "paint-step",
+            "folder",
+        ] {
+            let (mut app, ctx) = workspace::fixture(depth);
+            let id = app.selected.clone();
+            {
+                let mut engine = app.shared.lock().unwrap();
+                engine
+                    .edit(
+                        "human",
+                        &[json!({"op":"mask.add","layer":id})],
+                        None,
+                        None,
+                        "Painted mask",
+                    )
+                    .unwrap();
+                let layer = &mut engine.doc.layers[0];
+                for y in 0..24 {
+                    for x in 0..32 {
+                        layer.pixels.set16(
+                            x,
+                            y,
+                            [
+                                10001 + x as u16 * 137,
+                                20003 + y as u16 * 193,
+                                40007,
+                                if (x + y) % 7 == 0 { 0 } else { 49157 },
+                            ],
+                        );
+                        let value = 12347 + x as u16 * 97 + y as u16 * 193;
+                        layer.mask.as_mut().unwrap().steps[1].pixels.set16(
+                            x,
+                            y,
+                            [value, value, value, 65535],
+                        );
+                    }
+                }
+                if target != "linked-color" && target != "folder" {
+                    engine
+                        .edit(
+                            "human",
+                            &[json!({"op":"mask.link","layer":id,"linked":false})],
+                            None,
+                            None,
+                            "Unlink mask",
+                        )
+                        .unwrap();
+                }
+                if target == "folder" {
+                    let mut root = crate::engine::Layer::new("Skew folder", "group", 32, 24);
+                    root.pixels = crate::raster::Raster::new_depth(32, 24, depth);
+                    let mut child = engine.doc.layers[0].clone();
+                    child.parent = Some(root.id.clone());
+                    let mut hidden = child.clone();
+                    hidden.id = crate::engine::id();
+                    hidden.name = "Hidden native child".into();
+                    hidden.visible = false;
+                    hidden.pixels.set16(7, 6, [14143, 25253, 36367, 0]);
+                    hidden.mask = None;
+                    app.selected = root.id.clone();
+                    engine.doc.layers = vec![root, child, hidden];
+                }
+                engine.edit("human", &[
+                    json!({"op":"selection","kind":"ellipse","rect":[4,4,26,21],"feather":2.}),
+                    json!({"op":"selection","kind":"rectangle","mode":"subtract","rect":[11,9,16,14]})
+                ], None, None, "Soft selection with hole").unwrap();
+            }
+            app.selection_layers = [app.selected.clone()].into_iter().collect();
+            app.mask = target == "unlinked-mask" || target == "paint-step";
+            if target == "paint-step" {
+                app.mask_step = Some(
+                    app.shared.lock().unwrap().doc.layers[0]
+                        .mask
+                        .as_ref()
+                        .unwrap()
+                        .steps[1]
+                        .id
+                        .clone(),
+                );
+            }
+            let original = app.shared.lock().unwrap().doc.clone();
+            let unchanged = workspace::source(&app);
+            let history = app.shared.lock().unwrap().undo.len();
+            open(&mut app, &ctx);
+            settle(&mut app, &ctx);
+            skew_edge_drag(&mut app, &ctx, 0);
+            let output = settle(&mut app, &ctx);
+            actual_preview(&app, &output);
+            assert_ne!(app.free_transform.as_ref().unwrap().values.skew[0], 0.);
+            skew_edge_drag(&mut app, &ctx, 1);
+            let output = settle(&mut app, &ctx);
+            actual_preview(&app, &output);
+            let commands = app.free_transform.as_ref().unwrap().commands().unwrap();
+            assert_eq!(commands.len(), 1);
+            assert_eq!(commands[0]["selection_only"], true);
+            assert_eq!(commands[0]["mask"], app.mask);
+            assert_eq!(commands[0]["step"].as_str(), app.mask_step.as_deref());
+            let key = app.free_transform.as_ref().unwrap().key().unwrap();
+            workspace::click(&mut app, &ctx, SIZE, workspace::label(&output, "Move"));
+            assert!(!app.free_transform.as_ref().unwrap().skew_mode);
+            assert!(matches!(
+                app.free_transform.as_ref().unwrap().mode(),
+                Some(Tool::Move)
+            ));
+            assert_eq!(app.free_transform.as_ref().unwrap().key().unwrap(), key);
+            assert_eq!(
+                workspace::source(&app),
+                unchanged,
+                "Modes and release retain the same pending source"
+            );
+            let expected =
+                crate::engine::Engine::preview_edits(original.clone(), &commands).unwrap();
+            skew_structure_eq(&expected, &original);
+            let output = settle(&mut app, &ctx);
+            if target == "linked-color" {
+                app.shared
+                    .lock()
+                    .unwrap()
+                    .reserve(
+                        "other",
+                        "Selection owner",
+                        vec![crate::engine::Scope::layer("@selection")],
+                    )
+                    .unwrap();
+                workspace::click(&mut app, &ctx, SIZE, workspace::label(&output, "Apply"));
+                assert!(
+                    app.free_transform.is_some(),
+                    "Reserved Apply must preserve the actual pending session"
+                );
+                assert_eq!(workspace::source(&app), unchanged);
+                app.shared.lock().unwrap().leases.clear();
+            }
+            let output = settle(&mut app, &ctx);
+            workspace::click(&mut app, &ctx, SIZE, workspace::label(&output, "Apply"));
+            assert!(app.free_transform.is_none(), "{}", app.message);
+            let mut engine = app.shared.lock().unwrap();
+            assert_eq!(engine.undo.len(), history + 1);
+            skew_native_layers_eq(&engine.doc, &expected);
+            assert!(independent_coverage_eq(
+                engine.doc.selection_coverage.as_ref(),
+                expected.selection_coverage.as_ref()
+            ));
+            assert_eq!(
+                engine.doc.export_png().unwrap(),
+                expected.export_png().unwrap()
+            );
+            for encoded in [
+                crate::psd::encode(&engine.doc).unwrap(),
+                crate::psd::encode_psb(&engine.doc).unwrap(),
+            ] {
+                let reopened = crate::psd::decode(&encoded).unwrap();
+                assert!(!reopened.read_only);
+                assert_eq!(reopened.bit_depth, depth);
+                assert_eq!(
+                    reopened.export_png().unwrap(),
+                    engine.doc.export_png().unwrap()
+                );
+                skew_native_layers_eq(&reopened, &engine.doc);
+            }
+            let applied = engine.doc.clone();
+            engine.undo("human").unwrap();
+            assert_eq!(
+                engine.doc.export_png().unwrap(),
+                original.export_png().unwrap()
+            );
+            assert_eq!(engine.doc.selection_coverage, original.selection_coverage);
+            skew_native_layers_eq(&engine.doc, &original);
+            engine.redo("human").unwrap();
+            assert_eq!(
+                engine.doc.export_png().unwrap(),
+                applied.export_png().unwrap()
+            );
+            assert_eq!(engine.doc.selection_coverage, applied.selection_coverage);
+            skew_native_layers_eq(&engine.doc, &applied);
+        }
+    }
+}
+
+#[test]
+fn skew_mode_cancel_and_reference_axis_leave_native_history_exact() {
+    for depth in [8, 16] {
+        let (mut app, ctx) = workspace::fixture(depth);
+        let before = workspace::source(&app);
+        open(&mut app, &ctx);
+        settle(&mut app, &ctx);
+        let editor = app.free_transform.as_mut().unwrap();
+        let b = editor.whole_bounds;
+        let origin = [(b[0] + b[2]) * 0.5, b[1]];
+        editor.set_reference(origin).unwrap();
+        let key = editor.key().unwrap();
+        editor.drag = Some(Drag {
+            origin,
+            start: editor.values.clone(),
+            handle: Handle::Skew(0),
+        });
+        editor.drag_to([origin[0] + 20., origin[1]], false);
+        assert_eq!(
+            editor.key().unwrap(),
+            key,
+            "An edge on its reference axis cannot change that shear"
+        );
+        editor.drag = None;
+        editor
+            .set_reference([(b[0] + b[2]) * 0.5, (b[1] + b[3]) * 0.5])
+            .unwrap();
+        // Sparse whole-target content starts beneath the floating controls.
+        // Pan presentation into actual free canvas space; retain real hit tests.
+        let reference = editor.reference_point();
+        let rect = app.view_rect.unwrap();
+        let point = app
+            .view
+            .point(reference.map(|v| v as f32), rect, rect.width() / 32.);
+        let controls = ctx
+            .memory(|memory| memory.area_rect(egui::Id::new("free transform")))
+            .unwrap();
+        let available = app.canvas_input_region.unwrap().0;
+        let left = controls.right().max(available.left()) + 16.;
+        let right = available.right() - 16.;
+        assert!(left < right, "The fixture needs unobscured canvas space");
+        app.pan.x += (left + right) * 0.5 - point.x;
+        skew_edge_drag(&mut app, &ctx, 0);
+        let output = settle(&mut app, &ctx);
+        actual_preview(&app, &output);
+        frame(
+            &mut app,
+            &ctx,
+            vec![
+                key_event(egui::Key::Escape, Default::default()),
+                key_event(egui::Key::Delete, Default::default()),
+            ],
+        );
+        assert!(app.free_transform.is_none());
+        assert_eq!(workspace::source(&app), before);
+    }
+}
+
+#[test]
+fn skew_handles_keep_selected_source_protection_and_support_explicit_whole_source_preview() {
+    for depth in [8, 16] {
+        let (mut app, ctx) = workspace::fixture(depth);
+        let source = crate::source::Source {
+            width: 32,
+            height: 24,
+            matrix: [1., 0., 0., 1., 0., 0.],
+            content: crate::source::Content::Shape {
+                shape: "rectangle".into(),
+                bounds: [4., 4., 26., 20.],
+                points: vec![],
+                closed: true,
+                fill: [12347, 33559, 51237, 49157],
+                stroke: [0; 4],
+                stroke_width: 0.,
+            },
+        };
+        {
+            let mut engine = app.shared.lock().unwrap();
+            engine
+                .edit(
+                    "human",
+                    &[json!({"op":"source.add","source":source})],
+                    None,
+                    None,
+                    "Editable source",
+                )
+                .unwrap();
+            app.selected = engine.doc.layers[0].id.clone();
+            engine
+                .edit(
+                    "human",
+                    &[json!({"op":"selection","rect":[4,4,26,20],"feather":1.})],
+                    None,
+                    None,
+                    "Source selection",
+                )
+                .unwrap();
+        }
+        app.selection_layers = [app.selected.clone()].into_iter().collect();
+        let before = workspace::source(&app);
+        open(&mut app, &ctx);
+        settle(&mut app, &ctx);
+        skew_edge_drag(&mut app, &ctx, 0);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            frame(&mut app, &ctx, vec![]);
+            if !app.pending && app.free_transform.as_ref().unwrap().error.is_some() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Shared source protection did not arrive"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(app
+            .free_transform
+            .as_ref()
+            .unwrap()
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("rasterize"));
+        // egui Resize clips to the preceding content height; the new error is measured now.
+        // Draw once with that height before locating and clicking the actual disabled Apply.
+        let output = frame(&mut app, &ctx, vec![]);
+        assert!(
+            !app.pending
+                && app.free_transform.as_ref().is_some_and(|editor| {
+                    editor.rendered.is_none()
+                        && editor
+                            .error
+                            .as_deref()
+                            .is_some_and(|error| error.contains("rasterize"))
+                })
+        );
+        workspace::click(&mut app, &ctx, SIZE, workspace::label(&output, "Apply"));
+        assert!(
+            app.free_transform.is_some(),
+            "An unsupported selected-source preview cannot enable Apply"
+        );
+        assert_eq!(workspace::source(&app), before);
+        let output = frame(&mut app, &ctx, vec![]);
+        workspace::click(
+            &mut app,
+            &ctx,
+            SIZE,
+            workspace::label(&output, "Whole target (keep selection)"),
+        );
+        let output = settle(&mut app, &ctx);
+        actual_preview(&app, &output);
+        assert!(
+            !app.free_transform.as_ref().unwrap().commands().unwrap()[0]["selection_only"]
+                .as_bool()
+                .unwrap()
+        );
+        assert_eq!(workspace::source(&app), before);
+        workspace::click(&mut app, &ctx, SIZE, workspace::label(&output, "Cancel"));
+        assert!(app.free_transform.is_none());
+        assert_eq!(workspace::source(&app), before);
+    }
+}
+
+#[test]
+fn projective_corners_share_affine_order_pair_constraints_and_moved_reference() {
+    for depth in [8, 16] {
+        let (mut app, ctx) = workspace::fixture(depth);
+        let before = workspace::source(&app);
+        open(&mut app, &ctx);
+        let editor = app.free_transform.as_mut().unwrap();
+        editor.values.offset = [2., -1.];
+        editor.values.scale = [1.3, 0.8];
+        editor.values.angle = 23.;
+        editor.values.skew = [7., -4.];
+        let rect = editor.target_bounds();
+        let mut corners = Editor::rectangle(rect);
+        corners[0][0] += 0.5;
+        editor.set_quad(Quad { rect, corners });
+        let origin = editor.corners()[2];
+        let destination = [origin[0] + 0.7, origin[1] - 0.4];
+        editor
+            .drag_corner(2, origin, destination, false, false)
+            .unwrap();
+        let actual = editor.corners()[2];
+        for axis in 0..2 {
+            assert!((actual[axis] - destination[axis]).abs() < 1e-10);
+        }
+        let command = editor.commands().unwrap().pop().unwrap();
+        let map = crate::projective::combined(&command).unwrap().unwrap();
+        for (source, handle) in Editor::rectangle(rect).into_iter().zip(editor.corners()) {
+            let actual = map.point(source).unwrap();
+            for axis in 0..2 {
+                assert!((actual[axis] - handle[axis]).abs() < 1e-10);
+            }
+        }
+        for vertical in [false, true] {
+            let old = editor.quad().unwrap();
+            let other = if vertical { 3 } else { 1 };
+            let origin = editor.corners()[0];
+            editor
+                .drag_corner(
+                    0,
+                    origin,
+                    [origin[0] + 0.2, origin[1] + 0.3],
+                    true,
+                    vertical,
+                )
+                .unwrap();
+            let new = editor.quad().unwrap();
+            for axis in 0..2 {
+                assert!(
+                    (new.corners[0][axis] + new.corners[other][axis]
+                        - old.corners[0][axis]
+                        - old.corners[other][axis])
+                        .abs()
+                        < 1e-10
+                );
+            }
+            for index in 0..4 {
+                if index != 0 && index != other {
+                    assert_eq!(new.corners[index], old.corners[index]);
+                }
+            }
+        }
+        let commands = editor.commands().unwrap();
+        editor.set_reference([4.25, 5.5]).unwrap();
+        assert_eq!(editor.commands().unwrap(), commands);
+        let key = editor.key().unwrap();
+        editor.set_mode(Tool::Rotate);
+        assert_eq!(editor.key().unwrap(), key);
+        assert!(matches!(editor.mode(), Some(Tool::Rotate)));
+        editor.values.angle += 11.;
+        assert_eq!(
+            editor.commands().unwrap()[0]["projective"],
+            commands[0]["projective"]
+        );
+        assert_eq!(workspace::source(&app), before);
+    }
+}
+
+fn real_projective_corner_drag(app: &mut PeerBrush, ctx: &egui::Context, mode: &str) {
+    let output = frame(app, ctx, vec![]);
+    workspace::click(app, ctx, SIZE, workspace::label(&output, mode));
+    frame(app, ctx, vec![]);
+    let editor = app.free_transform.as_ref().unwrap();
+    let rect = app.view_rect.unwrap();
+    let reference = app.view.point(
+        editor.reference_point().map(|v| v as f32),
+        rect,
+        rect.width() / 32.,
+    );
+    let controls = ctx
+        .memory(|memory| memory.area_rect(egui::Id::new("free transform")))
+        .unwrap();
+    let available = app.canvas_input_region.unwrap().0;
+    let left = controls.right().max(available.left()) + 24.;
+    let right = available.right() - 24.;
+    assert!(left < right, "The fixture needs unobscured canvas space");
+    app.pan.x += (left + right) * 0.5 - reference.x;
+    frame(app, ctx, vec![]);
+    let editor = app.free_transform.as_ref().unwrap();
+    assert!(editor.mode().is_none());
+    let rect = app.view_rect.unwrap();
+    let available = app.canvas_input_region.unwrap().0;
+    let (index, start) = editor
+        .corners()
+        .into_iter()
+        .enumerate()
+        .map(|(i, p)| {
+            (
+                i,
+                app.view
+                    .point(p.map(|v| v as f32), rect, rect.width() / 32.),
+            )
+        })
+        .find(|(_, p)| {
+            available.shrink(24.).contains(*p)
+                && ctx
+                    .layer_id_at(*p)
+                    .is_some_and(|layer| layer.order == egui::Order::Background)
+        })
+        .expect("An actual projective corner must be visible outside floating controls");
+    let end = start + Vec2::new(12., 4.);
+    frame(
+        app,
+        ctx,
+        vec![egui::Event::PointerMoved(start), pointer(start, true)],
+    );
+    assert!(
+        matches!(app.free_transform.as_ref().unwrap().drag.as_ref().map(|drag|drag.handle),
+        Some(Handle::Projective(i,perspective)) if i == index && perspective == (mode == "Perspective"))
+    );
+    frame(app, ctx, vec![egui::Event::PointerMoved(end)]);
+    frame(app, ctx, vec![pointer(end, false)]);
+    assert!(app.free_transform.as_ref().unwrap().drag.is_none());
+    assert!(app
+        .free_transform
+        .as_ref()
+        .unwrap()
+        .values
+        .projective
+        .is_some());
+}
+
+#[test]
+fn real_projective_modes_preview_native_selected_color_masks_folders_and_commit_once() {
+    for depth in [8, 16] {
+        for target in ["color", "mask", "folder"] {
+            let (mut app, ctx) = workspace::fixture(depth);
+            {
+                let mut engine = app.shared.lock().unwrap();
+                engine
+                    .edit(
+                        "human",
+                        &[json!({"op":"mask.add","layer":app.selected})],
+                        None,
+                        None,
+                        "Painted mask",
+                    )
+                    .unwrap();
+                for y in 0..24 {
+                    for x in 0..32 {
+                        let layer = &mut engine.doc.layers[0];
+                        layer.pixels.set16(
+                            x,
+                            y,
+                            [
+                                10001 + x as u16 * 137,
+                                20003 + y as u16 * 193,
+                                40007,
+                                if (x + y) % 7 == 0 { 0 } else { 49157 },
+                            ],
+                        );
+                        let value = 12347 + x as u16 * 97 + y as u16 * 193;
+                        layer.mask.as_mut().unwrap().steps[1].pixels.set16(
+                            x,
+                            y,
+                            [value, value, value, 65535],
+                        );
+                    }
+                }
+                if target == "mask" {
+                    engine
+                        .edit(
+                            "human",
+                            &[json!({"op":"mask.link","layer":app.selected,"linked":false})],
+                            None,
+                            None,
+                            "Unlink mask",
+                        )
+                        .unwrap();
+                }
+                if target == "folder" {
+                    let mut root = crate::engine::Layer::new("Projective folder", "group", 32, 24);
+                    root.pixels = crate::raster::Raster::new_depth(32, 24, depth);
+                    let mut child = engine.doc.layers[0].clone();
+                    child.parent = Some(root.id.clone());
+                    let mut hidden = child.clone();
+                    hidden.id = crate::engine::id();
+                    hidden.visible = false;
+                    hidden.mask = None;
+                    hidden.pixels.set16(7, 6, [14143, 25253, 36367, 0]);
+                    app.selected = root.id.clone();
+                    engine.doc.layers = vec![root, child, hidden];
+                }
+                engine
+                    .edit(
+                        "human",
+                        &[json!({"op":"selection","kind":"ellipse",
+                    "rect":[4,4,26,21],"feather":1.})],
+                        None,
+                        None,
+                        "Soft selection",
+                    )
+                    .unwrap();
+            }
+            app.selection_layers = [app.selected.clone()].into_iter().collect();
+            app.mask = target == "mask";
+            app.zoom = 0.4;
+            let original = app.shared.lock().unwrap().doc.clone();
+            let before = workspace::source(&app);
+            let history = app.shared.lock().unwrap().undo.len();
+            open(&mut app, &ctx);
+            settle(&mut app, &ctx);
+            for mode in ["Distort", "Perspective"] {
+                real_projective_corner_drag(&mut app, &ctx, mode);
+                let output = settle(&mut app, &ctx);
+                actual_preview(&app, &output);
+                assert_eq!(workspace::source(&app), before);
+            }
+            // Real coordinate entry keeps Enter in the numeric editor.
+            let at = app.free_transform.as_ref().unwrap().projective_inputs[0]
+                .unwrap()
+                .center();
+            let requested = app.free_transform.as_ref().unwrap().corners()[0][0] + 0.25;
+            workspace::click(&mut app, &ctx, SIZE, at);
+            workspace::click(&mut app, &ctx, SIZE, at);
+            frame(
+                &mut app,
+                &ctx,
+                vec![
+                    key_event(egui::Key::A, egui::Modifiers::COMMAND),
+                    egui::Event::Text(format!("{requested:.6}")),
+                ],
+            );
+            frame(
+                &mut app,
+                &ctx,
+                vec![key_event(egui::Key::Enter, Default::default())],
+            );
+            assert!(app.free_transform.is_some(), "Numeric Enter must not Apply");
+            assert!(
+                (app.free_transform.as_ref().unwrap().corners()[0][0] - requested).abs() < 1e-5
+            );
+            let output = settle(&mut app, &ctx);
+            actual_preview(&app, &output);
+            let commands = app.free_transform.as_ref().unwrap().commands().unwrap();
+            assert_eq!(commands.len(), 1);
+            assert_eq!(commands[0]["selection_only"], true);
+            assert_eq!(commands[0]["mask"], app.mask);
+            assert!(!commands[0]["projective"].is_null());
+            let key = app.free_transform.as_ref().unwrap().key().unwrap();
+            workspace::click(&mut app, &ctx, SIZE, workspace::label(&output, "Move"));
+            assert_eq!(app.free_transform.as_ref().unwrap().key().unwrap(), key);
+            let expected =
+                crate::engine::Engine::preview_edits(original.clone(), &commands).unwrap();
+            assert_eq!(workspace::source(&app), before);
+            let output = settle(&mut app, &ctx);
+            if target == "color" {
+                app.shared
+                    .lock()
+                    .unwrap()
+                    .reserve(
+                        "other",
+                        "Selection owner",
+                        vec![crate::engine::Scope::layer("@selection")],
+                    )
+                    .unwrap();
+                workspace::click(&mut app, &ctx, SIZE, workspace::label(&output, "Apply"));
+                assert!(
+                    app.free_transform.is_some(),
+                    "Reserved Apply must retain the pending session"
+                );
+                assert_eq!(workspace::source(&app), before);
+                app.shared.lock().unwrap().leases.clear();
+            }
+            let output = settle(&mut app, &ctx);
+            workspace::click(&mut app, &ctx, SIZE, workspace::label(&output, "Apply"));
+            assert!(app.free_transform.is_none(), "{}", app.message);
+            let mut engine = app.shared.lock().unwrap();
+            assert_eq!(engine.undo.len(), history + 1);
+            assert_eq!(engine.doc.bit_depth, depth);
+            skew_native_layers_eq(&engine.doc, &expected);
+            assert!(independent_coverage_eq(
+                engine.doc.selection_coverage.as_ref(),
+                expected.selection_coverage.as_ref()
+            ));
+            for data in [
+                crate::psd::encode(&engine.doc).unwrap(),
+                crate::psd::encode_psb(&engine.doc).unwrap(),
+            ] {
+                let reopened = crate::psd::decode(&data).unwrap();
+                assert!(!reopened.read_only);
+                assert_eq!(reopened.bit_depth, depth);
+                skew_native_layers_eq(&reopened, &engine.doc);
+                assert_eq!(
+                    reopened.export_png().unwrap(),
+                    engine.doc.export_png().unwrap()
+                );
+            }
+            engine.undo("human").unwrap();
+            skew_native_layers_eq(&engine.doc, &original);
+            assert_eq!(engine.doc.selection_coverage, original.selection_coverage);
+            engine.redo("human").unwrap();
+            skew_native_layers_eq(&engine.doc, &expected);
+        }
+    }
+}
+
+#[test]
+fn invalid_projective_quad_stays_uncommitted_and_can_be_repaired_then_canceled() {
+    for depth in [8, 16] {
+        let (mut app, ctx) = workspace::fixture(depth);
+        let before = workspace::source(&app);
+        open(&mut app, &ctx);
+        settle(&mut app, &ctx);
+        let editor = app.free_transform.as_mut().unwrap();
+        editor.projective_mode = Some(ProjectiveMode::Distort);
+        let rect = editor.target_bounds();
+        let mut corners = Editor::rectangle(rect);
+        corners[0] = corners[1];
+        editor.set_quad(Quad { rect, corners });
+        editor.changed();
+        frame(&mut app, &ctx, vec![]);
+        let output = frame(&mut app, &ctx, vec![]);
+        assert!(app.free_transform.as_ref().unwrap().commands().is_err());
+        assert!(app.free_transform.as_ref().unwrap().rendered.is_none());
+        workspace::click(&mut app, &ctx, SIZE, workspace::label(&output, "Apply"));
+        assert!(app.free_transform.is_some());
+        assert_eq!(workspace::source(&app), before);
+        // Repair through the real document-coordinate field, including numeric Enter.
+        let at = app.free_transform.as_ref().unwrap().projective_inputs[0]
+            .unwrap()
+            .center();
+        workspace::click(&mut app, &ctx, SIZE, at);
+        workspace::click(&mut app, &ctx, SIZE, at);
+        frame(
+            &mut app,
+            &ctx,
+            vec![
+                key_event(egui::Key::A, egui::Modifiers::COMMAND),
+                egui::Event::Text(format!("{}", rect[0] + 0.25)),
+            ],
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![key_event(egui::Key::Enter, Default::default())],
+        );
+        let output = settle(&mut app, &ctx);
+        actual_preview(&app, &output);
+        assert_eq!(workspace::source(&app), before);
+        frame(&mut app, &ctx, vec![egui::Event::WindowFocused(false)]);
+        assert!(app.free_transform.is_none());
+        assert_eq!(workspace::source(&app), before);
+    }
+}
+
+#[test]
+fn pending_projective_selection_scope_reuses_one_map_when_toggling_whole_target() {
+    for depth in [8, 16] {
+        let (mut app, ctx) = workspace::fixture(depth);
+        {
+            let mut engine = app.shared.lock().unwrap();
+            engine
+                .edit(
+                    "human",
+                    &[json!({"op":"selection","rect":[4,4,20,18]})],
+                    None,
+                    None,
+                    "Selection",
+                )
+                .unwrap();
+        }
+        let before = workspace::source(&app);
+        open(&mut app, &ctx);
+        let editor = app.free_transform.as_mut().unwrap();
+        let rect = editor.target_bounds();
+        let mut corners = Editor::rectangle(rect);
+        corners[0][0] += 0.5;
+        editor.set_quad(Quad { rect, corners });
+        let initial = editor.commands().unwrap()[0]["projective"].clone();
+        let points = [[5.25, 6.5], [10., 11.], [-1., 2.]];
+        let expected = points.map(|p| editor.point(p));
+        editor.whole = true;
+        let whole = editor.quad().unwrap();
+        assert_eq!(whole.rect, editor.whole_bounds);
+        // Reframing the controls represents the same homography across its entire domain.
+        let reparameterized = json!({"op":"transform",
+            "projective":{"rect":whole.rect,"quad":whole.corners}});
+        let map = crate::projective::parse(&reparameterized)
+            .unwrap()
+            .unwrap()
+            .map;
+        for (point, expected) in points.into_iter().zip(expected) {
+            let actual = map.point(point).unwrap();
+            for axis in 0..2 {
+                assert!((actual[axis] - expected[axis]).abs() < 1e-10);
+            }
+        }
+        assert_eq!(editor.commands().unwrap()[0]["projective"], initial);
+        let output = settle(&mut app, &ctx);
+        actual_preview(&app, &output);
+        assert_eq!(workspace::source(&app), before);
+        workspace::click(
+            &mut app,
+            &ctx,
+            SIZE,
+            workspace::label(&output, "Whole target (keep selection)"),
+        );
+        assert!(!app.free_transform.as_ref().unwrap().whole);
+        assert_eq!(
+            app.free_transform.as_ref().unwrap().commands().unwrap()[0]["projective"],
+            initial
+        );
+        let output = settle(&mut app, &ctx);
+        actual_preview(&app, &output);
+        assert_eq!(workspace::source(&app), before);
+        workspace::click(&mut app, &ctx, SIZE, workspace::label(&output, "Cancel"));
+        assert!(app.free_transform.is_none());
+        assert_eq!(workspace::source(&app), before);
+    }
+}
+
+#[test]
+fn small_projective_window_scrolls_to_reference_corner_apply_and_cancel() {
+    let size = Vec2::new(980., 640.);
+    let (mut app, ctx) = workspace::fixture(16);
+    let before = workspace::source(&app);
+    workspace::draw(&mut app, &ctx, size, vec![]);
+    workspace::key(&mut app, &ctx, size, egui::Key::T, egui::Modifiers::COMMAND);
+    let output = workspace::draw(&mut app, &ctx, size, vec![]);
+    workspace::click(&mut app, &ctx, size, workspace::label(&output, "Distort"));
+    let visible = |output: &egui::FullOutput, label: &str| {
+        output.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.job.text == label => {
+                let at = text.pos + text.galley.size() * 0.5;
+                (shape.clip_rect.contains(at) && Rect::from_min_size(Pos2::ZERO, size).contains(at))
+                    .then_some(at)
+            }
+            _ => None,
+        })
+    };
+    let scroll_to = |app: &mut PeerBrush, label: &str, field: Option<(bool, usize)>| {
+        let target = |app: &PeerBrush, output: &egui::FullOutput| {
+            let at = visible(output, label)?;
+            let editor = app.free_transform.as_ref()?;
+            let clip = editor.scroll_rect?;
+            let rect = if let Some((projective, index)) = field {
+                if projective {
+                    editor.projective_inputs[index]?
+                } else {
+                    editor.inputs[index]?
+                }
+            } else {
+                Rect::from_center_size(at, Vec2::splat(2.))
+            };
+            (clip.contains_rect(rect) && Rect::from_min_size(Pos2::ZERO, size).contains_rect(rect))
+                .then_some((at, rect, editor.scroll_offset))
+        };
+        for _ in 0..12 {
+            let output = workspace::draw(app, &ctx, size, vec![]);
+            if target(app, &output).is_some() {
+                break;
+            }
+            let window = ctx
+                .memory(|m| m.area_rect(egui::Id::new("free transform")))
+                .unwrap();
+            workspace::draw(
+                app,
+                &ctx,
+                size,
+                vec![
+                    egui::Event::PointerMoved(window.center()),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: Vec2::new(0., -80.),
+                        modifiers: Default::default(),
+                    },
+                ],
+            );
+        }
+        // A wheel changes offset after layout and smooths across frames. Observe
+        // the real viewport/field until stable; never click a stale stored rect.
+        let (mut previous, mut stable) = (None, 0);
+        for _ in 0..60 {
+            let output = workspace::draw(app, &ctx, size, vec![]);
+            if let Some((at, rect, offset)) = target(app, &output) {
+                if previous == Some((rect, offset)) {
+                    stable += 1;
+                } else {
+                    stable = 0;
+                }
+                if stable >= 4 {
+                    return at;
+                }
+                previous = Some((rect, offset));
+            } else {
+                previous = None;
+                stable = 0;
+            }
+        }
+        panic!("Window scrolling did not expose a stable, fully visible {label}");
+    };
+    let enter = |app: &mut PeerBrush, projective: bool, index: usize, text: &str| {
+        // Re-read the actual field after scrolling and each click layout.
+        for _ in 0..2 {
+            let editor = app.free_transform.as_ref().unwrap();
+            let rect = if projective {
+                editor.projective_inputs[index]
+            } else {
+                editor.inputs[index]
+            }
+            .unwrap();
+            assert!(editor.scroll_rect.unwrap().contains_rect(rect));
+            workspace::click(app, &ctx, size, rect.center());
+        }
+        workspace::draw(
+            app,
+            &ctx,
+            size,
+            vec![
+                key_event(egui::Key::A, egui::Modifiers::COMMAND),
+                egui::Event::Text(text.into()),
+            ],
+        );
+        workspace::draw(
+            app,
+            &ctx,
+            size,
+            vec![key_event(egui::Key::Enter, Default::default())],
+        );
+        assert!(
+            app.free_transform.is_some(),
+            "Numeric Enter must keep the session"
+        );
+    };
+    scroll_to(&mut app, "Reference X", Some((false, 7)));
+    enter(&mut app, false, 7, "4.25");
+    assert_eq!(
+        app.free_transform.as_ref().unwrap().reference_point()[0],
+        4.25
+    );
+    scroll_to(&mut app, "Top left", Some((true, 0)));
+    let x = app.free_transform.as_ref().unwrap().corners()[0][0] + 0.25;
+    enter(&mut app, true, 0, &format!("{x:.6}"));
+    assert!((app.free_transform.as_ref().unwrap().corners()[0][0] - x).abs() < 1e-5);
+    // Preview completion removes its status row; measure buttons after that layout.
+    let output = settle_size(&mut app, &ctx, size);
+    actual_preview(&app, &output);
+    scroll_to(&mut app, "Apply", None);
+    let at = scroll_to(&mut app, "Cancel", None);
+    workspace::click(&mut app, &ctx, size, at);
+    assert!(app.free_transform.is_none());
+    assert_eq!(workspace::source(&app), before);
+}
+
+#[derive(Clone, Copy)]
+enum WarpInput {
+    Base(usize),
+    Node(usize),
+    Amount,
+}
+fn warp_input(editor: &Editor, input: WarpInput) -> Rect {
+    match input {
+        WarpInput::Base(index) => editor.inputs[index],
+        WarpInput::Node(index) => editor.warp_inputs[index],
+        WarpInput::Amount => editor.warp_amount_input,
+    }
+    .unwrap()
+}
+fn warp_reveal(
+    app: &mut PeerBrush,
+    ctx: &egui::Context,
+    size: Vec2,
+    label: &str,
+    input: Option<WarpInput>,
+) -> Pos2 {
+    let visible = |app: &PeerBrush, output: &egui::FullOutput| {
+        let editor = app.free_transform.as_ref().unwrap();
+        let viewport = editor.scroll_rect.unwrap();
+        let screen = Rect::from_min_size(Pos2::ZERO, size);
+        output.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.job.text == label => {
+                let at = text.pos + text.galley.size() * 0.5;
+                let rect = input.map_or(Rect::from_center_size(at, Vec2::splat(2.)), |input| {
+                    warp_input(editor, input)
+                });
+                (shape.clip_rect.contains(at)
+                    && viewport.contains_rect(rect)
+                    && screen.contains_rect(rect))
+                .then_some((at, rect, editor.scroll_offset))
+            }
+            _ => None,
+        })
+    };
+    // Use real wheel navigation from the top; do not force egui scroll state.
+    workspace::draw(app, ctx, size, vec![]);
+    let viewport = app.free_transform.as_ref().unwrap().scroll_rect.unwrap();
+    workspace::draw(
+        app,
+        ctx,
+        size,
+        vec![
+            egui::Event::PointerMoved(viewport.center()),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: Vec2::new(0., 2000.),
+                modifiers: Default::default(),
+            },
+        ],
+    );
+    for _ in 0..60 {
+        workspace::draw(app, ctx, size, vec![]);
+        if ctx.input(|i| i.time_since_last_scroll()) >= 0.1 {
+            break;
+        }
+    }
+    let (mut previous, mut stable) = (None, 0);
+    for _ in 0..180 {
+        let output = workspace::draw(app, ctx, size, vec![]);
+        if let Some((at, rect, offset)) = visible(app, &output) {
+            if previous == Some((rect, offset)) && ctx.input(|i| i.time_since_last_scroll()) >= 0.1
+            {
+                stable += 1;
+            } else {
+                stable = 0;
+            }
+            if stable >= 4 {
+                return at;
+            }
+            previous = Some((rect, offset));
+        } else if ctx.input(|i| i.time_since_last_scroll()) >= 0.1 {
+            let viewport = app.free_transform.as_ref().unwrap().scroll_rect.unwrap();
+            workspace::draw(
+                app,
+                ctx,
+                size,
+                vec![
+                    egui::Event::PointerMoved(viewport.center()),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: Vec2::new(0., -80.),
+                        modifiers: Default::default(),
+                    },
+                ],
+            );
+            previous = None;
+            stable = 0;
+        }
+    }
+    panic!("Actual Warp control is not stably visible: {label}");
+}
+fn warp_click(app: &mut PeerBrush, ctx: &egui::Context, size: Vec2, label: &str) {
+    let at = warp_reveal(app, ctx, size, label, None);
+    workspace::click(app, ctx, size, at);
+}
+fn warp_enter(
+    app: &mut PeerBrush,
+    ctx: &egui::Context,
+    size: Vec2,
+    label: &str,
+    input: WarpInput,
+    text: &str,
+) {
+    warp_reveal(app, ctx, size, label, Some(input));
+    for _ in 0..2 {
+        let editor = app.free_transform.as_ref().unwrap();
+        let rect = warp_input(editor, input);
+        assert!(editor.scroll_rect.unwrap().contains_rect(rect));
+        workspace::click(app, ctx, size, rect.center());
+    }
+    assert!(
+        ctx.wants_keyboard_input(),
+        "The actual numeric editor must own typing"
+    );
+    workspace::draw(
+        app,
+        ctx,
+        size,
+        vec![
+            key_event(egui::Key::A, egui::Modifiers::COMMAND),
+            egui::Event::Text(text.into()),
+        ],
+    );
+    workspace::draw(
+        app,
+        ctx,
+        size,
+        vec![key_event(egui::Key::Enter, Default::default())],
+    );
+    assert!(
+        app.free_transform.is_some(),
+        "Numeric Enter must not Apply Warp"
+    );
+}
+fn warp_fixture(depth: u16, target: &str) -> (PeerBrush, egui::Context) {
+    let (mut app, ctx) = workspace::fixture(depth);
+    {
+        let mut engine = app.shared.lock().unwrap();
+        engine
+            .edit(
+                "human",
+                &[json!({"op":"mask.add","layer":app.selected})],
+                None,
+                None,
+                "Painted mask",
+            )
+            .unwrap();
+        for y in 0..24 {
+            for x in 0..32 {
+                let layer = &mut engine.doc.layers[0];
+                layer.pixels.set16(
+                    x,
+                    y,
+                    [
+                        10001 + x as u16 * 137,
+                        20003 + y as u16 * 193,
+                        40007,
+                        if (x + y) % 7 == 0 { 0 } else { 49157 },
+                    ],
+                );
+                let value = 12347 + x as u16 * 97 + y as u16 * 193;
+                layer.mask.as_mut().unwrap().steps[1].pixels.set16(
+                    x,
+                    y,
+                    [value, value, value, 65535],
+                );
+            }
+        }
+        if target == "mask" {
+            engine.doc.layers[0].mask.as_mut().unwrap().linked = false;
+        }
+        if target == "folder" {
+            let mut root = crate::engine::Layer::new("Warp folder", "group", 32, 24);
+            root.pixels = crate::raster::Raster::new_depth(32, 24, depth);
+            let mut child = engine.doc.layers[0].clone();
+            child.parent = Some(root.id.clone());
+            let mut hidden = child.clone();
+            hidden.id = crate::engine::id();
+            hidden.visible = false;
+            hidden.pixels.set16(7, 6, [14143, 25253, 36367, 0]);
+            app.selected = root.id.clone();
+            engine.doc.layers = vec![root, child, hidden];
+        }
+        let mut mask = crate::raster::Raster::new(32, 24);
+        for y in 4..21 {
+            for x in 4..26 {
+                if !(12..16).contains(&x) || !(10..14).contains(&y) {
+                    mask.set(
+                        x,
+                        y,
+                        [if x == 4 || y == 4 {
+                            64
+                        } else if x == 5 || y == 5 {
+                            128
+                        } else {
+                            255
+                        }; 4],
+                    );
+                }
+            }
+        }
+        let coverage = crate::selection::from_mask(mask).unwrap();
+        engine.doc.selection = Some(coverage.bounds);
+        engine.doc.selection_polygon = None;
+        engine.doc.selection_coverage = Some(coverage);
+    }
+    app.selection_layers = [app.selected.clone()].into_iter().collect();
+    app.mask = target == "mask";
+    app.zoom = 0.4;
+    (app, ctx)
+}
+fn warp_node_drag(app: &mut PeerBrush, ctx: &egui::Context, release: bool) {
+    warp_click(app, ctx, SIZE, "Grid Warp");
+    frame(app, ctx, vec![]);
+    let viewport = app.canvas_input_region.unwrap().0;
+    let controls = ctx
+        .memory(|m| m.area_rect(egui::Id::new("free transform")))
+        .unwrap();
+    let rect = app.view_rect.unwrap();
+    let node = app.free_transform.as_ref().unwrap().grid_points().unwrap()[4];
+    let start = app
+        .view
+        .point(node.map(|v| v as f32), rect, rect.width() / 32.);
+    let left = controls.right().max(viewport.left()) + 30.;
+    let right = viewport.right() - 30.;
+    assert!(left < right, "Fixture needs unobscured canvas space");
+    app.pan.x += (left + right) * 0.5 - start.x;
+    frame(app, ctx, vec![]);
+    let rect = app.view_rect.unwrap();
+    let node = app.free_transform.as_ref().unwrap().grid_points().unwrap()[4];
+    let start = app
+        .view
+        .point(node.map(|v| v as f32), rect, rect.width() / 32.);
+    assert!(app
+        .canvas_input_region
+        .unwrap()
+        .0
+        .shrink(20.)
+        .contains(start));
+    assert!(ctx
+        .layer_id_at(start)
+        .is_some_and(|layer| layer.order == egui::Order::Background));
+    frame(
+        app,
+        ctx,
+        vec![egui::Event::PointerMoved(start), pointer(start, true)],
+    );
+    assert!(matches!(
+        app.free_transform
+            .as_ref()
+            .unwrap()
+            .drag
+            .as_ref()
+            .map(|d| d.handle),
+        Some(Handle::Warp(4))
+    ));
+    let end = start + Vec2::new(6., 4.);
+    frame(app, ctx, vec![egui::Event::PointerMoved(end)]);
+    if release {
+        frame(app, ctx, vec![pointer(end, false)]);
+    }
+}
+
+#[test]
+fn warp_nodes_use_post_map_while_projective_controls_keep_their_reference_plane() {
+    for depth in [8, 16] {
+        let (mut app, ctx) = warp_fixture(depth, "color");
+        let before = workspace::source(&app);
+        open(&mut app, &ctx);
+        let editor = app.free_transform.as_mut().unwrap();
+        editor.values.offset = [2., -1.];
+        editor.values.scale = [1.1, 0.9];
+        editor.values.angle = 17.;
+        editor.values.skew = [7., -4.];
+        let grid = crate::warp::Grid::preset(editor.warp_domain().unwrap(), "arc", 0.15).unwrap();
+        editor.set_grid(grid.clone());
+        let rect = editor.target_bounds();
+        editor.projective_mode = Some(ProjectiveMode::Distort);
+        let affine =
+            crate::projective::affine(&editor.affine_command("", false).unwrap(), editor.pivot)
+                .unwrap();
+        for (actual, point) in editor.corners().into_iter().zip(Editor::rectangle(rect)) {
+            let expected = affine.point(point).unwrap();
+            for a in 0..2 {
+                assert!((actual[a] - expected[a]).abs() < 1e-10);
+            }
+        }
+        let mut quad = Editor::rectangle(rect);
+        quad[0][0] += 0.5;
+        quad[2][1] -= 0.25;
+        editor.set_quad(Quad {
+            rect,
+            corners: quad,
+        });
+        let projection = editor.values.projective.clone();
+        let old_affine = (
+            editor.values.offset,
+            editor.values.scale,
+            editor.values.angle,
+            editor.values.skew,
+        );
+        let origin = editor.grid_points().unwrap()[4];
+        let destination = [origin[0] + 0.25, origin[1] - 0.125];
+        editor.drag_node(4, origin, destination, false).unwrap();
+        let displayed = editor.grid_points().unwrap()[4];
+        for axis in 0..2 {
+            assert!((displayed[axis] - destination[axis]).abs() < 1e-9);
+        }
+        assert!(editor.values.projective == projection);
+        assert_eq!(
+            (
+                editor.values.offset,
+                editor.values.scale,
+                editor.values.angle,
+                editor.values.skew
+            ),
+            old_affine
+        );
+        editor.projective_mode = Some(ProjectiveMode::Distort);
+        let affine =
+            crate::projective::affine(&editor.affine_command("", false).unwrap(), editor.pivot)
+                .unwrap();
+        for (actual, point) in editor.corners().into_iter().zip(quad) {
+            let expected = affine.point(point).unwrap();
+            for axis in 0..2 {
+                assert!((actual[axis] - expected[axis]).abs() < 1e-10);
+            }
+        }
+        let initial = editor.commands().unwrap();
+        editor.set_reference([5.25, 8.5]).unwrap();
+        assert_eq!(editor.commands().unwrap(), initial);
+        editor.set_mode(Tool::Move);
+        assert_eq!(editor.commands().unwrap(), initial);
+        assert!(
+            editor.outline().len() > 4,
+            "Warped boundaries must include triangle seam bends"
+        );
+        let map = crate::warp::CommandMap::new(&initial[0], editor.pivot).unwrap();
+        let corners = Editor::rectangle(editor.target_bounds());
+        for (i, actual) in editor.edge_points().into_iter().enumerate() {
+            let expected = map
+                .point([
+                    (corners[i][0] + corners[(i + 1) % 4][0]) * 0.5,
+                    (corners[i][1] + corners[(i + 1) % 4][1]) * 0.5,
+                ])
+                .unwrap();
+            for a in 0..2 {
+                assert!((actual[a] - expected[a]).abs() < 1e-10);
+            }
+        }
+        assert_eq!(workspace::source(&app), before);
+    }
+}
+
+#[test]
+fn actual_grid_presets_nodes_and_mixed_modes_preview_then_apply_native_targets_once() {
+    for depth in [8, 16] {
+        for target in ["color", "mask", "folder"] {
+            let (mut app, ctx) = warp_fixture(depth, target);
+            let before = workspace::source(&app);
+            let original = app.shared.lock().unwrap().doc.clone();
+            let history = app.shared.lock().unwrap().undo.len();
+            open(&mut app, &ctx);
+            settle(&mut app, &ctx);
+            warp_click(&mut app, &ctx, SIZE, "Grid Warp");
+            for (label, name) in [("Arc", "arc"), ("Bulge", "bulge"), ("Flag", "flag")] {
+                warp_click(&mut app, &ctx, SIZE, label);
+                let editor = app.free_transform.as_ref().unwrap();
+                assert_eq!(
+                    editor.values.warp.as_ref().unwrap(),
+                    &crate::warp::Grid::preset(editor.warp_domain().unwrap(), name, 0.15).unwrap()
+                );
+                let output = settle(&mut app, &ctx);
+                actual_preview(&app, &output);
+                assert_eq!(workspace::source(&app), before);
+            }
+            warp_node_drag(&mut app, &ctx, true);
+            let output = settle(&mut app, &ctx);
+            actual_preview(&app, &output);
+            assert_eq!(workspace::source(&app), before);
+            let requested =
+                app.free_transform.as_ref().unwrap().grid_points().unwrap()[4][0] + 0.25;
+            warp_enter(
+                &mut app,
+                &ctx,
+                SIZE,
+                "Node 5",
+                WarpInput::Node(8),
+                &format!("{requested:.6}"),
+            );
+            assert!(
+                (app.free_transform.as_ref().unwrap().grid_points().unwrap()[4][0] - requested)
+                    .abs()
+                    < 1e-5
+            );
+            warp_enter(&mut app, &ctx, SIZE, "Move X", WarpInput::Base(0), "2");
+            warp_enter(&mut app, &ctx, SIZE, "Angle", WarpInput::Base(4), "11");
+            warp_click(&mut app, &ctx, SIZE, "Distort");
+            real_projective_corner_drag(&mut app, &ctx, "Distort");
+            let output = settle(&mut app, &ctx);
+            actual_preview(&app, &output);
+            let commands = app.free_transform.as_ref().unwrap().commands().unwrap();
+            assert_eq!(commands.len(), 1);
+            assert!(commands[0]["warp"].is_object());
+            assert!(commands[0]["projective"].is_object());
+            let key = app.free_transform.as_ref().unwrap().key().unwrap();
+            warp_click(&mut app, &ctx, SIZE, "Move");
+            assert_eq!(app.free_transform.as_ref().unwrap().key().unwrap(), key);
+            let output = settle(&mut app, &ctx);
+            actual_preview(&app, &output);
+            assert_eq!(workspace::source(&app), before);
+            let expected =
+                crate::engine::Engine::preview_edits(original.clone(), &commands).unwrap();
+            if target == "color" {
+                app.shared
+                    .lock()
+                    .unwrap()
+                    .reserve(
+                        "other",
+                        "Selection owner",
+                        vec![crate::engine::Scope::layer("@selection")],
+                    )
+                    .unwrap();
+                warp_click(&mut app, &ctx, SIZE, "Apply");
+                assert!(app.free_transform.is_some());
+                assert_eq!(workspace::source(&app), before);
+                app.shared.lock().unwrap().leases.clear();
+            }
+            warp_click(&mut app, &ctx, SIZE, "Apply");
+            assert!(app.free_transform.is_none(), "{}", app.message);
+            let mut engine = app.shared.lock().unwrap();
+            assert_eq!(engine.undo.len(), history + 1);
+            assert_eq!(engine.doc.bit_depth, depth);
+            skew_native_layers_eq(&engine.doc, &expected);
+            assert!(independent_coverage_eq(
+                engine.doc.selection_coverage.as_ref(),
+                expected.selection_coverage.as_ref()
+            ));
+            let applied = engine.doc.clone();
+            for data in [
+                crate::psd::encode(&engine.doc).unwrap(),
+                crate::psd::encode_psb(&engine.doc).unwrap(),
+            ] {
+                let reopened = crate::psd::decode(&data).unwrap();
+                assert!(!reopened.read_only);
+                assert_eq!(reopened.bit_depth, depth);
+                skew_native_layers_eq(&reopened, &applied);
+                assert_eq!(
+                    reopened.export_png().unwrap(),
+                    applied.export_png().unwrap()
+                );
+            }
+            engine.undo("human").unwrap();
+            skew_native_layers_eq(&engine.doc, &original);
+            assert_eq!(engine.doc.selection_coverage, original.selection_coverage);
+            engine.redo("human").unwrap();
+            skew_native_layers_eq(&engine.doc, &applied);
+            assert_eq!(engine.doc.selection_coverage, applied.selection_coverage);
+        }
+    }
+}
+
+#[test]
+fn invalid_grid_is_repairable_and_held_node_escape_and_source_changes_preserve_history() {
+    for depth in [8, 16] {
+        let (mut app, ctx) = warp_fixture(depth, "color");
+        let before = workspace::source(&app);
+        open(&mut app, &ctx);
+        warp_click(&mut app, &ctx, SIZE, "Grid Warp");
+        warp_click(&mut app, &ctx, SIZE, "Arc");
+        settle(&mut app, &ctx);
+        let good = app
+            .free_transform
+            .as_ref()
+            .unwrap()
+            .values
+            .warp
+            .clone()
+            .unwrap();
+        let mut bad = good.clone();
+        bad.points[4] = bad.points[0];
+        {
+            let editor = app.free_transform.as_mut().unwrap();
+            editor.values.warp = Some(bad);
+            editor.changed();
+        }
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.free_transform.as_ref().unwrap().commands().is_err());
+        assert!(app.free_transform.as_ref().unwrap().rendered.is_none());
+        warp_click(&mut app, &ctx, SIZE, "Apply");
+        assert!(app.free_transform.is_some());
+        assert_eq!(workspace::source(&app), before);
+        for axis in 0..2 {
+            warp_enter(
+                &mut app,
+                &ctx,
+                SIZE,
+                "Node 5",
+                WarpInput::Node(8 + axis),
+                &format!("{:.6}", good.points[4][axis]),
+            );
+        }
+        let output = settle(&mut app, &ctx);
+        actual_preview(&app, &output);
+        assert_eq!(workspace::source(&app), before);
+        warp_node_drag(&mut app, &ctx, false);
+        frame(
+            &mut app,
+            &ctx,
+            vec![key_event(egui::Key::Escape, Default::default())],
+        );
+        assert!(app.free_transform.is_none());
+        frame(&mut app, &ctx, vec![pointer(Pos2::new(800., 500.), false)]);
+        assert_eq!(workspace::source(&app), before);
+        open(&mut app, &ctx);
+        warp_click(&mut app, &ctx, SIZE, "Grid Warp");
+        warp_click(&mut app, &ctx, SIZE, "Arc");
+        settle(&mut app, &ctx);
+        app.shared
+            .lock()
+            .unwrap()
+            .edit(
+                "human",
+                &[json!({"op":"layer.update","layer":app.selected,"name":"Later human work"})],
+                None,
+                None,
+                "Later work",
+            )
+            .unwrap();
+        let later = workspace::source(&app);
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.free_transform.is_none());
+        assert_eq!(workspace::source(&app), later);
+    }
+}
+
+#[test]
+fn warp_scope_toggle_preserves_pending_map_and_explicit_reset_keeps_affine_values() {
+    for depth in [8, 16] {
+        let (mut app, ctx) = warp_fixture(depth, "color");
+        let before = workspace::source(&app);
+        let original = app.shared.lock().unwrap().doc.clone();
+        let history = app.shared.lock().unwrap().undo.len();
+        open(&mut app, &ctx);
+        warp_enter(&mut app, &ctx, SIZE, "Move X", WarpInput::Base(0), "2");
+        warp_enter(&mut app, &ctx, SIZE, "Angle", WarpInput::Base(4), "7");
+        {
+            let editor = app.free_transform.as_mut().unwrap();
+            let rect = editor.target_bounds();
+            let mut corners = Editor::rectangle(rect);
+            corners[0][0] += 0.25;
+            editor.set_quad(Quad { rect, corners });
+            editor.changed();
+        }
+        warp_click(&mut app, &ctx, SIZE, "Grid Warp");
+        warp_click(&mut app, &ctx, SIZE, "Arc");
+        settle(&mut app, &ctx);
+        let key = app.free_transform.as_ref().unwrap().key().unwrap();
+        let values = app.free_transform.as_ref().unwrap().values.clone();
+        warp_click(&mut app, &ctx, SIZE, "Whole target (keep selection)");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            frame(&mut app, &ctx, vec![]);
+            if !app.pending && app.free_transform.as_ref().unwrap().error.is_some() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Shared insufficient-domain preview must fail"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(app.free_transform.as_ref().unwrap().values == values);
+        assert!(app.free_transform.as_ref().unwrap().rendered.is_none());
+        assert_eq!(workspace::source(&app), before);
+        warp_click(&mut app, &ctx, SIZE, "Apply");
+        assert!(app.free_transform.is_some());
+        assert_eq!(workspace::source(&app), before);
+        warp_click(&mut app, &ctx, SIZE, "Whole target (keep selection)");
+        assert_eq!(app.free_transform.as_ref().unwrap().key().unwrap(), key);
+        let output = settle(&mut app, &ctx);
+        actual_preview(&app, &output);
+        warp_click(&mut app, &ctx, SIZE, "Whole target (keep selection)");
+        warp_click(&mut app, &ctx, SIZE, "Grid Warp");
+        warp_click(&mut app, &ctx, SIZE, "Reset Warp");
+        let editor = app.free_transform.as_ref().unwrap();
+        assert!(editor.values.warp.is_none());
+        assert_eq!(editor.values.offset, values.offset);
+        assert_eq!(editor.values.angle, values.angle);
+        assert!(editor.values.projective == values.projective);
+        warp_click(&mut app, &ctx, SIZE, "Arc");
+        let output = settle(&mut app, &ctx);
+        actual_preview(&app, &output);
+        let editor = app.free_transform.as_ref().unwrap();
+        assert_eq!(
+            editor.values.warp.as_ref().unwrap().rect,
+            editor.warp_domain().unwrap()
+        );
+        let commands = editor.commands().unwrap();
+        let expected = crate::engine::Engine::preview_edits(original.clone(), &commands).unwrap();
+        warp_click(&mut app, &ctx, SIZE, "Apply");
+        assert!(app.free_transform.is_none());
+        let mut engine = app.shared.lock().unwrap();
+        assert_eq!(engine.undo.len(), history + 1);
+        skew_native_layers_eq(&engine.doc, &expected);
+        assert_eq!(engine.doc.selection_coverage, original.selection_coverage);
+        assert_eq!(
+            engine.doc.layers[0]
+                .pixels
+                .retained
+                .as_ref()
+                .unwrap()
+                .warps
+                .len(),
+            1
+        );
+        for bytes in [
+            crate::psd::encode(&engine.doc).unwrap(),
+            crate::psd::encode_psb(&engine.doc).unwrap(),
+        ] {
+            let reopened = crate::psd::decode(&bytes).unwrap();
+            assert!(!reopened.read_only);
+            assert_eq!(reopened.bit_depth, depth);
+            skew_native_layers_eq(&reopened, &engine.doc);
+            assert_eq!(
+                reopened.export_png().unwrap(),
+                engine.doc.export_png().unwrap()
+            );
+        }
+        engine.undo("human").unwrap();
+        skew_native_layers_eq(&engine.doc, &original);
+        assert_eq!(engine.doc.selection_coverage, original.selection_coverage);
+    }
+}
+
+#[test]
+fn short_window_grid_amount_and_last_node_are_real_controls_and_cancel_is_exact() {
+    let size = Vec2::new(980., 640.);
+    let (mut app, ctx) = warp_fixture(16, "color");
+    let before = workspace::source(&app);
+    workspace::draw(&mut app, &ctx, size, vec![]);
+    workspace::key(&mut app, &ctx, size, egui::Key::T, egui::Modifiers::COMMAND);
+    warp_click(&mut app, &ctx, size, "Grid Warp");
+    warp_click(&mut app, &ctx, size, "Arc");
+    warp_enter(&mut app, &ctx, size, "Amount", WarpInput::Amount, "0.2");
+    let editor = app.free_transform.as_ref().unwrap();
+    assert_eq!(
+        editor.values.warp.as_ref().unwrap(),
+        &crate::warp::Grid::preset(editor.warp_domain().unwrap(), "arc", 0.2).unwrap()
+    );
+    let x = editor.grid_points().unwrap()[8][0] + 0.25;
+    warp_enter(
+        &mut app,
+        &ctx,
+        size,
+        "Node 9",
+        WarpInput::Node(16),
+        &format!("{x:.6}"),
+    );
+    assert!((app.free_transform.as_ref().unwrap().grid_points().unwrap()[8][0] - x).abs() < 1e-5);
+    let output = settle_size(&mut app, &ctx, size);
+    actual_preview(&app, &output);
+    assert_eq!(workspace::source(&app), before);
+    warp_reveal(&mut app, &ctx, size, "Apply", None);
+    warp_click(&mut app, &ctx, size, "Cancel");
+    assert!(app.free_transform.is_none());
+    assert_eq!(workspace::source(&app), before);
+}
+
+fn transform_context_point(app: &PeerBrush, ctx: &egui::Context) -> Pos2 {
+    let (viewport, layer) = app.canvas_input_region.unwrap();
+    (1..8)
+        .flat_map(|y| (1..8).map(move |x| (x, y)))
+        .map(|(x, y)| viewport.min + viewport.size() * Vec2::new(x as f32 / 8., y as f32 / 8.))
+        .find(|at| ctx.layer_id_at(*at) == Some(layer))
+        .expect("A visible unoccluded canvas region for the real secondary click")
+}
+fn transform_secondary(
+    app: &mut PeerBrush,
+    ctx: &egui::Context,
+    at: Pos2,
+    modifiers: egui::Modifiers,
+) {
+    for pressed in [true, false] {
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, SIZE)),
+                time: Some(ctx.input(|input| input.time) + 0.05),
+                modifiers,
+                events: vec![
+                    egui::Event::PointerMoved(at),
+                    egui::Event::PointerButton {
+                        pos: at,
+                        button: egui::PointerButton::Secondary,
+                        pressed,
+                        modifiers,
+                    },
+                ],
+                ..Default::default()
+            },
+            |ctx| app.draw(ctx),
+        );
+    }
+}
+#[track_caller]
+fn transform_context(app: &mut PeerBrush, ctx: &egui::Context) -> egui::FullOutput {
+    let at = transform_context_point(app, ctx);
+    let state = |app: &PeerBrush| {
+        let editor = app.free_transform.as_ref().unwrap();
+        let focus = ctx.memory(|memory| memory.focused());
+        (
+            ctx.wants_keyboard_input(),
+            focus.is_some(),
+            focus.is_some_and(|id| egui::TextEdit::load_state(ctx, id).is_some()),
+            ctx.input(|input| {
+                input
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, egui::Event::Ime(_)))
+            }),
+            ctx.input(|input| input.pointer.primary_down()),
+            ctx.input(|input| input.pointer.secondary_down()),
+            editor.context_frame,
+            editor.context_secondary_typing,
+            editor.drag.is_some(),
+            ctx.memory(|memory| memory.any_popup_open()),
+            ctx.memory(|memory| memory.top_modal_layer().is_some()),
+        )
+    };
+    let before = state(app);
+    transform_secondary(app, ctx, at, Default::default());
+    assert!(
+        app.free_transform.as_ref().unwrap().context.is_some(),
+        "Actual secondary gesture must open its context menu; booleans (keyboard, focus, text, ime, primary, secondary, frame, typed_gesture, drag, popup, modal): before={before:?}, after={:?}",
+        state(app)
+    );
+    frame(app, ctx, vec![]);
+    frame(app, ctx, vec![])
+}
+#[track_caller]
+fn transform_context_choose(app: &mut PeerBrush, ctx: &egui::Context, label: &str) {
+    let output = transform_context(app, ctx);
+    let root = app
+        .free_transform
+        .as_ref()
+        .unwrap()
+        .context
+        .as_ref()
+        .unwrap();
+    let at = output
+        .shapes
+        .iter()
+        .find_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.job.text == label => {
+                let at = text.pos + text.galley.size() * 0.5;
+                (shape.clip_rect.contains(at)
+                    && root.menu_state.read().area_contains(at)
+                    && ctx
+                        .layer_id_at(at)
+                        .is_some_and(|layer| layer.order == egui::Order::Foreground))
+                .then_some(at)
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("Visible actual transform context action: {label}"));
+    workspace::click(app, ctx, SIZE, at);
+    assert!(app.free_transform.as_ref().unwrap().context.is_none());
+}
+
+#[test]
+fn canvas_context_modes_keep_the_same_native_map_and_flips_apply_once() {
+    for depth in [8, 16] {
+        let (mut app, ctx) = warp_fixture(depth, "color");
+        let original = app.shared.lock().unwrap().doc.clone();
+        let unchanged = workspace::source(&app);
+        let undo = app.shared.lock().unwrap().undo.len();
+        open(&mut app, &ctx);
+        warp_click(&mut app, &ctx, SIZE, "Grid Warp");
+        warp_click(&mut app, &ctx, SIZE, "Arc");
+        warp_enter(&mut app, &ctx, SIZE, "Move X", WarpInput::Base(0), "3");
+        warp_enter(&mut app, &ctx, SIZE, "Angle", WarpInput::Base(4), "9");
+        warp_click(&mut app, &ctx, SIZE, "Distort");
+        real_projective_corner_drag(&mut app, &ctx, "Distort");
+        let output = settle(&mut app, &ctx);
+        actual_preview(&app, &output);
+        let commands = app.free_transform.as_ref().unwrap().commands().unwrap();
+        let values = app.free_transform.as_ref().unwrap().values.clone();
+        for label in [
+            "Move",
+            "Scale",
+            "Rotate",
+            "Skew",
+            "Distort",
+            "Perspective",
+            "Grid Warp",
+        ] {
+            transform_context_choose(&mut app, &ctx, label);
+            let editor = app.free_transform.as_ref().unwrap();
+            match label {
+                "Move" => assert!(editor.mode() == Some(Tool::Move)),
+                "Scale" => assert!(editor.mode() == Some(Tool::Scale)),
+                "Rotate" => assert!(editor.mode() == Some(Tool::Rotate)),
+                "Skew" => assert!(
+                    editor.skew_mode && editor.projective_mode.is_none() && !editor.warp_mode
+                ),
+                "Distort" => assert!(editor.projective_mode == Some(ProjectiveMode::Distort)),
+                "Perspective" => {
+                    assert!(editor.projective_mode == Some(ProjectiveMode::Perspective))
+                }
+                "Grid Warp" => assert!(
+                    editor.warp_mode && !editor.skew_mode && editor.projective_mode.is_none()
+                ),
+                _ => unreachable!(),
+            }
+            assert!(editor.values == values);
+            assert_eq!(editor.commands().unwrap(), commands);
+            assert!(editor.drag.is_none());
+            assert_eq!(workspace::source(&app), unchanged);
+            let output = settle(&mut app, &ctx);
+            actual_preview(&app, &output);
+        }
+        for (label, mirrors) in [
+            ("Flip Horizontal", [true, false]),
+            ("Flip Vertical", [true, true]),
+            ("Flip Horizontal", [false, true]),
+        ] {
+            transform_context_choose(&mut app, &ctx, label);
+            assert_eq!(app.free_transform.as_ref().unwrap().values.mirror, mirrors);
+            assert_eq!(workspace::source(&app), unchanged);
+            let output = settle(&mut app, &ctx);
+            actual_preview(&app, &output);
+        }
+        let commands = app.free_transform.as_ref().unwrap().commands().unwrap();
+        assert_eq!(commands.len(), 1);
+        assert!(!commands[0]["warp"].is_null());
+        assert!(!commands[0]["projective"].is_null());
+        assert_eq!(commands[0]["mirror_y"], true);
+        let expected = crate::engine::Engine::preview_edits(original.clone(), &commands).unwrap();
+        warp_click(&mut app, &ctx, SIZE, "Apply");
+        assert!(app.free_transform.is_none());
+        let mut engine = app.shared.lock().unwrap();
+        assert_eq!(engine.undo.len(), undo + 1);
+        skew_native_layers_eq(&engine.doc, &expected);
+        assert!(independent_coverage_eq(
+            engine.doc.selection_coverage.as_ref(),
+            expected.selection_coverage.as_ref()
+        ));
+        let applied = engine.doc.clone();
+        engine.undo("human").unwrap();
+        skew_native_layers_eq(&engine.doc, &original);
+        assert_eq!(engine.doc.selection_coverage, original.selection_coverage);
+        engine.redo("human").unwrap();
+        skew_native_layers_eq(&engine.doc, &applied);
+        assert_eq!(engine.doc.selection_coverage, applied.selection_coverage);
+    }
+}
+
+#[test]
+fn canvas_context_keeps_navigation_typing_popup_escape_and_source_cancellation_guards() {
+    for depth in [8, 16] {
+        let (mut app, ctx) = warp_fixture(depth, "color");
+        let unchanged = workspace::source(&app);
+        open(&mut app, &ctx);
+        settle(&mut app, &ctx);
+        let current_apply = |app: &PeerBrush, output: &egui::FullOutput| {
+            let at = workspace::label(output, "Apply");
+            let editor = app.free_transform.as_ref().unwrap();
+            assert!(output.shapes.iter().any(|shape| matches!(
+                &shape.shape, egui::Shape::Text(text)
+                    if text.galley.job.text == "Apply" && shape.clip_rect.contains(at)
+            )));
+            assert!(editor.scroll_rect.unwrap().contains(at));
+            assert!(Rect::from_min_size(Pos2::ZERO, SIZE).contains(at));
+            assert_eq!(
+                ctx.layer_id_at(at),
+                Some(egui::LayerId::new(
+                    egui::Order::Middle,
+                    egui::Id::new("free transform")
+                ))
+            );
+            assert!(!editor
+                .context
+                .as_ref()
+                .unwrap()
+                .menu_state
+                .read()
+                .area_contains(at));
+            at
+        };
+        let commands = app.free_transform.as_ref().unwrap().commands().unwrap();
+        let at = transform_context_point(&app, &ctx);
+        transform_secondary(&mut app, &ctx, at, egui::Modifiers::ALT);
+        assert!(app.free_transform.as_ref().unwrap().context.is_none());
+        assert_eq!(
+            app.free_transform.as_ref().unwrap().commands().unwrap(),
+            commands
+        );
+        assert_eq!(workspace::source(&app), unchanged);
+
+        // A click over the actual floating numeric control cannot open the canvas menu.
+        warp_reveal(&mut app, &ctx, SIZE, "Move X", Some(WarpInput::Base(0)));
+        let at = app.free_transform.as_ref().unwrap().inputs[0]
+            .unwrap()
+            .center();
+        assert_ne!(
+            ctx.layer_id_at(at),
+            Some(app.canvas_input_region.unwrap().1)
+        );
+        transform_secondary(&mut app, &ctx, at, Default::default());
+        assert!(app.free_transform.as_ref().unwrap().context.is_none());
+        for _ in 0..2 {
+            workspace::click(&mut app, &ctx, SIZE, at);
+        }
+        assert!(ctx.wants_keyboard_input());
+        frame(
+            &mut app,
+            &ctx,
+            vec![
+                key_event(egui::Key::A, egui::Modifiers::COMMAND),
+                egui::Event::Text("4.25".into()),
+            ],
+        );
+        assert!(
+            ctx.wants_keyboard_input(),
+            "The actual numeric field is still editing"
+        );
+        assert_eq!(app.free_transform.as_ref().unwrap().values.offset[0], 4.25);
+        let typed = app.free_transform.as_ref().unwrap().commands().unwrap();
+        let at = transform_context_point(&app, &ctx);
+        transform_secondary(&mut app, &ctx, at, Default::default());
+        assert!(app.free_transform.as_ref().unwrap().context.is_none());
+        assert_eq!(
+            app.free_transform.as_ref().unwrap().commands().unwrap(),
+            typed
+        );
+        assert_eq!(workspace::source(&app), unchanged);
+        // The outside press normally ends DragValue editing. Re-enter the actual
+        // field before checking its separate Escape contract.
+        warp_reveal(&mut app, &ctx, SIZE, "Move X", Some(WarpInput::Base(0)));
+        let at = app.free_transform.as_ref().unwrap().inputs[0]
+            .unwrap()
+            .center();
+        workspace::click(&mut app, &ctx, SIZE, at);
+        assert!(ctx.wants_keyboard_input());
+        workspace::key(&mut app, &ctx, SIZE, egui::Key::Escape, Default::default());
+        assert!(
+            app.free_transform.is_some(),
+            "Numeric Escape only completes the field"
+        );
+        assert_eq!(
+            app.free_transform.as_ref().unwrap().commands().unwrap(),
+            typed
+        );
+        assert_eq!(workspace::source(&app), unchanged);
+
+        transform_context_choose(&mut app, &ctx, "Flip Horizontal");
+        settle(&mut app, &ctx);
+        warp_reveal(&mut app, &ctx, SIZE, "Apply", None);
+        let output = transform_context(&mut app, &ctx);
+        let apply = current_apply(&app, &output);
+        assert!(!app
+            .free_transform
+            .as_ref()
+            .unwrap()
+            .context
+            .as_ref()
+            .unwrap()
+            .menu_state
+            .read()
+            .area_contains(apply));
+        workspace::click(&mut app, &ctx, SIZE, apply);
+        assert!(
+            app.free_transform.is_some(),
+            "Outside menu dismissal must not Apply behind the popup"
+        );
+        assert!(app.free_transform.as_ref().unwrap().context.is_none());
+        assert_eq!(workspace::source(&app), unchanged);
+        for canvas in [true, false] {
+            let output = transform_context(&mut app, &ctx);
+            let at = if canvas {
+                transform_context_point(&app, &ctx)
+            } else {
+                current_apply(&app, &output)
+            };
+            assert!(!app
+                .free_transform
+                .as_ref()
+                .unwrap()
+                .context
+                .as_ref()
+                .unwrap()
+                .menu_state
+                .read()
+                .area_contains(at));
+            let values = app.free_transform.as_ref().unwrap().values.clone();
+            let commands = app.free_transform.as_ref().unwrap().commands().unwrap();
+            frame(
+                &mut app,
+                &ctx,
+                vec![
+                    key_event(egui::Key::Escape, Default::default()),
+                    egui::Event::PointerMoved(at),
+                    pointer(at, true),
+                    pointer(at, false),
+                ],
+            );
+            let editor = app
+                .free_transform
+                .as_ref()
+                .expect("Escape dismisses only the menu in this input frame");
+            assert!(editor.context.is_none());
+            assert!(editor.drag.is_none());
+            assert!(editor.values == values);
+            assert_eq!(editor.commands().unwrap(), commands);
+            assert_eq!(workspace::source(&app), unchanged);
+            let mut release = key_event(egui::Key::Escape, Default::default());
+            if let egui::Event::Key { pressed, .. } = &mut release {
+                *pressed = false;
+            }
+            frame(&mut app, &ctx, vec![release]);
+        }
+        // Finish an actual numeric entry before the independent menu-keyboard case.
+        let values = app.free_transform.as_ref().unwrap().values.clone();
+        let commands = app.free_transform.as_ref().unwrap().commands().unwrap();
+        if let Some(focus) = ctx.memory(|memory| memory.focused()) {
+            let response = ctx
+                .read_response(focus)
+                .expect("The focused control is still drawn");
+            assert!(egui::TextEdit::load_state(&ctx, focus).is_some());
+            assert!(
+                app.free_transform
+                    .as_ref()
+                    .unwrap()
+                    .inputs
+                    .iter()
+                    .flatten()
+                    .any(|rect| *rect == response.rect),
+                "Only an actual current numeric entry may be completed"
+            );
+            workspace::key(&mut app, &ctx, SIZE, egui::Key::Escape, Default::default());
+        }
+        assert!(
+            !ctx.wants_keyboard_input(),
+            "The menu-keyboard case starts after numeric entry finishes"
+        );
+        let editor = app
+            .free_transform
+            .as_ref()
+            .expect("Field completion keeps the session pending");
+        assert!(editor.values == values);
+        assert_eq!(editor.commands().unwrap(), commands);
+        assert!(editor.context.is_none() && editor.drag.is_none());
+        assert_eq!(workspace::source(&app), unchanged);
+        transform_context(&mut app, &ctx);
+        workspace::key(&mut app, &ctx, SIZE, egui::Key::Enter, Default::default());
+        assert!(
+            app.free_transform.is_some(),
+            "Menu Enter may activate an item, never Apply the session behind it"
+        );
+        assert_eq!(workspace::source(&app), unchanged);
+        if app.free_transform.as_ref().unwrap().context.is_none() {
+            transform_context(&mut app, &ctx);
+        }
+        let values = app.free_transform.as_ref().unwrap().values.clone();
+        workspace::key(&mut app, &ctx, SIZE, egui::Key::Escape, Default::default());
+        assert!(app.free_transform.as_ref().unwrap().context.is_none());
+        assert!(app.free_transform.as_ref().unwrap().values == values);
+        assert_eq!(workspace::source(&app), unchanged);
+        transform_context(&mut app, &ctx);
+        let at = transform_context_point(&app, &ctx);
+        workspace::click(&mut app, &ctx, SIZE, at);
+        assert!(app.free_transform.as_ref().unwrap().context.is_none());
+        assert!(
+            app.free_transform.as_ref().unwrap().drag.is_none(),
+            "Dismissal must not begin a transform behind the popup"
+        );
+        assert_eq!(workspace::source(&app), unchanged);
+        warp_click(&mut app, &ctx, SIZE, "Cancel");
+        assert!(app.free_transform.is_none());
+        assert_eq!(workspace::source(&app), unchanged);
+
+        open(&mut app, &ctx);
+        settle(&mut app, &ctx);
+        transform_context(&mut app, &ctx);
+        let selected = app.selected.clone();
+        app.shared
+            .lock()
+            .unwrap()
+            .edit(
+                "human",
+                &[json!({"op":"layer.update","layer":selected,"name":"Later human work"})],
+                None,
+                None,
+                "Later human work",
+            )
+            .unwrap();
+        let later = workspace::source(&app);
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.free_transform.is_none());
+        assert_eq!(workspace::source(&app), later);
+        open(&mut app, &ctx);
+        settle(&mut app, &ctx);
+        transform_context(&mut app, &ctx);
+        frame(&mut app, &ctx, vec![egui::Event::WindowFocused(false)]);
+        assert!(app.free_transform.is_none());
+        assert_eq!(workspace::source(&app), later);
+    }
+}
+
+#[test]
+fn canvas_context_typing_guard_spans_held_and_same_frame_secondary_gestures() {
+    for depth in [8, 16] {
+        for same_frame in [false, true] {
+            let (mut app, ctx) = warp_fixture(depth, "color");
+            let unchanged = workspace::source(&app);
+            open(&mut app, &ctx);
+            settle(&mut app, &ctx);
+            warp_reveal(&mut app, &ctx, SIZE, "Move X", Some(WarpInput::Base(0)));
+            let numeric = app.free_transform.as_ref().unwrap().inputs[0]
+                .unwrap()
+                .center();
+            for _ in 0..2 {
+                workspace::click(&mut app, &ctx, SIZE, numeric);
+            }
+            frame(
+                &mut app,
+                &ctx,
+                vec![
+                    key_event(egui::Key::A, egui::Modifiers::COMMAND),
+                    egui::Event::Text("4.25".into()),
+                ],
+            );
+            assert!(ctx.wants_keyboard_input());
+            let values = app.free_transform.as_ref().unwrap().values.clone();
+            assert_eq!(values.offset[0], 4.25);
+            let commands = app.free_transform.as_ref().unwrap().commands().unwrap();
+            let at = transform_context_point(&app, &ctx);
+            let secondary = |pressed| egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Secondary,
+                pressed,
+                modifiers: Default::default(),
+            };
+            let mut events = vec![egui::Event::PointerMoved(at), secondary(true)];
+            if same_frame {
+                events.push(secondary(false));
+            }
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, SIZE)),
+                    time: Some(ctx.input(|input| input.time) + 0.05),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    app.draw(ctx);
+                    if ctx.output(|output| output.num_completed_passes == 0) {
+                        ctx.request_discard(
+                            "Verify the typing guard across a repeated layout pass",
+                        );
+                    }
+                },
+            );
+            assert_eq!(output.platform_output.num_completed_passes, 2);
+            {
+                let editor = app.free_transform.as_ref().unwrap();
+                assert!(editor.context.is_none() && editor.drag.is_none());
+                assert!(editor.values == values);
+                assert_eq!(editor.commands().unwrap(), commands);
+                assert_eq!(workspace::source(&app), unchanged);
+            }
+            if !same_frame {
+                frame(&mut app, &ctx, vec![]);
+                assert!(app.free_transform.as_ref().unwrap().context.is_none());
+                frame(&mut app, &ctx, vec![secondary(false)]);
+            }
+            let editor = app.free_transform.as_ref().unwrap();
+            assert!(editor.context.is_none() && editor.drag.is_none());
+            assert!(editor.values == values);
+            assert_eq!(editor.commands().unwrap(), commands);
+            assert_eq!(workspace::source(&app), unchanged);
+
+            // A new click after completing the field is a new menu gesture,
+            // even without an intervening idle input frame.
+            transform_context(&mut app, &ctx);
+            assert_eq!(
+                app.free_transform.as_ref().unwrap().commands().unwrap(),
+                commands
+            );
+            workspace::key(&mut app, &ctx, SIZE, egui::Key::Escape, Default::default());
+            assert!(app.free_transform.as_ref().unwrap().context.is_none());
+            warp_click(&mut app, &ctx, SIZE, "Cancel");
+            assert!(app.free_transform.is_none());
+            assert_eq!(workspace::source(&app), unchanged);
+        }
+    }
+}
+
+#[test]
+fn canvas_context_ime_during_secondary_hold_stays_blocked_through_release() {
+    for depth in [8, 16] {
+        let (mut app, ctx) = warp_fixture(depth, "color");
+        let unchanged = workspace::source(&app);
+        open(&mut app, &ctx);
+        settle(&mut app, &ctx);
+        assert!(!ctx.wants_keyboard_input());
+        let commands = app.free_transform.as_ref().unwrap().commands().unwrap();
+        let values = app.free_transform.as_ref().unwrap().values.clone();
+        let at = transform_context_point(&app, &ctx);
+        let secondary = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        for events in [
+            vec![egui::Event::PointerMoved(at), secondary(true)],
+            vec![egui::Event::Ime(egui::ImeEvent::Enabled)],
+            vec![egui::Event::Ime(egui::ImeEvent::Disabled)],
+            vec![secondary(false)],
+        ] {
+            frame(&mut app, &ctx, events);
+            let editor = app.free_transform.as_ref().unwrap();
+            assert!(editor.context.is_none() && editor.drag.is_none());
+            assert!(editor.values == values);
+            assert_eq!(editor.commands().unwrap(), commands);
+            assert_eq!(workspace::source(&app), unchanged);
+        }
+        transform_context(&mut app, &ctx);
+        assert_eq!(
+            app.free_transform.as_ref().unwrap().commands().unwrap(),
+            commands
+        );
+        workspace::key(&mut app, &ctx, SIZE, egui::Key::Escape, Default::default());
+        warp_click(&mut app, &ctx, SIZE, "Cancel");
+        assert!(app.free_transform.is_none());
+        assert_eq!(workspace::source(&app), unchanged);
+    }
+}
+
+#[test]
+fn numeric_escape_keeps_the_session_and_blocks_same_frame_canvas_or_apply_until_fresh_escape() {
+    for depth in [8, 16] {
+        for canvas in [true, false] {
+            for multipass in [false, true] {
+                for held in [false, true] {
+                    let (mut app, ctx) = warp_fixture(depth, "color");
+                    let unchanged = workspace::source(&app);
+                    open(&mut app, &ctx);
+                    settle(&mut app, &ctx);
+                    warp_reveal(&mut app, &ctx, SIZE, "Move X", Some(WarpInput::Base(0)));
+                    let numeric = app.free_transform.as_ref().unwrap().inputs[0]
+                        .unwrap()
+                        .center();
+                    workspace::click(&mut app, &ctx, SIZE, numeric);
+                    assert!(ctx.wants_keyboard_input());
+                    frame(
+                        &mut app,
+                        &ctx,
+                        vec![
+                            key_event(egui::Key::A, egui::Modifiers::COMMAND),
+                            egui::Event::Text("4.25".into()),
+                        ],
+                    );
+                    assert!(ctx.wants_keyboard_input());
+                    assert_eq!(app.free_transform.as_ref().unwrap().values.offset[0], 4.25);
+                    let output = settle(&mut app, &ctx);
+                    actual_preview(&app, &output);
+                    let apply = warp_reveal(&mut app, &ctx, SIZE, "Apply", None);
+                    assert!(
+                        ctx.wants_keyboard_input(),
+                        "The actual numeric editor still owns input"
+                    );
+                    let owner = ctx.memory(|memory| memory.focused()).unwrap();
+                    assert_eq!(app.free_transform.as_ref().unwrap().text_focus, Some(owner));
+                    let values = app.free_transform.as_ref().unwrap().values.clone();
+                    let commands = app.free_transform.as_ref().unwrap().commands().unwrap();
+                    assert!(!commands.is_empty());
+                    let at = if canvas {
+                        transform_context_point(&app, &ctx)
+                    } else {
+                        apply
+                    };
+                    let mut events = vec![
+                        key_event(egui::Key::Escape, Default::default()),
+                        egui::Event::PointerMoved(at),
+                        pointer(at, true),
+                    ];
+                    if !held {
+                        events.push(pointer(at, false));
+                    }
+                    if multipass {
+                        let output = ctx.run(egui::RawInput {
+                            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, SIZE)),
+                            time: Some(ctx.input(|input| input.time) + 0.05),
+                            events,
+                            ..Default::default()
+                        }, |ctx| {
+                            app.draw(ctx);
+                            if ctx.output(|output| output.num_completed_passes == 0) {
+                                ctx.request_discard("Verify numeric Escape and pointer shielding across two passes");
+                            }
+                        });
+                        assert_eq!(output.platform_output.num_completed_passes, 2);
+                    } else {
+                        frame(&mut app, &ctx, events);
+                    }
+                    {
+                        let editor = app
+                            .free_transform
+                            .as_ref()
+                            .expect("The field's Escape must not cancel the session");
+                        assert!(editor.drag.is_none() && editor.context.is_none());
+                        assert!(editor.values == values);
+                        assert_eq!(editor.commands().unwrap(), commands);
+                        assert!(
+                            !ctx.wants_keyboard_input(),
+                            "Escape completed the numeric field"
+                        );
+                        assert_eq!(workspace::source(&app), unchanged);
+                    }
+                    if held {
+                        for events in [vec![], vec![pointer(at, false)]] {
+                            frame(&mut app, &ctx, events);
+                            let editor = app
+                                .free_transform
+                                .as_ref()
+                                .expect("The old held press/release cannot Apply");
+                            assert!(editor.drag.is_none() && editor.context.is_none());
+                            assert!(editor.values == values);
+                            assert_eq!(editor.commands().unwrap(), commands);
+                            assert_eq!(workspace::source(&app), unchanged);
+                        }
+                    }
+                    let mut repeat = key_event(egui::Key::Escape, Default::default());
+                    if let egui::Event::Key { repeat, .. } = &mut repeat {
+                        *repeat = true;
+                    }
+                    frame(&mut app, &ctx, vec![repeat]);
+                    let editor = app
+                        .free_transform
+                        .as_ref()
+                        .expect("A held repeat is not a new session Escape");
+                    assert!(editor.values == values);
+                    assert_eq!(editor.commands().unwrap(), commands);
+                    assert_eq!(workspace::source(&app), unchanged);
+                    let mut released = key_event(egui::Key::Escape, Default::default());
+                    if let egui::Event::Key { pressed, .. } = &mut released {
+                        *pressed = false;
+                    }
+                    frame(&mut app, &ctx, vec![released]);
+                    assert!(app.free_transform.is_some());
+                    assert_eq!(workspace::source(&app), unchanged);
+                    workspace::key(&mut app, &ctx, SIZE, egui::Key::Escape, Default::default());
+                    assert!(
+                        app.free_transform.is_none(),
+                        "A released and fresh Escape still cancels"
+                    );
+                    assert_eq!(workspace::source(&app), unchanged);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn numeric_escape_held_apply_press_needs_a_fresh_click_and_commits_only_once() {
+    for depth in [8, 16] {
+        let (mut app, ctx) = warp_fixture(depth, "color");
+        let original = app.shared.lock().unwrap().doc.clone();
+        let undo = app.shared.lock().unwrap().undo.len();
+        let unchanged = workspace::source(&app);
+        open(&mut app, &ctx);
+        settle(&mut app, &ctx);
+        warp_reveal(&mut app, &ctx, SIZE, "Move X", Some(WarpInput::Base(0)));
+        let numeric = app.free_transform.as_ref().unwrap().inputs[0]
+            .unwrap()
+            .center();
+        workspace::click(&mut app, &ctx, SIZE, numeric);
+        frame(
+            &mut app,
+            &ctx,
+            vec![
+                key_event(egui::Key::A, egui::Modifiers::COMMAND),
+                egui::Event::Text("4.25".into()),
+            ],
+        );
+        let output = settle(&mut app, &ctx);
+        actual_preview(&app, &output);
+        let apply = warp_reveal(&mut app, &ctx, SIZE, "Apply", None);
+        assert!(ctx.wants_keyboard_input());
+        let commands = app.free_transform.as_ref().unwrap().commands().unwrap();
+        let expected = crate::engine::Engine::preview_edits(original.clone(), &commands).unwrap();
+        frame(
+            &mut app,
+            &ctx,
+            vec![
+                key_event(egui::Key::Escape, Default::default()),
+                egui::Event::PointerMoved(apply),
+                pointer(apply, true),
+            ],
+        );
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![pointer(apply, false)]);
+        assert!(
+            app.free_transform.is_some(),
+            "Releasing the old press must not Apply"
+        );
+        assert_eq!(
+            app.free_transform.as_ref().unwrap().commands().unwrap(),
+            commands
+        );
+        assert_eq!(workspace::source(&app), unchanged);
+        let mut released = key_event(egui::Key::Escape, Default::default());
+        if let egui::Event::Key { pressed, .. } = &mut released {
+            *pressed = false;
+        }
+        frame(&mut app, &ctx, vec![released]);
+        let output = settle(&mut app, &ctx);
+        actual_preview(&app, &output);
+        warp_click(&mut app, &ctx, SIZE, "Apply");
+        assert!(app.free_transform.is_none());
+        let mut engine = app.shared.lock().unwrap();
+        assert_eq!(engine.undo.len(), undo + 1);
+        skew_native_layers_eq(&engine.doc, &expected);
+        assert!(independent_coverage_eq(
+            engine.doc.selection_coverage.as_ref(),
+            expected.selection_coverage.as_ref()
+        ));
+        engine.undo("human").unwrap();
+        skew_native_layers_eq(&engine.doc, &original);
+        assert_eq!(engine.doc.selection_coverage, original.selection_coverage);
+    }
+}
+
+#[test]
+fn numeric_escape_release_and_fresh_press_in_one_input_batch_cancels() {
+    for depth in [8, 16] {
+        let (mut app, ctx) = warp_fixture(depth, "color");
+        let unchanged = workspace::source(&app);
+        open(&mut app, &ctx);
+        settle(&mut app, &ctx);
+        warp_reveal(&mut app, &ctx, SIZE, "Move X", Some(WarpInput::Base(0)));
+        let numeric = app.free_transform.as_ref().unwrap().inputs[0]
+            .unwrap()
+            .center();
+        workspace::click(&mut app, &ctx, SIZE, numeric);
+        assert!(ctx.wants_keyboard_input());
+        frame(
+            &mut app,
+            &ctx,
+            vec![key_event(egui::Key::Escape, Default::default())],
+        );
+        assert!(app.free_transform.is_some());
+        assert_eq!(workspace::source(&app), unchanged);
+        let mut released = key_event(egui::Key::Escape, Default::default());
+        if let egui::Event::Key { pressed, .. } = &mut released {
+            *pressed = false;
+        }
+        frame(
+            &mut app,
+            &ctx,
+            vec![released, key_event(egui::Key::Escape, Default::default())],
+        );
+        assert!(
+            app.free_transform.is_none(),
+            "Ordered release then new press is a fresh Escape"
+        );
+        assert_eq!(workspace::source(&app), unchanged);
+    }
+}

@@ -1,6 +1,8 @@
 use crate::icons::{self, Icon};
+mod about;
 mod activation;
 mod animation;
+mod associations;
 mod brush;
 #[cfg(test)]
 mod brush_toolbar_tests;
@@ -8,6 +10,8 @@ mod calibration;
 mod color;
 mod compatibility;
 mod contour_points;
+mod dialogs;
+mod edit_job;
 mod effect_color;
 mod effects;
 mod exports;
@@ -15,6 +19,7 @@ mod file_drop;
 mod file_ownership;
 mod filename;
 mod filters;
+mod free_transform;
 mod geometry;
 mod gradient_stops;
 mod history;
@@ -22,28 +27,47 @@ mod image_open;
 mod layers;
 mod lifecycle;
 mod liquify;
+mod native_preview;
+mod native_texture;
+mod new_canvas;
 mod pattern_source;
 mod pen;
 #[cfg(test)]
 mod pen_tests;
+mod preview_worker;
 mod protection;
 mod recovery;
 mod refinement;
 mod retouch;
 mod saved_versions;
+mod saving;
 mod selection;
 mod shortcuts;
+pub(crate) use shortcuts::validate_file as validate_shortcut_preferences;
+#[cfg(test)]
+mod input_performance_diagnostic;
+#[cfg(test)]
+mod parameter_preview_tests;
 mod source;
 mod style_settings;
 mod tabs;
+#[cfg(test)]
+mod text_tests;
 mod tool_settings;
 #[cfg(test)]
 mod tool_settings_tests;
 mod transform_snapping;
+mod updates;
 mod view;
+#[cfg(test)]
+mod workspace_tests;
 use crate::{controls, thumbnails};
 use crate::{
-    engine::Document,
+    engine::{
+        runtime_value::RuntimeValue,
+        view::{DocumentSnapshot, DocumentView, LayerView},
+        Document,
+    },
     raster::Pixel,
     server::{self, Connection, Shared},
 };
@@ -59,31 +83,26 @@ use std::{
 const ACCENT: Color32 = Color32::from_rgb(233, 84, 32);
 const AI_BLUE: Color32 = Color32::from_rgb(90, 170, 255);
 const MUTED: Color32 = Color32::from_rgb(188, 183, 189);
-fn key_modifiers(input: &egui::InputState, key: egui::Key) -> egui::Modifiers {
-    input
-        .events
-        .iter()
-        .find_map(|event| match event {
-            egui::Event::Key {
-                key: k,
-                physical_key,
-                pressed: true,
-                modifiers,
-                ..
-            } if *k == key || *physical_key == Some(key) => Some(*modifiers),
-            _ => None,
-        })
-        .unwrap_or(input.modifiers)
+fn command_modifiers(input: &egui::InputState, key: egui::Key) -> Option<egui::Modifiers> {
+    input.events.iter().find_map(|event| match event {
+        egui::Event::Key {
+            key: k,
+            pressed: true,
+            modifiers,
+            ..
+        } if *k == key && (modifiers.command || modifiers.ctrl) => Some(*modifiers),
+        _ => None,
+    })
 }
 fn command_key(input: &egui::InputState, key: egui::Key) -> bool {
-    let mods = key_modifiers(input, key);
-    (mods.command || mods.ctrl) && input.key_pressed(key)
+    command_modifiers(input, key).is_some()
 }
 fn paint_tool(painter: &egui::Painter, rect: Rect, tool: Tool, color: Color32) {
     use crate::icons::{self, Icon};
     let icon = match tool {
         Tool::None => Icon::Cursor,
         Tool::Pen => Icon::Curves,
+        Tool::Text => Icon::Text,
         Tool::Move => Icon::Move,
         Tool::Rotate => Icon::Rotate,
         Tool::Scale => Icon::Scale,
@@ -114,6 +133,7 @@ fn eye_button(ui: &mut egui::Ui, visible: bool) -> egui::Response {
 #[derive(PartialEq, Clone, Copy)]
 enum Tool {
     Pen,
+    Text,
     None,
     Move,
     Rotate,
@@ -137,6 +157,7 @@ impl Tool {
     fn label(self) -> &'static str {
         match self {
             Self::Pen => "Pen · P",
+            Self::Text => "Text · T",
             Self::None => "Deselect · Q",
             Self::Move => "Move · W",
             Self::Rotate => "Rotate · E",
@@ -159,6 +180,11 @@ impl Tool {
     }
 }
 struct Preview {
+    job: u64,
+    parameter: Option<ParameterRequest>,
+    parameter_document: Option<Result<Document, String>>,
+    #[cfg(test)]
+    parameter_replayed: bool,
     coarse: bool,
     error: Option<String>,
     live: String,
@@ -280,7 +306,7 @@ struct ProjectView {
     zoom: f32,
     pan: Vec2,
     view: view::View,
-    message: String,
+    message: RuntimeValue<String>,
 }
 struct LayerDrag {
     gesture: String,
@@ -298,17 +324,56 @@ struct EyeSweep {
     visible: bool,
     ids: HashSet<String>,
 }
+struct AltSample {
+    engine: std::sync::Weak<std::sync::Mutex<crate::engine::Engine>>,
+    project: String,
+    document: String,
+    revision: u64,
+    point: [i32; 2],
+    selected: String,
+    mask: bool,
+    step: Option<String>,
+    value: Pixel,
+}
+#[derive(Clone)]
+struct ParameterRequest {
+    engine: std::sync::Weak<std::sync::Mutex<crate::engine::Engine>>,
+    document: String,
+    revision: u64,
+    gesture: String,
+    commands: Vec<Value>,
+}
+impl ParameterRequest {
+    fn matches(&self, edit: &ParameterEdit, shared: &Shared, source: &Document) -> bool {
+        self.engine.as_ptr() == Arc::as_ptr(shared)
+            && edit.engine.as_ptr() == self.engine.as_ptr()
+            && self.document == source.id
+            && self.revision == source.revision
+            && self.document == edit.document
+            && self.revision == edit.revision
+            && self.gesture == edit.gesture
+            && self.commands == edit.commands
+    }
+}
 struct ParameterEdit {
     control: egui::Id,
     gesture: String,
+    engine: std::sync::Weak<std::sync::Mutex<crate::engine::Engine>>,
     document: String,
     revision: u64,
     commands: Vec<Value>,
+    // Derived from this edit's source and commands; never authorizes a commit.
+    preview: Option<Result<Document, String>>,
+    #[cfg(test)]
+    preview_runs: usize,
     label: String,
     typing: Option<egui::Context>,
     dirty: bool,
 }
 pub struct PeerBrush {
+    // Drain previews before any document, workspace or profile owner drops.
+    preview_worker: preview_worker::Worker,
+    fonts: filename::FontSetup,
     shared: Shared,
     workspace_root: Shared,
     workspace: crate::workspace::Registry,
@@ -320,10 +385,12 @@ pub struct PeerBrush {
     tab_active: String,
     tab_drag: Option<tabs::TabDrag>,
     project_picker_rect: Option<Rect>,
-    doc_snapshot: Document,
+    doc_snapshot: DocumentSnapshot,
     canvas_press_document: Option<String>,
     canvas_input_region: Option<(Rect, egui::LayerId)>,
     jobs: HashSet<String>,
+    updates: updates::Panel,
+    about: about::About,
     lifecycle: Option<lifecycle::Review>,
     recovery: recovery::Browser,
     saved_versions: Option<saved_versions::Browser>,
@@ -361,7 +428,13 @@ pub struct PeerBrush {
     selection_shortcut_keys: HashSet<egui::Key>,
     project_settings: Option<(u32, u32, u16)>,
     geometry: Option<geometry::Editor>,
+    free_transform: Option<free_transform::Editor>,
+    free_transform_frame: bool,
+    free_transform_cancelled_pointer: bool,
     source_editor: Option<source::Editor>,
+    native_source_preview: Option<crate::psd::memory36::Admitted<Value>>,
+    edit_worker: edit_job::Worker<server::EditReply>,
+    edit_control: Option<server::EditControl>,
     pen: pen::State,
     straight: brush::Straight,
     filter_editor: Option<filters::Editor>,
@@ -420,6 +493,9 @@ pub struct PeerBrush {
     texture: Option<TextureHandle>,
     canvas_pixels: Option<(u32, u32, Vec<u8>)>,
     canvas_generation: u64,
+    alt_sample: Option<AltSample>,
+    #[cfg(test)]
+    color_pick_runs: usize,
     canvas_preview: Option<(String, u64, String, bool)>,
     capture_ready_at: f64,
     canvas_selection: Option<CanvasSelection>,
@@ -427,6 +503,16 @@ pub struct PeerBrush {
     preview_rx: mpsc::Receiver<Preview>,
     preview_tx: mpsc::Sender<Preview>,
     pending: bool,
+    preview_epoch: Arc<std::sync::atomic::AtomicU64>,
+    preview_job: u64,
+    native_preview: native_preview::Presentation,
+    native_canvas: native_texture::Presenter,
+    #[cfg(test)]
+    parameter_worker_gate: Option<Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>>,
+    #[cfg(test)]
+    parameter_worker_runs: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    preview_variant_builds: std::cell::Cell<usize>,
     preview_cache: Arc<std::sync::Mutex<crate::preview::Cache>>,
     last_preview: Option<(String, u64, String, bool)>,
     thumbs: HashMap<String, (u64, TextureHandle)>,
@@ -441,8 +527,8 @@ pub struct PeerBrush {
     drag_start: Option<[f32; 2]>,
     view_rect: Option<Rect>,
     view: view::View,
-    message: String,
-    last_status: String,
+    message: RuntimeValue<String>,
+    last_status: RuntimeValue<String>,
     import_tx: mpsc::Sender<ImportReply>,
     import_rx: mpsc::Receiver<ImportReply>,
     pending_import: Option<PendingImport>,
@@ -455,12 +541,14 @@ pub struct PeerBrush {
     load_control: Option<crate::loading::Control>,
     load_preview: Option<TextureHandle>,
     show_new: bool,
+    new_size: new_canvas::Suggestion,
+    associations: associations::Choice,
     read_only_info: Option<String>,
     read_only_patterns: Option<String>,
     selection_commit_failed: bool,
     selection_pointer_cancelled: bool,
     selection_gesture_source: Option<selection::GestureSource>,
-    save_report: Option<crate::compatibility::SaveReport>,
+    save_report: Option<crate::compatibility::PreparedReport>,
     save_loss_review: Option<compatibility::SaveReview>,
     export_editor: Option<exports::Editor>,
     new_width: u32,
@@ -500,9 +588,28 @@ pub struct PeerBrush {
     gizmo_bounds: Option<(String, u64, [i32; 4])>,
 }
 impl PeerBrush {
+    #[cfg(any(windows, target_os = "macos"))]
+    pub fn set_update_profile(&mut self, profile: Option<crate::settings::UpdateProfile>) {
+        self.updates.set_update_profile(profile);
+    }
+
+    pub fn new_with_preferences(
+        cc: &eframe::CreationContext<'_>,
+        shared: Shared,
+        connection: Connection,
+        preferences: &Path,
+    ) -> Self {
+        let mut app = Self::new(cc, shared, connection);
+        app.shortcuts = shortcuts::Shortcuts::load(preferences);
+        app.updates = updates::Panel::load(preferences);
+        app
+    }
+
     pub fn new(cc: &eframe::CreationContext<'_>, shared: Shared, connection: Connection) -> Self {
+        #[cfg(target_os = "macos")]
+        crate::activation::macos::repaint_with(&cc.egui_ctx);
         if let Some(state) = &cc.wgpu_render_state {
-            let _ = crate::gpu::install(state);
+            crate::gpu::install_background(state, &cc.egui_ctx);
         }
         Self::init(&cc.egui_ctx, shared, connection)
     }
@@ -540,8 +647,7 @@ impl PeerBrush {
             egui::FontFamily::Name("semibold".into()),
             vec!["Ubuntu Sans Semibold".into()],
         );
-        filename::install_fallbacks(&mut fonts);
-        ctx.set_fonts(fonts);
+        let fonts = filename::FontSetup::new(ctx, fonts);
         let image = image::load_from_memory(include_bytes!("../assets/peerbrush-logo.png"))
             .unwrap()
             .to_rgba8();
@@ -632,6 +738,7 @@ impl PeerBrush {
         let tool_profile = tool_settings::initial(&tool_settings_store);
         let initial_tool_profile = tool_profile.snapshot.profile.clone();
         let (preview_tx, preview_rx) = mpsc::channel();
+        let preview_epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let (job_tx, job_rx) = mpsc::channel();
         let (import_tx, import_rx) = mpsc::channel();
         let (image_open_tx, image_open_rx) = mpsc::channel();
@@ -641,9 +748,11 @@ impl PeerBrush {
         let workspace = crate::workspace::attach(&shared);
         let (project_id, doc_snapshot) = {
             let e = shared.lock().unwrap();
-            (e.project_id.clone(), e.doc.clone())
+            (e.project_id.clone(), e.doc_snapshot())
         };
         Self {
+            preview_worker: preview_worker::Worker::new(preview_epoch.clone()),
+            fonts,
             recovery: recovery::Browser::new(&connection.state_dir),
             saved_versions: None,
             open_file_warning: None,
@@ -674,6 +783,8 @@ impl PeerBrush {
             transfer_rx,
             shared,
             shortcuts: shortcuts::Shortcuts::load(&connection.state_dir),
+            updates: updates::Panel::load(&connection.state_dir),
+            about: about::About::load(),
             connection,
             selection_layers: [selected.clone()].into_iter().collect(),
             selection_anchor: selected.clone(),
@@ -697,7 +808,13 @@ impl PeerBrush {
             selection_shortcut_keys: HashSet::new(),
             project_settings: None,
             geometry: None,
+            free_transform: None,
+            free_transform_frame: false,
+            free_transform_cancelled_pointer: false,
             source_editor: None,
+            native_source_preview: None,
+            edit_worker: Default::default(),
+            edit_control: None,
             pen: pen::State::default(),
             straight: brush::Straight::default(),
             filter_editor: None,
@@ -746,7 +863,10 @@ impl PeerBrush {
             eye_rects: HashMap::new(),
             layer_context: None,
             effect_add_rect: None,
+            #[cfg(not(test))]
             clipboard: crate::clipboard::Worker::new(ctx.clone()),
+            #[cfg(test)]
+            clipboard: crate::clipboard::Worker::memory(ctx.clone()),
             zoom: 1.0,
             pan: Vec2::ZERO,
             frame_pending: false,
@@ -755,6 +875,9 @@ impl PeerBrush {
             texture: None,
             canvas_pixels: None,
             canvas_generation: 0,
+            alt_sample: None,
+            #[cfg(test)]
+            color_pick_runs: 0,
             canvas_preview: None,
             capture_ready_at: 0.,
             canvas_selection: None,
@@ -762,6 +885,16 @@ impl PeerBrush {
             preview_rx,
             preview_tx,
             pending: false,
+            preview_epoch,
+            preview_job: 0,
+            native_preview: native_preview::Presentation::default(),
+            native_canvas: native_texture::Presenter::default(),
+            #[cfg(test)]
+            parameter_worker_gate: None,
+            #[cfg(test)]
+            parameter_worker_runs: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            preview_variant_builds: std::cell::Cell::new(0),
             preview_cache: Arc::new(std::sync::Mutex::new(crate::preview::Cache::default())),
             last_preview: None,
             thumbs: HashMap::new(),
@@ -790,6 +923,8 @@ impl PeerBrush {
             load_control: None,
             load_preview: None,
             show_new: false,
+            new_size: Default::default(),
+            associations: Default::default(),
             read_only_info: None,
             read_only_patterns: None,
             selection_commit_failed: false,
@@ -842,6 +977,10 @@ impl PeerBrush {
         }
     }
     fn edit(&mut self, commands: Vec<Value>, label: &str) {
+        self.try_edit(commands, label);
+    }
+    fn try_edit(&mut self, commands: Vec<Value>, label: &str) -> bool {
+        self.cancel_free_transform();
         self.close_proposal();
         let selection_edit = commands.iter().any(|command| {
             command["op"]
@@ -868,14 +1007,147 @@ impl PeerBrush {
                 }
                 self.message = label.into();
                 self.last_preview = None;
+                true
             }
             Err(e) => {
                 self.selection_commit_failed |= selection_edit;
-                self.message = e;
+                self.message = e.into();
+                false
             }
         }
     }
+    fn submit_source_edit(
+        &mut self,
+        command: source::EditCommand,
+        token: source::EditToken,
+        ctx: &egui::Context,
+    ) -> Result<(), String> {
+        let editor = self
+            .source_editor
+            .as_ref()
+            .filter(|editor| editor.token() == token)
+            .ok_or("Source draft changed before applying")?;
+        let request = edit_job::Request {
+            project: self.project_id.clone(),
+            document: editor.document.clone(),
+            revision: editor.revision,
+            label: "Edit text/vector source".into(),
+            selection_edit: false,
+            origin: edit_job::Origin::Source(token.nonce()),
+        };
+        let commands = match command {
+            source::EditCommand::Resident(command) => edit_job::Commands::resident(vec![command]),
+            source::EditCommand::Native(command) => edit_job::Commands::Native(command),
+        };
+        let shared = self.shared.clone();
+        let control = server::EditControl::default();
+        let worker_control = control.clone();
+        let ctx = ctx.clone();
+        self.edit_worker.submit(
+            request,
+            commands,
+            move |request, commands| {
+                server::edit_shared_controlled(
+                    &shared,
+                    "human",
+                    commands,
+                    Some(request.revision),
+                    None,
+                    &request.label,
+                    None,
+                    Some(&request.document),
+                    &worker_control,
+                )
+            },
+            move || ctx.request_repaint(),
+        )?;
+        self.edit_control = Some(control);
+        self.lifecycle_frame = true;
+        self.message = "Applying source changes…".into();
+        Ok(())
+    }
+    fn poll_edit_job(&mut self) {
+        if !self.edit_worker.pending() {
+            return;
+        }
+        let document = match self.shared.try_lock() {
+            Ok(engine) => crate::engine::view::current(&engine).id().to_owned(),
+            Err(_) => return,
+        };
+        let Some(completed) = self.edit_worker.poll() else {
+            return;
+        };
+        self.edit_control = None;
+        let request = &completed.request;
+        if let edit_job::Origin::Source(nonce) = request.origin {
+            self.source_edit_finished_nonce(
+                nonce,
+                completed.result.as_ref().map(|_| ()).map_err(Clone::clone),
+            );
+        }
+        let current = request.project == self.project_id && document == request.document;
+        if current {
+            match &completed.result {
+                Ok(value) => {
+                    if let Some(id) = value.data()["created"]
+                        .as_array()
+                        .and_then(|ids| ids.first())
+                        .and_then(Value::as_str)
+                    {
+                        self.selected = id.into();
+                        self.selection_layers = [id.to_owned()].into_iter().collect();
+                        self.selection_anchor = id.into();
+                        self.mask = false;
+                        self.mask_step = None;
+                    }
+                    self.message = value.data()["cleanup_warning"]
+                        .as_str()
+                        .map(|warning| format!("{}; {warning}", request.label))
+                        .unwrap_or_else(|| request.label.clone())
+                        .into();
+                    self.native_source_preview = None;
+                    self.last_preview = None;
+                }
+                Err(error) => {
+                    self.selection_commit_failed |= request.selection_edit;
+                    self.message = error.clone().into();
+                }
+            }
+        } else if let Some(view) = self.project_views.get_mut(&request.project) {
+            view.message = completed
+                .result
+                .as_ref()
+                .map(|_| request.label.clone())
+                .unwrap_or_else(Clone::clone)
+                .into();
+        }
+    }
+    fn cancel_pending_edit(&mut self) {
+        let Some(control) = &self.edit_control else {
+            return;
+        };
+        self.message = if control.cancel() {
+            "Cancelling edit before publication…".into()
+        } else {
+            "Waiting for the edit result…".into()
+        };
+    }
     fn select_tool(&mut self, tool: Tool) {
+        self.alt_sample = None;
+        if let Some(editor) = &mut self.free_transform {
+            if matches!(tool, Tool::Move | Tool::Rotate | Tool::Scale) {
+                editor.set_mode(tool);
+                return;
+            }
+            self.cancel_free_transform();
+        }
+        if self
+            .source_editor
+            .as_ref()
+            .is_some_and(|editor| editor.placement.is_some())
+        {
+            self.cancel_source();
+        }
         self.selection_pointer_cancelled = false;
         if self.tool != tool {
             self.straight.reset();
@@ -933,7 +1205,11 @@ impl PeerBrush {
                 let key = self.shortcuts.tool_label(tool).replace("Shift+", "⇧");
                 let response = response.on_hover_text(self.tool_caption(tool));
                 self.transform_rects[index] = Some(response.rect);
-                let active = self.tool == tool;
+                let active = self
+                    .free_transform
+                    .as_ref()
+                    .map_or(Some(self.tool), |editor| editor.mode())
+                    == Some(tool);
                 if active || response.hovered() {
                     ui.painter().rect_filled(
                         response.rect,
@@ -1006,11 +1282,11 @@ impl PeerBrush {
             }
         });
     }
-    fn selected_layer_ids(&self, doc: &Document) -> Vec<String> {
-        doc.layers
-            .iter()
-            .filter(|l| self.selection_layers.contains(&l.id))
-            .map(|l| l.id.clone())
+    fn selected_layer_ids<'a>(&self, doc: impl Into<DocumentView<'a>>) -> Vec<String> {
+        let doc = doc.into();
+        doc.layers()
+            .filter(|l| self.selection_layers.contains(l.id()))
+            .map(|l| l.id().to_owned())
             .collect()
     }
     fn copy_request(
@@ -1051,7 +1327,8 @@ impl PeerBrush {
             })
         }
     }
-    fn create_folder(&mut self, doc: &Document) {
+    fn create_folder<'a>(&mut self, doc: impl Into<DocumentView<'a>>) {
+        let doc = doc.into();
         if self.busy {
             return;
         }
@@ -1060,15 +1337,15 @@ impl PeerBrush {
         let ids = self.selected_layer_ids(doc);
         let result = {
             let mut engine = self.shared.lock().unwrap();
-            if engine.doc.id != doc.id {
+            if crate::engine::view::current(&engine).id() != doc.id() {
                 Err("The document changed before grouping layers".into())
-            } else if engine.doc.revision != doc.revision {
+            } else if crate::engine::view::current(&engine).revision() != doc.revision() {
                 Err("The project revision changed before grouping layers".into())
             } else {
                 engine.edit(
                     "human",
                     &[json!({"op":"group.create_selected","layers":ids,"name":"Folder"})],
-                    Some(doc.revision),
+                    Some(doc.revision()),
                     None,
                     "Group selected layers",
                 )
@@ -1088,24 +1365,29 @@ impl PeerBrush {
                 self.last_preview = None;
                 self.message = "Grouped selected layers".into();
             }
-            Err(error) => self.message = error,
+            Err(error) => self.message = error.into(),
         }
     }
-    fn selection_points(&self, doc: &Document, rect: Rect, scale: f32) -> Vec<Pos2> {
+    fn selection_points<'a>(
+        &self,
+        doc: impl Into<DocumentView<'a>>,
+        rect: Rect,
+        scale: f32,
+    ) -> Vec<Pos2> {
+        let doc = doc.into();
         let preview = self
             .canvas_selection
             .as_ref()
-            .filter(|p| p.document == doc.id && p.revision == doc.revision);
-        let (bounds, polygon) = preview
-            .map_or((doc.selection, doc.selection_polygon.as_ref()), |p| {
-                (p.bounds, p.polygon.as_ref())
-            });
+            .filter(|p| p.document == doc.id() && p.revision == doc.revision());
+        let (bounds, polygon) = preview.map_or((doc.selection(), doc.selection_polygon()), |p| {
+            (p.bounds, p.polygon.as_deref())
+        });
         let Some(bounds) = bounds else {
             return vec![];
         };
         let corners;
         let points = if let Some(polygon) = polygon {
-            polygon.as_slice()
+            polygon
         } else {
             corners = [
                 [bounds[0] as f32, bounds[1] as f32],
@@ -1120,14 +1402,15 @@ impl PeerBrush {
             .map(|p| self.view.point(*p, rect, scale))
             .collect()
     }
-    fn duplicate_layers(&mut self, doc: &Document) {
+    fn duplicate_layers<'a>(&mut self, doc: impl Into<DocumentView<'a>>) {
+        let doc = doc.into();
         let ids = self.selected_layer_ids(doc);
         let result = {
             let mut e = self.shared.lock().unwrap();
             e.edit(
                 "human",
                 &[json!({"op":"layer.duplicate","layers":ids})],
-                Some(doc.revision),
+                Some(doc.revision()),
                 None,
                 "Duplicate layers",
             )
@@ -1139,7 +1422,7 @@ impl PeerBrush {
                     .filter_map(Value::as_str)
                     .map(str::to_string)
                     .collect::<HashSet<_>>();
-                crate::tree::roots(&e.doc, &created)
+                crate::tree::roots_view(crate::engine::view::current(&e), &created)
             })
         };
         match result {
@@ -1152,15 +1435,16 @@ impl PeerBrush {
                 self.message = "Duplicated layers".into();
                 self.last_preview = None;
             }
-            Err(e) => self.message = e,
+            Err(e) => self.message = e.into(),
         }
     }
-    fn duplicate_selection(&mut self, doc: &Document) {
+    fn duplicate_selection<'a>(&mut self, doc: impl Into<DocumentView<'a>>) {
+        let doc = doc.into();
         self.close_proposal();
         let result = self.shared.lock().unwrap().edit(
             "human",
-            &[json!({"op":"layer.duplicate_selection","layer":self.selected,"document_id":doc.id,"source_revision":doc.revision})],
-            Some(doc.revision), None, "Duplicate layer selection",
+            &[json!({"op":"layer.duplicate_selection","layer":self.selected,"document_id":doc.id(),"source_revision":doc.revision()})],
+            Some(doc.revision()), None, "Duplicate layer selection",
         );
         match result {
             Ok(result) => {
@@ -1175,7 +1459,7 @@ impl PeerBrush {
                 self.message = "Duplicated layer selection".into();
                 self.last_preview = None;
             }
-            Err(error) => self.message = error,
+            Err(error) => self.message = error.into(),
         }
     }
     fn layer_cmd(&mut self, op: &str, extra: Value, label: &str) {
@@ -1214,6 +1498,36 @@ impl PeerBrush {
         };
         self.edit(commands, label);
     }
+    fn pending_parameter_document(
+        &mut self,
+        ctx: &egui::Context,
+        doc: &Document,
+    ) -> Option<Document> {
+        let edit = self.parameter_gesture.as_mut()?;
+        if edit.engine.as_ptr() != Arc::as_ptr(&self.shared)
+            || edit.document != doc.id
+            || edit.revision != doc.revision
+        {
+            edit.preview = None;
+            return None;
+        }
+        {
+            let Ok(engine) = self.shared.try_lock() else {
+                ctx.request_repaint_after(Duration::from_millis(16));
+                return None;
+            };
+            if crate::workspace::guard(&engine, &edit.document, edit.revision).is_err() {
+                edit.preview = None;
+                return None;
+            }
+        }
+        edit.preview.as_ref()?.as_ref().ok().cloned()
+    }
+    fn invalidate_parameter_preview(&mut self) {
+        self.preview_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.last_preview = None;
+    }
     fn finish_parameter(&mut self, cancel: bool) {
         let Some(edit) = self.parameter_gesture.take() else {
             return;
@@ -1221,15 +1535,20 @@ impl PeerBrush {
         if cancel {
             self.cancelled_parameter = Some(edit.control);
         }
-        self.last_preview = None;
+        self.invalidate_parameter_preview();
         if let Some(ctx) = &edit.typing {
             controls::cancel_number_edit(ctx, edit.control);
         }
         if cancel || !edit.dirty {
             return;
         }
+        if edit.engine.as_ptr() != Arc::as_ptr(&self.shared) {
+            self.cancelled_parameter = Some(edit.control);
+            self.message = "Image changed during parameter edit · preview cancelled".into();
+            return;
+        }
         let mut engine = self.shared.lock().unwrap();
-        if engine.doc.id != edit.document || engine.doc.revision != edit.revision {
+        if crate::workspace::guard(&engine, &edit.document, edit.revision).is_err() {
             self.cancelled_parameter = Some(edit.control);
             self.message = "Image changed during parameter edit · preview cancelled".into();
             return;
@@ -1243,7 +1562,8 @@ impl PeerBrush {
                 &edit.label,
             )
             .map(|_| edit.label)
-            .unwrap_or_else(|error| error);
+            .unwrap_or_else(|error| error)
+            .into();
     }
     fn layer_parameter(&mut self, extra: Value, label: &str, response: &egui::Response) {
         if response
@@ -1257,6 +1577,15 @@ impl PeerBrush {
         // A cancelled control must not rebind a still-held pointer to newer work.
         // The next physical press clears this transient guard in draw().
         if self.cancelled_parameter == Some(response.id) {
+            return;
+        }
+        if self
+            .parameter_gesture
+            .as_ref()
+            .is_some_and(|edit| edit.engine.as_ptr() != Arc::as_ptr(&self.shared))
+        {
+            self.finish_parameter(true);
+            self.message = "Image changed during parameter edit · preview cancelled".into();
             return;
         }
         let down = response.is_pointer_button_down_on() || response.dragged();
@@ -1298,14 +1627,19 @@ impl PeerBrush {
             self.parameter_gesture = Some(ParameterEdit {
                 control: response.id,
                 gesture: crate::engine::id(),
+                engine: Arc::downgrade(&self.shared),
                 document: doc.id,
                 revision: doc.revision,
                 commands,
+                preview: None,
+                #[cfg(test)]
+                preview_runs: 0,
                 label: label.into(),
                 typing: Some(response.ctx.clone()),
                 dirty: response.changed(),
             });
             self.animation.cancel();
+            self.invalidate_parameter_preview();
             return;
         }
         if self
@@ -1315,9 +1649,12 @@ impl PeerBrush {
         {
             if response.changed() {
                 let edit = self.parameter_gesture.as_mut().unwrap();
-                edit.commands = commands;
+                if edit.commands != commands {
+                    edit.commands = commands;
+                    edit.preview = None;
+                }
                 edit.dirty = true;
-                self.last_preview = None;
+                self.invalidate_parameter_preview();
                 if !controls::number_editing(&response.ctx, response.id) {
                     self.finish_parameter(false);
                 }
@@ -1342,34 +1679,45 @@ impl PeerBrush {
                 command["document_id"] = json!(document);
                 command["source_revision"] = json!(revision);
             }
-            match crate::engine::Engine::preview_edits(doc, &commands) {
-                Ok(_) => {
-                    let gesture = self
+            let unchanged = self.parameter_gesture.as_ref().is_some_and(|edit| {
+                edit.engine.as_ptr() == Arc::as_ptr(&self.shared)
+                    && edit.control == response.id
+                    && edit.document == doc.id
+                    && edit.revision == doc.revision
+                    && edit.commands == commands
+            });
+            if unchanged {
+                let edit = self.parameter_gesture.as_mut().unwrap();
+                edit.dirty |= response.changed();
+            } else {
+                let gesture = self
+                    .parameter_gesture
+                    .as_ref()
+                    .map(|edit| edit.gesture.clone())
+                    .unwrap_or_else(crate::engine::id);
+                self.parameter_gesture = Some(ParameterEdit {
+                    control: response.id,
+                    gesture,
+                    engine: Arc::downgrade(&self.shared),
+                    document,
+                    revision,
+                    commands,
+                    preview: None,
+                    #[cfg(test)]
+                    preview_runs: self
                         .parameter_gesture
                         .as_ref()
-                        .map(|edit| edit.gesture.clone())
-                        .unwrap_or_else(crate::engine::id);
-                    self.parameter_gesture = Some(ParameterEdit {
-                        control: response.id,
-                        gesture,
-                        document,
-                        revision,
-                        commands,
-                        label: label.into(),
-                        typing: None,
-                        dirty: response.changed()
-                            || self
-                                .parameter_gesture
-                                .as_ref()
-                                .is_some_and(|edit| edit.dirty),
-                    });
-                    self.animation.cancel();
-                }
-                Err(error) => {
-                    self.parameter_gesture = None;
-                    self.cancelled_parameter = Some(response.id);
-                    self.message = error;
-                }
+                        .map_or(0, |edit| edit.preview_runs),
+                    label: label.into(),
+                    typing: None,
+                    dirty: response.changed()
+                        || self
+                            .parameter_gesture
+                            .as_ref()
+                            .is_some_and(|edit| edit.dirty),
+                });
+                self.animation.cancel();
+                self.invalidate_parameter_preview();
             }
         } else {
             self.finish_parameter(true);
@@ -1379,7 +1727,8 @@ impl PeerBrush {
                 .unwrap()
                 .edit("human", &commands, None, None, label)
                 .map(|_| label.into())
-                .unwrap_or_else(|error| error);
+                .unwrap_or_else(|error| error)
+                .into();
         }
         self.last_preview = None;
     }
@@ -1416,7 +1765,7 @@ impl PeerBrush {
         let ctx = ctx.clone();
         self.connecting = true;
         self.connect_feedback = "Preparing MCP discovery and installed AI clients…".into();
-        self.message = self.connect_feedback.clone();
+        self.message = self.connect_feedback.clone().into();
         if let Err(error) = std::thread::Builder::new()
             .name("peerbrush-ai-connect".into())
             .spawn(move || {
@@ -1449,27 +1798,28 @@ impl PeerBrush {
             .connect_feedback
             .split_whitespace()
             .collect::<Vec<_>>()
-            .join(" ");
+            .join(" ")
+            .into();
         // Client presence belongs to the live MCP handshake, never to a setup result.
     }
-    fn merge_layers(&mut self, ctx: &egui::Context, doc: &Document) {
+    fn merge_layers<'a>(&mut self, ctx: &egui::Context, doc: impl Into<DocumentView<'a>>) {
+        let doc = doc.into();
         if self.busy {
             return;
         }
         self.close_proposal();
         self.finish_parameter(true);
         let mut ids = doc
-            .layers
-            .iter()
-            .filter(|l| self.selection_layers.contains(&l.id))
-            .map(|l| l.id.clone())
+            .layers()
+            .filter(|l| self.selection_layers.contains(l.id()))
+            .map(|l| l.id().to_owned())
             .collect::<Vec<_>>();
         if ids.is_empty() {
             ids.push(self.selected.clone());
         }
-        let document = doc.id.clone();
+        let document = doc.id().to_owned();
         let project = self.project_id.clone();
-        let revision = doc.revision;
+        let revision = doc.revision();
         let shared = self.shared.clone();
         let tx = self.merge_tx.clone();
         let ctx = ctx.clone();
@@ -1498,7 +1848,7 @@ impl PeerBrush {
         {
             self.busy = false;
             self.jobs.remove(&self.project_id);
-            self.message = format!("Could not start merging layers: {error}");
+            self.message = format!("Could not start merging layers: {error}").into();
         }
     }
     fn open(&mut self) {
@@ -1526,7 +1876,8 @@ impl PeerBrush {
         let control = crate::loading::Control::default();
         {
             let e = s.lock().unwrap();
-            control.bind(e.doc.id.clone(), e.doc.revision);
+            let view = crate::engine::view::current(&e);
+            control.bind(view.id().to_owned(), view.revision());
         }
         self.load_control = Some(control.clone());
         self.load_preview = None;
@@ -1586,8 +1937,7 @@ impl PeerBrush {
                     e.doc.name = format!("Recovered — {name}");
                 }
             }
-            let engine = s.lock().unwrap().clone();
-            crate::workspace::register_in(&workspace, engine, Some(&initiating))?;
+            crate::workspace::register_opened(&workspace, s, Some(&initiating))?;
             Ok(if recover {
                 "Recovered version — save to your chosen PSD or PSB"
             } else {
@@ -1597,6 +1947,10 @@ impl PeerBrush {
         });
     }
     fn save(&mut self, save_as: bool) {
+        if self.free_transform.is_some() {
+            self.message = "Apply or cancel Free Transform before saving.".into();
+            return;
+        }
         if self.busy {
             self.message = "Finish the current file operation before saving".into();
             return;
@@ -1604,23 +1958,23 @@ impl PeerBrush {
         if self.save_loss_review.is_some() {
             return;
         }
-        let report = match crate::compatibility::report(&self.doc_snapshot) {
+        let report = match crate::compatibility::report_snapshot(&self.doc_snapshot) {
             Ok(report) => report,
             Err(error) => {
-                self.message = error;
+                self.message = error.into();
                 return;
             }
         };
-        if !report.save_allowed {
+        if !report.data().save_allowed {
             self.open_save_report();
             self.message =
                 "Protected source · create an explicit compatible copy before saving".into();
             return;
         }
-        if report.has_editability_losses {
+        if report.data().has_editability_losses {
             self.save_loss_review = Some(compatibility::SaveReview::new(
                 self.project_id.clone(),
-                self.doc_snapshot.name.clone(),
+                self.doc_snapshot.view().name().to_owned(),
                 report,
                 compatibility::SaveIntent::Save { save_as },
             ));
@@ -1629,8 +1983,8 @@ impl PeerBrush {
         }
         self.save_frozen(
             save_as,
-            self.doc_snapshot.id.clone(),
-            self.doc_snapshot.revision,
+            self.doc_snapshot.view().id().to_owned(),
+            self.doc_snapshot.view().revision(),
             false,
         );
     }
@@ -1661,20 +2015,45 @@ impl PeerBrush {
             Ok("Photoshop document saved".into())
         });
     }
-    fn export(&mut self) {
+    fn export(&mut self, format: crate::production_export::Format) {
+        use crate::production_export::Format;
         let s = self.shared.clone();
-        let document = self.doc_snapshot.id.clone();
-        let revision = self.doc_snapshot.revision;
+        let document = self.doc_snapshot.view().id().to_owned();
+        let revision = self.doc_snapshot.view().revision();
+        let depth = self.doc_snapshot.view().depth();
         self.job(move || {
+            let (label, title) = match format {
+                Format::Png => ("PNG", format!("Export native {depth}-bit PNG")),
+                Format::Jxl => (
+                    "JPEG XL",
+                    format!("Export lossless native {depth}-bit JPEG XL"),
+                ),
+                Format::Webp => (
+                    "WebP · lossless 8-bit",
+                    format!("Export 8-bit WebP · {depth}-bit project unchanged"),
+                ),
+            };
             let Some(path) = rfd::FileDialog::new()
-                .add_filter("PNG", &["png"])
-                .set_file_name("PeerBrush.png")
+                .add_filter(label, &[format.extension()])
+                .set_title(title)
+                .set_file_name(format!("PeerBrush.{}", format.extension()))
                 .save_file()
             else {
                 return Ok("Ready".into());
             };
+            if Format::from_path(&path)? != format {
+                return Err(format!(
+                    "Choose a .{} destination for this export",
+                    format.extension()
+                ));
+            }
             server::export_confirmed_source(&s, &path, &document, revision)?;
-            Ok("PNG exported".into())
+            Ok(match format {
+                Format::Png => "PNG exported",
+                Format::Jxl => "Lossless JPEG XL exported",
+                Format::Webp => "8-bit WebP exported · working document unchanged",
+            }
+            .into())
         });
     }
     fn import(&mut self) {
@@ -1690,7 +2069,8 @@ impl PeerBrush {
         let project = self.project_id.clone();
         let (document, revision) = {
             let e = self.shared.lock().unwrap();
-            (e.doc.id.clone(), e.doc.revision)
+            let view = crate::engine::view::current(&e);
+            (view.id().to_owned(), view.revision())
         };
         self.busy = true;
         self.jobs.insert(project.clone());
@@ -1759,7 +2139,8 @@ impl PeerBrush {
                 commands.push(command); pixels.push(image);
             }
             let count = commands.len(); let mut engine = shared.lock().unwrap();
-            if engine.doc.id != pending.document || engine.doc.revision != pending.revision { return Err("The source project changed; import the images again".into()); }
+            crate::workspace::guard(&engine, &pending.document, pending.revision)
+                .map_err(|_| "The source project changed; import the images again")?;
             engine.import_images(&commands,pixels,pending.revision)?;
             Ok(format!("Imported {count} image layers"))
         });
@@ -1863,6 +2244,9 @@ impl PeerBrush {
             "Liquify: paint on the canvas · Choose Push, Expand, Pinch or Restore above".into();
     }
     fn preview_variant(&self) -> String {
+        #[cfg(test)]
+        self.preview_variant_builds
+            .set(self.preview_variant_builds.get() + 1);
         if let Some(id) = &self.proposal_review {
             return format!("proposal:{id}:{}", self.proposal_original);
         }
@@ -1916,6 +2300,9 @@ impl PeerBrush {
         )
     }
     fn live_key(&self) -> String {
+        if let Some(editor) = &self.free_transform {
+            return editor.live_key();
+        }
         if let Some(edit) = &self.parameter_gesture {
             return format!(
                 "parameter:{}:{}:{}",
@@ -1994,6 +2381,15 @@ impl PeerBrush {
     }
     fn request_preview(&mut self, ctx: &egui::Context, _doc: &Document) {
         let current = self.shared.lock().unwrap().doc.clone();
+        if self.parameter_gesture.as_ref().is_some_and(|edit| {
+            edit.engine.as_ptr() != Arc::as_ptr(&self.shared)
+                || edit.document != current.id
+                || edit.revision != current.revision
+        }) {
+            self.finish_parameter(true);
+            self.message = "Image changed during parameter edit · preview cancelled".into();
+        }
+        self.sync_free_transform(ctx, &current);
         if self
             .filter_editor
             .as_ref()
@@ -2044,11 +2440,8 @@ impl PeerBrush {
                 (r.width().max(r.height()) * ctx.pixels_per_point()).ceil() as u32
             })
             .clamp(512, 1536);
-        let variant = format!(
-            "{};{};{edge}",
-            self.preview_variant(),
-            self.animation.render_key(time)
-        );
+        let animation_key = self.animation.render_key(time);
+        let mut variant = None;
         let mut live = self.live_key();
         if live.is_empty() {
             let ai = self.animation.live_key();
@@ -2056,20 +2449,74 @@ impl PeerBrush {
                 live = format!("{ai}:{}:{}:{}", self.selected, self.mask, self.isolate);
             }
         }
-        while let Ok(p) = self.preview_rx.try_recv() {
-            if p.doc_id != doc.id {
+        while let Ok(mut p) = self.preview_rx.try_recv() {
+            if p.job != self.preview_job {
                 continue;
             }
             if !p.coarse {
                 self.pending = false;
             }
-            if p.doc_id == doc.id
+            if p.job
+                != self
+                    .preview_epoch
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                self.last_preview = None;
+                continue;
+            }
+            let parameter_matches = match &p.parameter {
+                Some(request) => self
+                    .parameter_gesture
+                    .as_ref()
+                    .is_some_and(|edit| request.matches(edit, &self.shared, doc)),
+                None => self.parameter_gesture.is_none(),
+            };
+            if parameter_matches
+                && p.doc_id == doc.id
                 && p.revision == doc.revision
-                && (p.target == variant || (!live.is_empty() && p.live == live))
+                && p.parameter.is_some()
+                && !p.coarse
+            {
+                #[cfg(test)]
+                if p.parameter_replayed {
+                    self.parameter_gesture.as_mut().unwrap().preview_runs += 1;
+                }
+                if let Some(preview) = p.parameter_document.take() {
+                    match preview {
+                        Ok(preview) => {
+                            self.parameter_gesture.as_mut().unwrap().preview = Some(Ok(preview));
+                        }
+                        Err(error) => {
+                            self.finish_parameter(true);
+                            self.message = error.into();
+                            ctx.request_repaint();
+                            return;
+                        }
+                    }
+                }
+            }
+            if !parameter_matches || p.doc_id != doc.id || p.revision != doc.revision {
+                self.last_preview = None;
+                continue;
+            }
+            let variant = variant.get_or_insert_with(|| {
+                format!("{};{animation_key};{edge}", self.preview_variant())
+            });
+            if (p.target == *variant || (!live.is_empty() && p.live == live))
+                && (p.parameter.is_none() || p.target == *variant)
                 && p.mask == preview_mask
+                && (self.free_transform.is_none() || (p.target == *variant && p.live == live))
                 && ((self.source_editor.is_none() && self.filter_editor.is_none())
                     || p.live == live)
             {
+                if let Some(editor) = &mut self.free_transform {
+                    editor.error = p.error.clone();
+                    editor.rendered = if !p.coarse && p.error.is_none() && !p.bytes.is_empty() {
+                        editor.key().ok()
+                    } else {
+                        None
+                    };
+                }
                 if let Some(editor) = &mut self.geometry {
                     editor.error = p.error.clone();
                 }
@@ -2117,11 +2564,38 @@ impl PeerBrush {
         if self.animation.fading() || self.animation.progress(time) < 1.0 {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
+        if self.pending {
+            return;
+        }
+        let variant =
+            variant.unwrap_or_else(|| format!("{};{animation_key};{edge}", self.preview_variant()));
         let key = (doc.id.clone(), doc.revision, variant.clone(), preview_mask);
-        if !self.pending && self.last_preview.as_ref() != Some(&key) {
+        if self.last_preview.as_ref() != Some(&key) {
             self.pending = true;
             self.last_preview = Some(key);
-            let mut doc = proposal_doc.unwrap_or_else(|| self.animation.document(doc, time, true));
+            let job = self
+                .preview_epoch
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                .wrapping_add(1);
+            self.preview_job = job;
+            let epoch = self.preview_epoch.clone();
+            let parameter = self
+                .parameter_gesture
+                .as_ref()
+                .map(|edit| ParameterRequest {
+                    engine: edit.engine.clone(),
+                    document: edit.document.clone(),
+                    revision: edit.revision,
+                    gesture: edit.gesture.clone(),
+                    commands: edit.commands.clone(),
+                });
+            let mut doc = proposal_doc.unwrap_or_else(|| {
+                if parameter.is_some() {
+                    current.clone()
+                } else {
+                    self.animation.document(doc, time, true).into_owned()
+                }
+            });
             doc.revision = current.revision;
             let mut commands = self.transient.clone();
             if let Some(edit) = &self.parameter_gesture {
@@ -2158,6 +2632,28 @@ impl PeerBrush {
             if self.proposal_review.is_some() {
                 commands.clear();
             }
+            // Only a pure parameter result can be reused by either parameter panel.
+            // Mixed tool/hover/transient previews keep their existing command order.
+            let parameter_only = parameter.as_ref().is_some_and(|p| p.commands == commands);
+            if parameter_only {
+                if let Some(Ok(preview)) = self
+                    .parameter_gesture
+                    .as_ref()
+                    .and_then(|e| e.preview.as_ref())
+                {
+                    doc = preview.clone();
+                    commands.clear();
+                }
+            }
+            #[cfg(test)]
+            let parameter_replayed = parameter.is_some() && !commands.is_empty();
+            #[cfg(test)]
+            let worker_gate = self
+                .parameter_worker_gate
+                .clone()
+                .filter(|_| parameter_replayed || !self.points.is_empty());
+            #[cfg(test)]
+            let worker_runs = self.parameter_worker_runs.clone();
             let dirty = if !live.is_empty()
                 && commands.len() == 1
                 && matches!(commands[0]["op"].as_str(), Some("paint" | "smudge"))
@@ -2194,103 +2690,196 @@ impl PeerBrush {
                         })
                         .map(|_| (None, "cutout".into()))
                 });
-            std::thread::spawn(move || {
-                let id = doc.id.clone();
-                let revision = doc.revision;
-                let output = (|| {
-                    let mut dirty = dirty;
-                    // A replay delta belongs to these retained pixels. Keep
-                    // worker replay/render together across project switches.
-                    let mut cache = cache
-                        .lock()
-                        .map_err(|_| "Preview worker cache unavailable")?;
-                    if !commands.is_empty() {
-                        if dirty.is_some() && commands.len() == 1 && commands[0]["op"] == "paint" {
-                            (doc, dirty) = cache.edit_with_region(doc, &commands, &live)?;
+            let failure_context = ctx.clone();
+            let request_context = ctx.clone();
+            let failure_tx = tx.clone();
+            let failure_message =
+                "Canvas preview could not complete; current work preserved".to_owned();
+            let failure_reply = Preview {
+                job,
+                parameter: parameter.clone(),
+                parameter_document: parameter_only.then(|| Err(failure_message.clone())),
+                #[cfg(test)]
+                parameter_replayed: false,
+                coarse: false,
+                error: Some(failure_message),
+                live: live.clone(),
+                revision: doc.revision,
+                doc_id: doc.id.clone(),
+                w: 0,
+                h: 0,
+                bytes: Vec::new(),
+                dirty: None,
+                selection: None,
+                selection_polygon: None,
+                selection_coverage: None,
+                target: variant.clone(),
+                mask,
+            };
+            let requested = self.preview_worker.request(
+                move || {
+                    let id = doc.id.clone();
+                    let revision = doc.revision;
+                    let mut parameter_document = None;
+                    let check = || {
+                        if epoch.load(std::sync::atomic::Ordering::Relaxed) == job {
+                            Ok(())
                         } else {
-                            doc = cache.edit(doc, &commands, &live)?;
+                            Err("Preview superseded".to_string())
                         }
-                    }
-                    // A coarse shared-engine frame reaches the canvas before detailed sampling.
-                    // Derived only: no source changes, history, or 16-bit conversion.
-                    if dirty.is_none()
-                        && refinement.is_none()
-                        && edge > 512
-                        && doc.width.max(doc.height) > 1024
-                    {
-                        if let Ok((w, h, bytes, _)) = doc.preview(None, 256, layer.as_deref(), mask)
+                    };
+                    let output = (|| {
+                        #[cfg(test)]
+                        if let Some(gate) = &worker_gate {
+                            let (lock, ready) = &**gate;
+                            let mut released = lock.lock().unwrap();
+                            while !*released {
+                                check()?;
+                                released = ready
+                                    .wait_timeout(released, Duration::from_millis(25))
+                                    .unwrap()
+                                    .0;
+                            }
+                        }
+                        check()?;
+                        let mut dirty = dirty;
+                        // A replay delta belongs to these retained pixels. Keep
+                        // worker replay/render together across project switches.
+                        let mut cache = cache
+                            .lock()
+                            .map_err(|_| "Preview worker cache unavailable")?;
+                        check()?;
+                        if !commands.is_empty() {
+                            #[cfg(test)]
+                            if parameter_replayed {
+                                worker_runs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            if dirty.is_some()
+                                && commands.len() == 1
+                                && commands[0]["op"] == "paint"
+                            {
+                                (doc, dirty) = cache.edit_with_region(doc, &commands, &live)?;
+                            } else {
+                                doc = cache.edit(doc, &commands, &live)?;
+                            }
+                        }
+                        check()?;
+                        if parameter_only {
+                            parameter_document = Some(doc.clone());
+                        }
+                        // A coarse shared-engine frame reaches the canvas before detailed sampling.
+                        // Derived only: no source changes, history, or 16-bit conversion.
+                        if dirty.is_none()
+                            && refinement.is_none()
+                            && edge > 512
+                            && doc.width.max(doc.height) > 1024
                         {
-                            let _ = tx.send(Preview {
-                                coarse: true,
-                                error: None,
-                                live: live.clone(),
-                                doc_id: id.clone(),
-                                revision,
-                                target: variant.clone(),
-                                mask,
-                                w,
-                                h,
-                                bytes,
-                                dirty: None,
-                                selection: doc.selection,
-                                selection_polygon: doc.selection_polygon.clone(),
-                                selection_coverage: doc.selection_coverage.clone(),
-                            });
-                            ctx.request_repaint();
+                            if let Ok((w, h, bytes, _)) =
+                                doc.preview(None, 256, layer.as_deref(), mask)
+                            {
+                                let _ = tx.send(Preview {
+                                    job,
+                                    parameter: parameter.clone(),
+                                    parameter_document: None,
+                                    #[cfg(test)]
+                                    parameter_replayed: false,
+                                    coarse: true,
+                                    error: None,
+                                    live: live.clone(),
+                                    doc_id: id.clone(),
+                                    revision,
+                                    target: variant.clone(),
+                                    mask,
+                                    w,
+                                    h,
+                                    bytes,
+                                    dirty: None,
+                                    selection: doc.selection,
+                                    selection_polygon: doc.selection_polygon.clone(),
+                                    selection_coverage: doc.selection_coverage.clone(),
+                                });
+                                ctx.request_repaint();
+                            }
                         }
-                    }
-                    let mut rendered =
-                        cache.render(&doc, &live, dirty, edge, layer.as_deref(), mask)?;
-                    if let Some((target, mode)) = &refinement {
-                        if target.is_none() {
-                            crate::selection::display::apply(
-                                &doc,
-                                rendered.width,
-                                rendered.height,
-                                &mut rendered.bytes,
-                                mode,
-                            );
-                            rendered.dirty = None;
-                        } else if mode == "mask" {
-                            let (w, h, bytes, _) =
-                                doc.preview(None, edge, target.as_deref(), true)?;
-                            rendered.width = w;
-                            rendered.height = h;
-                            rendered.bytes = bytes;
-                            rendered.dirty = None;
+                        let mut rendered =
+                            cache.render(&doc, &live, dirty, edge, layer.as_deref(), mask)?;
+                        if let Some((target, mode)) = &refinement {
+                            if target.is_none() {
+                                crate::selection::display::apply(
+                                    &doc,
+                                    rendered.width,
+                                    rendered.height,
+                                    &mut rendered.bytes,
+                                    mode,
+                                );
+                                rendered.dirty = None;
+                            } else if mode == "mask" {
+                                let (w, h, bytes, _) =
+                                    doc.preview(None, edge, target.as_deref(), true)?;
+                                rendered.width = w;
+                                rendered.height = h;
+                                rendered.bytes = bytes;
+                                rendered.dirty = None;
+                            }
                         }
-                    }
-                    Ok::<_, String>((
-                        rendered.width,
-                        rendered.height,
-                        rendered.bytes,
-                        rendered.dirty,
-                        doc.selection,
-                        doc.selection_polygon.clone(),
-                        doc.selection_coverage.clone(),
-                    ))
-                })();
-                let error = output.as_ref().err().cloned();
-                let (w, h, bytes, dirty, selection, selection_polygon, selection_coverage) =
-                    output.unwrap_or((0, 0, vec![], None, None, None, None));
-                let _ = tx.send(Preview {
-                    coarse: false,
-                    error,
-                    live,
-                    doc_id: id,
-                    revision,
-                    target: variant,
-                    mask,
-                    w,
-                    h,
-                    bytes,
-                    dirty,
-                    selection,
-                    selection_polygon,
-                    selection_coverage,
-                });
-                ctx.request_repaint();
-            });
+                        check()?;
+                        Ok::<_, String>((
+                            rendered.width,
+                            rendered.height,
+                            rendered.bytes,
+                            rendered.dirty,
+                            doc.selection,
+                            doc.selection_polygon.clone(),
+                            doc.selection_coverage.clone(),
+                        ))
+                    })();
+                    let error = output.as_ref().err().cloned();
+                    let (w, h, bytes, dirty, selection, selection_polygon, selection_coverage) =
+                        output.unwrap_or((0, 0, vec![], None, None, None, None));
+                    let _ = tx.send(Preview {
+                        job,
+                        parameter,
+                        parameter_document: if parameter_only {
+                            parameter_document
+                                .map(Ok)
+                                .filter(|_| error.is_none())
+                                .or_else(|| error.as_ref().map(|error| Err(error.clone())))
+                        } else {
+                            None
+                        },
+                        #[cfg(test)]
+                        parameter_replayed,
+                        coarse: false,
+                        error,
+                        live,
+                        doc_id: id,
+                        revision,
+                        target: variant,
+                        mask,
+                        w,
+                        h,
+                        bytes,
+                        dirty,
+                        selection,
+                        selection_polygon,
+                        selection_coverage,
+                    });
+                    ctx.request_repaint();
+                },
+                move || {
+                    let _ = failure_tx.send(failure_reply);
+                    failure_context.request_repaint();
+                },
+            );
+            if let Err(error) = requested {
+                self.pending = false;
+                self.last_preview = None;
+                self.message = format!(
+                    "Canvas preview worker could not start: {error}; current work preserved"
+                )
+                .into();
+                request_context.request_repaint();
+            }
         }
     }
     fn thumbnail(
@@ -2344,10 +2933,29 @@ impl PeerBrush {
         }
         self.thumbs.get(&key).map(|(_, texture)| texture.clone())
     }
-    fn layer_menu(&mut self, ui: &mut egui::Ui, doc: &Document, l: &crate::engine::Layer) {
+    fn layer_menu<'a>(
+        &mut self,
+        ui: &mut egui::Ui,
+        doc: impl Into<DocumentView<'a>>,
+        l: impl Into<LayerView<'a>>,
+    ) {
+        let doc = doc.into();
+        if self.layer_menu_contents(ui, doc, l) {
+            self.open_source(doc, "edit");
+        }
+    }
+    fn layer_menu_contents<'a>(
+        &mut self,
+        ui: &mut egui::Ui,
+        doc: impl Into<DocumentView<'a>>,
+        l: impl Into<LayerView<'a>>,
+    ) -> bool {
+        let doc = doc.into();
+        let l = l.into();
+        let mut edit_source = false;
         if ui
             .add_enabled(
-                !self.busy && !doc.read_only,
+                !self.busy && !doc.read_only(),
                 egui::Button::new("Group layers").shortcut_text(if cfg!(target_os = "macos") {
                     "⌘ G"
                 } else {
@@ -2356,15 +2964,15 @@ impl PeerBrush {
             )
             .clicked()
         {
-            if !self.selection_layers.contains(&l.id) {
-                self.select_content(&l.id);
+            if !self.selection_layers.contains(l.id()) {
+                self.select_content(l.id());
             }
             self.create_folder(doc);
             ui.close_menu();
         }
         if ui
             .add_enabled(
-                !self.busy && !doc.read_only,
+                !self.busy && !doc.read_only(),
                 egui::Button::new("Merge layers").shortcut_text(if cfg!(target_os = "macos") {
                     "⌘ ⇧ G"
                 } else {
@@ -2376,8 +2984,8 @@ impl PeerBrush {
             )
             .clicked()
         {
-            if !self.selection_layers.contains(&l.id) {
-                self.select_content(&l.id);
+            if !self.selection_layers.contains(l.id()) {
+                self.select_content(l.id());
             }
             self.merge_layers(ui.ctx(), doc);
             ui.close_menu();
@@ -2387,26 +2995,26 @@ impl PeerBrush {
             ("Rename", "rename", json!({})),
             ("Duplicate", "layer.duplicate", json!({})),
             (
-                if l.locked { "Unlock" } else { "Lock" },
+                if l.locked() { "Unlock" } else { "Lock" },
                 "layer.update",
-                json!({"locked":!l.locked}),
+                json!({"locked":!l.locked()}),
             ),
             ("Add mask", "mask.add", json!({"value":255})),
         ] {
             if ui
                 .add_enabled(
-                    !(op == "layer.duplicate" && l.kind == "group")
-                        && !(op == "mask.add" && l.mask.is_some()),
+                    !(op == "layer.duplicate" && l.kind() == "group")
+                        && !(op == "mask.add" && l.mask().is_some()),
                     egui::Button::new(title),
                 )
                 .clicked()
             {
-                self.selected = l.id.clone();
+                self.selected = l.id().to_owned();
                 if op == "rename" {
-                    self.begin_rename(doc, &l.id);
+                    self.begin_rename(doc, l.id());
                 } else {
                     let extra = if op == "mask.add" {
-                        json!({"value":255,"document_id":doc.id,"source_revision":doc.revision})
+                        json!({"value":255,"document_id":doc.id(),"source_revision":doc.revision()})
                     } else {
                         extra
                     };
@@ -2415,60 +3023,57 @@ impl PeerBrush {
                 ui.close_menu();
             }
         }
-        if l.mask.is_some() && ui.button("Remove mask").clicked() {
-            self.selected = l.id.clone();
+        if l.mask().is_some() && ui.button("Remove mask").clicked() {
+            self.selected = l.id().to_owned();
             self.layer_cmd("mask.remove", json!({}), "Remove mask");
             self.mask = false;
             ui.close_menu();
         }
-        if l.source.is_some() && ui.button("Edit text/vector properties…").clicked() {
-            self.select_content(&l.id);
-            self.open_source(doc, "edit");
+        if l.source().is_some() && ui.button("Edit text/vector properties…").clicked() {
+            self.select_content(l.id());
+            edit_source = true;
             ui.close_menu();
         }
         ui.separator();
-        if l.parent.is_some() && ui.button("Move out of group").clicked() {
-            self.selected = l.id.clone();
+        if l.parent().is_some() && ui.button("Move out of group").clicked() {
+            self.selected = l.id().to_owned();
             self.layer_cmd("layer.parent", json!({"parent":null}), "Move out of group");
             ui.close_menu();
         }
         ui.menu_button("Move into group", |ui| {
             for group in doc
-                .layers
-                .iter()
-                .filter(|g| g.kind == "group" && g.id != l.id)
+                .layers()
+                .filter(|g| g.kind() == "group" && g.id() != l.id())
             {
-                if ui.button(&group.name).clicked() {
-                    self.selected = l.id.clone();
+                if ui.button(group.name()).clicked() {
+                    self.selected = l.id().to_owned();
                     self.layer_cmd(
                         "layer.parent",
-                        json!({"parent":group.id}),
+                        json!({"parent":group.id()}),
                         "Move into group",
                     );
                     ui.close_menu();
                 }
             }
         });
-        let doc = self.shared.lock().unwrap().doc.clone();
         if ui
-            .button(if l.clip_to.is_some() {
+            .button(if l.clip_to().is_some() {
                 "Release clipping"
             } else {
                 "Clip to layer below"
             })
             .clicked()
         {
-            let base = if l.clip_to.is_some() {
+            let base = if l.clip_to().is_some() {
                 None
             } else {
-                doc.layers
-                    .iter()
-                    .skip_while(|b| b.id != l.id)
+                doc.layers()
+                    .skip_while(|b| b.id() != l.id())
                     .skip(1)
-                    .find(|b| b.parent == l.parent)
-                    .map(|b| b.clip_to.clone().unwrap_or_else(|| b.id.clone()))
+                    .find(|b| b.parent() == l.parent())
+                    .map(|b| b.clip_to().unwrap_or_else(|| b.id()).to_owned())
             };
-            self.selected = l.id.clone();
+            self.selected = l.id().to_owned();
             self.layer_cmd("layer.clip", json!({"base":base}), "Layer clipping");
             ui.close_menu();
         }
@@ -2477,27 +3082,29 @@ impl PeerBrush {
             .button(RichText::new("Delete layer").color(Color32::from_rgb(255, 154, 144)))
             .clicked()
         {
-            self.selected = l.id.clone();
+            self.selected = l.id().to_owned();
             self.layer_cmd("layer.delete", json!({}), "Delete layer");
             ui.close_menu();
         }
+        edit_source
     }
-    fn layer_footer(&mut self, ui: &mut egui::Ui, l: &crate::engine::Layer) {
-        let mut blend = l.blend.clone();
+    fn layer_footer<'a>(&mut self, ui: &mut egui::Ui, l: impl Into<LayerView<'a>>) {
+        let l = l.into();
+        let mut blend = l.blend().to_owned();
         self.blend_hover = None;
         let combo = egui::ComboBox::from_id_salt("blend")
             .selected_text(
-                crate::raster::layer_blends(&l.kind)
+                crate::raster::layer_blends(l.kind())
                     .find(|(mode, _)| *mode == blend)
                     .map(|(_, label)| label)
                     .unwrap_or("Normal"),
             )
             .width(ui.available_width() - 10.0)
             .show_ui(ui, |ui| {
-                for (name, label) in crate::raster::layer_blends(&l.kind) {
+                for (name, label) in crate::raster::layer_blends(l.kind()) {
                     let response = ui.selectable_value(&mut blend, name.into(), label);
                     if response.hovered() {
-                        self.blend_hover = Some((l.id.clone(), name.into()));
+                        self.blend_hover = Some((l.id().to_owned(), name.into()));
                     }
                     if response.clicked() {
                         self.blend_hover = None;
@@ -2508,11 +3115,11 @@ impl PeerBrush {
         self.blend_rect = Some(combo.response.rect);
         ui.horizontal(|ui| {
             ui.label(RichText::new("Opacity").size(12.0).color(MUTED));
-            let mut percent = l.opacity * 100.0;
+            let mut percent = l.opacity() * 100.0;
             let width = (ui.available_width() - 3.0).max(60.0);
             let response = controls::range(
                 ui,
-                ("opacity", &l.id),
+                ("opacity", l.id()),
                 &mut percent,
                 0.0..=100.0,
                 width,
@@ -2526,23 +3133,24 @@ impl PeerBrush {
             }
         });
     }
-    fn add_selected_masks(&mut self, doc: &Document) {
+    fn add_selected_masks<'a>(&mut self, doc: impl Into<DocumentView<'a>>) {
+        let doc = doc.into();
         let mut ids = self.selected_layer_ids(doc);
         if !ids.contains(&self.selected) {
             ids.push(self.selected.clone());
         }
-        let commands: Vec<_> = doc
-            .layers
-            .iter()
-            .filter(|layer| ids.contains(&layer.id) && layer.mask.is_none())
-            .map(|layer| json!({"op":"mask.add","layer":layer.id,"value":255,"document_id":doc.id,"source_revision":doc.revision}))
+        let commands: Vec<_> = doc.layers()
+            .filter(|layer| ids.iter().any(|id|id==layer.id()) && layer.mask().is_none())
+            .map(|layer| json!({"op":"mask.add","layer":layer.id(),"value":255,"document_id":doc.id(),"source_revision":doc.revision()}))
             .collect();
         let result = {
             let mut engine = self.shared.lock().unwrap();
-            if engine.doc.id != doc.id || engine.doc.revision != doc.revision {
+            if crate::engine::view::current(&engine).id() != doc.id()
+                || crate::engine::view::current(&engine).revision() != doc.revision()
+            {
                 Err("The document changed before adding masks".into())
             } else {
-                engine.edit("human", &commands, Some(doc.revision), None, "Add masks")
+                engine.edit("human", &commands, Some(doc.revision()), None, "Add masks")
             }
         };
         match result {
@@ -2552,10 +3160,16 @@ impl PeerBrush {
                 self.last_preview = None;
                 self.message = "Added masks".into();
             }
-            Err(error) => self.message = error,
+            Err(error) => self.message = error.into(),
         }
     }
-    fn channel_tabs(&mut self, ui: &mut egui::Ui, doc: &Document, has_mask: bool) {
+    fn channel_tabs<'a>(
+        &mut self,
+        ui: &mut egui::Ui,
+        doc: impl Into<DocumentView<'a>>,
+        has_mask: bool,
+    ) {
+        let doc = doc.into();
         ui.spacing_mut().item_spacing.x = 0.0;
         let color = ui.add(
             egui::Button::new("Color")
@@ -2574,7 +3188,7 @@ impl PeerBrush {
             self.select_channel(false);
         }
         let mask = ui.add_enabled(
-            has_mask || !doc.read_only,
+            has_mask || !doc.read_only(),
             egui::Button::new(if has_mask { "Mask" } else { "Add mask" })
                 .selected(self.mask && has_mask)
                 .corner_radius(egui::CornerRadius {
@@ -2596,7 +3210,7 @@ impl PeerBrush {
         }
         mask.on_hover_text(if has_mask {
             "Edit mask"
-        } else if doc.selection.is_some() {
+        } else if doc.selection().is_some() {
             "Create masks from the selection for selected layers that do not have one"
         } else {
             "Create white masks for selected layers that do not have one"
@@ -2628,7 +3242,7 @@ impl PeerBrush {
                 .on_hover_text(caption);
         }
         ui.add_space(12.0);
-        let selected = doc.layers.iter().find(|l| l.id == self.selected).cloned();
+        let selected = doc.layers.iter().find(|l| l.id == self.selected);
         ui.add_space(8.0);
         ui.separator();
         ui.add_space(8.0);
@@ -2668,7 +3282,7 @@ impl PeerBrush {
                     ui.horizontal(|ui| {
                         self.channel_tabs(ui, doc, l.mask.is_some());
                         if l.mask.is_some() {
-                            self.mask_link_button(ui, doc, &l);
+                            self.mask_link_button(ui, doc, l);
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui
@@ -2705,9 +3319,9 @@ impl PeerBrush {
                         });
                     }
                     if !self.mask {
-                        self.color_stack(ui, &l, doc.revision);
+                        self.color_stack(ui, l, doc.revision);
                     } else if l.mask.is_some() {
-                        self.mask_stack(ui, doc, &l);
+                        self.mask_stack(ui, doc, l);
                     } else {
                         ui.label(
                             RichText::new("Reveal. Hide. Refine.")
@@ -2719,7 +3333,7 @@ impl PeerBrush {
             ui.advance_cursor_after_rect(stack_rect);
             ui.add_space(5.0);
             ui.separator();
-            self.layer_footer(ui, &l);
+            self.layer_footer(ui, l);
         }
     }
     fn gizmo(
@@ -2939,7 +3553,7 @@ impl PeerBrush {
                         self.transient.push(command);
                     }
                     Err(error) => {
-                        self.message = error;
+                        self.message = error.into();
                         self.transient.clear();
                     }
                 }
@@ -3044,7 +3658,8 @@ impl PeerBrush {
             );
             self.message = result
                 .map(|_| "Transform applied · Undo to try again".into())
-                .unwrap_or_else(|e| e);
+                .unwrap_or_else(|e| e)
+                .into();
             self.last_preview = None;
             self.drag_start = None;
             self.gizmo_handle = 0;
@@ -3053,15 +3668,62 @@ impl PeerBrush {
             self.live_gesture = None;
         }
     }
-    fn pick_color(&mut self, doc: &Document, point: [f32; 2]) {
+    fn pick_color(&mut self, doc: &Document, point: [f32; 2]) -> bool {
+        #[cfg(test)]
+        {
+            self.color_pick_runs += 1;
+        }
         let (x, y) = (point[0].floor() as i32, point[1].floor() as i32);
         if self.mask {
             if let Some(l) = doc.layers.iter().find(|l| l.id == self.selected) {
                 self.mask_value = (l.mask_value_raw(x - l.x, y - l.y) * 255.0).round() as u8;
+                return true;
             }
         } else if let Ok((_, _, bytes, _)) = doc.preview(Some([x, y, x + 1, y + 1]), 1, None, false)
         {
             self.color.copy_from_slice(&bytes[..4]);
+            return true;
+        }
+        false
+    }
+    fn pick_alt_color(&mut self, doc: &Document, project: &str, point: [f32; 2]) {
+        // shortcut: only repeated identical-pixel samples; cold/new-pixel preparation still blocks,
+        // replace only after ordered async sampling acceptance.
+        let native = point.map(|value| value.floor() as i32);
+        if let Some(sample) = self.alt_sample.as_ref().filter(|sample| {
+            sample.engine.as_ptr() == Arc::as_ptr(&self.shared)
+                && sample.project == project
+                && sample.document == doc.id
+                && sample.revision == doc.revision
+                && sample.point == native
+                && sample.selected == self.selected
+                && sample.mask == self.mask
+                && sample.step == self.mask_step
+        }) {
+            if self.mask {
+                self.mask_value = sample.value[0];
+            } else {
+                self.color = sample.value;
+            }
+            return;
+        }
+        self.alt_sample = None;
+        if self.pick_color(doc, point) {
+            self.alt_sample = Some(AltSample {
+                engine: Arc::downgrade(&self.shared),
+                project: project.into(),
+                document: doc.id.clone(),
+                revision: doc.revision,
+                point: native,
+                selected: self.selected.clone(),
+                mask: self.mask,
+                step: self.mask_step.clone(),
+                value: if self.mask {
+                    [self.mask_value; 4]
+                } else {
+                    self.color
+                },
+            });
         }
     }
     fn canvas(&mut self, ui: &mut egui::Ui, doc: &Document) {
@@ -3095,11 +3757,19 @@ impl PeerBrush {
             self.message = "Image changed during retouch · stroke cancelled".into();
         }
         self.transient.clear();
+        if let Some(editor) = &self.free_transform {
+            self.transient.extend(editor.commands().unwrap_or_default());
+        }
         if let Some(editor) = &self.geometry {
             self.transient.push(editor.command());
         }
+        self.native_source_preview = None;
         if let Some(editor) = &self.source_editor {
-            self.transient.push(editor.command());
+            if editor.is_native() {
+                self.native_source_preview = editor.owned_command();
+            } else {
+                self.transient.push(editor.command());
+            }
         }
         if let Some(editor) = &self.filter_editor {
             self.transient.extend(editor.preview_commands(doc));
@@ -3173,12 +3843,22 @@ impl PeerBrush {
             Tool::Liquify,
         ]
         .contains(&self.tool)
-            && !ui.ctx().wants_keyboard_input()
+            && !ui
+                .ctx()
+                .memory(|m| m.focused())
+                .is_some_and(|id| egui::TextEdit::load_state(ui.ctx(), id).is_some())
             && !self.shortcuts.open
             && self.points.is_empty()
             && self.drag_start.is_none()
             && self.gizmo_handle == 0
-            && ui.input(|i| self.shortcuts.size_held(i));
+            && ui.input(|i| {
+                i.focused
+                    && !i
+                        .events
+                        .iter()
+                        .any(|event| matches!(event, egui::Event::WindowFocused(false)))
+                    && self.shortcuts.size_held(i)
+            });
         let navigate = self.lifecycle.is_none()
             && !self.lifecycle_frame
             && self.proposal_review.is_none()
@@ -3228,7 +3908,17 @@ impl PeerBrush {
         let painter = ui.painter().with_clip_rect(available);
         let visible = view.bounds(rect, scale).intersect(available);
         view.image(&painter, rect, scale, view::checker(ui.ctx()).id(), true);
-        if let Some(texture) = self.texture.as_ref().filter(|_| {
+        if let Some(canvas) = self
+            .native_canvas
+            .current()
+            .filter(|c| c.key().identity.document_id == doc.id)
+        {
+            canvas.paint_with(
+                &painter,
+                |point| view.point(point, rect, scale),
+                Color32::WHITE,
+            );
+        } else if let Some(texture) = self.texture.as_ref().filter(|_| {
             self.proposal_review.is_none()
                 || self.proposal_rendered.as_deref() == Some(self.live_key().as_str())
         }) {
@@ -3276,7 +3966,39 @@ impl PeerBrush {
             }
             return;
         }
+        if self.free_transform.is_some() {
+            self.free_transform_canvas(ui, doc, rect, scale, available);
+            return;
+        }
+        if self.free_transform_frame {
+            return;
+        }
+        if self.free_transform_cancelled_pointer {
+            if ui.input(|input| input.pointer.primary_pressed()) {
+                self.free_transform_cancelled_pointer = false;
+            } else {
+                if !ui.input(|input| input.pointer.primary_down()) {
+                    self.free_transform_cancelled_pointer = false;
+                }
+                return;
+            }
+        }
+        if self.tool == Tool::Text
+            && !zoom_drag
+            && !pan_drag
+            && (self.source_editor.is_some() || !ui.input(|input| input.key_down(egui::Key::Space)))
+            && self.geometry.is_none()
+            && self.filter_editor.is_none()
+            && self
+                .source_editor
+                .as_ref()
+                .is_none_or(|editor| editor.placement.is_some())
+        {
+            self.text_canvas(ui, doc, &response, &painter, rect, scale);
+            return;
+        }
         if self.geometry.is_some() || self.source_editor.is_some() || self.filter_editor.is_some() {
+            self.text_field_outline(&painter, rect, scale);
             return;
         }
         if self.brush_tool() && self.straight.cancelled {
@@ -3505,8 +4227,19 @@ impl PeerBrush {
                     }
                     ui.ctx().set_cursor_icon(egui::CursorIcon::None);
                     if ui.input(|i| i.pointer.primary_down()) || response.clicked() {
-                        let current = self.shared.lock().unwrap().doc.clone();
-                        self.pick_color(&current, to_doc(pointer));
+                        let (current, project) = {
+                            let engine = self.shared.lock().unwrap();
+                            (engine.doc.clone(), engine.project_id.clone())
+                        };
+                        if ui.input(|i| {
+                            i.pointer.primary_down()
+                                && i.focused
+                                && !i.key_pressed(egui::Key::Escape)
+                        }) {
+                            self.pick_alt_color(&current, &project, to_doc(pointer));
+                        } else {
+                            self.pick_color(&current, to_doc(pointer));
+                        }
                     }
                 }
             }
@@ -3711,7 +4444,7 @@ impl PeerBrush {
                         Tool::Fill => {
                             self.layer_cmd("paint.fill", json!({"color":if self.mask{[self.mask_value,self.mask_value,self.mask_value,self.color[3]]}else{self.color},"mask":self.mask,"step":self.mask_step}), "Fill layer")
                         }
-                        Tool::Picker => self.pick_color(doc, p),
+                        Tool::Picker => { self.pick_color(doc, p); }
                         _ => {}
                     }
                 }
@@ -3721,9 +4454,14 @@ impl PeerBrush {
 }
 impl PeerBrush {
     fn switch_project(&mut self, id: &str) {
+        if self.edit_worker.pending() && id != self.project_id {
+            self.message = "Wait for the edit result before switching projects".into();
+            return;
+        }
         if id == self.project_id {
             return;
         }
+        self.cancel_free_transform();
         let Some((_, _, shared)) = crate::workspace::entries_in(&self.workspace)
             .into_iter()
             .find(|(project, _, _)| project == id)
@@ -3809,11 +4547,13 @@ impl PeerBrush {
         self.canvas_selection = None;
         self.last_preview = None;
         self.pending = false;
+        self.preview_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.preview_cache = Arc::new(std::sync::Mutex::new(crate::preview::Cache::default()));
         self.thumbs.clear();
         self.thumb_pending.clear();
         self.thumb_document.clear();
-        self.last_status.clear();
+        self.last_status = "".into();
     }
     fn draw_header(&mut self, ctx: &egui::Context) {
         let (connected, activity) = {
@@ -3985,7 +4725,7 @@ impl PeerBrush {
                                     ),
                                 ));
                             }
-                            Err(error) => self.message = error,
+                            Err(error) => self.message = error.into(),
                         }
                     }
                 }
@@ -4024,7 +4764,7 @@ impl PeerBrush {
                             }
                             .into();
                         }
-                        Err(error) => self.message = error,
+                        Err(error) => self.message = error.into(),
                     }
                     self.last_preview = None;
                 }
@@ -4095,11 +4835,12 @@ impl PeerBrush {
     }
     // Commands before selection completion must not act on old coverage. Require
     // an explicit retry; never retain delayed destructive/clipboard work.
-    fn hold_canvas_selection_shortcuts(
+    fn hold_canvas_selection_shortcuts<'a>(
         &mut self,
         ctx: &egui::Context,
-        doc: &Document,
+        doc: impl Into<DocumentView<'a>>,
     ) -> Option<Vec<egui::Event>> {
+        let doc = doc.into();
         if !matches!(self.tool, Tool::Selection | Tool::MagicWand)
             || self.lifecycle.is_some()
             || self.lifecycle_frame
@@ -4155,7 +4896,7 @@ impl PeerBrush {
                 rect.contains(*pos) && ctx.layer_id_at(*pos) == Some(layer)
             })
         });
-        let owner = self.canvas_press_document.as_deref() == Some(doc.id.as_str());
+        let owner = self.canvas_press_document.as_deref() == Some(doc.id());
         let start = if owner || path_tool && !self.selection_path.is_empty() {
             0
         } else {
@@ -4204,11 +4945,12 @@ impl PeerBrush {
     }
     // Canvas gestures commit in the central panel. Shortcuts delivered after
     // their mouse release must see that commit, rather than the frame's snapshot.
-    fn defer_canvas_shortcuts(
+    fn defer_canvas_shortcuts<'a>(
         &mut self,
         ctx: &egui::Context,
-        doc: &Document,
+        doc: impl Into<DocumentView<'a>>,
     ) -> Option<(Vec<egui::Event>, Vec<egui::Event>, egui::Modifiers)> {
+        let doc = doc.into();
         // A quick click may deliver both buttons in one frame. Use the prior
         // canvas hit region and layer to exclude floating windows and panels.
         let press = ctx.input(|i| {
@@ -4262,7 +5004,7 @@ impl PeerBrush {
                     .iter()
                     .any(|event| matches!(event, egui::Event::WindowFocused(false)))
                 || self.selection_gesture_stale(doc)
-                || (owner.as_deref() != Some(doc.id.as_str()) && !pressed_canvas)
+                || (owner.as_deref() != Some(doc.id()) && !pressed_canvas)
             {
                 return None;
             }
@@ -4276,11 +5018,9 @@ impl PeerBrush {
                         key,
                         pressed: true,
                         modifiers,
-                        physical_key,
                         ..
                     } => {
                         shortcuts::Shortcuts::allowed(*key)
-                            || physical_key.is_some_and(shortcuts::Shortcuts::allowed)
                             || (*key == egui::Key::Delete
                                 && self.tool != Tool::Pen
                                 && !(self.tool == Tool::Selection
@@ -4309,6 +5049,13 @@ impl PeerBrush {
         })
     }
     fn document_shortcuts(&mut self, ctx: &egui::Context, doc: &Document) {
+        if self.free_transform.is_some() {
+            self.free_transform_keys(ctx, doc);
+            return;
+        }
+        if self.free_transform_frame {
+            return;
+        }
         let stale_selection = self.selection_gesture_stale(doc);
         if ctx.input(|i| {
             !i.focused
@@ -4346,6 +5093,11 @@ impl PeerBrush {
             return;
         }
         let typing = self.lifecycle.is_some()
+            || self.source_editor.is_some()
+            || (self.tool == Tool::Text
+                && ctx.input(|input| {
+                    input.pointer.primary_down() || input.pointer.primary_pressed()
+                }))
             || self.shortcuts.open
             || self.filter_editor.is_some()
             || self.lifecycle_frame
@@ -4354,6 +5106,16 @@ impl PeerBrush {
                 .memory(|m| m.focused())
                 .is_some_and(|id| egui::TextEdit::load_state(ctx, id).is_some());
         if !typing {
+            if ctx.input(|input| {
+                input.events.iter().any(|event| {
+                    matches!(event,
+                egui::Event::Key {key:egui::Key::T,pressed:true,repeat:false,modifiers,..}
+                    if (modifiers.command||modifiers.ctrl)&&!modifiers.alt&&!modifiers.shift)
+                })
+            }) {
+                self.open_free_transform(ctx, doc);
+                return;
+            }
             // A held key may keep producing OS repeats after selection
             // completion. Those are not an explicit retry. Track both logical
             // and physical identities; a release or new non-repeat press ends
@@ -4446,7 +5208,8 @@ impl PeerBrush {
                                 "Copying selection…".into()
                             }
                         })
-                        .unwrap_or_else(|e| e);
+                        .unwrap_or_else(|e| e)
+                        .into();
                 }
             }
             if paste {
@@ -4459,26 +5222,29 @@ impl PeerBrush {
                         revision: doc.revision,
                     })
                     .map(|_| "Pasting image…".into())
-                    .unwrap_or_else(|e| e);
+                    .unwrap_or_else(|e| e)
+                    .into();
             }
             ctx.input(|i| {
-                if i.modifiers.alt && !i.modifiers.command && (i.key_pressed(egui::Key::B) || i.key_pressed(egui::Key::Backspace)) {
+                if i.events.iter().any(|event| matches!(event,
+                    egui::Event::Key { key: egui::Key::B | egui::Key::Backspace, pressed: true, modifiers, .. }
+                        if modifiers.alt && !modifiers.command)) {
                     let color=if self.mask {[self.mask_value,self.mask_value,self.mask_value,255]}else{self.color};
                     self.layer_cmd("paint.fill",json!({"color":color,"mask":self.mask,"step":self.mask_step}),"Fill foreground");
                 }
-                if command_key(i,egui::Key::Z) {
-                    let r = if key_modifiers(i,egui::Key::Z).shift {
+                if let Some(modifiers) = command_modifiers(i,egui::Key::Z) {
+                    let r = if modifiers.shift {
                         self.shared.lock().unwrap().redo("human")
                     } else {
                         self.shared.lock().unwrap().undo("human")
                     };
                     if let Err(e) = r {
-                        self.message = e;
+                        self.message = e.into();
                     }
                     self.last_preview = None;
                 }
-                if command_key(i,egui::Key::S) {
-                    self.save(key_modifiers(i,egui::Key::S).shift);
+                if let Some(modifiers) = command_modifiers(i,egui::Key::S) {
+                    self.save(modifiers.shift);
                 }
                 if command_key(i,egui::Key::O) {
                     self.open();
@@ -4486,17 +5252,18 @@ impl PeerBrush {
                 if command_key(i,egui::Key::E) {
                     self.merge_layers(ctx, doc);
                 }
-                if command_key(i,egui::Key::G) {
-                    if key_modifiers(i,egui::Key::G).shift {
+                if let Some(modifiers) = command_modifiers(i,egui::Key::G) {
+                    if modifiers.shift {
                         self.merge_layers(ctx, doc);
                     } else {
                         self.create_folder(doc);
                     }
                 }
-                if i.key_pressed(egui::Key::Delete)
+                if i.events.iter().any(|event| matches!(event,
+                    egui::Event::Key { key: egui::Key::Delete, pressed: true, modifiers, .. }
+                        if !modifiers.any()))
                     && self.tool != Tool::Pen
                     && self.selection_path.is_empty()
-                    && !key_modifiers(i,egui::Key::Delete).any()
                 {
                     if doc.selection.is_some() {
                         self.edit(vec![json!({"op":"paint.clear_selection","layer":self.selected,"mask":self.mask,"step":self.mask_step,"document_id":doc.id,"source_revision":doc.revision})],"Clear selected pixels");
@@ -4504,8 +5271,7 @@ impl PeerBrush {
                         self.layer_cmd("layer.delete",json!({}),"Delete selected layers");
                     }
                 }
-                if command_key(i,egui::Key::D) {
-                    let mods = key_modifiers(i,egui::Key::D);
+                if let Some(mods) = command_modifiers(i,egui::Key::D) {
                     if mods.alt && !mods.shift {
                         self.edit(vec![json!({"op":"selection.reselect"})],"Reselect");
                     } else if mods.shift && !mods.alt {
@@ -4515,7 +5281,7 @@ impl PeerBrush {
                     }
                 }
                 if command_key(i,egui::Key::A) {self.edit(vec![json!({"op":"selection","kind":"rectangle","rect":[0,0,doc.width,doc.height]})],"Select all");}
-                if command_key(i,egui::Key::I) && key_modifiers(i,egui::Key::I).shift && !key_modifiers(i,egui::Key::I).alt {
+                if command_modifiers(i,egui::Key::I).is_some_and(|mods| mods.shift && !mods.alt) {
                     self.edit(vec![json!({"op":"selection.invert"})],"Invert selection");
                 }
                 if command_key(i,egui::Key::J) && self.layer_clipboard {self.duplicate_layers(doc);}
@@ -4540,24 +5306,59 @@ impl PeerBrush {
         }
     }
     fn draw(&mut self, ctx: &egui::Context) {
+        self.poll_edit_job();
+        if self.edit_worker.pending() && ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+            self.cancel_pending_edit();
+        }
+        if self.edit_worker.pending() && ctx.input(|input| input.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.message = "Wait for the edit result before closing PeerBrush".into();
+        }
+        if self.update_exit_committed() {
+            return;
+        }
+        if self.tool != Tool::Brush
+            || ctx.input(|input| {
+                !input.focused
+                    || !input.modifiers.alt
+                    || !input.pointer.primary_down()
+                    || input.pointer.primary_pressed()
+                    || input.key_pressed(egui::Key::Escape)
+            })
+        {
+            self.alt_sample = None;
+        }
+        self.free_transform_frame = self.free_transform.is_some();
+        self.updates_tick(ctx);
+        if self.update_exit_committed() {
+            return;
+        }
+        self.about.dismiss_escape(ctx);
+        self.fonts.refresh(ctx);
         self.selection_commit_failed = false;
         let drawn_generation = self.canvas_generation;
         self.sync_tool_profile(ctx);
-        self.temporary_pen_tool(ctx);
-        self.lifecycle_frame = self.save_loss_review.is_some();
+        self.lifecycle_frame =
+            self.save_loss_review.is_some() || self.show_new || self.edit_worker.pending();
+        if !self.lifecycle_frame && self.free_transform.is_none() {
+            self.temporary_pen_tool(ctx);
+        }
         if let Some(warning) = self.workspace.lock().unwrap().open_warning.take() {
             self.open_file_warning = Some(warning);
         }
         if let Some(warning) = self.open_file_warning.clone() {
             egui::Window::new("File already open")
                 .id(egui::Id::new("duplicate_file_warning"))
+                .title_bar(false)
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
                 .show(ctx, |ui| {
-                    ui.set_max_width(440.);
+                    dialogs::body(ui, 440.);
+                    dialogs::heading(ui, "File already open", true);
                     ui.label(warning);
-                    if ui.button("OK").clicked() {
+                    ui.add_space(3.);
+                    if ui.add(dialogs::primary("OK")).clicked() {
                         self.open_file_warning = None;
                     }
                 });
@@ -4602,6 +5403,8 @@ impl PeerBrush {
             self.show_calibration = panel == "calibration";
             self.show_view = panel == "view";
             self.shortcuts.open = panel == "shortcuts";
+            self.updates.open = panel == "updates";
+            self.about.open = panel == "application_info";
             if panel == "solo_color" || panel == "solo_mask" {
                 self.mask = panel == "solo_mask";
                 let active = !self.mask
@@ -4676,7 +5479,8 @@ impl PeerBrush {
                     view.message = reply
                         .result
                         .map(|_| "Merged layers".into())
-                        .unwrap_or_else(|e| e);
+                        .unwrap_or_else(|e| e)
+                        .into();
                 }
                 continue;
             }
@@ -4700,7 +5504,7 @@ impl PeerBrush {
                     self.last_preview = None;
                 }
                 Err(error) => {
-                    self.message = error;
+                    self.message = error.into();
                 }
             }
         }
@@ -4724,7 +5528,7 @@ impl PeerBrush {
                 self.select_content(&id);
                 self.layer_clipboard = false;
             }
-            self.message = reply.result.unwrap_or_else(|e| e);
+            self.message = reply.result.unwrap_or_else(|e| e).into();
             self.last_preview = None;
         }
         let status = self
@@ -4762,9 +5566,9 @@ impl PeerBrush {
                 Ok(_) => {}
                 Err(error) => {
                     if reply.project == self.project_id {
-                        self.message = error;
+                        self.message = error.into();
                     } else if let Some(view) = self.project_views.get_mut(&reply.project) {
-                        view.message = error;
+                        view.message = error.into();
                     }
                 }
             }
@@ -4777,7 +5581,7 @@ impl PeerBrush {
             let result = reply.result;
             if reply.project != self.project_id {
                 if let Some(view) = self.project_views.get_mut(&reply.project) {
-                    view.message = result.unwrap_or_else(|e| e);
+                    view.message = result.unwrap_or_else(|e| e).into();
                 }
                 continue;
             }
@@ -4793,13 +5597,18 @@ impl PeerBrush {
                     self.mask_step = None;
                 }
             }
-            self.message = result.unwrap_or_else(|e| e);
+            self.message = result.unwrap_or_else(|e| e).into();
             self.last_preview = None;
         }
         if self.save_loss_review.is_some() {
             self.save_loss_dialog(ctx);
         } else {
             self.lifecycle_dialog(ctx);
+        }
+        // eframe treats any CancelClose as final for this native close frame.
+        // Validate all projects first; a clean approved exit needs no cancellation.
+        if ctx.input(|input| input.viewport().close_requested()) && !self.exit_approved {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
         if self.exit_approved {
             return;
@@ -4843,12 +5652,14 @@ impl PeerBrush {
         {
             self.finish_parameter(false);
         }
-        let (doc, ai_change) = {
+        let (frame, ai_change) = {
             let mut e = self.shared.lock().unwrap();
             e.expire();
-            (e.doc.clone(), e.ai_change.clone())
+            (Arc::new(e.doc.clone()), e.ai_change.clone())
         };
-        self.doc_snapshot = doc.clone();
+        self.doc_snapshot = DocumentSnapshot::Resident(frame.clone());
+        let doc = frame.as_ref();
+        self.sync_free_transform(ctx, doc);
         if self.lifecycle.is_none() && !self.lifecycle_frame {
             self.import_dialog(ctx);
             self.image_open_dialog(ctx);
@@ -4860,7 +5671,7 @@ impl PeerBrush {
             self.rename_edit = None;
         }
         let time = ctx.input(|i| i.time);
-        if self.animation.observe(&doc, ai_change, time) {
+        if self.animation.observe(&self.doc_snapshot, ai_change, time) {
             // Reveal the destination so an AI hierarchy move remains visible.
             for scope in self.animation.scopes(time) {
                 let mut parent = scope.target.and_then(|id| {
@@ -4884,11 +5695,11 @@ impl PeerBrush {
         if ctx.input(|i| i.pointer.any_pressed()) {
             self.animation.cancel();
         }
-        if self
-            .parameter_gesture
-            .as_ref()
-            .is_some_and(|edit| edit.document != doc.id || edit.revision != doc.revision)
-        {
+        if self.parameter_gesture.as_ref().is_some_and(|edit| {
+            edit.engine.as_ptr() != Arc::as_ptr(&self.shared)
+                || edit.document != doc.id
+                || edit.revision != doc.revision
+        }) {
             self.finish_parameter(true);
             self.message = "Image changed during parameter edit · preview cancelled".into();
         }
@@ -4906,7 +5717,7 @@ impl PeerBrush {
                     }
                 })
         });
-        self.thumb_worker.document(&doc);
+        self.thumb_worker.document(doc);
         if self.thumb_document != doc.id {
             self.retouch_source = None;
             self.retouch_revision = None;
@@ -4966,13 +5777,13 @@ impl PeerBrush {
             }
         }
         self.file_drop_feedback(ctx);
-        let held_selection_shortcuts = self.hold_canvas_selection_shortcuts(ctx, &doc);
-        let deferred_shortcuts = self.defer_canvas_shortcuts(ctx, &doc);
+        let held_selection_shortcuts = self.hold_canvas_selection_shortcuts(ctx, doc);
+        let deferred_shortcuts = self.defer_canvas_shortcuts(ctx, doc);
         let show_held_shortcut_message = held_selection_shortcuts.is_some()
             && deferred_shortcuts
                 .as_ref()
                 .is_none_or(|(_, late, _)| late.is_empty());
-        self.document_shortcuts(ctx, &doc);
+        self.document_shortcuts(ctx, doc);
         egui::TopBottomPanel::top("context")
             .exact_height(48.0)
             .show(ctx, |ui| {
@@ -4980,9 +5791,12 @@ impl PeerBrush {
                     ui.disable();
                 }
                 ui.horizontal_centered(|ui| {
-                    ui.menu_button("File", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 0.;
+                    egui::menu::menu_custom_button(ui, egui::Button::new("File").corner_radius(egui::CornerRadius { nw: 6, sw: 6, ne: 0, se: 0 }), |ui| {
+                        ui.spacing_mut().item_spacing.x = 8.;
                         if ui.button("New canvas").clicked() {
-                            self.show_new = true;
+                            self.open_new_canvas();
                             ui.close_menu();
                         }
                         if ui.button("Open PSD/PSB").clicked() {
@@ -5016,45 +5830,65 @@ impl PeerBrush {
                             ui.close_menu();
                         }
                         if ui.button("Export PNG...").clicked() {
-                            self.export();
+                            self.export(crate::production_export::Format::Png);
+                            ui.close_menu();
+                        }
+                        if ui.button("Export WebP (8-bit)…").clicked() {
+                            self.export(crate::production_export::Format::Webp);
+                            ui.close_menu();
+                        }
+                        if ui.button("Export JPEG XL (lossless)…").clicked() {
+                            self.export(crate::production_export::Format::Jxl);
                             ui.close_menu();
                         }
                         if ui.button("Production export…").clicked() {
-                            self.open_exports(&doc);
+                            self.open_exports(doc);
                             ui.close_menu();
                         }
+                        ui.separator();
+                        self.associations.menu(ui);
+                        if ui.button("Updates…").clicked() {
+                            self.updates.open = true;
+                            ui.close_menu();
+                        }
+                        self.about.menu(ui);
                     });
-                    ui.menu_button("View",|ui| self.canvas_view_menu(ui));
-                    ui.menu_button("Image",|ui| {
-                        if ui.add_enabled(!doc.read_only&&!self.busy,egui::Button::new("Whole-image filters…")).clicked(){self.open_filters(&doc);ui.close_menu();}
-                        if !doc.filters.is_empty(){ui.menu_button("Filter stack",|ui|self.document_filter_stack(ui,&doc));}
+                    egui::menu::menu_custom_button(ui, egui::Button::new("View").corner_radius(egui::CornerRadius::same(0)),|ui| { ui.spacing_mut().item_spacing.x = 8.; self.canvas_view_menu(ui) });
+                    egui::menu::menu_custom_button(ui, egui::Button::new("Image").corner_radius(egui::CornerRadius::same(0)),|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.;
+                        if ui.add_enabled(!doc.read_only&&!self.busy,egui::Button::new("Whole-image filters…")).clicked(){self.open_filters(doc);ui.close_menu();}
+                        if !doc.filters.is_empty(){ui.menu_button("Filter stack",|ui|self.document_filter_stack(ui,doc));}
                         for (label,mode) in [("Crop…","crop"),("Canvas size…","canvas.resize"),("Image size…","image.resize")] {
-                            if ui.add_enabled(!doc.read_only && !self.busy,egui::Button::new(label)).clicked() {self.open_geometry(&doc,mode);ui.close_menu();}
+                            if ui.add_enabled(!doc.read_only && !self.busy,egui::Button::new(label)).clicked() {self.open_geometry(doc,mode);ui.close_menu();}
                         }
                     });
-                    ui.menu_button("Layer",|ui| {
-                        if ui.add_enabled(!self.busy&&!doc.read_only,egui::Button::new("Group layers").shortcut_text(if cfg!(target_os="macos") {"⌘ G"} else {"Ctrl+G"})).clicked(){self.create_folder(&doc);ui.close_menu();}
-                        if ui.add_enabled(!self.busy&&!doc.read_only,egui::Button::new("Merge layers").shortcut_text(if cfg!(target_os="macos") {"⌘ ⇧ G"} else {"Ctrl+Shift+G"})).clicked(){self.merge_layers(ctx,&doc);ui.close_menu();}
+                    egui::menu::menu_custom_button(ui, egui::Button::new("Layer").corner_radius(egui::CornerRadius::same(0)),|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.;
+                        if ui.add_enabled(!self.busy&&!doc.read_only,egui::Button::new("Free Transform...").shortcut_text(if cfg!(target_os="macos") {"Cmd+T"}else{"Ctrl+T"})).clicked(){self.open_free_transform(ctx,doc);ui.close_menu();}
+                        if ui.add_enabled(!self.busy&&!doc.read_only,egui::Button::new("Group layers").shortcut_text(if cfg!(target_os="macos") {"⌘ G"} else {"Ctrl+G"})).clicked(){self.create_folder(doc);ui.close_menu();}
+                        if ui.add_enabled(!self.busy&&!doc.read_only,egui::Button::new("Merge layers").shortcut_text(if cfg!(target_os="macos") {"⌘ ⇧ G"} else {"Ctrl+Shift+G"})).clicked(){self.merge_layers(ctx,doc);ui.close_menu();}
                         ui.separator();
                         for (label,kind) in [("New text…","text"),("New vector shape…","shape"),("Edit text/vector…","edit")] {
                             let enabled=!doc.read_only&&!self.busy && (kind!="edit"||doc.layers.iter().any(|l|l.id==self.selected&&l.source.is_some()));
-                            if ui.add_enabled(enabled,egui::Button::new(label)).clicked(){self.open_source(&doc,kind);ui.close_menu();}
+                            if ui.add_enabled(enabled,egui::Button::new(label)).clicked(){self.open_source(doc,kind);ui.close_menu();}
                         }
                         if ui.add_enabled(!doc.read_only&&doc.layers.iter().any(|l|l.id==self.selected&&l.source.is_some()),egui::Button::new("Rasterize text/vector")).on_hover_text("Keep the current pixels and remove editable properties · Undo restores the source").clicked(){self.layer_cmd("source.rasterize",json!({}),"Rasterize text/vector");ui.close_menu();}
                     });
-                    ui.menu_button("Select",|ui| {
+                    egui::menu::menu_custom_button(ui, egui::Button::new("Select").corner_radius(egui::CornerRadius { nw: 0, sw: 0, ne: 6, se: 6 }),|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.;
                         let learned = crate::segmentation::configured() && !doc.read_only && !self.busy;
-                        if ui.add_enabled(learned, egui::Button::new("Select subject")).on_hover_text("Uses the externally configured local selection provider").clicked(){self.segment_subject(&doc,false);ui.close_menu();}
-                        if ui.add_enabled(learned && doc.selection.is_some(), egui::Button::new("Select subject in region")).clicked(){self.segment_subject(&doc,true);ui.close_menu();}
-                        if ui.add_enabled(doc.selection.is_some()&&!doc.read_only,egui::Button::new("Refine selection…")).clicked(){self.open_refinement(&doc,None);ui.close_menu();}
+                        if ui.add_enabled(learned, egui::Button::new("Select subject")).on_hover_text("Uses the externally configured local selection provider").clicked(){self.segment_subject(doc,false);ui.close_menu();}
+                        if ui.add_enabled(learned && doc.selection.is_some(), egui::Button::new("Select subject in region")).clicked(){self.segment_subject(doc,true);ui.close_menu();}
+                        if ui.add_enabled(doc.selection.is_some()&&!doc.read_only,egui::Button::new("Refine selection…")).clicked(){self.open_refinement(doc,None);ui.close_menu();}
                         if ui.add_enabled(doc.selection.is_some()&&!doc.read_only,egui::Button::new("Mask from selection")).clicked(){self.layer_cmd("mask.from_selection",json!({}),"Mask from selection");ui.close_menu();}
-                        if ui.add_enabled(doc.layers.iter().any(|l|l.id==self.selected&&l.mask.is_some())&&!doc.read_only,egui::Button::new("Refine layer mask…")).clicked(){self.open_refinement(&doc,Some(self.selected.clone()));ui.close_menu();}
+                        if ui.add_enabled(doc.layers.iter().any(|l|l.id==self.selected&&l.mask.is_some())&&!doc.read_only,egui::Button::new("Refine layer mask…")).clicked(){self.open_refinement(doc,Some(self.selected.clone()));ui.close_menu();}
                         for (label,op) in [("All · Ctrl+A","all"),("Deselect · Ctrl+Shift+D","selection.clear"),("Reselect · Ctrl+Alt+D","selection.reselect"),("Inverse","selection.invert")] {
                             let button=egui::Button::new(label);
                             let button=if op=="selection.invert" {button.shortcut_text(if cfg!(target_os="macos") {"⌘ ⇧ I"} else {"Ctrl+Shift+I"})} else {button};
-                            if ui.add(button).clicked(){if op=="selection.clear" {self.deselect_area(&doc,false);}else{self.edit(vec![if op=="all"{json!({"op":"selection","kind":"rectangle","rect":[0,0,doc.width,doc.height]})}else{json!({"op":op})}],label);}ui.close_menu();}
+                            if ui.add(button).clicked(){if op=="selection.clear" {self.deselect_area(doc,false);}else{self.edit(vec![if op=="all"{json!({"op":"selection","kind":"rectangle","rect":[0,0,doc.width,doc.height]})}else{json!({"op":op})}],label);}ui.close_menu();}
                         }
                         for (label,mode) in [("Expand by 1 px","expand"),("Contract by 1 px","contract")] {if ui.button(label).clicked(){self.edit(vec![json!({"op":"selection.modify","mode":mode,"radius":1})],label);ui.close_menu();}}
+                    });
                     });
                     if ui
                         .add_enabled_ui(!self.busy, |ui| {
@@ -5092,8 +5926,8 @@ impl PeerBrush {
                         let ai=self.tool_preferences_ai(time);
                         liquify::toolbar(ui, &mut self.radius, &mut self.liquify,radius,strength,ai);
                     }
-                    self.transform_snap_toolbar(ui, &doc);
-                    self.pen_toolbar(ui,&doc);
+                    self.transform_snap_toolbar(ui, doc);
+                    self.pen_toolbar(ui,doc);
                     self.retouch_toolbar(ui);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if icons::button(ui, Icon::Frame, "Frame selection or canvas · F").clicked()
@@ -5129,7 +5963,7 @@ impl PeerBrush {
                     if self.animation.layer("@selection", ui.input(|i| i.time)) {
                         ui.style_mut().visuals.selection.stroke.color = AI_BLUE;
                     }
-                    self.selection_toolbar(ui, &doc);
+                    self.selection_toolbar(ui, doc);
                 });
         }
         self.recovery_failure(ctx);
@@ -5159,7 +5993,7 @@ impl PeerBrush {
                         ), 11., MUTED, 300.,
                     );
                     ui.separator();
-                    ui.label(RichText::new(&self.message).size(11.0));
+                    ui.label(RichText::new(self.message.as_str()).size(11.0));
                     if doc.read_only {
                         ui.label(RichText::new("READ ONLY").size(10.0).color(ACCENT))
                             .on_hover_text(doc.warnings.join("\n"));
@@ -5209,10 +6043,12 @@ impl PeerBrush {
                 ui.add_space(6.0);
                 ui.spacing_mut().item_spacing.y = 4.0;
                 egui::ScrollArea::vertical()
+                    // Tool clicks must not drag the strip when it overflows.
+                    .drag_to_scroll(false)
                     .auto_shrink([false, false])
                     .max_height((ui.available_height() - 70.0).max(60.0))
                     .show(ui, |ui| {
-                        let mut buttons = Vec::with_capacity(15);
+                        let mut buttons = Vec::with_capacity(16);
                         for (index, tool) in [
                             Tool::Brush,
                             Tool::Smudge,
@@ -5229,6 +6065,7 @@ impl PeerBrush {
                             Tool::Pan,
                             Tool::MagicWand,
                             Tool::Pen,
+                            Tool::Text,
                         ]
                         .into_iter()
                         .enumerate()
@@ -5307,7 +6144,7 @@ impl PeerBrush {
                 ui.add_space((ui.available_height() - 64.0).max(0.0));
                 self.palette(ui);
             });
-        self.sync_solo(&doc);
+        self.sync_solo(doc);
         egui::SidePanel::right("layer_panel")
             .default_width(320.0)
             .min_width(300.0)
@@ -5316,20 +6153,15 @@ impl PeerBrush {
                 if self.lifecycle.is_some() || self.lifecycle_frame {
                     ui.disable();
                 }
-                let mut display = self.animation.document(&doc, ui.input(|i| i.time), false);
-                if let Some(edit) = &self.parameter_gesture {
-                    if let Ok(preview) =
-                        crate::engine::Engine::preview_edits(doc.clone(), &edit.commands)
-                    {
-                        display = preview;
-                    }
-                }
+                let display = self.pending_parameter_document(ui.ctx(), doc)
+                    .map(std::borrow::Cow::Owned)
+                    .unwrap_or_else(|| self.animation.document(doc, ui.input(|i| i.time), false));
                 if self.ai_layer(&self.selected, ui.input(|i| i.time)) {
                     ui.style_mut().visuals.selection.stroke.color = AI_BLUE;
                 }
-                self.layers(ui, &display);
+                self.layers(ui, display.as_ref());
             });
-        self.sync_solo(&doc);
+        self.sync_solo(doc);
         let shortcut_modifiers = deferred_shortcuts
             .as_ref()
             .map(|(_, _, release_modifiers)| {
@@ -5365,8 +6197,8 @@ impl PeerBrush {
                     ui.add(egui::Image::new((texture.id(), size * scale)));
                     return;
                 }
-                let display = self.review_document(&doc);
-                self.canvas(ui, display.as_ref().unwrap_or(&doc));
+                let display = self.review_document(doc);
+                self.canvas(ui, display.as_ref().unwrap_or(doc));
             });
 
         if let Some(modifiers) = shortcut_modifiers {
@@ -5374,10 +6206,10 @@ impl PeerBrush {
         }
         if let Some((original, late, _)) = deferred_shortcuts {
             ctx.input_mut(|i| i.events = late);
-            let current = self.shared.lock().unwrap().doc.clone();
+            let current = Arc::new(self.shared.lock().unwrap().doc.clone());
             if current.id == doc.id && self.tab_transfer.is_none() && !self.selection_commit_failed
             {
-                self.doc_snapshot = current.clone();
+                self.doc_snapshot = DocumentSnapshot::Resident(current.clone());
                 self.document_shortcuts(ctx, &current);
                 ctx.request_repaint();
             }
@@ -5404,10 +6236,15 @@ impl PeerBrush {
         }
 
         if self.tab_transfer.is_none() {
-            self.request_preview(ctx, &doc);
+            self.request_preview(ctx, doc);
         }
         if self.lifecycle.is_some() || self.lifecycle_frame {
+            if self.lifecycle.is_none() && self.save_loss_review.is_none() {
+                self.new_canvas_window(ctx);
+            }
             self.finish_capture(ctx, drawn_generation);
+            // Shared-state requests must remain observable while the dialog owns input.
+            ctx.request_repaint_after(Duration::from_millis(200));
             return;
         }
         if self.liquify_effect.as_ref().is_some_and(|id| {
@@ -5463,69 +6300,19 @@ impl PeerBrush {
             self.brush_settings(ctx);
         }
         self.color_window(ctx);
-        self.task_history_review(ctx, &doc);
-        self.proposal_window(ctx, &doc);
-        self.refinement_window(ctx, &doc);
-        self.geometry_window(ctx, &doc);
-        self.source_window(ctx, &doc);
-        self.filters_window(ctx, &doc);
-        self.exports_window(ctx, &doc);
-        self.protection_window(ctx, &doc);
-        self.patterns_window(ctx, &doc);
-        self.compatibility_window(ctx, &doc);
-        if self.show_new {
-            let mut open = true;
-            egui::Window::new("New canvas")
-                .open(&mut open)
-                .collapsible(false)
-                .resizable(false)
-                .show(ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Width");
-                        controls::numeric(ui, &mut self.new_width, 16..=8192);
-                        ui.label("Height");
-                        controls::numeric(ui, &mut self.new_height, 16..=8192);
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Color");
-                        ui.selectable_value(&mut self.new_bit_depth, 8, "8 bit");
-                        ui.selectable_value(&mut self.new_bit_depth, 16, "16 bit");
-                    });
-                    ui.label("Opens in a new project tab.");
-                    if ui.button("Create canvas").clicked() {
-                        let result = Document::new_depth(
-                            self.new_width,
-                            self.new_height,
-                            self.new_bit_depth,
-                        )
-                        .and_then(|d| {
-                            let mut e = crate::engine::Engine::new();
-                            e.doc = d;
-                            crate::workspace::register_in(
-                                &self.workspace,
-                                e,
-                                Some(&self.project_id),
-                            )
-                        });
-                        match result {
-                            Ok(_) => {
-                                self.texture = None;
-                                self.canvas_pixels = None;
-                                self.animation.cancel();
-                                self.show_new = false;
-                                self.pan = Vec2::ZERO;
-                                self.zoom = 1.0;
-                                self.view = view::View::default();
-                                self.last_preview = None;
-                            }
-                            Err(e) => self.message = e,
-                        }
-                    }
-                });
-            if !open {
-                self.show_new = false;
-            }
-        }
+        self.task_history_review(ctx, doc);
+        self.proposal_window(ctx, doc);
+        self.refinement_window(ctx, doc);
+        self.geometry_window(ctx, doc);
+        self.free_transform_window(ctx, doc, drawn_generation);
+        self.source_window(ctx, doc);
+        self.filters_window(ctx, doc);
+        self.exports_window(ctx, doc);
+        self.protection_window(ctx, doc);
+        self.patterns_window(ctx, doc);
+        self.compatibility_window(ctx, doc);
+        self.associations.show(ctx);
+        self.new_canvas_window(ctx);
         if self.show_connection {
             let mut open = true;
             egui::Window::new("AI connection settings").open(&mut open).default_width(550.0).show(ctx, |ui| {
@@ -5557,6 +6344,7 @@ impl PeerBrush {
         }
         self.recovery_window(ctx);
         self.saved_versions_window(ctx);
+        self.save_progress_windows(ctx);
         let loading = self
             .load_control
             .clone()
@@ -5604,6 +6392,8 @@ impl PeerBrush {
         self.pressure_calibration(ctx);
         self.canvas_view_window(ctx);
         self.shortcuts_window(ctx);
+        self.updates_dialog(ctx);
+        self.about.show(ctx);
         self.finish_capture(ctx, drawn_generation);
         self.sync_tool_profile(ctx);
         if self.tool_preferences_ai(ctx.input(|i| i.time)) {
@@ -5617,18 +6407,37 @@ impl PeerBrush {
     }
     fn finish_capture(&mut self, ctx: &egui::Context, drawn_generation: u64) {
         let time = ctx.input(|i| i.time);
-        let ready = !self.pending
+        let presentation_ready = !self.pending
             && self.exports_capture_ready()
             && drawn_generation == self.canvas_generation
             && time >= self.capture_ready_at
             && !self.animation.fading()
-            && self.animation.progress(time) >= 1.
-            && self.canvas_preview.as_ref().is_some_and(|key| {
-                let doc = &self.shared.lock().unwrap().doc;
-                key.0 == doc.id && key.1 == doc.revision && self.last_preview.as_ref() == Some(key)
-            });
+            && self.animation.progress(time) >= 1.;
+        // Keep selection and both documents stable through dequeue. Every lock
+        // here is nonblocking; root may itself be the selected engine.
         if let Ok(mut engine) = self.workspace_root.try_lock() {
             if engine.capture_ui.is_some() {
+                ctx.request_repaint_after(Duration::from_millis(16));
+                let selected = if std::sync::Arc::ptr_eq(&self.workspace_root, &self.shared) {
+                    None
+                } else {
+                    let Ok(selected) = self.shared.try_lock() else {
+                        return;
+                    };
+                    Some(selected)
+                };
+                let Ok(workspace) = self.workspace.try_lock() else {
+                    return;
+                };
+                let doc = &selected.as_deref().unwrap_or(&engine).doc;
+                let ready = presentation_ready
+                    && engine.capture_panel.is_none()
+                    && workspace.is_active_engine(&self.shared)
+                    && self.canvas_preview.as_ref().is_some_and(|key| {
+                        key.0 == doc.id
+                            && key.1 == doc.revision
+                            && self.last_preview.as_ref() == Some(key)
+                    });
                 if ready {
                     let path = engine.capture_ui.take().unwrap();
                     ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new(
@@ -5638,20 +6447,54 @@ impl PeerBrush {
                     ctx.request_repaint_after(Duration::from_millis(16));
                 }
             }
+        } else {
+            ctx.request_repaint_after(Duration::from_millis(16));
         }
     }
 }
 
+// The disposable health workspace renders the real app but must never accept
+// human document edits which would disappear when the probe exits.
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) fn isolate_probe_input(ctx: &eframe::egui::Context) {
+    ctx.input_mut(|input| {
+        input.events.clear();
+        input.raw.events.clear();
+        input.keys_down.clear();
+        input.modifiers = Default::default();
+        input.raw.modifiers = Default::default();
+        input.pointer = Default::default();
+        input.raw.dropped_files.clear();
+        input.raw.hovered_files.clear();
+        input.raw_scroll_delta = eframe::egui::Vec2::ZERO;
+        input.smooth_scroll_delta = eframe::egui::Vec2::ZERO;
+    });
+}
+
 impl eframe::App for PeerBrush {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        #[cfg(windows)]
+        self.updates.native_window(_frame);
         self.draw(ctx);
     }
     fn on_exit(&mut self) {
-        crate::production_export::jobs::cancel_all(&self.shared.lock().unwrap().export_library);
-        self.store_current_tool_profile();
-        if let Err(error) = self.tool_settings_store.lock().unwrap().flush() {
-            eprintln!("PeerBrush: tool settings not saved: {error}");
+        if let Some(control) = &self.edit_control {
+            control.cancel();
         }
+        self.preview_worker.stop();
+        self.animation.clear();
+        self.native_preview.clear();
+        self.native_canvas.clear();
+        self.native_source_preview = None;
+        crate::production_export::jobs::cancel_all(&self.shared.lock().unwrap().export_library);
+        if self.update_exit_committed() {
+            return;
+        }
+        #[cfg(target_os = "macos")]
+        if let Err(error) = self.updates.retire_profile_capture() {
+            eprintln!("PeerBrush: app update profile capture remains unusable: {error}");
+        }
+        self.exit_tool_profile();
         server::checkpoint_projects(
             &self.workspace,
             &self.connection.state_dir,
@@ -5718,6 +6561,36 @@ mod tests {
                 "new isolation/target needs its own pixels"
             );
             app.canvas_preview = Some(next);
+            let root = app.workspace_root.clone();
+            let registry = app.workspace.clone();
+            {
+                let _held = root.lock().unwrap();
+                assert!(!run(&mut app, 0.71, painted), "root contention must defer");
+            }
+            {
+                let _held = registry.lock().unwrap();
+                assert!(
+                    !run(&mut app, 0.72, painted),
+                    "registry contention must defer"
+                );
+            }
+            root.lock().unwrap().capture_panel = Some("workspace".into());
+            assert!(
+                !run(&mut app, 0.73, painted),
+                "pending panel must be presented first"
+            );
+            root.lock().unwrap().capture_panel = None;
+            let mut other_engine = Engine::new();
+            other_engine.doc = Document::new_depth(32, 32, depth).unwrap();
+            let other = crate::workspace::register_in(&registry, other_engine, None).unwrap();
+            let other_id = other.lock().unwrap().project_id.clone();
+            crate::workspace::select_in(&registry, &other_id).unwrap();
+            assert!(
+                !run(&mut app, 0.74, painted),
+                "mid-frame project selection must defer"
+            );
+            let original_id = root.lock().unwrap().project_id.clone();
+            crate::workspace::select_in(&registry, &original_id).unwrap();
             assert!(run(&mut app, 0.8, painted));
             assert!(app.workspace_root.lock().unwrap().capture_ui.is_none());
             assert!(
@@ -5729,6 +6602,22 @@ mod tests {
                 !path.exists(),
                 "synthetic screenshot request must not write a fake capture"
             );
+            app.shared = other.clone();
+            crate::workspace::select_in(&registry, &other_id).unwrap();
+            let doc = other.lock().unwrap().doc.clone();
+            let key = (doc.id, doc.revision, "owned engine".into(), false);
+            app.canvas_preview = Some(key.clone());
+            app.last_preview = Some(key);
+            root.lock().unwrap().capture_ui = Some(path);
+            {
+                let _held = other.lock().unwrap();
+                assert!(
+                    !run(&mut app, 1.0, painted),
+                    "selected engine contention must defer"
+                );
+            }
+            assert!(run(&mut app, 1.1, painted));
+            assert!(!run(&mut app, 1.2, painted));
         }
     }
     #[test]
@@ -7124,9 +8013,12 @@ mod tests {
         app.parameter_gesture = Some(ParameterEdit {
             control: egui::Id::new("test"),
             gesture: "test".into(),
+            engine: Arc::downgrade(&app.shared),
             document: doc.id,
             revision: doc.revision,
             commands: vec![json!({"op":"layer.update","layer":layer,"opacity":0.2})],
+            preview: None,
+            preview_runs: 0,
             label: "Opacity".into(),
             typing: None,
             dirty: true,
@@ -7649,8 +8541,8 @@ mod tests {
             &mut app,
             &ctx,
             vec![egui::Event::Key {
-                key: egui::Key::A,
-                physical_key: Some(egui::Key::W),
+                key: egui::Key::W,
+                physical_key: Some(egui::Key::Q),
                 pressed: true,
                 repeat: false,
                 modifiers: Default::default(),
@@ -9035,6 +9927,136 @@ mod tests {
         assert!(app.points.is_empty());
     }
     #[test]
+    fn size_gesture_survives_control_focus_and_preserves_text_entry_and_native_sources() {
+        for depth in [8, 16] {
+            for control in ["button", "slider", "text"] {
+                // egui-winit maps an unrecognized Hebrew letter to physical S;
+                // this covers that app input shape, not actual OS layout changes.
+                for (physical, typed) in [(None, "s"), (Some(egui::Key::S), "ד")] {
+                    let (mut app, ctx) = fixture();
+                    app.recovery.open = false;
+                    app.shortcuts = shortcuts::Shortcuts::load(Path::new(""));
+                    {
+                        let mut engine = app.shared.lock().unwrap();
+                        engine.doc = Document::new_depth(32, 32, depth).unwrap();
+                        engine.doc.layers[0]
+                            .pixels
+                            .set16(1, 1, [12001, 23003, 34007, 65003]);
+                        engine.doc.revision = 7;
+                    }
+                    let before = serde_json::to_value(&app.shared.lock().unwrap().doc).unwrap();
+                    let mut text = String::new();
+                    let mut slider = 0.4;
+                    let mut draw = |app: &mut PeerBrush, events, focused| {
+                        let mut id = egui::Id::NULL;
+                        let _ = ctx.run(
+                            egui::RawInput {
+                                screen_rect: Some(Rect::from_min_size(
+                                    Pos2::ZERO,
+                                    Vec2::new(1360., 900.),
+                                )),
+                                events,
+                                focused,
+                                ..Default::default()
+                            },
+                            |ctx| {
+                                egui::Window::new("Shortcut focus fixture")
+                                    .fixed_pos(Pos2::new(20., 100.))
+                                    .default_width(180.)
+                                    .show(ctx, |ui| {
+                                        let response = match control {
+                                            "button" => ui.button("Focused button"),
+                                            "slider" => ui.add(
+                                                egui::Slider::new(&mut slider, 0. ..=1.)
+                                                    .show_value(false),
+                                            ),
+                                            _ => ui.text_edit_singleline(&mut text),
+                                        };
+                                        id = response.id;
+                                        response.request_focus();
+                                    });
+                                app.draw(ctx);
+                            },
+                        );
+                        id
+                    };
+                    draw(&mut app, vec![], true);
+                    let id = draw(&mut app, vec![], true);
+                    assert_eq!(ctx.memory(|m| m.focused()), Some(id));
+                    assert!(ctx.wants_keyboard_input());
+                    assert_eq!(
+                        egui::TextEdit::load_state(&ctx, id).is_some(),
+                        control == "text"
+                    );
+                    app.radius = 20.;
+                    app.brush.hardness = 0.7;
+                    let radius = app.radius;
+                    let hardness = app.brush.hardness;
+                    let at = app.view_rect.unwrap().center();
+                    let key = |pressed| egui::Event::Key {
+                        key: egui::Key::S,
+                        physical_key: physical,
+                        pressed,
+                        repeat: false,
+                        modifiers: Default::default(),
+                    };
+                    draw(
+                        &mut app,
+                        vec![
+                            egui::Event::PointerMoved(at),
+                            key(true),
+                            egui::Event::Text(typed.into()),
+                        ],
+                        true,
+                    );
+                    assert_eq!(
+                        app.size_drag.is_some(),
+                        control != "text",
+                        "{control}, depth {depth}, physical {physical:?}"
+                    );
+                    draw(
+                        &mut app,
+                        vec![egui::Event::PointerMoved(at + Vec2::new(24., 20.))],
+                        true,
+                    );
+                    assert_eq!(ctx.memory(|m| m.focused()), Some(id));
+                    if control == "text" {
+                        assert_eq!(app.radius, radius);
+                        assert_eq!(app.brush.hardness, hardness);
+                    } else {
+                        assert!(app.radius > radius);
+                        assert!(app.brush.hardness < hardness);
+                    }
+                    let stopped = (app.radius, app.brush.hardness);
+                    draw(
+                        &mut app,
+                        vec![
+                            egui::Event::WindowFocused(false),
+                            egui::Event::PointerMoved(at + Vec2::new(48., 40.)),
+                        ],
+                        false,
+                    );
+                    assert!(app.size_drag.is_none());
+                    assert_eq!((app.radius, app.brush.hardness), stopped);
+                    draw(
+                        &mut app,
+                        vec![egui::Event::WindowFocused(true), key(false)],
+                        true,
+                    );
+                    assert!(app.size_drag.is_none());
+                    if control == "text" {
+                        assert_eq!(text, typed);
+                    }
+                    assert_eq!(slider, 0.4);
+                    assert!(app.points.is_empty());
+                    let engine = app.shared.lock().unwrap();
+                    assert_eq!(serde_json::to_value(&engine.doc).unwrap(), before);
+                    assert!(engine.undo.is_empty() && engine.redo.is_empty());
+                }
+            }
+        }
+    }
+    #[test]
     fn alt_temporarily_samples_color_without_painting_or_switching_tools() {
         let (mut app, ctx) = fixture();
         {
@@ -9302,6 +10324,10 @@ mod tests {
         app.points.push([30.0, 10.0]);
         app.preview_tx
             .send(Preview {
+                job: app.preview_job,
+                parameter: None,
+                parameter_document: None,
+                parameter_replayed: false,
                 coarse: false,
                 error: None,
                 live,
@@ -9383,7 +10409,7 @@ mod tests {
                     kind: "invert".into(),
                     enabled: true,
                     weight: 1.,
-                    settings: json!({}),
+                    settings: json!({}).into(),
                 });
                 app.selected = engine.doc.layers[0].id.clone();
             }
@@ -10351,6 +11377,271 @@ mod tests {
             assert!(app.source_editor.is_none());
         }
     }
+
+    #[test]
+    fn missing_installed_text_retains_native_pixels_and_explicit_picker_replacement_previews_and_undoes(
+    ) {
+        use crate::fonts::{self, FontError, InstalledFont, TextFont};
+        let font = InstalledFont {
+            family: "Unavailable fixture".into(),
+            postscript: "UnavailableFixture-Regular".into(),
+            style: "normal".into(),
+            weight: 400,
+            stretch: 5,
+            index: 0,
+            sha256: "d".repeat(64),
+        };
+        let _fonts = fonts::test_fonts(vec![(font.clone(), Err(FontError::Missing))]);
+        let (mut app, ctx) = small_fixture();
+        let original = {
+            let mut engine = app.shared.lock().unwrap();
+            engine.doc = Document::new_depth(32, 32, 16).unwrap();
+            engine.doc.layers[0]
+                .pixels
+                .set16(2, 3, [12347, 33659, 51237, 65535]);
+            engine.doc.layers[0].source = Some(
+                crate::source::Source {
+                    width: 32,
+                    height: 32,
+                    matrix: [1., 0., 0., 1., 0., 0.],
+                    content: crate::source::Content::Text {
+                        text: "Hi".into(),
+                        layout: crate::source::TextLayout::Legacy,
+                        font: TextFont::Installed(font),
+                        size: 16.,
+                        line_height: 1.2,
+                        letter_spacing: 0.,
+                        align: "left".into(),
+                        color: [53471, 12679, 33457, 65535],
+                    },
+                }
+                .into(),
+            );
+            engine.doc.clone()
+        };
+        app.select_content(&original.layers[0].id);
+        app.open_source(&original, "edit");
+        frame(&mut app, &ctx, vec![], Default::default());
+        assert!(app.source_editor.is_some());
+        assert!(
+            app.transient.is_empty(),
+            "Missing fonts must retain the saved raster, without failed source previews"
+        );
+        assert!(app.shared.lock().unwrap().undo.is_empty());
+        assert_eq!(
+            app.shared.lock().unwrap().doc.layers[0].pixels.rgba16(),
+            original.layers[0].pixels.rgba16()
+        );
+        fn control(app: &mut PeerBrush, ctx: &egui::Context, label: &str) -> Pos2 {
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1360., 900.))),
+                    ..Default::default()
+                },
+                |ctx| app.draw(ctx),
+            );
+            output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text() == label => {
+                        Some(text.pos + text.galley.size() * 0.5)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("Source control absent: {label}"))
+        }
+        // Apply is disabled while the exact font is missing.
+        let apply = control(&mut app, &ctx, "Apply");
+        click(&mut app, &ctx, apply);
+        assert!(app.source_editor.is_some());
+        assert!(app.shared.lock().unwrap().undo.is_empty());
+        let label = app.source_editor.as_ref().unwrap().source.content.clone();
+        let crate::source::Content::Text { font, .. } = label else {
+            panic!()
+        };
+        let picker = control(&mut app, &ctx, &font.label());
+        click(&mut app, &ctx, picker);
+        let replacement = control(&mut app, &ctx, "Ubuntu Sans medium");
+        click(&mut app, &ctx, replacement);
+        assert!(
+            matches!(&app.source_editor.as_ref().unwrap().source.content,
+            crate::source::Content::Text {font:TextFont::Bundled(name),..} if name=="medium")
+        );
+        let command = app.source_editor.as_ref().unwrap().command();
+        let expected = Engine::preview_edits(original.clone(), &[command]).unwrap();
+        assert_ne!(
+            expected.layers[0].pixels.rgba16(),
+            original.layers[0].pixels.rgba16()
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(4);
+        loop {
+            frame(&mut app, &ctx, vec![], Default::default());
+            if !app.pending
+                && app.canvas_pixels.as_ref().is_some_and(|(w, h, pixels)| {
+                    *pixels == expected.preview(None, (*w).max(*h), None, false).unwrap().2
+                })
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Replacement font must preview actual engine pixels"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(app.shared.lock().unwrap().undo.is_empty());
+        let apply = control(&mut app, &ctx, "Apply");
+        click(&mut app, &ctx, apply);
+        super::text_tests::wait_edit(&mut app);
+        assert!(app.source_editor.is_none());
+        let mut engine = app.shared.lock().unwrap();
+        assert_eq!(engine.undo.len(), 1);
+        assert_eq!(
+            engine.doc.layers[0].pixels.rgba16(),
+            expected.layers[0].pixels.rgba16()
+        );
+        engine.undo("human").unwrap();
+        assert_eq!(engine.doc.layers[0].source, original.layers[0].source);
+        assert_eq!(
+            engine.doc.layers[0].pixels.rgba16(),
+            original.layers[0].pixels.rgba16()
+        );
+        drop(engine);
+        let current = app.shared.lock().unwrap().doc.clone();
+        app.open_source(&current, "edit");
+        frame(&mut app, &ctx, vec![], Default::default());
+        let cancel = control(&mut app, &ctx, "Cancel");
+        click(&mut app, &ctx, cancel);
+        assert!(app.source_editor.is_none());
+        assert!(app.transient.is_empty());
+        assert_eq!(
+            app.shared.lock().unwrap().doc.layers[0].pixels.rgba16(),
+            original.layers[0].pixels.rgba16()
+        );
+    }
+
+    #[test]
+    fn unchanged_installed_text_retries_loading_and_busy_then_previews_ready_native_pixels() {
+        use crate::fonts::{self, FontError, InstalledFont, TextFont};
+        for depth in [8, 16] {
+            for pending in [FontError::Loading, FontError::Busy] {
+                let font = InstalledFont {
+                    family: "Pending fixture".into(),
+                    postscript: "PendingFixture-Regular".into(),
+                    style: "normal".into(),
+                    weight: 400,
+                    stretch: 5,
+                    index: 0,
+                    sha256: "e".repeat(64),
+                };
+                let waiting = fonts::test_fonts(vec![(font.clone(), Err(pending))]);
+                let (mut app, ctx) = small_fixture();
+                let original = {
+                    let mut engine = app.shared.lock().unwrap();
+                    engine.doc = Document::new_depth(32, 32, depth).unwrap();
+                    engine.doc.layers[0]
+                        .pixels
+                        .set16(1, 2, [21347, 41259, 31357, 65535]);
+                    engine.doc.layers[0].source = Some(
+                        crate::source::Source {
+                            width: 32,
+                            height: 32,
+                            matrix: [1., 0., 0., 1., 0., 0.],
+                            content: crate::source::Content::Text {
+                                text: "Hi".into(),
+                                layout: crate::source::TextLayout::Legacy,
+                                font: TextFont::Installed(font.clone()),
+                                size: 16.,
+                                line_height: 1.2,
+                                letter_spacing: 0.,
+                                align: "left".into(),
+                                color: [53471, 12679, 33457, 65535],
+                            },
+                        }
+                        .into(),
+                    );
+                    engine.doc.clone()
+                };
+                app.select_content(&original.layers[0].id);
+                app.open_source(&original, "edit");
+                let command = app.source_editor.as_ref().unwrap().command();
+                // A preview can lose its snapshot between UI validation and rendering.
+                app.source_editor.as_mut().unwrap().error = Some(pending.to_string());
+                app.last_preview = Some((
+                    original.id.clone(),
+                    original.revision,
+                    "cached failed preview".into(),
+                    false,
+                ));
+                let draw_source = |app: &mut PeerBrush| {
+                    ctx.run(
+                        egui::RawInput {
+                            screen_rect: Some(Rect::from_min_size(
+                                Pos2::ZERO,
+                                Vec2::new(1360., 900.),
+                            )),
+                            ..Default::default()
+                        },
+                        |ctx| app.source_window(ctx, &original),
+                    )
+                };
+                let output = draw_source(&mut app);
+                assert!(
+                    output.viewport_output[&egui::ViewportId::ROOT].repaint_delay
+                        <= Duration::from_millis(50)
+                );
+                assert!(app.transient.is_empty());
+                assert!(app.source_editor.as_ref().unwrap().error.is_some());
+                assert!(app.shared.lock().unwrap().undo.is_empty());
+                assert_eq!(
+                    app.shared.lock().unwrap().doc.layers[0].pixels.rgba16(),
+                    original.layers[0].pixels.rgba16()
+                );
+                drop(waiting);
+                let _ready = fonts::test_fonts(vec![(
+                    font,
+                    Ok(ab_glyph::FontArc::new(fonts::bundled("regular").unwrap())),
+                )]);
+                draw_source(&mut app);
+                assert_eq!(
+                    app.source_editor.as_ref().unwrap().command(),
+                    command,
+                    "Readiness must not substitute or edit metadata"
+                );
+                assert!(app.source_editor.as_ref().unwrap().error.is_none());
+                assert!(
+                    app.last_preview.is_none(),
+                    "A cached loading failure must be retried without another property edit"
+                );
+                assert_eq!(app.transient, vec![command.clone()]);
+                let expected = Engine::preview_edits(original.clone(), &[command]).unwrap();
+                let deadline = std::time::Instant::now() + Duration::from_secs(4);
+                loop {
+                    frame(&mut app, &ctx, vec![], Default::default());
+                    if !app.pending
+                        && app.canvas_pixels.as_ref().is_some_and(|(w, h, pixels)| {
+                            *pixels == expected.preview(None, (*w).max(*h), None, false).unwrap().2
+                        })
+                    {
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "Ready unchanged font must render after pending state"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                assert!(app.shared.lock().unwrap().undo.is_empty());
+                assert_eq!(
+                    app.shared.lock().unwrap().doc.layers[0].pixels.rgba16(),
+                    original.layers[0].pixels.rgba16()
+                );
+                app.cancel_source();
+            }
+        }
+    }
+
     #[test]
     fn document_geometry_previews_pixels_dimensions_and_cancels_when_source_changes() {
         for mode in ["crop", "canvas.resize", "image.resize"] {
@@ -10502,7 +11793,8 @@ mod tests {
             assert_eq!(selected.len(), 1, "Only the current tool is highlighted");
             assert!(
                 selected[0].contains(pos),
-                "The clicked tool is painted without a fade"
+                "The clicked tool is painted without a fade: {pos:?} vs {:?}",
+                selected[0]
             );
         }
         let engine = app.shared.lock().unwrap();
@@ -12596,11 +13888,11 @@ mod tests {
                         "fill" => egui::Key::B,
                         "duplicate" => egui::Key::D,
                         // Exercise different logical/physical identities.
-                        _ => egui::Key::Z,
+                        _ => egui::Key::W,
                     };
                     let event = |pressed, repeat| egui::Event::Key {
                         key,
-                        physical_key: Some(if action == "move" { egui::Key::W } else { key }),
+                        physical_key: Some(if action == "move" { egui::Key::Z } else { key }),
                         pressed,
                         repeat,
                         modifiers,
@@ -15249,6 +16541,10 @@ mod tests {
             app.pending = true;
             app.preview_tx
                 .send(Preview {
+                    job: app.preview_job,
+                    parameter: None,
+                    parameter_document: None,
+                    parameter_replayed: false,
                     coarse: false,
                     error: None,
                     live: String::new(),

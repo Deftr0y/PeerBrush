@@ -1122,6 +1122,52 @@ mod peerbrush_clipboard_tests {
     use super::*;
 
     #[test]
+    fn layout_resolution_keeps_logical_keys_and_non_latin_clipboard_fallbacks() {
+        use winit::keyboard::{Key, KeyCode};
+        for text in ["ד", "ы", "و", "स"] {
+            let logical = key_from_winit_key(&Key::Character(text.into()));
+            assert_eq!(logical, None);
+            assert_eq!(
+                logical.or(key_from_key_code(KeyCode::KeyS)),
+                Some(egui::Key::S)
+            );
+        }
+        assert_eq!(
+            key_from_winit_key(&Key::Character("w".into())).or(key_from_key_code(KeyCode::KeyQ)),
+            Some(egui::Key::W)
+        );
+        let command = egui::Modifiers::COMMAND;
+        for (text, code, expected) in [
+            ("ס", KeyCode::KeyC, egui::Key::C),
+            ("ч", KeyCode::KeyX, egui::Key::X),
+            ("ر", KeyCode::KeyV, egui::Key::V),
+        ] {
+            let active = key_from_winit_key(&Key::Character(text.into()))
+                .or(key_from_key_code(code))
+                .unwrap();
+            assert_eq!(active, expected);
+            let mut reads = 0;
+            let translated = clipboard_input(command, active, true, false, || {
+                reads += 1;
+                Some("Literal דы".into())
+            });
+            match (active, translated) {
+                (egui::Key::C, ClipboardInput::Event(egui::Event::Copy))
+                | (egui::Key::X, ClipboardInput::Event(egui::Event::Cut)) => assert_eq!(reads, 0),
+                (egui::Key::V, ClipboardInput::Event(egui::Event::Paste(text))) => {
+                    assert_eq!(text, "Literal דы");
+                    assert_eq!(reads, 1);
+                }
+                _ => panic!("Resolved native clipboard command was lost"),
+            }
+            assert!(matches!(
+                clipboard_input(command, active, true, true, || panic!("repeat read")),
+                ClipboardInput::Suppressed
+            ));
+        }
+    }
+
+    #[test]
     fn native_key_repeats_require_a_fresh_press_in_the_current_focus_session() {
         use winit::keyboard::{KeyCode, NativeKeyCode, PhysicalKey};
 

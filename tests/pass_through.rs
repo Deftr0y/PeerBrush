@@ -84,7 +84,7 @@ fn invert(l: &mut Layer) {
         id: id(),
         kind: "invert".into(),
         enabled: true,
-        settings: json!({}),
+        settings: json!({}).into(),
     });
 }
 fn inverse(mut p: [u16; 4]) -> [u16; 4] {

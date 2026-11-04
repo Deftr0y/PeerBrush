@@ -3,7 +3,7 @@ use peerbrush::{
     effects::Effect,
     engine::{Document, Engine, Layer, Mask, MaskStep},
     production_export::{
-        self as export, Control, Crop, DuplicateNames, Resampling, Settings, Variant,
+        self as export, Control, Crop, DuplicateNames, Format, Resampling, Settings, Variant,
     },
     raster::Raster,
 };
@@ -29,7 +29,7 @@ fn effect() -> Effect {
         kind: "invert".into(),
         enabled: true,
         weight: 0.7,
-        settings: json!({}),
+        settings: json!({}).into(),
     }
 }
 fn fixture(depth: u16) -> Document {
@@ -369,16 +369,38 @@ fn invalid_exports_and_cancellation_keep_original_precision_pixels_and_definitio
 }
 
 fn wait_job(shared: &peerbrush::server::Shared, run: &str) -> serde_json::Value {
-    for _ in 0..1000 {
+    let start = std::time::Instant::now();
+    let deadline = start + std::time::Duration::from_secs(15);
+    loop {
         let state =
             peerbrush::server::dispatch(shared, "exports", &json!({"action":"status","run":run}))
                 .unwrap();
         if state["status"] != "running" {
             return state;
         }
+        if std::time::Instant::now() >= deadline {
+            let phase = match state["stage"].as_str().unwrap_or("") {
+                "Planning native output" => "planning",
+                "Export complete" => "complete",
+                "Export stopped" => "stopped",
+                stage if stage.starts_with("Rendering ") => "rendering",
+                _ => "unknown",
+            };
+            let count = |status: &str| {
+                state["outputs"].as_array().map_or(0, |outputs| {
+                    outputs
+                        .iter()
+                        .filter(|output| output["status"] == status)
+                        .count()
+                })
+            };
+            panic!("PB_EXPORT_WAIT elapsed_ms={} status=running phase={} outputs={} written={} skipped={} failed={} not_written={}",
+                start.elapsed().as_millis().min(999999), phase,
+                state["outputs"].as_array().map_or(0, Vec::len),
+                count("written"), count("skipped"), count("failed"), count("not_written"));
+        }
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
-    panic!("Export run did not finish")
 }
 #[test]
 fn export_presets_persist_with_revision_and_disk_conflict_guards_outside_history() {
@@ -580,4 +602,333 @@ fn batch_existing_file_policies_report_written_skipped_failed_and_unattempted_ou
         }));
     drop(shared);
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn lossless_webp_retains_rendered_alpha_icc_and_declares_derived_eight_bit_output() {
+    for depth in [8, 16] {
+        for tagged in [0, 1] {
+            let mut doc = fixture(depth);
+            doc.srgb_tagged = tagged == 1;
+            doc.layers[0]
+                .pixels
+                .set16(3, 4, [12347, 23459, 34571, 32781]);
+            doc.layers[0].pixels.set16(
+                4,
+                4,
+                [45679, 23459, 12347, if depth == 16 { 129 } else { 257 }],
+            );
+            doc.filters = vec![effect()];
+            let before = serde_json::to_value(&doc).unwrap();
+            let png = doc.export_png().unwrap();
+            let expected: Vec<_> = decoded(&png, depth)
+                .2
+                .into_iter()
+                .map(peerbrush::raster::project16)
+                .collect();
+            let settings = Settings {
+                format: Format::Webp,
+                ..Default::default()
+            };
+            let plan = export::plan(&doc, &[], &settings, &Control::default()).unwrap();
+            let output = &plan.outputs[0];
+            assert_eq!(output.filename, "Production_composite_native.webp");
+            assert_eq!(output.format, Format::Webp);
+            assert_eq!(output.native_source_depth, depth);
+            assert_eq!(output.bit_depth, 8);
+            let bytes = export::render(&doc, output, &settings, &Control::default()).unwrap();
+            assert_eq!(&bytes[..4], b"RIFF");
+            assert_eq!(&bytes[8..12], b"WEBP");
+            let mut decoder = image::codecs::webp::WebPDecoder::new(Cursor::new(&bytes)).unwrap();
+            assert_eq!(decoder.dimensions(), (doc.width, doc.height));
+            assert_eq!(decoder.color_type(), image::ColorType::Rgba8);
+            assert_eq!(
+                decoder.icc_profile().unwrap().as_deref(),
+                if tagged == 0 {
+                    None
+                } else {
+                    Some(peerbrush::color_profile::srgb_profile())
+                }
+            );
+            let actual = image::load_from_memory(&bytes)
+                .unwrap()
+                .into_rgba8()
+                .into_raw();
+            assert_eq!(actual, expected);
+            assert!(actual.chunks_exact(4).any(|pixel| pixel[3] == 0));
+            assert!(actual
+                .chunks_exact(4)
+                .any(|pixel| pixel[3] > 0 && pixel[3] < 255));
+            assert_eq!(serde_json::to_value(&doc).unwrap(), before);
+            assert_eq!(doc.export_png().unwrap(), png);
+            let saved = peerbrush::psd::decode(&peerbrush::psd::encode_psb(&doc).unwrap()).unwrap();
+            assert_eq!(saved.bit_depth, depth);
+            assert_eq!(
+                saved.layers[0].pixels.rgba16(),
+                doc.layers[0].pixels.rgba16()
+            );
+            let mut mismatched = output.clone();
+            mismatched.format = Format::Png;
+            assert!(export::render(&doc, &mismatched, &settings, &Control::default()).is_err());
+            mismatched = output.clone();
+            mismatched.bit_depth = 16;
+            assert!(export::render(&doc, &mismatched, &settings, &Control::default()).is_err());
+        }
+    }
+}
+
+#[test]
+fn webp_crop_padding_and_resampling_match_native_png_before_final_projection() {
+    for depth in [8, 16] {
+        let doc = fixture(depth);
+        for resampling in [Resampling::Nearest, Resampling::Bilinear] {
+            let settings = Settings {
+                crop: Crop::Alpha,
+                padding: 2,
+                resampling,
+                variants: vec![Variant {
+                    name: "scaled".into(),
+                    scale: 1.7,
+                }],
+                ..Default::default()
+            };
+            let png_plan = export::plan(&doc, &[], &settings, &Control::default()).unwrap();
+            let png =
+                export::render(&doc, &png_plan.outputs[0], &settings, &Control::default()).unwrap();
+            let webp_settings = Settings {
+                format: Format::Webp,
+                ..settings
+            };
+            let webp_plan = export::plan(&doc, &[], &webp_settings, &Control::default()).unwrap();
+            assert_eq!(
+                webp_plan.outputs[0].document_rect,
+                png_plan.outputs[0].document_rect
+            );
+            let webp = export::render(
+                &doc,
+                &webp_plan.outputs[0],
+                &webp_settings,
+                &Control::default(),
+            )
+            .unwrap();
+            let expected: Vec<_> = decoded(&png, depth)
+                .2
+                .into_iter()
+                .map(peerbrush::raster::project16)
+                .collect();
+            assert_eq!(
+                image::load_from_memory(&webp)
+                    .unwrap()
+                    .into_rgba8()
+                    .into_raw(),
+                expected
+            );
+            let control = Control::default();
+            control.cancel();
+            assert!(export::render(&doc, &webp_plan.outputs[0], &webp_settings, &control).is_err());
+        }
+    }
+}
+
+#[test]
+fn old_presets_default_to_png_and_webp_presets_use_the_same_guarded_library() {
+    use export::library::Library;
+    let root = std::env::temp_dir().join(format!("pb-webp-presets-{}", peerbrush::engine::id()));
+    std::fs::create_dir(&root).unwrap();
+    let path = root.join("export-presets.json");
+    let mut old_settings = serde_json::to_value(Settings::default()).unwrap();
+    assert!(
+        old_settings.get("jxl").is_none(),
+        "Default PNG settings remain readable by the prior preset schema"
+    );
+    old_settings.as_object_mut().unwrap().remove("format");
+    let old = serde_json::to_vec(&json!({"version":1,"revision":7,"presets":[{"id":"export-original","name":"Original PNG","settings":old_settings}]})).unwrap();
+    std::fs::write(&path, &old).unwrap();
+    let mut library = Library::load(path.clone());
+    assert!(library.snapshot().error.is_none());
+    assert_eq!(
+        library.get("export-original").unwrap().settings.format,
+        Format::Png
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), old);
+    assert_eq!(
+        library.get("export-original").unwrap().settings.jxl,
+        peerbrush::jpeg_xl::Options::default()
+    );
+    let preset = library
+        .save(
+            None,
+            "WebP",
+            Settings {
+                format: Format::Webp,
+                ..Default::default()
+            },
+            7,
+            "human",
+        )
+        .unwrap();
+    let loaded = Library::load(path.clone());
+    assert_eq!(
+        loaded.get(&preset.id).unwrap().settings.format,
+        Format::Webp
+    );
+    assert!(
+        serde_json::to_value(&loaded.get(&preset.id).unwrap().settings)
+            .unwrap()
+            .get("jxl")
+            .is_none()
+    );
+    assert_eq!(
+        loaded.get("export-original").unwrap().settings.format,
+        Format::Png
+    );
+    let custom = Settings {
+        format: Format::Jxl,
+        jxl: peerbrush::jpeg_xl::Options {
+            lossless: false,
+            distance: 0.5,
+            effort: 4,
+        },
+        ..Default::default()
+    };
+    assert_eq!(
+        serde_json::to_value(&custom).unwrap()["jxl"],
+        json!({"lossless":false,"distance":0.5,"effort":4})
+    );
+    let preset = library
+        .save(None, "JPEG XL", custom.clone(), 8, "human")
+        .unwrap();
+    let loaded = Library::load(path.clone());
+    assert_eq!(loaded.get(&preset.id).unwrap().settings, custom);
+    assert_eq!(
+        loaded.get("export-original").unwrap().settings.format,
+        Format::Png
+    );
+    let saved = std::fs::read(&path).unwrap();
+    for invalid in [json!("jpeg"), json!(null), json!(8)] {
+        let mut settings = old_settings.clone();
+        settings["format"] = invalid;
+        assert!(serde_json::from_value::<Settings>(settings).is_err());
+    }
+    assert_eq!(std::fs::read(&path).unwrap(), saved);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn webp_shared_protocol_preview_batch_and_reopening_keep_the_original_project() {
+    use peerbrush::server;
+    use std::sync::{Arc, Mutex};
+    for depth in [8, 16] {
+        let root =
+            std::env::temp_dir().join(format!("pb-webp-protocol-{}", peerbrush::engine::id()));
+        std::fs::create_dir(&root).unwrap();
+        let mut engine = Engine::new();
+        engine.doc = fixture(depth);
+        engine.doc.layers[0]
+            .pixels
+            .set16(3, 4, [12347, 23459, 34571, 32781]);
+        let doc = engine.doc.clone();
+        let shared = Arc::new(Mutex::new(engine));
+        let before = serde_json::to_value(&doc).unwrap();
+        let settings = Settings {
+            format: Format::Webp,
+            ..Default::default()
+        };
+        let request = json!({"action":"preview","actor":"human","document_id":doc.id,"expected_revision":doc.revision,"settings":settings});
+        let preview = server::dispatch(&shared, "exports", &request).unwrap();
+        assert_eq!(preview["images"][0]["mime_type"], "image/png");
+        assert_eq!(preview["images"][0]["output_format"], "webp");
+        assert_eq!(preview["images"][0]["output_bit_depth"], 8);
+        assert_eq!(preview["images"][0]["native_source_depth"], depth);
+        let mut start = request.clone();
+        start["action"] = json!("start");
+        start["directory"] = json!(root);
+        let run = server::dispatch(&shared, "exports", &start).unwrap();
+        let state = wait_job(&shared, run["run"].as_str().unwrap());
+        assert_eq!(state["status"], "completed", "{state}");
+        assert_eq!(state["outputs"][0]["output"]["bit_depth"], 8);
+        assert_eq!(state["outputs"][0]["output"]["native_source_depth"], depth);
+        let path = root.join("Production_composite_native.webp");
+        let bytes = std::fs::read(&path).unwrap();
+        let rerun = server::dispatch(&shared, "exports", &start).unwrap();
+        let failed = wait_job(&shared, rerun["run"].as_str().unwrap());
+        assert_eq!(failed["status"], "failed", "{failed}");
+        assert_eq!(failed["outputs"][0]["status"], "failed");
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        start["existing"] = json!("skip");
+        let rerun = server::dispatch(&shared, "exports", &start).unwrap();
+        let skipped = wait_job(&shared, rerun["run"].as_str().unwrap());
+        assert_eq!(skipped["status"], "completed", "{skipped}");
+        assert_eq!(skipped["outputs"][0]["status"], "skipped");
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let expected = image::load_from_memory(&bytes).unwrap().into_rgba8();
+        let reopened = Arc::new(Mutex::new(Engine::new()));
+        server::open(&reopened, &path).unwrap();
+        assert_eq!(reopened.lock().unwrap().doc.bit_depth, 8);
+        assert_eq!(
+            reopened.lock().unwrap().doc.layers[0].pixels.rgba(),
+            expected.as_raw().clone()
+        );
+        assert_eq!(
+            peerbrush::image_import::decode_file(
+                &path,
+                &json!({}),
+                peerbrush::image_import::BUDGET
+            )
+            .unwrap()
+            .rgba(),
+            expected.into_raw()
+        );
+        let direct = root.join("direct.WEBP");
+        std::fs::write(&direct, b"Previous exact WebP").unwrap();
+        assert!(server::export(&shared, &direct).is_err());
+        assert_eq!(std::fs::read(&direct).unwrap(), b"Previous exact WebP");
+        server::export_confirmed_source(&shared, &direct, &doc.id, doc.revision).unwrap();
+        assert_eq!(std::fs::read(&direct).unwrap(), bytes);
+        assert!(std::fs::read_dir(root.join(".peerbrush-versions"))
+            .unwrap()
+            .flatten()
+            .any(|entry| std::fs::read(entry.path()).unwrap() == b"Previous exact WebP"));
+        assert!(server::export_confirmed_source(&shared, &path, &doc.id, doc.revision).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert!(server::dispatch(
+            &shared,
+            "document",
+            &json!({"action":"export","path":root.join("invalid.webp"),"bit_depth":16})
+        )
+        .is_err());
+        assert!(!root.join("invalid.webp").exists());
+        let mut invalid = request.clone();
+        invalid["settings"]["format"] = json!("jpeg");
+        assert!(server::dispatch(&shared, "exports", &invalid).is_err());
+        let tools = server::tools();
+        let tool = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "peerbrush_exports")
+            .unwrap();
+        assert_eq!(
+            tool["inputSchema"]["properties"]["settings"]["properties"]["format"]["enum"],
+            json!(["png", "webp", "jxl"])
+        );
+        let mcp = server::mcp(
+            &shared,
+            &json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"peerbrush_exports","arguments":request}}),
+        );
+        assert_eq!(mcp["result"]["isError"], false, "{mcp}");
+        assert!(mcp["result"]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["type"] == "image" && item["mimeType"] == "image/png"));
+        assert_eq!(
+            serde_json::to_value(&shared.lock().unwrap().doc).unwrap(),
+            before
+        );
+        assert!(shared.lock().unwrap().undo.is_empty());
+        drop(reopened);
+        drop(shared);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

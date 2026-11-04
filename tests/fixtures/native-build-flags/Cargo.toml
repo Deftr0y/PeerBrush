@@ -1,0 +1,11 @@
+[package]
+name = "peerbrush-native-flags-fixture"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+cc = "=1.6.0"
+cmake = { path = "../../../vendor/cmake" }

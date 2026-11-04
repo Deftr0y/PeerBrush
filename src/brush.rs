@@ -1,4 +1,8 @@
 //! Shared, bounded brush rasterization. Opacity caps a stroke; flow accumulates per dab.
+#[path = "brush/input.rs"]
+pub(crate) mod input;
+#[path = "brush/native.rs"]
+pub(crate) mod native;
 use crate::raster::{blend, Pixel, Raster, TILE};
 use serde_json::Value;
 use std::{
@@ -343,8 +347,14 @@ pub fn points_from_command(c: &Value) -> Result<(Vec<[f32; 2]>, Option<Vec<f32>>
         .as_array()
         .filter(|p| !p.is_empty() && p.len() <= 10000)
         .ok_or("Stroke needs 1–10000 points")?;
-    let mut points = Vec::with_capacity(values.len());
-    let mut pressures = Vec::with_capacity(values.len());
+    let mut points = Vec::new();
+    points
+        .try_reserve_exact(values.len())
+        .map_err(|_| "Stroke point allocation failed")?;
+    let mut pressures = Vec::new();
+    pressures
+        .try_reserve_exact(values.len())
+        .map_err(|_| "Stroke pressure allocation failed")?;
     let mut explicit = false;
     for value in values {
         let point = value
@@ -374,7 +384,10 @@ pub fn points_from_command(c: &Value) -> Result<(Vec<[f32; 2]>, Option<Vec<f32>>
             .as_array()
             .filter(|p| p.len() == points.len())
             .ok_or("Pressures must match the point count")?;
-        pressures = values.iter().map(pressure).collect::<Result<Vec<_>, _>>()?;
+        pressures.clear();
+        for value in values {
+            pressures.push(pressure(value)?);
+        }
         explicit = true;
     }
     if let Some(axis) = c.get("stroke_axis") {
@@ -447,22 +460,25 @@ pub(crate) fn dabs(
     let document_points = if settings.texture_origin == [0, 0] {
         std::borrow::Cow::Borrowed(points)
     } else {
-        std::borrow::Cow::Owned(
-            points
-                .iter()
-                .map(|p| {
-                    [
-                        p[0] + settings.texture_origin[0] as f32,
-                        p[1] + settings.texture_origin[1] as f32,
-                    ]
-                })
-                .collect::<Vec<_>>(),
-        )
+        let mut document = Vec::new();
+        document
+            .try_reserve_exact(points.len())
+            .map_err(|_| "Document stroke point allocation failed")?;
+        for p in points {
+            document.push([
+                p[0] + settings.texture_origin[0] as f32,
+                p[1] + settings.texture_origin[1] as f32,
+            ]);
+        }
+        std::borrow::Cow::Owned(document)
     };
     let points = document_points.as_ref();
     let step = (settings.radius * 2.0 * settings.spacing).max(0.5);
     let at_pressure = |index: usize| pressures.map_or(1.0, |p| p[index]);
-    let mut raw = vec![(points[0], 0.0, at_pressure(0))];
+    let mut raw = Vec::new();
+    raw.try_reserve(1)
+        .map_err(|_| "Raw stroke dab allocation failed")?;
+    raw.push((points[0], 0.0, at_pressure(0)));
     let mut previous = points[0];
     let mut until_next = step;
     let mut length = 0.0;
@@ -481,6 +497,10 @@ pub(crate) fn dabs(
         let distance = dx.hypot(dy);
         let mut along = until_next;
         while along <= distance {
+            if raw.len() == raw.capacity() {
+                raw.try_reserve(1)
+                    .map_err(|_| "Raw stroke dab allocation failed")?;
+            }
             raw.push((
                 [
                     previous[0] + dx * along / distance,
@@ -499,40 +519,42 @@ pub(crate) fn dabs(
         until_next = along - distance;
         previous = target;
     }
-    Ok(raw
-        .into_iter()
-        .map(|(point, distance, p)| {
-            let smooth = |v: f32| {
-                let v = v.clamp(0.0, 1.0);
-                v * v * (3.0 - 2.0 * v)
-            };
-            let start = if settings.taper_start > 0.0 && length > 0.0 {
-                smooth(distance / settings.taper_start)
-            } else {
-                1.0
-            };
-            let end = if settings.taper_end > 0.0 && length > 0.0 {
-                smooth((length - distance) / settings.taper_end)
-            } else {
-                1.0
-            };
-            let taper = start.min(end);
-            let p = settings.pressure_response(p);
-            let size_pressure = if settings.pressure_size { p } else { 1.0 };
-            let opacity_pressure = if settings.pressure_opacity { p } else { 1.0 };
-            let size_taper = if settings.taper_size { taper } else { 1.0 };
-            let opacity_taper = if settings.taper_opacity { taper } else { 1.0 };
-            Dab {
-                point: [
-                    point[0] - settings.texture_origin[0] as f32,
-                    point[1] - settings.texture_origin[1] as f32,
-                ],
-                document_point: point,
-                radius: settings.radius * size_pressure * size_taper,
-                opacity: opacity_pressure * opacity_taper,
-            }
-        })
-        .collect())
+    let mut prepared = Vec::new();
+    prepared
+        .try_reserve_exact(raw.len())
+        .map_err(|_| "Prepared stroke dab allocation failed")?;
+    for (point, distance, p) in raw {
+        let smooth = |v: f32| {
+            let v = v.clamp(0.0, 1.0);
+            v * v * (3.0 - 2.0 * v)
+        };
+        let start = if settings.taper_start > 0.0 && length > 0.0 {
+            smooth(distance / settings.taper_start)
+        } else {
+            1.0
+        };
+        let end = if settings.taper_end > 0.0 && length > 0.0 {
+            smooth((length - distance) / settings.taper_end)
+        } else {
+            1.0
+        };
+        let taper = start.min(end);
+        let p = settings.pressure_response(p);
+        let size_pressure = if settings.pressure_size { p } else { 1.0 };
+        let opacity_pressure = if settings.pressure_opacity { p } else { 1.0 };
+        let size_taper = if settings.taper_size { taper } else { 1.0 };
+        let opacity_taper = if settings.taper_opacity { taper } else { 1.0 };
+        prepared.push(Dab {
+            point: [
+                point[0] - settings.texture_origin[0] as f32,
+                point[1] - settings.texture_origin[1] as f32,
+            ],
+            document_point: point,
+            radius: settings.radius * size_pressure * size_taper,
+            opacity: opacity_pressure * opacity_taper,
+        });
+    }
+    Ok(prepared)
 }
 
 pub(crate) fn dab_bounds(dab: Dab) -> [i32; 4] {
@@ -735,10 +757,12 @@ fn accumulate(
         }
         let tip = base_tip.with_radius(dab.radius);
         let b = dab_bounds(dab);
-        let left = b[0].max(clip[0]);
-        let top = b[1].max(clip[1]);
-        let right = b[2].min(clip[2]);
-        let bottom = b[3].min(clip[3]);
+        let [left, top, right, bottom] = [
+            b[0].max(clip[0]),
+            b[1].max(clip[1]),
+            b[2].min(clip[2]),
+            b[3].min(clip[3]),
+        ];
         if left >= right || top >= bottom {
             continue;
         }
@@ -748,34 +772,70 @@ fn accumulate(
                 let tile = coverage
                     .entry((tx, ty))
                     .or_insert_with(|| vec![0; (TILE * TILE) as usize]);
-                let tile_x = (tx * TILE) as i32;
-                let tile_y = (ty * TILE) as i32;
-                let x0 = left.max(tile_x);
-                let x1 = right.min(tile_x + TILE as i32);
-                let y0 = top.max(tile_y);
-                let y1 = bottom.min(tile_y + TILE as i32);
-                for y in y0..y1 {
-                    let row = ((y - tile_y) as u32 * TILE) as usize;
-                    for x in x0..x1 {
-                        if polygon.is_some_and(|selection| {
-                            !crate::selection::contains(selection, x as f32 + 0.5, y as f32 + 0.5)
-                        }) {
-                            continue;
-                        }
-                        let alpha = tip.at(dab.document_point, x, y) * settings.flow;
-                        if alpha <= 0.0 {
-                            continue;
-                        }
-                        let alpha_byte = &mut tile[row + (x - tile_x) as usize];
-                        let old = *alpha_byte as f32 / 255.0;
-                        *alpha_byte =
-                            ((old + alpha * (dab.opacity - old).max(0.0)) * 255.0).round() as u8;
-                    }
-                }
+                visit_tile_dab(
+                    dab,
+                    tip,
+                    clip,
+                    [(tx * TILE) as i32, (ty * TILE) as i32],
+                    polygon,
+                    |at, amount| {
+                        tile[at] = accumulated8(tile[at], amount, settings.flow, dab.opacity);
+                    },
+                );
             }
         }
     }
     touched
+}
+
+/// A single admitted tile's memory-only coverage kernel, shared by the resident
+/// gesture and explicit backed-tile workers. Each invocation visits at most 256² pixels.
+fn visit_tile_dab(
+    dab: Dab,
+    tip: Tip,
+    clip: [i32; 4],
+    origin: [i32; 2],
+    polygon: Option<&[[f32; 2]]>,
+    mut visit: impl FnMut(usize, f32),
+) {
+    let b = dab_bounds(dab);
+    let [left, top, right, bottom] = [
+        b[0].max(clip[0]).max(origin[0]),
+        b[1].max(clip[1]).max(origin[1]),
+        b[2].min(clip[2]).min(origin[0] + TILE as i32),
+        b[3].min(clip[3]).min(origin[1] + TILE as i32),
+    ];
+    for y in top..bottom {
+        let row = ((y - origin[1]) as u32 * TILE) as usize;
+        for x in left..right {
+            if polygon
+                .is_some_and(|p| !crate::selection::contains(p, x as f32 + 0.5, y as f32 + 0.5))
+            {
+                continue;
+            }
+            visit(
+                row + (x - origin[0]) as usize,
+                tip.at(dab.document_point, x, y),
+            );
+        }
+    }
+}
+
+fn accumulated8(value: u8, amount: f32, flow: f32, opacity: f32) -> u8 {
+    let alpha = amount * flow;
+    if alpha <= 0.0 {
+        return value;
+    }
+    let old = value as f32 / 255.0;
+    ((old + alpha * (opacity - old).max(0.0)) * 255.0).round() as u8
+}
+fn accumulated16(value: u16, amount: f32, flow: f32, opacity: f32) -> u16 {
+    let alpha = amount as f64 * flow as f64;
+    if alpha <= 0.0 {
+        return value;
+    }
+    let old = value as f64 / 65535.0;
+    ((old + alpha * (opacity as f64 - old).max(0.0)) * 65535.0).round() as u16
 }
 
 fn apply_coverage16(
@@ -790,24 +850,38 @@ fn apply_coverage16(
         if coverage == 0 {
             continue;
         }
-        let alpha = coverage as f64 / 65535.0 * opacity as f64;
-        let old = [pixel[0], pixel[1], pixel[2], pixel[3]];
-        let mut src = color;
-        src[3] = (color[3] as f64 * alpha).round() as u16;
-        let result = if erase {
-            [
-                old[0],
-                old[1],
-                old[2],
-                (old[3] as f64 * (1.0 - src[3] as f64 / 65535.0)).round() as u16,
-            ]
-        } else {
-            crate::raster::blend16(old, src, 1.0, "normal")
-        };
+        let result = coverage_pixel16(
+            [pixel[0], pixel[1], pixel[2], pixel[3]],
+            coverage,
+            opacity,
+            color,
+            erase,
+        );
         nonzero |= result != [0; 4];
         pixel.copy_from_slice(&result);
     }
     nonzero
+}
+fn coverage_pixel16(
+    old: [u16; 4],
+    coverage: u16,
+    opacity: f32,
+    color: [u16; 4],
+    erase: bool,
+) -> [u16; 4] {
+    let alpha = coverage as f64 / 65535.0 * opacity as f64;
+    let mut src = color;
+    src[3] = (color[3] as f64 * alpha).round() as u16;
+    if erase {
+        [
+            old[0],
+            old[1],
+            old[2],
+            (old[3] as f64 * (1.0 - src[3] as f64 / 65535.0)).round() as u16,
+        ]
+    } else {
+        crate::raster::blend16(old, src, 1.0, "normal")
+    }
 }
 
 fn accumulate16(
@@ -825,10 +899,12 @@ fn accumulate16(
         }
         let tip = base_tip.with_radius(dab.radius);
         let b = dab_bounds(dab);
-        let left = b[0].max(clip[0]);
-        let top = b[1].max(clip[1]);
-        let right = b[2].min(clip[2]);
-        let bottom = b[3].min(clip[3]);
+        let [left, top, right, bottom] = [
+            b[0].max(clip[0]),
+            b[1].max(clip[1]),
+            b[2].min(clip[2]),
+            b[3].min(clip[3]),
+        ];
         if left >= right || top >= bottom {
             continue;
         }
@@ -838,26 +914,16 @@ fn accumulate16(
                 let tile = coverage
                     .entry((tx, ty))
                     .or_insert_with(|| vec![0; (TILE * TILE) as usize]);
-                let tile_x = (tx * TILE) as i32;
-                let tile_y = (ty * TILE) as i32;
-                for y in top.max(tile_y)..bottom.min(tile_y + TILE as i32) {
-                    let row = ((y - tile_y) as u32 * TILE) as usize;
-                    for x in left.max(tile_x)..right.min(tile_x + TILE as i32) {
-                        if polygon.is_some_and(|p| {
-                            !crate::selection::contains(p, x as f32 + 0.5, y as f32 + 0.5)
-                        }) {
-                            continue;
-                        }
-                        let alpha = tip.at(dab.document_point, x, y) as f64 * settings.flow as f64;
-                        if alpha <= 0.0 {
-                            continue;
-                        }
-                        let byte = &mut tile[row + (x - tile_x) as usize];
-                        let old = *byte as f64 / 65535.0;
-                        *byte = ((old + alpha * (dab.opacity as f64 - old).max(0.0)) * 65535.0)
-                            .round() as u16;
-                    }
-                }
+                visit_tile_dab(
+                    dab,
+                    tip,
+                    clip,
+                    [(tx * TILE) as i32, (ty * TILE) as i32],
+                    polygon,
+                    |at, amount| {
+                        tile[at] = accumulated16(tile[at], amount, settings.flow, dab.opacity);
+                    },
+                );
             }
         }
     }
@@ -930,20 +996,16 @@ impl Session {
         if visible {
             work_budget(&next, self.clip)?;
         }
-        let append = next.starts_with(&self.dabs);
-        let prefix = if append {
-            self.dabs.len()
-        } else {
-            self.coverage.clear();
-            self.coverage16.clear();
-            self.raster = self.baseline.clone();
-            0
-        };
-        self.last_update_dabs = next.len() - prefix;
+        let prefix = next
+            .iter()
+            .zip(&self.dabs)
+            .take_while(|(a, b)| a == b)
+            .count();
+        let append = prefix == self.dabs.len();
         self.last_update_bounds = if visible {
             next[prefix..]
                 .iter()
-                .chain(self.dabs.iter().filter(|_| !append))
+                .chain(&self.dabs[prefix..])
                 .map(|&dab| {
                     let b = dab_bounds(dab);
                     [
@@ -965,12 +1027,61 @@ impl Session {
         } else {
             None
         };
+        let mut clip = self.clip;
+        let replay = if visible && !append {
+            clip = self.last_update_bounds.map_or([0; 4], |b| {
+                let tile = TILE as i32;
+                [
+                    (b[0] / tile * tile).max(self.clip[0]),
+                    (b[1] / tile * tile).max(self.clip[1]),
+                    ((b[2] + tile - 1) / tile * tile).min(self.clip[2]),
+                    ((b[3] + tile - 1) / tile * tile).min(self.clip[3]),
+                ]
+            });
+            if clip[0] < clip[2] && clip[1] < clip[3] {
+                // A reshaped tail invalidates coverage only in these tiles. Rebuild
+                // their complete current coverage to retain quantized dab order.
+                for y in clip[1] as u32 / TILE..=(clip[3] - 1) as u32 / TILE {
+                    for x in clip[0] as u32 / TILE..=(clip[2] - 1) as u32 / TILE {
+                        let key = (x, y);
+                        self.coverage.remove(&key);
+                        self.coverage16.remove(&key);
+                        if self.baseline.depth == 16 {
+                            if let Some(tile) = self.baseline.samples16.get(&key) {
+                                self.raster.samples16.insert(key, tile.clone());
+                            } else {
+                                self.raster.samples16.remove(&key);
+                            }
+                        } else if let Some(tile) = self.baseline.tiles.get(&key) {
+                            self.raster.tiles.insert(key, tile.clone());
+                        } else {
+                            self.raster.tiles.remove(&key);
+                        }
+                    }
+                }
+            }
+            next.iter()
+                .copied()
+                .filter(|&dab| {
+                    let b = dab_bounds(dab);
+                    b[0].max(clip[0]) < b[2].min(clip[2]) && b[1].max(clip[1]) < b[3].min(clip[3])
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let update = if visible && !append {
+            replay.as_slice()
+        } else {
+            &next[prefix..]
+        };
+        self.last_update_dabs = update.len();
         if visible && self.baseline.depth == 16 {
             let touched = accumulate16(
                 &mut self.coverage16,
-                &next[prefix..],
+                update,
                 self.settings,
-                self.clip,
+                clip,
                 self.polygon.as_deref(),
             );
             for key in touched {
@@ -1000,9 +1111,9 @@ impl Session {
         if visible {
             let touched = accumulate(
                 &mut self.coverage,
-                &next[prefix..],
+                update,
                 self.settings,
-                self.clip,
+                clip,
                 self.polygon.as_deref(),
             );
             for key in touched {

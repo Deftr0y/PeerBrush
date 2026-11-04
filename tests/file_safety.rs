@@ -47,6 +47,53 @@ fn paint(s: &server::Shared, value: u16) {
 fn png(s: &server::Shared) -> Vec<u8> {
     s.lock().unwrap().doc.export_png().unwrap()
 }
+
+#[test]
+fn impossible_raw_psd_and_psb_saves_reject_before_replacing_files_or_work() {
+    for depth in [8, 16] {
+        for extension in ["psd", "psb"] {
+            let directory = Directory::new();
+            let path = directory.0.join(format!("artwork.{extension}"));
+            let shared = fixture(depth);
+            server::save(&shared, &path).unwrap();
+            let original = fs::read(&path).unwrap();
+            let (before, saved_revision, file_version, source_path, history) = {
+                let mut engine = shared.lock().unwrap();
+                // This valid sparse canvas needs over 256 MiB of raw standard
+                // channels even at eight bits, before sources or record metadata.
+                engine.doc.width = 8192;
+                engine.doc.height = 4096;
+                engine.doc.layers[0].pixels =
+                    peerbrush::raster::Raster::new_depth(8192, 4096, depth);
+                engine.doc.layers[0]
+                    .pixels
+                    .set16(2, 3, [12345, 23457, 34569, 50001]);
+                engine.doc.revision += 1;
+                (
+                    serde_json::to_value(&engine.doc).unwrap(),
+                    engine.saved_revision,
+                    engine.file_version,
+                    engine.path.clone(),
+                    (engine.undo.len(), engine.redo.len()),
+                )
+            };
+            for _ in 0..2 {
+                assert!(server::save(&shared, &path)
+                    .unwrap_err()
+                    .contains("Uncompressed Photoshop channels alone"));
+                assert_eq!(fs::read(&path).unwrap(), original);
+                let engine = shared.lock().unwrap();
+                assert_eq!(serde_json::to_value(&engine.doc).unwrap(), before);
+                assert_eq!(engine.saved_revision, saved_revision);
+                assert_eq!(engine.file_version, file_version);
+                assert_eq!(engine.path, source_path);
+                assert_eq!((engine.undo.len(), engine.redo.len()), history);
+                assert_ne!(engine.saved_revision, engine.doc.revision);
+            }
+            assert!(versions(&directory).is_empty());
+        }
+    }
+}
 // Legacy instances and other editors can bypass modern open-file ownership.
 // Keep content-based publication protection independently exercised.
 fn legacy_open(s: &server::Shared, path: &std::path::Path) {

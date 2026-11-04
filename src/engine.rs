@@ -1,3 +1,11 @@
+pub(crate) mod authority;
+pub mod backed;
+pub mod native;
+pub(crate) mod reframe_scope;
+pub(crate) mod runtime_value;
+pub use runtime_value::RuntimeValue;
+pub mod scene;
+pub(crate) mod view;
 use crate::raster::{blend, check_size, Pixel, Raster};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -63,7 +71,7 @@ pub struct Layer {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub psd_metadata: Vec<crate::psd::LayerMetadata>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source: Option<crate::source::Source>,
+    pub source: Option<Arc<crate::source::Source>>,
     #[serde(skip, default = "id")]
     pub effect_key: String,
 }
@@ -382,23 +390,12 @@ impl Document {
         Ok((w, h, bytes, rect))
     }
     pub fn export_png(&self) -> Result<Vec<u8>, String> {
-        let profile = self
-            .icc_profile
-            .as_deref()
-            .map(Vec::as_slice)
-            .or_else(|| self.srgb_tagged.then(crate::color_profile::srgb_profile));
-        if self.bit_depth == 16 {
-            let image = crate::depth16::render(self)?;
-            return crate::raster::png16_with_profile(
-                image.width,
-                image.height,
-                &image.words,
-                profile,
-            );
-        }
-        let (w, h, bytes, _) =
-            self.preview_native8(None, self.width.max(self.height), None, false)?;
-        crate::raster::png_with_profile(w, h, &bytes, profile)
+        crate::production_export::render_document(
+            self,
+            crate::production_export::Format::Png,
+            crate::jpeg_xl::Options::default(),
+            &crate::production_export::Control::default(),
+        )
     }
 }
 
@@ -468,9 +465,11 @@ pub struct Engine {
     pub(crate) truncated_tasks: BTreeSet<(String, String)>,
     pub changes: Vec<(u64, Vec<Scope>)>,
     pub saved_revision: u64,
+    /// Runtime I/O survives engine clones; never serialized into project sources.
+    pub(crate) file_operations: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     pub feedback: BTreeMap<String, String>,
     pub path: Option<std::path::PathBuf>,
-    pub status: String,
+    pub status: runtime_value::RuntimeValue<String>,
     pub file_version: Option<crate::file_safety::Version>,
     pub(crate) file_ownership: Option<std::sync::Arc<crate::file_ownership::Ownership>>,
     pub capture_ui: Option<std::path::PathBuf>,
@@ -479,10 +478,11 @@ pub struct Engine {
     pub capture_panel: Option<String>,
     pub mcp_clients: BTreeMap<String, u64>,
     pub activity: String,
-    pub ai_change: Option<AiChange>,
+    pub ai_change: Option<runtime_value::RuntimeValue<AiChange>>,
     ai_serial: u64,
     pub focus_requested: bool,
     pub loading: Option<crate::loading::Control>,
+    pub saving: Option<crate::saving::Control>,
     pub brush_library: std::sync::Arc<std::sync::Mutex<crate::brush_library::Library>>,
     pub tool_settings: std::sync::Arc<std::sync::Mutex<crate::tool_settings::Store>>,
     pub filter_library: std::sync::Arc<std::sync::Mutex<crate::filter_library::Library>>,
@@ -491,6 +491,58 @@ pub struct Engine {
     pub(crate) proposals: Vec<crate::collaboration::Proposal>,
     pub(crate) recent_tasks: Vec<crate::collaboration::TaskRecord>,
     pub(crate) code_jobs: Vec<crate::code::Job>,
+}
+impl Engine {
+    /// An explicit resident-only route. Native callers must use a captured
+    /// source/metadata view and a prepared worker instead of materializing pixels.
+    pub(crate) fn resident(&self) -> Result<&Document, String> {
+        Ok(&self.doc)
+    }
+    pub(crate) fn into_resident_document(self) -> Result<Document, String> {
+        Ok(self.doc)
+    }
+    /// Isolated edit against the captured revision. Keep the live write guards
+    /// and preset resolution; the draft needs no earlier history or file owner.
+    pub(crate) fn resident_draft(&self) -> Result<Self, String> {
+        self.ensure_write_available()?;
+        let mut draft = Self::from_document(self.resident()?.clone());
+        draft.project_id = self.project_id.clone();
+        draft.leases = self.leases.clone();
+        draft.saving = self.saving.clone();
+        draft.brush_library = self.brush_library.clone();
+        draft.filter_library = self.filter_library.clone();
+        Ok(draft)
+    }
+    pub(crate) fn doc_snapshot(&self) -> view::DocumentSnapshot {
+        self.doc.clone().into()
+    }
+    pub(crate) fn history_lengths(&self) -> [usize; 2] {
+        [self.undo.len(), self.redo.len()]
+    }
+    pub(crate) fn history_entries(&self) -> authority::HistoryEntries<'_> {
+        authority::HistoryEntries::Resident(self.undo.iter())
+    }
+    /// Capture strong immutable owners under the engine lock; staging and source
+    /// I/O must happen only after releasing that lock and the root/registry locks.
+    pub fn capture_scene(
+        &self,
+        preview: Option<&Document>,
+    ) -> Result<scene::CapturedScene, String> {
+        if self.closed {
+            return Err("Cannot capture a closed project".into());
+        }
+        let document = preview.unwrap_or(&self.doc);
+        if document.id != self.doc.id || document.revision != self.doc.revision {
+            return Err("Preview does not belong to the captured project revision".into());
+        }
+        Ok(scene::CapturedScene::from_parts(
+            document.clone(),
+            self.project_id.clone(),
+            self.leases.clone(),
+            self.file_version,
+            self.file_ownership.clone(),
+        ))
+    }
 }
 fn num(v: &Value, key: &str, default: f64) -> f64 {
     v.get(key).and_then(Value::as_f64).unwrap_or(default)
@@ -521,6 +573,35 @@ pub fn rect(v: &Value) -> Option<[i32; 4]> {
         out[i] = n as i32;
     }
     (out[2] >= out[0] && out[3] >= out[1]).then_some(out)
+}
+
+pub(crate) fn activity_tool(command: &Value) -> &'static str {
+    match text(command, "op", "") {
+        "paint" if command["erase"] == true => "eraser",
+        "paint.clear_selection" => "eraser",
+        "paint" => "brush",
+        "smudge" => "smudge",
+        "clone" => "clone",
+        "heal" => "heal",
+        "crop" => "selection",
+        "canvas.resize" | "image.resize" | "resize" => "scale",
+        "liquify.stroke" => "liquify",
+        "adjustment.add" => "effects",
+        op if op.starts_with("source.") => "layers",
+        op if op.starts_with("path.") => "pen",
+        "move" => "move",
+        "transform" if num(command, "angle", 0.0) != 0.0 => "rotate",
+        "transform" => "scale",
+        "image.place" | "image.import" | "image.paste" | "image.patch" => "place",
+        "layer.update" if command.get("opacity").is_some() => "opacity",
+        "fill" | "paint.fill" => "fill",
+        op if op.starts_with("effect.") || op.starts_with("filter.") => "effects",
+        op if op.starts_with("mask.") => "mask",
+        "selection" => "selection",
+        op if op.starts_with("selection.") => "selection",
+        op if op.starts_with("layer.") => "layers",
+        _ => "canvas",
+    }
 }
 
 #[derive(Default)]
@@ -568,8 +649,7 @@ impl SelectionGesture {
 impl Engine {
     /// Transient visual feedback uses the same commands as a committed edit, without touching history or shared state.
     pub fn preview_edits(doc: Document, commands: &[Value]) -> Result<Document, String> {
-        let mut engine = Self::new();
-        engine.doc = doc;
+        let mut engine = Self::from_document(doc);
         let commands = engine
             .filter_library
             .lock()
@@ -601,21 +681,25 @@ impl Engine {
             crate::depth16::validate_budget(&engine.doc)?;
         }
         crate::effects::invalidate(&mut engine.doc, &commands);
-        Ok(engine.doc)
+        engine.into_resident_document()
     }
     pub fn new() -> Self {
+        Self::from_document(Document::new(1024, 768).unwrap())
+    }
+    pub(crate) fn from_document(doc: Document) -> Self {
         Self {
             project_id: id(),
             closed: false,
             workspace: None,
             workspace_owner: None,
-            doc: Document::new(1024, 768).unwrap(),
+            doc,
             leases: vec![],
             undo: vec![],
             redo: vec![],
             truncated_tasks: BTreeSet::new(),
             changes: vec![],
             saved_revision: 0,
+            file_operations: Default::default(),
             feedback: BTreeMap::new(),
             path: None,
             status: "Ready".into(),
@@ -630,6 +714,7 @@ impl Engine {
             ai_serial: 0,
             focus_requested: false,
             loading: None,
+            saving: None,
             brush_library: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::brush_library::Library::default(),
             )),
@@ -663,19 +748,29 @@ impl Engine {
             Ok(())
         }
     }
+    pub(crate) fn ensure_write_available(&self) -> Result<(), String> {
+        self.ensure_open()?;
+        if let Some(save) = &self.saving {
+            save.ensure_editable()?;
+        }
+        Ok(())
+    }
     pub(crate) fn mark_ai(&mut self, actor: &str, label: &str, tool: &str, scopes: Vec<Scope>) {
         if actor == "human" {
             return;
         }
         self.ai_serial += 1;
-        self.ai_change = Some(AiChange {
-            serial: self.ai_serial,
-            actor: actor.into(),
-            label: label.into(),
-            tool: tool.into(),
-            scopes,
-            at: now(),
-        });
+        self.ai_change = Some(
+            AiChange {
+                serial: self.ai_serial,
+                actor: actor.into(),
+                label: label.into(),
+                tool: tool.into(),
+                scopes,
+                at: now(),
+            }
+            .into(),
+        );
     }
     pub fn state(&mut self) -> Value {
         let mut result = self.state_core();
@@ -687,7 +782,7 @@ impl Engine {
     }
     fn state_core(&mut self) -> Value {
         self.expire();
-        json!({"loading":self.loading.as_ref().map(|c|{let s=c.status();json!({"stage":s.stage,"completed":s.completed,"total":s.total})}),"file_status":self.status,"document":{"id":self.doc.id,"name":self.doc.name,"width":self.doc.width,"height":self.doc.height,"revision":self.doc.revision,"bit_depth":self.doc.bit_depth,"color_profile":crate::color_profile::summary(self.doc.icc_profile.as_deref().map(Vec::as_slice)),"read_only":self.doc.read_only,"warnings":self.doc.warnings,"source_structure":self.doc.source_structure,"source_patterns":self.doc.source_patterns,"filters":self.doc.filters,"selection":self.doc.selection,"selection_polygon":crate::selection::polygon(&self.doc)},"layers":self.doc.layers.iter().map(|l|json!({"id":l.id,"name":l.name,"kind":l.kind,"parent":l.parent,"clip_to":l.clip_to,"visible":l.visible,"locked":l.locked,"opacity":l.opacity,"blend":l.blend,"bounds":[l.x,l.y,l.x+l.pixels.width as i32,l.y+l.pixels.height as i32],"effects":l.effects,"source":l.source,"path_document_nodes":crate::path::observe(l),"transform_source":crate::retained::observe(&l.pixels),"mask":l.mask.as_ref().map(|m|json!({"enabled":m.enabled,"linked":m.linked,"steps":m.steps.iter().map(|s|json!({"id":s.id,"kind":s.kind,"enabled":s.enabled,"weight":s.weight,"value":s.value,"settings":s.settings,"transform_source":crate::retained::observe(&s.pixels)})).collect::<Vec<_>>()}))})).collect::<Vec<_>>(),"reservations":self.leases,"ai_change":self.ai_change,"dirty":self.doc.revision!=self.saved_revision})
+        json!({"saving":self.saving.as_ref().map(|c| c.status()),"loading":self.loading.as_ref().map(|c|{let s=c.status();json!({"stage":s.stage,"completed":s.completed,"total":s.total})}),"file_status":self.status,"document":{"id":self.doc.id,"name":self.doc.name,"width":self.doc.width,"height":self.doc.height,"revision":self.doc.revision,"bit_depth":self.doc.bit_depth,"color_profile":crate::color_profile::summary(self.doc.icc_profile.as_deref().map(Vec::as_slice)),"read_only":self.doc.read_only,"warnings":self.doc.warnings,"source_structure":self.doc.source_structure,"source_patterns":self.doc.source_patterns,"filters":self.doc.filters,"selection":self.doc.selection,"selection_polygon":crate::selection::polygon(&self.doc)},"layers":self.doc.layers.iter().map(|l|json!({"id":l.id,"name":l.name,"kind":l.kind,"parent":l.parent,"clip_to":l.clip_to,"visible":l.visible,"locked":l.locked,"opacity":l.opacity,"blend":l.blend,"bounds":[l.x,l.y,l.x+l.pixels.width as i32,l.y+l.pixels.height as i32],"effects":l.effects,"source":l.source,"path_document_nodes":crate::path::observe(l),"transform_source":crate::retained::observe(&l.pixels),"mask":l.mask.as_ref().map(|m|json!({"enabled":m.enabled,"linked":m.linked,"steps":m.steps.iter().map(|s|json!({"id":s.id,"kind":s.kind,"enabled":s.enabled,"weight":s.weight,"value":s.value,"settings":s.settings,"transform_source":crate::retained::observe(&s.pixels)})).collect::<Vec<_>>()}))})).collect::<Vec<_>>(),"reservations":self.leases,"ai_change":self.ai_change,"dirty":self.doc.revision!=self.saved_revision})
     }
     pub fn scope_overlap(&self, a: &Scope, b: &Scope) -> bool {
         let visibility = |s: &Scope| {
@@ -757,7 +852,7 @@ impl Engine {
         Ok(lease)
     }
     pub fn check(&mut self, actor: &str, scopes: &[Scope]) -> Result<(), String> {
-        self.ensure_open()?;
+        self.ensure_write_available()?;
         self.expire();
         for l in &self.leases {
             if l.owner != actor
@@ -775,6 +870,31 @@ impl Engine {
     }
     pub fn scopes(&self, c: &Value) -> Vec<Scope> {
         let mut scopes = self.command_scopes(c);
+        if self.doc.selection.is_some()
+            && matches!(c["op"].as_str(), Some("move" | "transform"))
+            && c["selection_only"] != false
+        {
+            if let Some(layer) = c["layer"]
+                .as_str()
+                .and_then(|id| self.doc.layers.iter().find(|layer| layer.id == id))
+            {
+                if let Some(mask) = &layer.mask {
+                    for scope in &mut scopes {
+                        if let Some(area) = &mut scope.rect {
+                            *area = reframe_scope::widen(
+                                *area,
+                                [layer.x, layer.y],
+                                [layer.pixels.width, layer.pixels.height],
+                                mask.linked,
+                                mask.steps
+                                    .iter()
+                                    .map(|step| [step.pixels.width, step.pixels.height]),
+                            );
+                        }
+                    }
+                }
+            }
+        }
         if self.doc.selection.is_some()
             && (c["op"] == "paint.clear_selection"
                 || (matches!(c["op"].as_str(), Some("move" | "transform"))
@@ -1002,11 +1122,63 @@ impl Engine {
                 .and_then(|_| rect(&c["rect"]))
                 .or(self.doc.selection);
         }
+        if op == "transform" && c.get("warp").is_some() {
+            match crate::warp::parse(c) {
+                Ok(Some(_)) => {
+                    let area = self
+                        .doc
+                        .selection
+                        .filter(|_| c["selection_only"] != false)
+                        .and_then(|b| {
+                            crate::warp::CommandMap::new(c, [0., 0.])
+                                .and_then(|m| m.bounds(b.map(|v| v as f64)))
+                                .ok()
+                                .map(|p| {
+                                    [
+                                        b[0].min(p[0].floor() as i32),
+                                        b[1].min(p[1].floor() as i32),
+                                        b[2].max(p[2].ceil() as i32),
+                                        b[3].max(p[3].ceil() as i32),
+                                    ]
+                                })
+                        });
+                    return vec![Scope { target, rect: area }];
+                }
+                Err(_) => return vec![Scope { target, rect: None }],
+                Ok(None) => {}
+            }
+        }
+        if op == "transform" && c.get("projective").is_some() {
+            match crate::projective::combined(c) {
+                Ok(Some(map)) => {
+                    let area = self
+                        .doc
+                        .selection
+                        .filter(|_| c["selection_only"] != false)
+                        .and_then(|b| {
+                            map.bounds(b.map(|v| v as f64)).ok().map(|p| {
+                                [
+                                    b[0].min(p[0].floor() as i32),
+                                    b[1].min(p[1].floor() as i32),
+                                    b[2].max(p[2].ceil() as i32),
+                                    b[3].max(p[3].ceil() as i32),
+                                ]
+                            })
+                        });
+                    return vec![Scope { target, rect: area }];
+                }
+                Err(_) => return vec![Scope { target, rect: None }],
+                Ok(None) => {}
+            }
+        }
         if ["move", "transform"].contains(&op) && c["selection_only"] != false {
             if let Some(b) = self.doc.selection {
                 let moving = op == "move";
-                let dx = if moving { num(c, "dx", 0.).round() } else { 0. };
-                let dy = if moving { num(c, "dy", 0.).round() } else { 0. };
+                let [dx, dy] = if moving {
+                    [num(c, "dx", 0.).round(), num(c, "dy", 0.).round()]
+                } else {
+                    crate::transform::translation(c).unwrap_or([0., 0.])
+                };
                 let angle = if moving {
                     0.
                 } else {
@@ -1024,16 +1196,66 @@ impl Engine {
                 let py = c["pivot"][1]
                     .as_f64()
                     .unwrap_or((b[1] as f64 + b[3] as f64) / 2.);
+                let shear = crate::transform::selected_shear(c).unwrap_or([0., 0.]);
+                let linear = [cos * sx, sin * sx, -sin * sy, cos * sy];
+                let skew = crate::transform::skewed(linear, c)
+                    .ok()
+                    .filter(|_| shear != [0., 0.]);
                 let mut out = b;
                 for p in crate::selection::rectangle(b) {
-                    let x = px + (p[0] as f64 - px) * sx * cos - (p[1] as f64 - py) * sy * sin + dx;
-                    let y = py + (p[0] as f64 - px) * sx * sin + (p[1] as f64 - py) * sy * cos + dy;
+                    let (x, y) = if let Some([a, bb, cc, d]) = skew {
+                        (
+                            px + a * (p[0] as f64 - px) + cc * (p[1] as f64 - py) + dx,
+                            py + bb * (p[0] as f64 - px) + d * (p[1] as f64 - py) + dy,
+                        )
+                    } else {
+                        (
+                            px + (p[0] as f64 - px) * sx * cos - (p[1] as f64 - py) * sy * sin + dx,
+                            py + (p[0] as f64 - px) * sx * sin + (p[1] as f64 - py) * sy * cos + dy,
+                        )
+                    };
                     out = [
                         out[0].min(x.floor() as i32),
                         out[1].min(y.floor() as i32),
                         out[2].max(x.ceil() as i32),
                         out[3].max(y.ceil() as i32),
                     ];
+                }
+                if shear != [0., 0.] || c["fractional_translation"] == true {
+                    let (mut sin, mut cos) = (num(c, "angle", 0.) as f32).to_radians().sin_cos();
+                    if sin.abs() < 0.000001 {
+                        sin = 0.;
+                    }
+                    if cos.abs() < 0.000001 {
+                        cos = 0.;
+                    }
+                    let rectangle = crate::selection::rectangle(b);
+                    let covered = self
+                        .doc
+                        .selection_coverage
+                        .as_ref()
+                        .is_some_and(|coverage| coverage.bounds == b);
+                    let points = if covered {
+                        rectangle.as_slice()
+                    } else {
+                        crate::selection::polygon(&self.doc).unwrap_or(&rectangle)
+                    };
+                    for &p in points {
+                        let [x, y] = crate::transform::selected_point(
+                            p,
+                            [px as f32, py as f32],
+                            [dx as f32, dy as f32],
+                            [sx as f32, sy as f32],
+                            [sin, cos],
+                            shear,
+                        );
+                        out = [
+                            out[0].min(x.floor() as i32),
+                            out[1].min(y.floor() as i32),
+                            out[2].max(x.ceil() as i32),
+                            out[3].max(y.ceil() as i32),
+                        ];
+                    }
                 }
                 area = Some(out);
             }
@@ -1073,7 +1295,7 @@ impl Engine {
         gesture: Option<&str>,
     ) -> Result<Value, String> {
         self.edit_transaction(
-            actor, commands, expected, task, label, gesture, None, None, None, None,
+            actor, commands, expected, task, label, gesture, None, None, None, None, None,
         )
     }
     pub(crate) fn edit_prepared_merge(
@@ -1092,6 +1314,7 @@ impl Engine {
             "Merge layers",
             None,
             Some(prepared),
+            None,
             None,
             None,
             None,
@@ -1115,6 +1338,7 @@ impl Engine {
             None,
             None,
             Some(snapshot.clone()),
+            None,
             None,
             None,
         )
@@ -1141,6 +1365,7 @@ impl Engine {
             None,
             Some(doc),
             None,
+            None,
         )
     }
     pub(crate) fn commit_code(
@@ -1161,6 +1386,7 @@ impl Engine {
             None,
             None,
             Some(doc),
+            None,
             None,
         )
     }
@@ -1189,6 +1415,7 @@ impl Engine {
             None,
             None,
             Some(pixels.into()),
+            None,
         )
     }
     fn validate_source(&self, c: &Value) -> Result<(), String> {
@@ -1237,8 +1464,9 @@ impl Engine {
         mut clipboard: Option<crate::layer_clipboard::Layers>,
         prepared_doc: Option<Document>,
         mut imports: Option<std::collections::VecDeque<crate::image_import::Prepared>>,
+        pixels: Option<backed::PreparedPixels>,
     ) -> Result<Value, String> {
-        self.ensure_open()?;
+        self.ensure_write_available()?;
         if self.doc.read_only {
             return Err("This PSD is read-only. Create a compatible copy first.".into());
         }
@@ -1257,6 +1485,12 @@ impl Engine {
             .resolve_commands(&commands)?;
         let resolved = crate::transform::resolve_commands(resolved)?;
         let commands = resolved.as_slice();
+        if let Some(pixels) = &pixels {
+            if commands.len() != 1 {
+                return Err("Prepared pixels require exactly one command".into());
+            }
+            pixels.validate(&self.doc, &commands[0])?;
+        }
         let before = self.doc.clone();
         let mut scopes = vec![];
         for c in commands {
@@ -1342,6 +1576,8 @@ impl Engine {
                     } else {
                         self.apply(c)
                     }
+                } else if let Some(pixels) = &pixels {
+                    self.apply_pixels(c, Some(pixels))
                 } else {
                     self.apply(c)
                 };
@@ -1393,6 +1629,12 @@ impl Engine {
                 return Err(error);
             }
         }
+        if let Some(pixels) = &pixels {
+            if let Err(error) = pixels.check_cancelled() {
+                self.doc = before;
+                return Err(error);
+            }
+        }
         crate::effects::invalidate(&mut self.doc, commands);
         self.doc.revision = before.revision + 1;
         let revision = self.doc.revision;
@@ -1436,32 +1678,7 @@ impl Engine {
             visual_scopes
         };
         let command = &commands[commands.len() - 1];
-        let tool = match text(command, "op", "") {
-            "paint" if command["erase"] == true => "eraser",
-            "paint.clear_selection" => "eraser",
-            "paint" => "brush",
-            "smudge" => "smudge",
-            "clone" => "clone",
-            "heal" => "heal",
-            "crop" => "selection",
-            "canvas.resize" | "image.resize" | "resize" => "scale",
-            "liquify.stroke" => "liquify",
-            "adjustment.add" => "effects",
-            op if op.starts_with("source.") => "layers",
-            op if op.starts_with("path.") => "pen",
-            "move" => "move",
-            "transform" if num(command, "angle", 0.0) != 0.0 => "rotate",
-            "transform" => "scale",
-            "image.place" | "image.import" | "image.paste" | "image.patch" => "place",
-            "layer.update" if command.get("opacity").is_some() => "opacity",
-            "fill" | "paint.fill" => "fill",
-            op if op.starts_with("effect.") || op.starts_with("filter.") => "effects",
-            op if op.starts_with("mask.") => "mask",
-            "selection" => "selection",
-            op if op.starts_with("selection.") => "selection",
-            op if op.starts_with("layer.") => "layers",
-            _ => "canvas",
-        };
+        let tool = activity_tool(command);
         self.mark_ai(actor, label, tool, visual_scopes);
         let continuous = gesture.is_some()
             && self.undo.last().is_some_and(|h| {
@@ -1505,15 +1722,23 @@ impl Engine {
         )
     }
     fn apply(&mut self, c: &Value) -> Result<(), String> {
+        self.apply_pixels(c, None)
+    }
+    fn apply_pixels(
+        &mut self,
+        c: &Value,
+        pixels: Option<&backed::PreparedPixels>,
+    ) -> Result<(), String> {
         if c["op"] != "selection.wand_update" && !(c["op"] == "selection" && c["kind"] == "wand") {
             self.doc.wand_source = None;
         }
         // Reframe before taking native-original and soft-selection baselines. The
         // outer transaction still owns the complete pre-gesture undo snapshot.
         self.doc.ensure_depth();
+        crate::fill::prepare_visual_baseline(&mut self.doc, c)?;
         crate::edit_bounds::prepare(&mut self.doc, c)?;
         let before = crate::retained::has_originals(&self.doc).then(|| self.doc.clone());
-        self.apply_retained(c)?;
+        self.apply_retained(c, pixels)?;
         if let Some(before) = before {
             let whole_transform = matches!(c["op"].as_str(), Some("move" | "transform"))
                 && (before.selection.is_none() || c["selection_only"] == false);
@@ -1523,7 +1748,11 @@ impl Engine {
         }
         Ok(())
     }
-    fn apply_retained(&mut self, c: &Value) -> Result<(), String> {
+    fn apply_retained(
+        &mut self,
+        c: &Value,
+        pixels: Option<&backed::PreparedPixels>,
+    ) -> Result<(), String> {
         if c.get("source_revision")
             .is_some_and(|r| r.as_u64() != Some(self.doc.revision))
             || c.get("document_id")
@@ -1556,14 +1785,18 @@ impl Engine {
                 .filter(|m| self.doc.selection == Some(m.bounds))
             {
                 let before = self.doc.clone();
-                self.apply_inner(c)?;
+                self.apply_inner(c, pixels)?;
                 crate::selection::restrict_document(&mut self.doc, &before, &coverage);
                 return Ok(());
             }
         }
-        self.apply_inner(c)
+        self.apply_inner(c, pixels)
     }
-    fn apply_inner(&mut self, c: &Value) -> Result<(), String> {
+    fn apply_inner(
+        &mut self,
+        c: &Value,
+        pixels: Option<&backed::PreparedPixels>,
+    ) -> Result<(), String> {
         let mut linked;
         let c = if matches!(c["op"].as_str(), Some("move" | "transform"))
             && c["mask"] == true
@@ -1793,6 +2026,11 @@ impl Engine {
             return Ok(());
         }
         if self.doc.layers[i].source.is_some() {
+            if op == "transform"
+                && (crate::projective::parse(c)?.is_some() || crate::warp::parse(c)?.is_some())
+            {
+                return Err("Rasterize the editable text/vector source at its native precision before Distort, Perspective or Warp".into());
+            }
             let mask = c["mask"] == true;
             if !mask
                 && matches!(
@@ -2057,7 +2295,7 @@ impl Engine {
                         id: id(),
                         kind: kind.into(),
                         enabled: true,
-                        settings,
+                        settings: settings.into(),
                     });
                 }
                 "effect.update" => {
@@ -2073,7 +2311,7 @@ impl Engine {
                         e.weight = crate::effects::command_weight(c)?;
                     }
                     if let Some(settings) = c.get("settings") {
-                        e.settings = crate::effects::normalized(&e.kind, settings)?;
+                        e.settings = crate::effects::normalized(&e.kind, settings)?.into();
                     }
                 }
                 "effect.delete" => {
@@ -2268,7 +2506,7 @@ impl Engine {
                     id: id(),
                     kind: "liquify".into(),
                     enabled: true,
-                    settings: crate::liquify::defaults(),
+                    settings: crate::liquify::defaults().into(),
                 });
                 l.effects.len() - 1
             };
@@ -2278,7 +2516,7 @@ impl Engine {
                 .ok_or("Invalid liquify stroke list")?
                 .push(stroke);
             crate::liquify::validate(&settings)?;
-            l.effects[at].settings = settings;
+            l.effects[at].settings = settings.into();
             return Ok(());
         }
         if op == "paint.fill" {
@@ -2536,7 +2774,16 @@ impl Engine {
             return Ok(());
         }
         if op == "pixels.replace" {
-            return crate::code::replace_pixels(&mut self.doc, c);
+            return if let Some(pixels) = pixels {
+                crate::code::replace_pixels_bytes(
+                    &mut self.doc,
+                    c,
+                    pixels.bytes(),
+                    crate::code::SampleOrder::Big,
+                )
+            } else {
+                crate::code::replace_pixels(&mut self.doc, c)
+            };
         }
         if op == "image.patch" {
             let path = text(c, "path", "");
@@ -2578,7 +2825,7 @@ impl Engine {
         Err(format!("Unsupported operation: {op}"))
     }
     pub fn undo(&mut self, actor: &str) -> Result<(), String> {
-        self.ensure_open()?;
+        self.ensure_write_available()?;
         let h = self.undo.last().ok_or("Nothing to undo")?.clone();
         if actor != "human" && h.actor != actor {
             return Err("Latest change belongs to another participant. Observe again or inspect selective task undo.".into());
@@ -2594,7 +2841,7 @@ impl Engine {
         Ok(())
     }
     pub fn redo(&mut self, actor: &str) -> Result<(), String> {
-        self.ensure_open()?;
+        self.ensure_write_available()?;
         let h = self.redo.last().ok_or("Nothing to redo")?.clone();
         if actor != "human" && h.actor != actor {
             return Err("Redo belongs to another participant".into());
@@ -2619,7 +2866,7 @@ impl Engine {
         mut doc: Document,
         path: Option<std::path::PathBuf>,
     ) -> Result<(), String> {
-        self.ensure_open()?;
+        self.ensure_write_available()?;
         if ![8, 16].contains(&doc.bit_depth) {
             return Err("Color depth must be 8 or 16 bits".into());
         }

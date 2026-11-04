@@ -6,6 +6,7 @@ use crate::{
     raster::Pixel,
 };
 use serde_json::Value;
+pub(crate) mod native_grid;
 pub(crate) mod regions;
 
 #[derive(Default)]

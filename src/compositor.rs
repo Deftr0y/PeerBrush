@@ -1,4 +1,6 @@
 //! Shared straight-alpha composition with clipping and backdrop-aware folders.
+pub(crate) mod native;
+pub(crate) mod region;
 use crate::{
     effects::Image,
     engine::Document,
@@ -636,7 +638,7 @@ mod tests {
                     id: id(),
                     kind: "invert".into(),
                     enabled: true,
-                    settings: json!({}),
+                    settings: json!({}).into(),
                 });
             }
             let mut adjustment = Layer::new("Adjustment", "adjustment", 9, 7);
@@ -647,7 +649,7 @@ mod tests {
                 id: id(),
                 kind: "adjust".into(),
                 enabled: true,
-                settings: json!({"brightness":0.15}),
+                settings: json!({"brightness":0.15}).into(),
             });
             if case % 4 == 0 {
                 adjustment.clip_to = Some(base.id.clone());

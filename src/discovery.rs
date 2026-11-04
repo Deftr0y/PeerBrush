@@ -130,6 +130,166 @@ pub fn discover() -> Result<Manifest, String> {
     serde_json::from_slice(&bytes)
         .map_err(|_| "PeerBrush discovery manifest is invalid; use Connect AI to refresh it".into())
 }
+
+#[derive(Serialize)]
+pub struct Status {
+    schema_version: u32,
+    product: &'static str,
+    application_version: &'static str,
+    manifest_status: &'static str,
+    recovery: &'static str,
+    stdio: Option<StdioRoute>,
+    connection: Option<crate::server::ConnectionProbe>,
+    clients: Vec<ClientStatus>,
+}
+
+#[derive(Serialize)]
+struct StdioRoute {
+    command: PathBuf,
+    args: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct ClientStatus {
+    client: &'static str,
+    configuration: PathBuf,
+    category: &'static str,
+    recovery: &'static str,
+    server_name: Option<String>,
+}
+
+/// Diagnose only the published route, without launching an app or changing clients.
+pub fn status(requested_state: Option<&Path>) -> Result<Status, String> {
+    Ok(status_at(&native_paths()?, requested_state))
+}
+
+/// Inject destinations so acceptance never reads or modifies real client settings.
+pub fn status_at(paths: &DiscoveryPaths, requested_state: Option<&Path>) -> Status {
+    let mut report = Status {
+        schema_version: 1,
+        product: "PeerBrush",
+        application_version: env!("CARGO_PKG_VERSION"),
+        manifest_status: "invalid",
+        recovery: "Use Connect AI in PeerBrush to publish or refresh the local discovery manifest.",
+        stdio: None,
+        connection: None,
+        clients: Vec::new(),
+    };
+    if !paths.manifest.is_absolute()
+        || !crate::packaged::external_config_is_visible(&paths.manifest).unwrap_or(false)
+    {
+        report.manifest_status = "inaccessible";
+        report.recovery =
+            "Use AI connection settings for manual configuration outside package-isolated AppData.";
+        return report;
+    }
+    let bytes = match read_existing(&paths.manifest) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => {
+            report.manifest_status = "missing";
+            return report;
+        }
+        Err(_) => {
+            report.manifest_status = "unreadable";
+            return report;
+        }
+    };
+    let Ok(manifest) = serde_json::from_slice::<Manifest>(&bytes) else {
+        return report;
+    };
+    if manifest.schema_version != 1
+        || manifest.name != "PeerBrush"
+        || manifest.transport != "stdio"
+        || semver::Version::parse(&manifest.version).is_err()
+        || manifest.http_endpoint_template != "{connection.url}/mcp"
+        || !manifest.command.is_absolute()
+    {
+        return report;
+    }
+    let state = match manifest.args.as_slice() {
+        [mode, option, path] if mode == "mcp" && option == "--state-dir" => PathBuf::from(path),
+        _ => return report,
+    };
+    if !state.is_absolute() || manifest.connection_file != state.join("connection.json") {
+        return report;
+    }
+    if !crate::packaged::external_config_is_visible(&state).unwrap_or(false) {
+        report.manifest_status = "state_inaccessible";
+        report.recovery = "Use Connect AI from installed PeerBrush to publish a workspace outside package-isolated AppData, or select an accessible --state-dir.";
+        return report;
+    }
+    if let Some(requested) = requested_state {
+        let selected = fs::canonicalize(&state).unwrap_or_else(|_| state.clone());
+        let requested =
+            std::path::absolute(requested).map(|path| fs::canonicalize(&path).unwrap_or(path));
+        if !requested.is_ok_and(|path| path == selected) {
+            report.manifest_status = "state_mismatch";
+            report.recovery = "Use the exact --state-dir in the published stdio arguments, or omit that option when requesting discovery status.";
+            return report;
+        }
+    }
+    if !(manifest.command.is_file() || crate::packaged::is_app_execution_alias(&manifest.command)) {
+        report.manifest_status = "executable_missing";
+        return report;
+    }
+    report.manifest_status = "ready";
+    report.recovery = "Use the exact stdio command and arguments below; initialize, list tools, then observe before editing. Client approval may still be required.";
+    report.clients = paths.clients.iter().map(|client| {
+        let mut result = ClientStatus {
+            client: client.kind.name(),
+            configuration: client.path.clone(),
+            category: "invalid",
+            recovery: "Review this client's configuration, then use Connect AI to refresh it; no settings were changed.",
+            server_name: None,
+        };
+        if !client.path.is_absolute()
+            || !crate::packaged::external_config_is_visible(&client.path).unwrap_or(false)
+        {
+            result.category = "manual_setup_required";
+            result.recovery = "Use AI connection settings for manual configuration; package isolation prevents verified external registration.";
+            return result;
+        }
+        let bytes = match read_existing(&client.path) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => {
+                result.category = if client.detected { "missing" } else { "not_detected" };
+                return result;
+            }
+            Err(_) => {
+                result.category = "unreadable";
+                return result;
+            }
+        };
+        let Ok(text) = std::str::from_utf8(&bytes) else { return result; };
+        let Some(command) = manifest.command.to_str() else { return result; };
+        let change = match client.kind {
+            ClientKind::Codex => register_toml(text, command, &manifest.args, &state),
+            kind => register_json(text, kind, command, &manifest.args, &state),
+        };
+        if let Ok(change) = change {
+            result.server_name = Some(change.name);
+            result.category = if change.blocked { "blocked" }
+                else if change.text.as_bytes() == bytes.as_slice() { "matching" }
+                else { "needs_refresh" };
+            if change.blocked {
+                result.recovery = "Review this client's MCP allow/exclude policy and approve PeerBrush; the policy was not changed.";
+            } else if result.category == "matching" {
+                result.recovery = "Reload or restart this client and approve PeerBrush if prompted; matching registration does not prove a live client connection.";
+            }
+        }
+        result
+    }).collect();
+    let connection = crate::server::probe_connection(&state);
+    if connection.category != crate::server::ConnectionCategory::Ready {
+        report.recovery = connection.recovery;
+    }
+    report.connection = Some(connection);
+    report.stdio = Some(StdioRoute {
+        command: manifest.command,
+        args: manifest.args,
+    });
+    report
+}
 pub fn connect(executable: &Path, state_dir: &Path) -> Result<Report, String> {
     let mut paths = native_paths()?;
     if !crate::packaged::external_config_is_visible(&paths.manifest)? {

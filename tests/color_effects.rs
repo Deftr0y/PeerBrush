@@ -302,11 +302,11 @@ fn effects_enforce_derived_and_transient_budgets_before_rendering() {
         id: "large".into(),
         kind: "blur".into(),
         enabled: true,
-        settings: json!({"radius":1}),
+        settings: json!({"radius":1}).into(),
     });
     assert!(effects::validate_budget(&doc).is_err());
     doc.layers[0].effects[0].kind = "hsl".into();
-    doc.layers[0].effects[0].settings = effects::defaults("hsl");
+    doc.layers[0].effects[0].settings = effects::defaults("hsl").into();
     assert!(effects::validate_budget(&doc).is_ok());
     for _ in 0..2 {
         let mut layer = Layer::new("large", "paint", 8192, 4096);

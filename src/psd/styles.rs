@@ -610,7 +610,7 @@ fn solid_stroke(items: &Map<String, Value>) -> Result<crate::effects::Effect, St
         kind: "stroke".into(),
         enabled: master && enabled && present,
         weight: 1.,
-        settings,
+        settings: settings.into(),
     })
 }
 // Shadow fields follow psd-tools/api/effects.py and Krita's ASL serializer.
@@ -760,7 +760,7 @@ fn hard_shadow(root: &Value) -> Result<crate::effects::Effect, String> {
         kind: kind.into(),
         enabled: master && enabled && present,
         weight: 1.,
-        settings,
+        settings: settings.into(),
     })
 }
 fn pattern_overlay(
@@ -870,7 +870,7 @@ fn pattern_overlay(
             kind: "pattern_overlay".into(),
             enabled: master && enabled && present,
             weight: 1.,
-            settings,
+            settings: settings.into(),
         },
         index,
     ))
@@ -1117,7 +1117,7 @@ fn gradient_overlay(root: &Value) -> Result<Vec<crate::effects::Effect>, String>
         kind: "gradient_overlay".into(),
         enabled: master && enabled && present,
         weight: 1.,
-        settings,
+        settings: settings.into(),
     }])
 }
 /// Small explicit import subset. The caller must verify the entire saved composite.
@@ -1206,7 +1206,7 @@ fn color_overlay_root(root: &Value) -> Result<Vec<crate::effects::Effect>, Strin
             kind: "color_overlay".into(),
             enabled: master && enabled && present,
             weight: 1.,
-            settings,
+            settings: settings.into(),
         });
     }
     Ok(effects)
@@ -1433,6 +1433,8 @@ mod tests {
         } else {
             layout.block(&mut info).unwrap();
             info.block().unwrap();
+            assert_eq!(info.bytes(8).unwrap(), b"8BIMMt16");
+            assert!(layout.tag_block(&mut info, b"Mt16").unwrap().is_empty());
             assert_eq!(info.bytes(4).unwrap(), b"8BIM");
             assert_eq!(info.bytes(4).unwrap(), b"Lr16");
             let length = section_start + info.pos;

@@ -47,7 +47,7 @@ pub fn add(doc: &mut Document, c: &Value) -> Result<String, String> {
         id: crate::engine::id(),
         kind: kind.into(),
         enabled: true,
-        settings,
+        settings: settings.into(),
     });
     let at = if let Some(id) = target {
         let at = draft

@@ -22,8 +22,7 @@ pub(super) fn finish(
         &pending.control,
         &options,
     )?;
-    let engine = pending.shared.lock().unwrap().clone();
-    crate::workspace::register_in(workspace, engine, Some(&pending.initiating))?;
+    crate::workspace::register_opened(workspace, pending.shared, Some(&pending.initiating))?;
     Ok("Image opened — save as PSD or PSB".into())
 }
 
@@ -52,6 +51,7 @@ impl PeerBrush {
             .resizable(false)
             .open(&mut open)
             .show(ctx, |ui| {
+                dialogs::body(ui, 420.);
                 ui.label(
                     pending
                         .prepared
@@ -74,7 +74,7 @@ impl PeerBrush {
                     });
                 ui.horizontal(|ui| {
                     apply = ui
-                        .add_enabled(!self.busy, egui::Button::new("Open"))
+                        .add_enabled(!self.busy, dialogs::primary("Open"))
                         .clicked();
                     cancel = ui.button("Cancel").clicked();
                 });
@@ -142,7 +142,13 @@ mod tests {
         let root = app.shared.clone();
         let before = root.lock().unwrap().state();
         app.pending_image_open = Some(pending(&app, &path));
+        crate::activation::quit_signal(&app.workspace)
+            .store(true, std::sync::atomic::Ordering::Release);
         frame(&mut app, &ctx, vec![]);
+        assert!(app.pending_image_open.is_some());
+        assert!(app.lifecycle.is_none() && !app.exit_approved);
+        assert!(!root.lock().unwrap().closed);
+        assert_eq!(root.lock().unwrap().state(), before);
         frame(
             &mut app,
             &ctx,

@@ -282,7 +282,9 @@ fn invalid_assets_and_limits_reject_atomically_including_disabled_sources() {
         kind: "pattern_overlay".into(),
         enabled: false,
         weight: 0.,
-        settings: effects::normalized("pattern_overlay", &settings(&png)).unwrap(),
+        settings: effects::normalized("pattern_overlay", &settings(&png))
+            .unwrap()
+            .into(),
     };
     e.doc.layers[0].effects.push(native);
     assert!(
@@ -293,7 +295,9 @@ fn invalid_assets_and_limits_reject_atomically_including_disabled_sources() {
     assert!(patterns::validate_document(&e.doc).is_ok());
     let large = STANDARD.encode(raster::png16(512, 512, &vec![12345; 512 * 512 * 4]).unwrap());
     let effect = effects::Effect {
-        settings: effects::normalized("pattern_overlay", &settings(&large)).unwrap(),
+        settings: effects::normalized("pattern_overlay", &settings(&large))
+            .unwrap()
+            .into(),
         ..e.doc.layers[0].effects[0].clone()
     };
     e.doc.layers[0].effects = vec![effect; 17];
@@ -485,7 +489,7 @@ fn bitmap_texture_shared_commands_keep_native_sources_geometry_history_and_forma
         assert_eq!(d.layers[0].pixels.rgba16(), source);
         assert_eq!(d.export_png().unwrap(), current);
     }
-    let mut invalid = e.doc.layers[0].effects[0].settings.clone();
+    let mut invalid = e.doc.layers[0].effects[0].settings.as_ref().clone();
     invalid["invert"] = json!(true);
     assert!(effects::validate("texture", &invalid).is_err());
     e.undo("human").unwrap();
@@ -493,4 +497,182 @@ fn bitmap_texture_shared_commands_keep_native_sources_geometry_history_and_forma
     assert_eq!(e.doc.export_png().unwrap(), before);
     e.redo("human").unwrap();
     assert_eq!(e.doc.export_png().unwrap(), current);
+}
+
+#[test]
+fn embedded_snapshot_sharing_keeps_independent_edits_history_and_native_saves() {
+    use peerbrush::source::{Content, Source};
+    for depth in [8, 16] {
+        let mut random = 0x98765432u32;
+        let words: Vec<u16> = (0..256 * 256 * 4)
+            .map(|index| {
+                random = random.wrapping_mul(1664525).wrapping_add(1013904223);
+                if index % 4 == 3 {
+                    65535
+                } else {
+                    (random >> 16) as u16
+                }
+            })
+            .collect();
+        let png = STANDARD.encode(if depth == 16 {
+            raster::png16(256, 256, &words).unwrap()
+        } else {
+            raster::png(
+                256,
+                256,
+                &words
+                    .iter()
+                    .copied()
+                    .map(raster::project16)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap()
+        });
+        assert!(png.len() > 128 * 1024);
+        let source = Source {
+            width: 12,
+            height: 10,
+            matrix: [1., 0., 0., 1., 0., 0.],
+            content: Content::Svg { svg: format!(
+                "<svg xmlns='http://www.w3.org/2000/svg' width='12' height='10'><!--{}--><rect x='1' y='1' width='3' height='3' fill='#123456'/></svg>",
+                "embedded source ".repeat(8192)
+            ) },
+        };
+        let mut e = fixture(depth);
+        let paint = e.doc.layers[0].id.clone();
+        let native = e.doc.layers[0].pixels.rgba16();
+        e.edit("human", &[
+            json!({"op":"source.add","source":source}),
+            json!({"op":"effect.add","layer":paint,"kind":"pattern_overlay","settings":settings(&png)}),
+        ], None, None, "Embedded sources").unwrap();
+        let vector = e.doc.layers[0].id.clone();
+        let before = e.doc.clone();
+        let wire = serde_json::to_value(&before).unwrap();
+        assert!(wire["layers"][1]["effects"][0]["settings"].is_object());
+        assert_eq!(wire["layers"][0]["source"], json!(source));
+        let snapshot = before.clone();
+        assert!(Arc::ptr_eq(
+            &before.layers[1].effects[0].settings,
+            &snapshot.layers[1].effects[0].settings
+        ));
+        assert!(Arc::ptr_eq(
+            before.layers[0].source.as_ref().unwrap(),
+            snapshot.layers[0].source.as_ref().unwrap()
+        ));
+        let mut independent = snapshot;
+        Arc::make_mut(&mut independent.layers[1].effects[0].settings)["phase_x"] = json!(3.);
+        let Content::Svg { svg } =
+            &mut Arc::make_mut(independent.layers[0].source.as_mut().unwrap()).content
+        else {
+            panic!("SVG")
+        };
+        *svg = svg.replace("#123456", "#abcdef");
+        assert!(!Arc::ptr_eq(
+            &before.layers[1].effects[0].settings,
+            &independent.layers[1].effects[0].settings
+        ));
+        assert!(!Arc::ptr_eq(
+            before.layers[0].source.as_ref().unwrap(),
+            independent.layers[0].source.as_ref().unwrap()
+        ));
+        assert_eq!(serde_json::to_value(&before).unwrap(), wire);
+        let effect = e.doc.layers[1].effects[0].id.clone();
+        let commands = [
+            json!({"op":"effect.update","layer":paint,"effect":effect,"settings":independent.layers[1].effects[0].settings}),
+            json!({"op":"source.update","layer":vector,"source":independent.layers[0].source}),
+        ];
+        let expected = Engine::preview_edits(before.clone(), &commands).unwrap();
+        assert_eq!(serde_json::to_value(&e.doc).unwrap(), wire);
+        assert_eq!(e.undo.len(), 1);
+        e.reserve(
+            "other",
+            "Retain source",
+            vec![Scope {
+                target: Some(vector.clone()),
+                rect: None,
+            }],
+        )
+        .unwrap();
+        assert!(e
+            .edit(
+                "human",
+                &commands,
+                Some(before.revision),
+                None,
+                "Reserved source"
+            )
+            .is_err());
+        assert_eq!(serde_json::to_value(&e.doc).unwrap(), wire);
+        assert_eq!(e.undo.len(), 1);
+        e.leases.clear();
+        e.edit(
+            "human",
+            &commands,
+            Some(before.revision),
+            None,
+            "Independent source edit",
+        )
+        .unwrap();
+        assert_eq!(e.doc.export_png().unwrap(), expected.export_png().unwrap());
+        assert_eq!(e.doc.layers[1].pixels.rgba16(), native);
+        assert_eq!(serde_json::to_value(&e.undo[1].before).unwrap(), wire);
+        assert!(Arc::ptr_eq(
+            &before.layers[1].effects[0].settings,
+            &e.undo[1].before.layers[1].effects[0].settings
+        ));
+        assert!(Arc::ptr_eq(
+            before.layers[0].source.as_ref().unwrap(),
+            e.undo[1].before.layers[0].source.as_ref().unwrap()
+        ));
+        let committed = serde_json::to_value(&e.doc).unwrap();
+        assert!(e
+            .edit(
+                "human",
+                &commands,
+                Some(before.revision),
+                None,
+                "Stale edit"
+            )
+            .is_err());
+        assert_eq!(serde_json::to_value(&e.doc).unwrap(), committed);
+        let current = rendered(&e.doc);
+        for bytes in [
+            psd::encode(&e.doc).unwrap(),
+            psd::encode_psb(&e.doc).unwrap(),
+        ] {
+            let reopened = psd::decode(&bytes).unwrap();
+            assert!(!reopened.read_only);
+            assert_eq!(reopened.bit_depth, depth);
+            assert_eq!(reopened.layers[0].source, e.doc.layers[0].source);
+            assert_eq!(
+                *reopened.layers[1].effects[0].settings,
+                *e.doc.layers[1].effects[0].settings
+            );
+            assert_eq!(reopened.layers[1].effects[0].settings["bitmap_png"], png);
+            assert_eq!(reopened.layers[1].pixels.rgba16(), native);
+            assert_eq!(rendered(&reopened), current);
+            let standard = psd::decode(&strip(&bytes)).unwrap();
+            assert!(!standard.read_only);
+            assert_eq!(standard.bit_depth, depth);
+            assert_eq!(rendered(&standard), current);
+        }
+        e.undo("human").unwrap();
+        assert_eq!(e.doc.layers[0].source, before.layers[0].source);
+        assert_eq!(
+            *e.doc.layers[1].effects[0].settings,
+            *before.layers[1].effects[0].settings
+        );
+        assert_eq!(e.doc.export_png().unwrap(), before.export_png().unwrap());
+        e.redo("human").unwrap();
+        assert_eq!(rendered(&e.doc), current);
+        assert_eq!(e.doc.layers[1].pixels.rgba16(), native);
+        assert_eq!(serde_json::to_value(&before).unwrap(), wire);
+        let decoded: Document =
+            serde_json::from_value(serde_json::to_value(&e.doc).unwrap()).unwrap();
+        assert_eq!(decoded.layers[0].source, e.doc.layers[0].source);
+        assert_eq!(
+            *decoded.layers[1].effects[0].settings,
+            *e.doc.layers[1].effects[0].settings
+        );
+    }
 }

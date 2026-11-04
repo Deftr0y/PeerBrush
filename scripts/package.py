@@ -1,5 +1,6 @@
 """Package a committed native build, matching GPL source and license notices."""
 import argparse
+import gzip
 import hashlib
 import io
 import json
@@ -13,21 +14,99 @@ import struct
 import subprocess
 import sys
 import tempfile
+import tarfile
 import time
 import tomllib
 import zipfile
+import zlib
 
 
 
 MANIFEST = "scripts/package-files.json"
+MACOS_RESOURCES = 'PeerBrush.app/Contents/Resources/'
+MACOS_INSTALLED_RELEASE = 'installed-release.json'
+MAX_CRATE_COMPRESSED_BYTES = 64 * 1024 * 1024
+MAX_CRATE_DECODED_BYTES = 128 * 1024 * 1024
+MAX_CRATE_MEMBERS = 10000
+MAX_CRATE_NOTICE_BYTES = 4 * 1024 * 1024
+MAX_CRATE_NOTICES_BYTES = 16 * 1024 * 1024
+
+
+def macos_installed_release_required(sources):
+    return any(name == 'src/sparkle/macos/installed.rs'
+               and b'const INSTALLED_RELEASE_LAYOUT: u32 = 1;' in data
+               for name, data, _ in sources)
+
+
+def macos_installed_release(manifest):
+    # This identity is sealed before codesign. Final executable/seal/notary
+    # hashes belong only to the outer release.json, avoiding a signing cycle.
+    return dict(format='PeerBrushInstalledReleaseV1', schema=1,
+                **{key: manifest[key] for key in ['product', 'version', 'commit',
+                    'binary_source_commit', 'platform', 'architecture', 'source',
+                    'source_sha256', 'license', 'build_info']})
+
+
+def macos_sparkle_required(sources):
+    values = dict((name, data) for name, data, _ in sources)
+    required = ('scripts/sparkle_bundle.py' in values
+                or b'pub const BUNDLED_LAYOUT: u32 = 1;' in values.get('src/sparkle.rs', b''))
+    if required and not {'scripts/sparkle_bundle.py', 'packaging/sparkle/native-policy.json',
+                         'packaging/sparkle/LICENSE', 'packaging/sparkle/sparkle-2.10.0.json'} <= set(values):
+        raise ValueError('Dormant Sparkle source policy is incomplete; do not downgrade its bundle layout')
+    if b'pub const CHECK_LAYOUT: u32 = 1;' in values.get('src/sparkle.rs', b''):
+        from sparkle_bundle import CHECK_SOURCES
+        if not required or not CHECK_SOURCES <= set(values):
+            raise ValueError('Manual Sparkle check source contract is incomplete')
+    return required
+
+
+def macos_info(version, sparkle=False, check_pins=None, check_layout=False):
+    numeric = r'(?:0|[1-9][0-9]*)'
+    parsed = re.fullmatch(r'(' + numeric + r'\.' + numeric + r'\.' + numeric + r')(-dev\.' + numeric + r')?', version)
+    if not parsed:
+        raise ValueError('macOS bundles require a stable A.B.C or canonical internal A.B.C-dev.N version')
+    info = {'CFBundleIdentifier': 'com.peerbrush.PeerBrush', 'CFBundleName': 'PeerBrush',
+            'CFBundleDisplayName': 'PeerBrush', 'CFBundleExecutable': 'peerbrush',
+            'CFBundlePackageType': 'APPL', 'CFBundleShortVersionString': parsed[1],
+            'CFBundleVersion': parsed[1], 'LSMinimumSystemVersion': '11.0',
+            'NSHighResolutionCapable': True, 'CFBundleIconFile': 'PeerBrush.icns',
+            'CFBundleDocumentTypes': [{'CFBundleTypeName': name, 'CFBundleTypeRole': 'Editor',
+                                      'LSHandlerRank': 'Alternate', 'CFBundleTypeIconFile': 'PeerBrush.icns',
+                                      'LSItemContentTypes': [uti]}
+                                     for name, uti in [('Photoshop PSD image', 'com.adobe.photoshop-image'),
+                                                       ('Photoshop PSB image', 'com.peerbrush.photoshop-large-document')]],
+            'UTImportedTypeDeclarations': [{'UTTypeIdentifier': 'com.peerbrush.photoshop-large-document',
+                                            'UTTypeConformsTo': ['public.image'],
+                                            'UTTypeDescription': 'Photoshop Large Document',
+                                            'UTTypeTagSpecification': {'public.filename-extension': ['psb'],
+                                                                       'public.mime-type': 'image/vnd.adobe.photoshop'}}]}
+    if sparkle:
+        from sparkle_bundle import DISABLED_INFO
+        info.update(DISABLED_INFO)
+        if not check_layout:
+            # Exact historical BUNDLED_LAYOUT1 sources used this ignored key.
+            # Preserve their byte contract; CHECK_LAYOUT1 corrects the policy.
+            info['SUSignedFeedFailureExpiration'] = info.pop('SUSignedFeedFailureExpirationInterval')
+        if check_pins is not None:
+            if not check_layout:
+                raise ValueError('Configured manual-check pins require the corrected source layout')
+            info.update(SUFeedURL=check_pins['feed_url'], SUPublicEDKey=check_pins['public_ed_key'])
+    if parsed[2]:
+        info['PeerBrushDevelopmentVersion'] = version
+    return info
 # Exact upstream notice names, not a LICENSE* glob that could pick up local files.
 NOTICE_NAMES = {
     "copying", "copyright", "license", "licence", "notice", "notices", "unlicense",
     "license-0bsd", "license-apache", "license-apache-2.0", "license-bsd",
-    "license-libm-mit", "license-mit", "license-unicode", "license-zlib",
+    "license-libm-mit", "license-mit", "license-isc", "license-unicode", "license-zlib",
     "license.apache", "license.mit",
 }
 EMBEDDED_FONT_NOTICES = {"epaint_default_fonts": {"fonts/Hack-Regular.txt", "fonts/OFL.txt", "fonts/UFL.txt", "fonts/emoji-icon-font-mit-license.txt"}}
+EXTRA_CRATE_NOTICES = {"ring": {
+    "LICENSE-BoringSSL", "LICENSE-other-bits", "src/polyfill/once_cell/LICENSE-APACHE",
+    "src/polyfill/once_cell/LICENSE-MIT", "third_party/fiat/LICENSE",
+}}
 NOTICE_NAMES |= {name + suffix for name in tuple(NOTICE_NAMES) for suffix in (".txt", ".md", ".rst")}
 
 
@@ -37,7 +116,8 @@ def relative_path(value):
     if not isinstance(value, str) or not value or any(ord(char) < 32 or ord(char) == 127 or char in '\\:<>"|?*' for char in value):
         raise ValueError("Manifest paths must be portable relative file names")
     path = pathlib.PurePosixPath(value)
-    reserved = {"con", "prn", "aux", "nul", *(f"com{i}" for i in range(1, 10)), *(f"lpt{i}" for i in range(1, 10))}
+    reserved = {"con", "prn", "aux", "nul", *(f"{prefix}{digit}" for prefix in ["com", "lpt"]
+        for digit in '123456789\u00b9\u00b2\u00b3')}
     if path.is_absolute() or str(path) != value or any(
         part in (".", "..") or part.rstrip(" .") != part or part.split(".")[0].casefold() in reserved for part in path.parts
     ):
@@ -70,6 +150,75 @@ def active_rust_docs():
         raise ValueError('Active Rust compiler did not return an absolute sysroot')
     return pathlib.Path(sysroot) / 'share' / 'doc' / 'rust'
 
+def cached_crate_notices(registry, crate, package, metadata):
+    """Read notices from a lock-verified Cargo cache, without extracting it."""
+    checksum = package.get('checksum')
+    if type(checksum) is not str or not re.fullmatch('[0-9a-f]{64}', checksum):
+        raise ValueError('Missing locked dependency archive checksum')
+    key = f"{package['name']}-{package['version']}"
+    relative_path(key)
+    meta = tomllib.loads(metadata.decode('utf-8'))['package']
+    if meta.get('name') != package['name'] or meta.get('version') != package['version']:
+        raise ValueError('Dependency metadata identity differs from its locked package')
+    required = (EXTRA_CRATE_NOTICES.get(package['name'], set())
+                | EMBEDDED_FONT_NOTICES.get(package['name'], set()))
+    if meta.get('license-file'):
+        required = required | {meta['license-file']}
+    for name in required:
+        relative_path(name)
+    try:
+        cache = regular_file(registry.parent / 'cache', crate.parent.name + '/' + key + '.crate')
+        with cache.open('rb') as stream:
+            compressed = stream.read(MAX_CRATE_COMPRESSED_BYTES + 1)
+        if len(compressed) > MAX_CRATE_COMPRESSED_BYTES:
+            raise ValueError('Dependency notice archive exceeds the compressed budget')
+        if hashlib.sha256(compressed).hexdigest() != checksum:
+            raise ValueError('Dependency archive differs from Cargo.lock checksum')
+        with gzip.GzipFile(fileobj=io.BytesIO(compressed)) as stream:
+            decoded = stream.read(MAX_CRATE_DECODED_BYTES + 1)
+        if len(decoded) > MAX_CRATE_DECODED_BYTES:
+            raise ValueError('Dependency notice archive exceeds the decoded budget')
+        seen, notices, found_metadata, total = set(), {}, False, 0
+        # Bound the decoded buffer before tar/PAX header parsing can read it.
+        with tarfile.open(fileobj=io.BytesIO(decoded), mode='r:') as archive:
+            for count, entry in enumerate(archive, 1):
+                path = relative_path(entry.name.rstrip('/') if entry.isdir() else entry.name)
+                if count > MAX_CRATE_MEMBERS or path.parts[0] != key or str(path).casefold() in seen:
+                    raise ValueError('Invalid dependency archive paths, duplicates or member count')
+                seen.add(str(path).casefold())
+                if entry.isdir():
+                    continue
+                if not entry.isfile() or len(path.parts) < 2 or not 0 <= entry.size <= MAX_CRATE_DECODED_BYTES:
+                    raise ValueError('Dependency archive must contain bounded regular files')
+                name = '/'.join(path.parts[1:])
+                selected = (name in required or (len(path.parts) == 2 and path.name.casefold() in NOTICE_NAMES)
+                            or (path.parts[1] == 'fonts' and path.name.casefold() in NOTICE_NAMES))
+                if name == 'Cargo.toml' or selected:
+                    if not 0 < entry.size <= MAX_CRATE_NOTICE_BYTES:
+                        raise ValueError('Dependency notice or metadata exceeds its file budget')
+                    with archive.extractfile(entry) as stream:
+                        data = stream.read(entry.size + 1)
+                    if len(data) != entry.size:
+                        raise ValueError('Truncated dependency notice archive')
+                    if name == 'Cargo.toml':
+                        if data != metadata:
+                            raise ValueError('Dependency metadata differs from the verified archive')
+                        found_metadata = True
+                    else:
+                        total += len(data)
+                        if total > MAX_CRATE_NOTICES_BYTES:
+                            raise ValueError('Dependency notices exceed the combined budget')
+                        notices[name] = data
+        if not found_metadata or not required <= set(notices):
+            raise ValueError('Missing required dependency notice inventory in verified archive')
+        for name, data in notices.items():
+            if digest(regular_file(crate, name)) != hashlib.sha256(data).hexdigest():
+                raise ValueError('Dependency notice checksum mismatch')
+        return notices
+    except (OSError, EOFError, tarfile.TarError, zlib.error):
+        raise ValueError('Could not read the required lock-verified dependency notice archive') from None
+
+
 def dependency_notices(root, bundle, registry, manifest, rust_docs=None):
     notices = bundle / "licenses"
     rows = ["# Third-party notices", "", "Dependencies retain their original licenses. Sources and checksums are pinned by Cargo.lock in the included project source archive. This list covers downloaded dependencies; not every crate is linked into this platform binary.", ""]
@@ -85,15 +234,34 @@ def dependency_notices(root, bundle, registry, manifest, rust_docs=None):
             raise ValueError("Ambiguous registry source; supply --registry for the build's registry")
         crate = matches[0]
         regular_file(registry, (crate / "Cargo.toml").relative_to(registry).as_posix())
-        meta = tomllib.loads(regular_file(crate, "Cargo.toml").read_text(encoding="utf-8"))["package"]
+        metadata = regular_file(crate, "Cargo.toml").read_bytes()
+        meta = tomllib.loads(metadata.decode('utf-8'))["package"]
         rows.append(f"- {key}: {meta.get('license', meta.get('license-file', 'See source license'))}")
         selected = {p.name for p in crate.iterdir() if p.name.casefold() in NOTICE_NAMES}
         if meta.get("license-file"):
             selected.add(meta["license-file"])
         # Embedded egui fonts have their own licenses; select checksum-listed notices.
         checksum_file = crate / ".cargo-checksum.json"
-        if checksum_file.exists():
+        extra_notices = EXTRA_CRATE_NOTICES.get(package["name"], set())
+        try:
+            checksum_file.lstat()
+            checksum_present = True
+        except FileNotFoundError:
+            checksum_present = False
+        if not checksum_present and (extra_notices or EMBEDDED_FONT_NOTICES.get(package['name'])):
+            for name, data in cached_crate_notices(registry, crate, package, metadata).items():
+                target = notices / key / relative_path(name)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(data)
+            continue
+        if checksum_present:
             checksums = json.loads(regular_file(crate, ".cargo-checksum.json").read_text(encoding="utf-8"))["files"]
+            if not extra_notices <= set(checksums):
+                raise ValueError("Missing required dependency notice inventory")
+            for name in extra_notices:
+                if digest(regular_file(crate, name)) != checksums[name]:
+                    raise ValueError("Dependency notice checksum mismatch")
+            selected.update(extra_notices)
             font_notices = EMBEDDED_FONT_NOTICES.get(package["name"], set())
             if not font_notices <= set(checksums):
                 raise ValueError("Missing embedded font notice inventory")
@@ -112,6 +280,18 @@ def dependency_notices(root, bundle, registry, manifest, rust_docs=None):
             path = relative_path(name)
             if str(path.parent) == directory and path.name.casefold() in NOTICE_NAMES:
                 copy_file(root, name, notices / key / path.name)
+        if meta['name'] == 'jpegxl-src':
+            # Exact compiled native components; all bytes must be committed source.
+            native_notices = ['libjxl/LICENSE', 'libjxl/third_party/highway/LICENSE',
+                              'libjxl/third_party/highway/LICENSE-BSD3',
+                              'libjxl/third_party/brotli/LICENSE',
+                              'libjxl/third_party/skcms/LICENSE']
+            for native in native_notices:
+                selected = directory + '/' + native
+                if selected not in manifest['source']:
+                    raise ValueError('Missing committed JPEG XL native notice')
+                copy_file(root, selected, notices / key / native)
+            copy_file(root, 'LICENSE', notices / key / 'GPL-3.0.txt')
     copy_file(root, "assets/fonts/LICENCE.txt", notices / "ubuntu-sans" / "LICENCE.txt")
     # Include named compiler notices only, never all local compiler documentation.
     rust_docs = rust_docs if rust_docs is not None else active_rust_docs()
@@ -126,8 +306,13 @@ def dependency_notices(root, bundle, registry, manifest, rust_docs=None):
     (bundle / "THIRD_PARTY_NOTICES.md").write_text("\n".join(rows) + "\n", encoding="utf-8")
 
 
-def git(root, *args):
-    return subprocess.run(['git', '-C', str(root), *args], check=True, capture_output=True).stdout
+def git(root, *args, input=None):
+    environment = {key: value for key, value in os.environ.items() if not key.upper().startswith('GIT_')}
+    return subprocess.run(['git', '-c', 'core.fsmonitor=false', '-C', str(root), *args], env=environment, input=input, check=True, capture_output=True).stdout
+
+
+def hidden_index_inputs(root):
+    return any(row[:1].islower() or row[:1] == b'S' for row in git(root, 'ls-files', '-v', '-z').split(b'\0'))
 
 
 def digest(path):
@@ -159,8 +344,11 @@ def architecture_from_stream(stream, platform):
 
 def write_zip(path, files, epoch, compression=zipfile.ZIP_DEFLATED):
     files = list(files)
-    for name, _, _ in files:
+    for name, data, mode in files:
         relative_path(name)
+        if mode & 0o170000 == 0o120000:
+            from sparkle_bundle import validate_link
+            validate_link(name, data)
     if len({name.casefold() for name, _, _ in files}) != len(files):
         raise ValueError("Ambiguous duplicate archive paths")
     stamp = time.gmtime(max(epoch, 315532800))[:6]
@@ -168,7 +356,12 @@ def write_zip(path, files, epoch, compression=zipfile.ZIP_DEFLATED):
         for name, data, mode in sorted(files):
             info = zipfile.ZipInfo(name, stamp)
             info.create_system = 3
-            info.external_attr = (0o100000 | mode) << 16
+            if mode & 0o170000 == 0o120000:
+                from sparkle_bundle import validate_link
+                validate_link(name, data)
+                info.external_attr = mode << 16
+            else:
+                info.external_attr = (0o100000 | mode) << 16
             info.compress_type = compression
             archive.writestr(info, data)
 
@@ -191,7 +384,7 @@ def source_files(root, commit=None):
         if kind != b'blob' or mode not in [b'100644', b'100755']:
             raise ValueError('Package source must contain regular committed files')
         entries.append((name, object_id, int(mode, 8) & 0o777))
-    output = subprocess.check_output(['git', '-C', str(root), 'cat-file', '--batch'], input=b'\n'.join(obj for _, obj, _ in entries) + b'\n')
+    output = git(root, 'cat-file', '--batch', input=b'\n'.join(obj for _, obj, _ in entries) + b'\n')
     stream = io.BytesIO(output)
     files = []
     for name, object_id, mode in entries:
@@ -203,6 +396,7 @@ def source_files(root, commit=None):
             raise ValueError('Truncated source object')
         files.append((name, data, mode))
     values = {name: data for name, data, _ in files}
+    macos_sparkle_required(files)
     version = tomllib.loads(values['Cargo.toml'].decode('utf-8'))['package']['version']
     if not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?', version):
         raise ValueError('Unsupported release version')
@@ -211,7 +405,7 @@ def source_files(root, commit=None):
 
 
 def validate_policy(policy, tree):
-    if not isinstance(policy, dict) or set(policy) != {'version', 'source', 'portable', 'readme', 'vendored', 'rust_notices'} or type(policy['version']) is not int or policy['version'] != 1:
+    if not isinstance(policy, dict) or set(policy) != {'version', 'source', 'portable', 'readme', 'vendored', 'rust_notices'} or type(policy['version']) is not int or policy['version'] not in (1, 2):
         raise ValueError('Unsupported package manifest')
     for group in ['source', 'portable', 'vendored', 'rust_notices']:
         values = policy[group]
@@ -224,6 +418,11 @@ def validate_policy(policy, tree):
     relative_path(policy['readme'])
     selected = set(policy['source'])
     required = {MANIFEST, policy['readme'], 'Cargo.toml', 'Cargo.lock', 'LICENSE', 'assets/fonts/LICENCE.txt', 'scripts/start-windows.cmd'}
+    provenance_inputs = {'build.rs', 'src/build_info.rs'}
+    if provenance_inputs & set(tree) and policy['version'] != 2:
+        raise ValueError('Build provenance source requires package policy version 2')
+    if policy['version'] == 2:
+        required |= provenance_inputs
     if not required <= selected or not set(policy['portable']) <= selected:
         raise ValueError('Required inputs and portable files must be in corresponding source')
     generated = {'readme.md', 'release.json', 'third_party_notices.md', 'peerbrush.exe', 'peerbrush', 'start peerbrush.cmd'}
@@ -241,7 +440,7 @@ def validate_policy(policy, tree):
     if not actual <= selected:
         missing = ', '.join(sorted(actual - selected))
         raise ValueError('Compiler input inventory changed; review scripts/package-files.json: ' + missing)
-    if any(n in tree and n not in selected for n in ['build.rs', '.cargo/config', '.cargo/config.toml']):
+    if any(n in tree and n not in selected for n in ['build.rs', 'rust-toolchain.toml', '.cargo/config', '.cargo/config.toml']):
         raise ValueError('Unlisted build configuration; review the package manifest')
 
 
@@ -266,6 +465,29 @@ def validate_binary(data):
         raise ValueError('Executable contains a credential marker or personal build path; rebuild with path remapping and review before packaging')
 
 
+def binary_build_info(data, version, commit):
+    """Check a public embedded label, not cryptographic proof of compilation."""
+    prefix = b'{"format":"PeerBrushBuildInfoV1",'
+    suffix = b'"end":"PeerBrushBuildInfoEnd"}'
+    if data.count(prefix) != 1:
+        raise ValueError('Missing or ambiguous embedded build provenance')
+    start = data.index(prefix)
+    record = data[start:start + 512]
+    end = record.find(suffix)
+    if end < 0:
+        raise ValueError('Malformed or oversized embedded build provenance')
+    record = record[:end + len(suffix)]
+    try:
+        info = json.loads(record)
+    except (UnicodeDecodeError, ValueError):
+        raise ValueError('Malformed embedded build provenance') from None
+    expected = {'format': 'PeerBrushBuildInfoV1', 'schema': 1, 'product': 'PeerBrush',
+                'version': version, 'commit': commit, 'tree': 'clean', 'end': 'PeerBrushBuildInfoEnd'}
+    if info != expected or type(info.get('schema')) is not int or record != json.dumps(info, separators=(',', ':')).encode():
+        raise ValueError('Executable build provenance differs from the clean expected version/commit')
+    return info
+
+
 def add_notices(source_root, bundle, registry, policy, rust_docs=None):
     dependency_notices(source_root, bundle, registry, policy, rust_docs)
     return {p.relative_to(bundle).as_posix(): digest(p) for p in sorted((bundle / 'licenses').rglob('*')) if p.is_file()}
@@ -275,9 +497,9 @@ def equivalent_build_inputs(root, sources, original_commit):
     if not re.fullmatch(r'[0-9a-f]{40}', original_commit):
         raise ValueError('Expected full executable source commit')
     compiler_roots = {'src', 'tests', 'examples', 'integrations', 'vendor'}
-    selected = {name: data for name, data, _ in sources if relative_path(name).parts[0] in compiler_roots or name.startswith('assets/') or name in ['Cargo.toml', 'Cargo.lock', 'build.rs', '.cargo/config', '.cargo/config.toml']}
+    selected = {name: data for name, data, _ in sources if relative_path(name).parts[0] in compiler_roots or name.startswith('assets/') or name in ['Cargo.toml', 'Cargo.lock', 'build.rs', 'rust-toolchain.toml', '.cargo/config', '.cargo/config.toml']}
     original_names = set(git(root, 'ls-tree', '-r', '--name-only', original_commit).decode().splitlines())
-    original_compiler = {name for name in original_names if relative_path(name).parts[0] in compiler_roots or name in ['Cargo.toml', 'Cargo.lock', 'build.rs', '.cargo/config', '.cargo/config.toml']}
+    original_compiler = {name for name in original_names if relative_path(name).parts[0] in compiler_roots or name in ['Cargo.toml', 'Cargo.lock', 'build.rs', 'rust-toolchain.toml', '.cargo/config', '.cargo/config.toml']}
     if original_compiler != {name for name in selected if not name.startswith('assets/')}:
         raise ValueError('Executable source compiler inventory differs from package source')
     for name, data in selected.items():
@@ -285,7 +507,7 @@ def equivalent_build_inputs(root, sources, original_commit):
             raise ValueError('Executable source inputs differ from package source')
 
 
-def package(root, binary, output, registry, platform, verify_binary=True, rust_docs=None, binary_source_commit=None):
+def package(root, binary, output, registry, platform, verify_binary=True, rust_docs=None, binary_source_commit=None, sparkle_archive=None):
     root = root.resolve(strict=True)
     if git(root, 'status', '--porcelain', '--untracked-files=no').strip():
         raise ValueError('Commit tracked changes before packaging a release')
@@ -293,14 +515,38 @@ def package(root, binary, output, registry, platform, verify_binary=True, rust_d
     epoch = int(git(root, 'show', '-s', '--format=%ct', commit))
     sources = source_files(root, commit)
     policy = policy_from_sources(sources)
+    sparkle = platform == 'macOS' and macos_sparkle_required(sources)
+    framework = []
+    if sparkle:
+        if sparkle_archive is None:
+            raise ValueError('Dormant macOS layout requires the explicitly selected pinned --sparkle-archive')
+        from sparkle_bundle import entries
+        framework = entries(sparkle_archive, {name: data for name, data, _ in sources})
+    if policy['version'] == 2 and git(root, 'status', '--porcelain', '--untracked-files=normal').strip():
+        raise ValueError('Commit or remove untracked source inputs before release packaging')
+    if policy['version'] == 2 and hidden_index_inputs(root):
+        raise ValueError('Hidden index inputs cannot establish clean release provenance')
     binary_source_commit = binary_source_commit or commit
     if binary_source_commit != commit:
         equivalent_build_inputs(root, sources, binary_source_commit)
     version = tomllib.loads(next(data for name, data, _ in sources if name == 'Cargo.toml').decode('utf-8'))['package']['version']
+    check_pins = None
+    check_layout = False
+    if sparkle:
+        from sparkle_bundle import CHECK_MARKER, check_pins as selected_check_pins
+        check_layout = CHECK_MARKER in dict((name, data) for name, data, _ in sources).get('src/sparkle.rs', b'')
+        check_pins = selected_check_pins({name: data for name, data, _ in sources}, version)
     binary = regular_file(binary.absolute().parent, binary.name)
     executable = binary.read_bytes()
     validate_binary(executable)
     architecture = architecture_from_stream(io.BytesIO(executable), platform)
+    build_info = binary_build_info(executable, version, binary_source_commit) if policy['version'] == 2 else None
+    windows_resource = False
+    if platform == 'Windows':
+        from windows_version import inspect, required
+        windows_resource = required(sources)
+        if windows_resource:
+            inspect(executable, version)
     output.mkdir(parents=True, exist_ok=True)
     name = f'PeerBrush-{version}-{platform}-{architecture}'
     # Stage all outputs before replacing final files. Never reuse an old
@@ -323,7 +569,7 @@ def package(root, binary, output, registry, platform, verify_binary=True, rust_d
             contents = bundle / 'PeerBrush.app' / 'Contents'
             (contents / 'MacOS').mkdir(parents=True)
             with (contents / 'Info.plist').open('wb') as stream:
-                plistlib.dump({'CFBundleIdentifier': 'com.peerbrush.PeerBrush', 'CFBundleName': 'PeerBrush', 'CFBundleDisplayName': 'PeerBrush', 'CFBundleExecutable': 'peerbrush', 'CFBundlePackageType': 'APPL', 'CFBundleShortVersionString': version, 'CFBundleVersion': version, 'LSMinimumSystemVersion': '11.0', 'NSHighResolutionCapable': True}, stream)
+                plistlib.dump(macos_info(version, sparkle=sparkle, check_pins=check_pins, check_layout=check_layout), stream)
         staged_binary = bundle / relative
         staged_binary.write_bytes(executable)
         staged_binary.chmod(0o755)
@@ -331,6 +577,10 @@ def package(root, binary, output, registry, platform, verify_binary=True, rust_d
             actual = subprocess.check_output([str(staged_binary.resolve()), '--version'], text=True, timeout=30).strip()
             if actual != f'PeerBrush {version}':
                 raise ValueError('Executable version does not match the committed source')
+            if build_info is not None:
+                actual = subprocess.check_output([str(staged_binary.resolve()), '--build-info'], text=True, timeout=30).strip()
+                if actual != json.dumps(build_info, separators=(',', ':')):
+                    raise ValueError('Executable --build-info differs from its embedded provenance')
         for filename, data, _ in portable_files(sources):
             destination = bundle / relative_path(filename)
             destination.parent.mkdir(parents=True, exist_ok=True)
@@ -340,9 +590,43 @@ def package(root, binary, output, registry, platform, verify_binary=True, rust_d
             (bundle / 'Start PeerBrush.cmd').write_bytes(launcher)
         shutil.copy2(source, bundle / source.name)
         notices = add_notices(source_root, bundle, registry, policy, rust_docs)
+        if sparkle:
+            from sparkle_bundle import NOTICE
+            notice = next(data for filename, data, _ in sources if filename == 'packaging/sparkle/LICENSE')
+            destination = bundle / NOTICE
+            destination.parent.mkdir(parents=True)
+            destination.write_bytes(notice)
+            notices[NOTICE] = digest(destination)
+            with (bundle / 'THIRD_PARTY_NOTICES.md').open('a', encoding='utf-8') as stream:
+                stream.write('\n- Sparkle 2.10.0: complete upstream/external notice in licenses/sparkle-2.10.0/LICENSE; exact upstream source revision and public source URL in the included packaging/sparkle/sparkle-2.10.0.json.\n')
         manifest = {'schema': 1, 'product': 'PeerBrush', 'version': version, 'commit': commit, 'binary_source_commit': binary_source_commit, 'platform': platform, 'architecture': architecture, 'executable': relative, 'executable_sha256': digest(staged_binary), 'source': source.name, 'source_sha256': digest(source), 'notice_files': notices, 'license': 'GPL-3.0-only', 'native_publisher_signing': 'not-configured', 'package_signature': 'See the matching external Sigstore bundle when supplied; this manifest alone is not a signature.'}
+        if windows_resource:
+            manifest['windows_version_resource'] = 1
+        if platform == 'macOS':
+            resources = bundle / MACOS_RESOURCES
+            resources.mkdir()
+            icon = next(data for name, data, _ in sources if name == 'assets/peerbrush.icns')
+            if icon[:4] != b'icns' or len(icon) < 16 or struct.unpack('>I', icon[4:8])[0] != len(icon):
+                raise ValueError('A valid committed macOS ICNS resource is required')
+            (resources / 'PeerBrush.icns').write_bytes(icon)
+            for filename in ['LICENSE', 'THIRD_PARTY_NOTICES.md', *notices]:
+                copy_file(bundle, filename, resources / filename)
+            manifest['macos_bundle_resources'] = 1
+            if sparkle:
+                manifest['macos_sparkle_layout'] = 1
+        if build_info is not None:
+            manifest['build_info'] = build_info
+        if platform == 'macOS' and macos_installed_release_required(sources):
+            if build_info is None or source.stat().st_size > 128 * 1024 * 1024:
+                raise ValueError('Installed macOS source requires bounded matching build provenance')
+            shutil.copy2(source, resources / source.name)
+            (resources / MACOS_INSTALLED_RELEASE).write_text(
+                json.dumps(macos_installed_release(manifest), indent=2) + '\n',
+                encoding='utf-8', newline='\n')
+            manifest['macos_installed_release'] = 1
         (bundle / 'release.json').write_text(json.dumps(manifest, indent=2) + '\n', encoding='utf-8')
         files = [(f'{name}/{p.relative_to(bundle).as_posix()}', p.read_bytes(), 0o755 if p == staged_binary else 0o644) for p in bundle.rglob('*') if p.is_file()]
+        files.extend((f'{name}/{relative}', data, mode) for relative, data, mode in framework)
         archive = stage / (name + '.zip')
         write_zip(archive, files, epoch)
         sums = stage / f'{name}.sha256'
@@ -364,6 +648,7 @@ def main():
     parser.add_argument('--output', type=pathlib.Path)
     parser.add_argument('--registry', type=pathlib.Path)
     parser.add_argument('--binary', type=pathlib.Path)
+    parser.add_argument('--sparkle-archive', type=pathlib.Path, help='Explicit exact-pinned upstream archive for dormant macOS bundling')
     parser.add_argument('--binary-source-commit', help='Explicit packaging-only correction: require identical application/build inputs to this original binary commit')
     args = parser.parse_args()
     root = pathlib.Path(__file__).resolve().parents[1]
@@ -375,7 +660,7 @@ def main():
             sources = source_files(root)
             print(f'Package source policy valid: {len(sources)} files')
             return
-        package(root, args.binary or root / 'target' / 'release' / exe, (args.output or root / 'dist').resolve(), args.registry or cargo_home / 'registry' / 'src', platform, binary_source_commit=args.binary_source_commit)
+        package(root, args.binary or root / 'target' / 'release' / exe, (args.output or root / 'dist').resolve(), args.registry or cargo_home / 'registry' / 'src', platform, binary_source_commit=args.binary_source_commit, sparkle_archive=args.sparkle_archive)
     except (ValueError, OSError, subprocess.SubprocessError) as error:
         message = str(error) if isinstance(error, ValueError) else 'Input/output validation failed; check required files and permissions'
         parser.exit(1, 'Packaging failed: ' + message + '\n')

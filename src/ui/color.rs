@@ -267,7 +267,7 @@ impl PeerBrush {
                         Some(&editor.gesture),
                     );
                     if let Err(error) = result {
-                        self.message = error;
+                        self.message = error.into();
                     } else {
                         self.last_preview = None;
                     }

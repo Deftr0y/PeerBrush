@@ -1,0 +1,41 @@
+{
+  "scope": "Isolated origin-aware renderer prototype; upstream versions unchanged",
+  "packages": [
+    {
+      "name": "tiny-skia",
+      "version": "0.12.0",
+      "registry_checksum": "47ffee5eaaf5527f630fb0e356b90ebdec84d5d18d937c5e440350f88c5a91ea",
+      "upstream_vcs": {
+        "git": {
+          "sha1": "e48b9027762d33731e60e40eb17eaa4f583b0185"
+        },
+        "path_in_vcs": ""
+      },
+      "manifest_sha256": "07ef83606b1448bcbd70fd6065cd0b71a51f61ad377a642b7796e4ea0dab0b52"
+    },
+    {
+      "name": "resvg",
+      "version": "0.48.1",
+      "registry_checksum": "67e3803f97b999e80cbf7c6ecdd07a8102204d92e1633cf48783720c521196bd",
+      "upstream_vcs": {
+        "git": {
+          "sha1": "68b14c4c3bccdb60344c777406486b54c36ec1a4"
+        },
+        "path_in_vcs": "crates/resvg"
+      },
+      "manifest_sha256": "6664ac63cb375e43127373ceb25f04c06ef363fca845e9df1bed1d9b47b6a99b"
+    },
+    {
+      "name": "tiny-skia-path",
+      "version": "0.12.0",
+      "registry_checksum": "edca365c3faccca67d06593c5980fa6c57687de727a03131735bb85f01fdeeb9",
+      "upstream_vcs": {
+        "git": {
+          "sha1": "e48b9027762d33731e60e40eb17eaa4f583b0185"
+        },
+        "path_in_vcs": "path"
+      },
+      "manifest_sha256": "57385d5a00ab54c415cd63a08ef1365e87b661019c74cccd4b50d6d9e6d659ad"
+    }
+  ]
+}

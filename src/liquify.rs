@@ -5,6 +5,9 @@ use crate::{
 };
 use serde_json::{json, Value};
 
+#[path = "liquify/regional.rs"]
+pub(crate) mod regional;
+
 pub const MAX_STROKES: usize = 128;
 pub const MAX_POINTS: usize = 8192;
 const MAX_DABS: usize = 32768;
@@ -64,22 +67,24 @@ fn parse_points(v: &Value, min: usize, max: usize) -> Result<Vec<[f32; 2]>, Stri
         .as_array()
         .filter(|a| (min..=max).contains(&a.len()))
         .ok_or_else(|| format!("Liquify needs {min}–{max} points"))?;
-    a.iter()
-        .map(|p| {
-            let p = p
-                .as_array()
-                .filter(|p| p.len() == 2)
-                .ok_or("Liquify points must be [x,y]")?;
-            let coordinate = |v: &Value| {
-                v.as_f64()
-                    .filter(|n| n.is_finite() && n.abs() <= 100000.0)
-                    .map(|n| n as f32)
-                    .ok_or("Invalid liquify coordinate")
-            };
-            Ok([coordinate(&p[0])?, coordinate(&p[1])?])
-        })
-        .collect::<Result<Vec<_>, &str>>()
-        .map_err(str::to_string)
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(a.len())
+        .map_err(|_| "Liquify points allocation failed")?;
+    for p in a {
+        let p = p
+            .as_array()
+            .filter(|p| p.len() == 2)
+            .ok_or("Liquify points must be [x,y]")?;
+        let coordinate = |v: &Value| {
+            v.as_f64()
+                .filter(|n| n.is_finite() && n.abs() <= 100000.0)
+                .map(|n| n as f32)
+                .ok_or("Invalid liquify coordinate")
+        };
+        output.push([coordinate(&p[0])?, coordinate(&p[1])?]);
+    }
+    Ok(output)
 }
 fn parse(settings: &Value) -> Result<Vec<Stroke>, String> {
     if !settings.is_object() {
@@ -96,80 +101,80 @@ fn parse(settings: &Value) -> Result<Vec<Stroke>, String> {
         .ok_or("Liquify supports up to 128 editable strokes")?;
     let mut total = 0;
     let mut coverage_bytes = 0usize;
-    strokes
-        .iter()
-        .map(|s| {
-            if !s.is_object() {
-                return Err("Liquify strokes must be objects".to_string());
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(strokes.len())
+        .map_err(|_| "Liquify strokes allocation failed")?;
+    for s in strokes {
+        if !s.is_object() {
+            return Err("Liquify strokes must be objects".to_string());
+        }
+        let mode = match s.get("mode").map_or(Ok("push"), |v| {
+            v.as_str().ok_or("Liquify mode must be a string")
+        })? {
+            "push" => Mode::Push,
+            "expand" => Mode::Expand,
+            "pinch" => Mode::Pinch,
+            "restore" => Mode::Restore,
+            _ => return Err("Liquify mode must be push, expand, pinch or restore".into()),
+        };
+        let points = parse_points(&s["points"], 1, 2048)?;
+        total += points.len();
+        if total > MAX_POINTS {
+            return Err("Liquify supports up to 8192 total control points".into());
+        }
+        let selection = if let Some(v) = s.get("selection").filter(|v| !v.is_null()) {
+            let v = v
+                .as_array()
+                .filter(|v| v.len() == 4)
+                .ok_or("Liquify selection must be [left,top,right,bottom]")?;
+            let mut b = [0; 4];
+            for (i, n) in v.iter().enumerate() {
+                b[i] = n
+                    .as_i64()
+                    .filter(|n| (-100000..=100000).contains(n))
+                    .ok_or("Invalid liquify selection")? as i32;
             }
-            let mode = match s.get("mode").map_or(Ok("push"), |v| {
-                v.as_str().ok_or("Liquify mode must be a string")
-            })? {
-                "push" => Mode::Push,
-                "expand" => Mode::Expand,
-                "pinch" => Mode::Pinch,
-                "restore" => Mode::Restore,
-                _ => return Err("Liquify mode must be push, expand, pinch or restore".into()),
-            };
-            let points = parse_points(&s["points"], 1, 2048)?;
-            total += points.len();
-            if total > MAX_POINTS {
-                return Err("Liquify supports up to 8192 total control points".into());
+            if b[0] >= b[2] || b[1] >= b[3] {
+                return Err("Liquify selection must have positive area".into());
             }
-            let selection = if let Some(v) = s.get("selection").filter(|v| !v.is_null()) {
-                let v = v
-                    .as_array()
-                    .filter(|v| v.len() == 4)
-                    .ok_or("Liquify selection must be [left,top,right,bottom]")?;
-                let mut b = [0; 4];
-                for (i, n) in v.iter().enumerate() {
-                    b[i] = n
-                        .as_i64()
-                        .filter(|n| (-100000..=100000).contains(n))
-                        .ok_or("Invalid liquify selection")? as i32;
-                }
-                if b[0] >= b[2] || b[1] >= b[3] {
-                    return Err("Liquify selection must have positive area".into());
-                }
-                Some(b)
-            } else {
-                None
-            };
-            let polygon = if let Some(v) = s.get("polygon").filter(|v| !v.is_null()) {
-                let polygon = parse_points(v, 3, 8192)?;
-                let bounds = crate::selection::bounds(&polygon)?;
-                if selection.is_some_and(|s| s != bounds) {
-                    return Err("Liquify polygon must match its selection bounds".into());
-                }
-                Some(polygon)
-            } else {
-                None
-            };
-            let coverage = if s["coverage"].is_null() {
-                None
-            } else {
-                let m: crate::selection::Coverage = serde_json::from_value(s["coverage"].clone())
-                    .map_err(|_| "Invalid Liquify coverage")?;
-                m.validate()?;
-                coverage_bytes += m.mask.bytes();
-                if coverage_bytes > 128 * 1024 * 1024 {
-                    return Err(
-                        "Liquify selection snapshots exceed the 128 MiB source budget".into(),
-                    );
-                }
-                Some(m)
-            };
-            Ok(Stroke {
-                coverage,
-                mode,
-                points,
-                radius: number(s, "radius", radius, 0.5, 512.0)?,
-                strength: number(s, "strength", 1.0, 0.0, 1.0)? * amount,
-                selection,
-                polygon,
-            })
-        })
-        .collect()
+            Some(b)
+        } else {
+            None
+        };
+        let polygon = if let Some(v) = s.get("polygon").filter(|v| !v.is_null()) {
+            let polygon = parse_points(v, 3, 8192)?;
+            let bounds = crate::selection::bounds(&polygon)?;
+            if selection.is_some_and(|s| s != bounds) {
+                return Err("Liquify polygon must match its selection bounds".into());
+            }
+            Some(polygon)
+        } else {
+            None
+        };
+        let coverage = if s["coverage"].is_null() {
+            None
+        } else {
+            let m: crate::selection::Coverage = serde_json::from_value(s["coverage"].clone())
+                .map_err(|_| "Invalid Liquify coverage")?;
+            m.validate()?;
+            coverage_bytes += m.mask.bytes();
+            if coverage_bytes > 128 * 1024 * 1024 {
+                return Err("Liquify selection snapshots exceed the 128 MiB source budget".into());
+            }
+            Some(m)
+        };
+        output.push(Stroke {
+            coverage,
+            mode,
+            points,
+            radius: number(s, "radius", radius, 0.5, 512.0)?,
+            strength: number(s, "strength", 1.0, 0.0, 1.0)? * amount,
+            selection,
+            polygon,
+        });
+    }
+    Ok(output)
 }
 pub fn validate(settings: &Value) -> Result<(), String> {
     parse(settings).map(|_| ())
@@ -221,6 +226,9 @@ fn clipped_segment(a: [f32; 2], b: [f32; 2], bounds: [f32; 4]) -> Option<([f32; 
 fn plan(width: u32, height: u32, settings: &Value) -> Result<Plan, String> {
     check_size(width, height)?;
     let strokes = parse(settings)?;
+    plan_strokes(width, height, strokes)
+}
+fn plan_strokes(width: u32, height: u32, strokes: Vec<Stroke>) -> Result<Plan, String> {
     // Fixed pixel-center spacing keeps existing strokes stable when another brush size
     // is added. Only the influenced region needs storage, independent of canvas size.
     let step = 1.0;
@@ -292,6 +300,10 @@ fn plan(width: u32, height: u32, settings: &Value) -> Result<Plan, String> {
                     "Liquify stroke replay exceeds the bounded work budget; split it into effects"
                         .into(),
                 );
+            }
+            if dabs.len() == dabs.capacity() {
+                dabs.try_reserve(1)
+                    .map_err(|_| "Liquify dab allocation failed")?;
             }
             dabs.push(Dab {
                 center,

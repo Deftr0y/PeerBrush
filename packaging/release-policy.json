@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "formats": {
+    "Windows": "microsoft-store",
+    "macOS": "dmg",
+    "Linux": "deb"
+  }
+}

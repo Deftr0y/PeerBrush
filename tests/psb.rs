@@ -292,7 +292,7 @@ fn psb_saved_groups_effects_clipping_profiles_and_standard_channels_are_current(
             kind: "invert".into(),
             enabled: true,
             weight: 0.35,
-            settings: json!({}),
+            settings: json!({}).into(),
         });
         let mut background = Layer::new("Opaque backdrop", "paint", 3, 2);
         background.pixels.convert_depth(depth);

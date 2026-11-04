@@ -16,6 +16,72 @@ pub const CACHE_BUDGET: usize = 128 * 1024 * 1024;
 pub fn supports(kind: &str) -> bool {
     effects::KINDS.contains(&kind) && kind != "liquify" && !effects::styles::contains(kind)
 }
+/// Source validation for a captured regional scene. This grants neither live
+/// document-size admission nor authority to allocate a complete filter image.
+pub(crate) fn validate_regional(filters: &[Effect]) -> Result<(), String> {
+    if filters.len() > LIMIT {
+        return Err("Whole-image filter stack limit: 32".into());
+    }
+    let mut ids = HashSet::new();
+    for filter in filters {
+        if filter.id.is_empty() || !ids.insert(&filter.id) {
+            return Err("Invalid or duplicate whole-image filter ID".into());
+        }
+        effects::validate_weight(filter.weight)?;
+        settings(&filter.kind, &filter.settings)?;
+    }
+    Ok(())
+}
+pub(crate) fn region_plan(
+    frame: effects::regional::Frame,
+    output: crate::raster::backed::Region,
+    depth: u16,
+    filters: &[Effect],
+) -> Result<effects::regional::Plan, String> {
+    validate_regional(filters)?;
+    effects::regional::Plan::new(frame, output, depth, filters)
+}
+
+#[cfg(test)]
+mod regional_tests {
+    use super::*;
+    use crate::{effects::regional::Frame, large_document::ResidentBudget, raster::backed::Region};
+    #[test]
+    fn regional_filters_preserve_source_validation_and_native_kernel_admission() {
+        let frame = Frame::new(16000, 16000).unwrap();
+        let roi = Region::new([15800, 15801, 15817, 15819]).unwrap();
+        let effect = Effect {
+            id: "retained-filter".into(),
+            kind: "invert".into(),
+            enabled: true,
+            weight: 1.,
+            settings: Arc::new(json!({})),
+        };
+        let plan = region_plan(frame, roi, 16, &[effect.clone()]).unwrap();
+        let pool = ResidentBudget::new(1024 * 1024).unwrap();
+        let output = plan
+            .render(&pool, &[None], &[None], &mut || Ok(()), |_, _| {
+                Ok([12347, 33559, 51237, 1])
+            })
+            .unwrap();
+        assert_eq!(
+            output.pixel16(15801, 15802).unwrap(),
+            [53188, 31976, 14298, 1]
+        );
+        drop(output);
+        assert_eq!(pool.used(), 0);
+        assert!(validate_regional(&[effect.clone(), effect.clone()]).is_err());
+        let mut invalid = effect.clone();
+        invalid.kind = "liquify".into();
+        assert!(validate_regional(&[invalid.clone()]).is_err());
+        invalid.kind = "gradient_overlay".into();
+        assert!(validate_regional(&[invalid]).is_err());
+        let mut invalid = effect;
+        invalid.enabled = false;
+        invalid.settings = Arc::new(json!({"unknown_setting":1}));
+        assert!(validate_regional(&[invalid]).is_err());
+    }
+}
 pub fn active(doc: &Document) -> bool {
     doc.filters.iter().any(|f| f.enabled && f.weight > 0.0)
 }
@@ -133,7 +199,7 @@ pub(crate) fn apply(doc: &mut Document, command: &Value) -> Result<(), String> {
                 kind: kind.into(),
                 enabled: true,
                 weight: effects::command_weight(command)?,
-                settings: self::settings(kind, &settings)?,
+                settings: self::settings(kind, &settings)?.into(),
             });
         }
         "filter.update" => {
@@ -149,7 +215,7 @@ pub(crate) fn apply(doc: &mut Document, command: &Value) -> Result<(), String> {
                 }
                 if kind != filter.kind {
                     filter.kind = kind.into();
-                    filter.settings = effects::defaults(kind);
+                    filter.settings = effects::defaults(kind).into();
                 }
             }
             if let Some(enabled) = command.get("enabled") {
@@ -161,7 +227,7 @@ pub(crate) fn apply(doc: &mut Document, command: &Value) -> Result<(), String> {
                 filter.weight = effects::command_weight(command)?;
             }
             if let Some(settings) = command.get("settings") {
-                filter.settings = self::settings(&filter.kind, settings)?;
+                filter.settings = self::settings(&filter.kind, settings)?.into();
             }
         }
         "filter.delete" | "filter.reorder" => {

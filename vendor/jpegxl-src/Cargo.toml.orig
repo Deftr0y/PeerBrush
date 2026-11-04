@@ -1,0 +1,50 @@
+[package]
+description = "Source of libjxl and logic to build it."
+edition = "2021"
+license = "BSD-3-Clause"
+name = "jpegxl-src"
+readme = "README.md"
+repository = "https://github.com/inflation/jpegxl-rs"
+version = "0.12.0"
+rust-version.workspace = true
+exclude = [
+    "libjxl/third_party/libpng",
+    "libjxl/third_party/sjpeg",
+    "libjxl/third_party/lcms",
+    "libjxl/third_party/googletest",
+    "libjxl/third_party/brotli/tests",
+    "libjxl/third_party/brotli/java",
+    "libjxl/third_party/brotli/csharp",
+    "libjxl/third_party/brotli/research",
+    "libjxl/third_party/brotli/js",
+    "libjxl/third_party/libjpeg-turbo",
+    "libjxl/third_party/highway/g3doc",
+    "libjxl/third_party/skcms/profiles",
+    "libjxl/third_party/zlib/contrib",
+    "libjxl/testdata",
+    "libjxl/examples",
+    "libjxl/experimental",
+    "libjxl/docker",
+    "libjxl/doc",
+    "libjxl/.github",
+    "libjxl/debian",
+    "libjxl/plugins",
+]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(coverage_nightly)',
+    'cfg(asan)',
+    'cfg(tsan)',
+] }
+
+[lints.clippy]
+pedantic = "warn"
+
+[dependencies]
+cmake = "0.1.58"
+
+[features]
+threads = []

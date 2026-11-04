@@ -10,12 +10,15 @@ use std::{
 pub const BUDGET: usize = 256 * 1024 * 1024;
 // Caches and transient effect buffers have separate, bounded budgets.
 pub const WORKING_BUDGET: usize = 256 * 1024 * 1024;
+pub(crate) mod alpha;
 pub mod catalog;
 pub mod channel_clamp;
 pub mod contours;
+pub(crate) mod field;
 pub mod gradient;
 pub mod patterns;
 pub mod posterize;
+pub(crate) mod regional;
 pub mod styles;
 pub const KINDS: &[&str] = &[
     "bevel_emboss",
@@ -50,10 +53,17 @@ pub struct Effect {
     pub enabled: bool,
     #[serde(default = "full_weight")]
     pub weight: f32,
-    pub settings: Value,
+    pub settings: Arc<Value>,
 }
 pub fn full_weight() -> f32 {
     1.0
+}
+fn allocation<T>(capacity: usize) -> Result<Vec<T>, String> {
+    let mut result = Vec::new();
+    result
+        .try_reserve_exact(capacity)
+        .map_err(|_| "Effect buffer allocation failed")?;
+    Ok(result)
 }
 pub fn validate_weight(weight: f32) -> Result<(), String> {
     if !weight.is_finite() || !(0.0..=1.0).contains(&weight) {
@@ -730,7 +740,8 @@ pub(crate) fn apply_region(
 fn apply_cpu_prepared(image: &mut Image, kind: &str, settings: Value) -> Result<(), String> {
     let (w, h) = (image.width as usize, image.height as usize);
     if styles::contains(kind) {
-        let mut words: Vec<u16> = image.bytes.iter().map(|b| u16::from(*b) * 257).collect();
+        let mut words = allocation(image.bytes.len())?;
+        words.extend(image.bytes.iter().map(|b| u16::from(*b) * 257));
         styles::apply(&mut words, image.width, image.height, kind, &settings)?;
         for (byte, word) in image.bytes.iter_mut().zip(words) {
             *byte = crate::raster::project16(word);
@@ -757,11 +768,11 @@ fn apply_cpu_prepared(image: &mut Image, kind: &str, settings: Value) -> Result<
             return Ok(());
         }
         "blur" => {
-            blur_rgba(&mut image.bytes, w, h, number(&settings, "radius", 8.0));
+            blur_rgba(&mut image.bytes, w, h, number(&settings, "radius", 8.0))?;
             return Ok(());
         }
         "bloom" => {
-            bloom(image, &settings);
+            bloom(image, &settings)?;
             return Ok(());
         }
         "liquify" => return crate::liquify::apply(image, &settings),
@@ -908,7 +919,7 @@ fn hsl_adjust(rgb: [f32; 3], hue: f32, saturation: f32, lightness: f32) -> [f32;
     };
     out.map(|v| v + m)
 }
-fn bloom(image: &mut Image, settings: &Value) {
+fn bloom(image: &mut Image, settings: &Value) -> Result<(), String> {
     let threshold = number(settings, "threshold", 0.75);
     let strength = number(settings, "strength", 0.5);
     if strength == 0.0
@@ -922,9 +933,9 @@ fn bloom(image: &mut Image, settings: &Value) {
                 ]) > threshold
         })
     {
-        return;
+        return Ok(());
     }
-    let mut glow = Vec::with_capacity(image.bytes.len());
+    let mut glow = allocation(image.bytes.len())?;
     for p in image.bytes.chunks_exact(4) {
         let luma = luminance([
             p[0] as f32 / 255.0,
@@ -948,7 +959,7 @@ fn bloom(image: &mut Image, settings: &Value) {
         image.width as usize,
         image.height as usize,
         number(settings, "spread", 12.0),
-    );
+    )?;
     for (p, g) in image.bytes.chunks_exact_mut(4).zip(glow.chunks_exact(4)) {
         let base_alpha = p[3] as f32 / 255.0;
         let glow_alpha = (g[3] as f32 / 65025.0 * strength).clamp(0.0, 1.0);
@@ -970,6 +981,7 @@ fn bloom(image: &mut Image, settings: &Value) {
         }
         p[3] = out_alpha;
     }
+    Ok(())
 }
 /// Three linear-time box passes approximate a Gaussian. Premultiplied RGBA prevents dark fringes.
 pub fn gaussian_radii(sigma: f32) -> [usize; 3] {
@@ -1021,15 +1033,15 @@ pub fn box_channel(
         }
     }
 }
-pub fn blur_rgba(bytes: &mut Vec<u8>, w: usize, h: usize, sigma: f32) {
+pub fn blur_rgba(bytes: &mut Vec<u8>, w: usize, h: usize, sigma: f32) -> Result<(), String> {
     if !sigma.is_finite() || sigma < 0.5 || w == 0 || h == 0 {
-        return;
+        return Ok(());
     }
     if w.checked_mul(h).and_then(|v| v.checked_mul(4)) != Some(bytes.len()) {
-        return;
+        return Err("Blur image dimensions do not match its samples".into());
     }
     // Keep 16-bit premultiplied values through every pass: faint colored edges retain their hue.
-    let mut pixels = Vec::with_capacity(bytes.len());
+    let mut pixels = allocation(bytes.len())?;
     for p in bytes.chunks_exact(4) {
         pixels.extend([
             p[0] as u16 * p[3] as u16,
@@ -1038,7 +1050,7 @@ pub fn blur_rgba(bytes: &mut Vec<u8>, w: usize, h: usize, sigma: f32) {
             p[3] as u16 * 255,
         ]);
     }
-    blur_premultiplied(&mut pixels, w, h, sigma.clamp(0.0, 64.0));
+    blur_premultiplied(&mut pixels, w, h, sigma.clamp(0.0, 64.0))?;
     for (p, v) in bytes.chunks_exact_mut(4).zip(pixels.chunks_exact(4)) {
         p[3] = ((v[3] as u32 + 127) / 255).min(255) as u8;
         for c in 0..3 {
@@ -1049,12 +1061,14 @@ pub fn blur_rgba(bytes: &mut Vec<u8>, w: usize, h: usize, sigma: f32) {
             };
         }
     }
+    Ok(())
 }
-fn blur_premultiplied(pixels: &mut [u16], w: usize, h: usize, sigma: f32) {
+fn blur_premultiplied(pixels: &mut [u16], w: usize, h: usize, sigma: f32) -> Result<(), String> {
     if w == 0 || h == 0 {
-        return;
+        return Ok(());
     }
-    let mut line = vec![0u16; w.max(h) * 4];
+    let mut line = allocation(w.max(h) * 4)?;
+    line.resize(w.max(h) * 4, 0u16);
     for radius in gaussian_radii(sigma) {
         if radius == 0 {
             continue;
@@ -1080,4 +1094,5 @@ fn blur_premultiplied(pixels: &mut [u16], w: usize, h: usize, sigma: f32) {
             }
         }
     }
+    Ok(())
 }

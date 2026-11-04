@@ -47,7 +47,7 @@ fn fixture(depth: u16, effects: bool) -> (Engine, String) {
             id: id(),
             kind: "invert".into(),
             enabled: true,
-            settings: json!({}),
+            settings: json!({}).into(),
         });
     }
     let mut nested = Layer::new("Nested folder", "group", 40, 32);
@@ -84,6 +84,8 @@ fn selected_folder_transforms_match_selected_children_at_native_depth_and_round_
             json!({"op":"move","dx":15,"dy":2}),
             json!({"op":"transform","angle":90}),
             json!({"op":"transform","scale_x":1.5,"scale_y":0.75}),
+            json!({"op":"transform","skew_x":45.,"dx":6.,"dy":2.}),
+            json!({"op":"transform","skew_x":45.,"skew_y":-45.,"mirror_x":true,"angle":90.,"scale_x":1.1,"scale_y":0.9}),
         ] {
             let (mut e, root) = fixture(depth, true);
             // Include disjoint selected pieces, a hole, a soft edge, and hidden content.
@@ -383,7 +385,7 @@ fn default_folder_pivot_uses_descendants_and_adjustment_masks_retain_native_fram
         id: id(),
         kind: "levels".into(),
         enabled: true,
-        settings: json!({"gamma":1.1}),
+        settings: json!({"gamma":1.1}).into(),
     });
     adjustment.mask = e.doc.layers[0].mask.clone();
     e.doc.layers.insert(2, adjustment);

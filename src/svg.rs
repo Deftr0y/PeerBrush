@@ -4,6 +4,10 @@ use resvg::{tiny_skia, usvg};
 use std::{collections::HashMap, str::FromStr};
 
 pub const MARKUP_LIMIT: usize = 512 * 1024;
+#[path = "svg/prepared.rs"]
+pub(crate) mod prepared;
+#[path = "svg/row_budget.rs"]
+pub(crate) mod row_budget;
 const NODES: usize = 4096;
 const GEOMETRY: usize = 65536;
 const SVG_NS: &str = "http://www.w3.org/2000/svg";
@@ -293,6 +297,9 @@ fn expansion(
     Ok(size)
 }
 pub fn tree(markup: &str) -> Result<usvg::Tree, String> {
+    tree_bounded(markup, false)
+}
+fn tree_bounded(markup: &str, native: bool) -> Result<usvg::Tree, String> {
     if markup.len() > MARKUP_LIMIT {
         return Err("SVG source exceeds 512 KiB".into());
     }
@@ -512,11 +519,19 @@ pub fn tree(markup: &str) -> Result<usvg::Tree, String> {
         usvg::Tree::from_xmltree(&xml, &options).map_err(|e| format!("Cannot render SVG: {e}"))?;
     let w = tree.size().width().ceil() as u32;
     let h = tree.size().height().ceil() as u32;
-    check_size(w, h)?;
-    if u64::from(w) * u64::from(h) > 4_000_000 {
+    if native {
+        if w == 0 || h == 0 || w > 16000 || h > 16000 {
+            return Err("SVG source frame exceeds native admission".into());
+        }
+    } else {
+        check_size(w, h)?;
+    }
+    if !native && u64::from(w) * u64::from(h) > 4_000_000 {
         return Err("SVG source frames are limited to four million pixels".into());
     }
-    if u64::from(w) * u64::from(h) * (expanded.1.div_ceil(32).max(1) as u64) > 256_000_000 {
+    if !native
+        && u64::from(w) * u64::from(h) * (expanded.1.div_ceil(32).max(1) as u64) > 256_000_000
+    {
         return Err("SVG source geometry exceeds bounded rendering work".into());
     }
     Ok(tree)

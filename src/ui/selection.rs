@@ -17,19 +17,21 @@ const TOOLS: &[(&str, &str, Icon)] = &[
     ("object", "Object region", Icon::ObjectSelection),
 ];
 impl PeerBrush {
-    pub(super) fn selection_gesture_stale(&self, doc: &Document) -> bool {
+    pub(super) fn selection_gesture_stale<'a>(&self, doc: impl Into<DocumentView<'a>>) -> bool {
+        let doc = doc.into();
         self.selection_gesture_source
             .as_ref()
             .is_some_and(|source| {
-                source.document != doc.id
-                    || source.revision != doc.revision
+                source.document != doc.id()
+                    || source.revision != doc.revision()
                     || source.layer != self.selected
             })
     }
-    pub(super) fn selection_source(&self, doc: &Document) -> GestureSource {
+    pub(super) fn selection_source<'a>(&self, doc: impl Into<DocumentView<'a>>) -> GestureSource {
+        let doc = doc.into();
         GestureSource {
-            document: doc.id.clone(),
-            revision: doc.revision,
+            document: doc.id().to_owned(),
+            revision: doc.revision(),
             layer: self.selected.clone(),
         }
     }
@@ -43,20 +45,22 @@ impl PeerBrush {
         self.drag_start = None;
         self.drag_revision = None;
     }
-    pub(super) fn deselect_area(&mut self, doc: &Document, tool: bool) {
+    pub(super) fn deselect_area<'a>(&mut self, doc: impl Into<DocumentView<'a>>, tool: bool) {
+        let doc = doc.into();
         self.finish_parameter(true);
         self.cancel_geometry();
         self.cancel_source();
         self.cancel_filters();
         self.cancel_refinement();
         self.select_tool(if tool { Tool::None } else { self.tool });
-        if doc.selection.is_some() {
-            self.edit(vec![json!({"op":"selection.clear","document_id":doc.id,"source_revision":doc.revision})], "Deselect");
+        if doc.selection().is_some() {
+            self.edit(vec![json!({"op":"selection.clear","document_id":doc.id(),"source_revision":doc.revision()})], "Deselect");
         }
     }
-    fn wand_update_command(&self, doc: &Document) -> Value {
-        json!({"op":"selection.wand_update", "document_id":doc.id,
-            "source_revision":doc.revision, "tolerance":self.selection_tolerance,
+    fn wand_update_command<'a>(&self, doc: impl Into<DocumentView<'a>>) -> Value {
+        let doc = doc.into();
+        json!({"op":"selection.wand_update", "document_id":doc.id(),
+            "source_revision":doc.revision(), "tolerance":self.selection_tolerance,
             "feather":self.selection_feather, "contiguous":self.selection_contiguous,
             "sample_merged":self.selection_merged,"color_similarity":self.selection_color_similarity})
     }
@@ -207,7 +211,13 @@ impl PeerBrush {
         })
         .to_owned()
     }
-    pub(super) fn select_command(&self, doc: &Document, points: &[[f32; 2]], mode: &str) -> Value {
+    pub(super) fn select_command<'a>(
+        &self,
+        doc: impl Into<DocumentView<'a>>,
+        points: &[[f32; 2]],
+        mode: &str,
+    ) -> Value {
+        let doc = doc.into();
         let a = points.first().copied().unwrap_or([0., 0.]);
         let b = points.last().copied().unwrap_or(a);
         let mut area = [
@@ -220,7 +230,7 @@ impl PeerBrush {
             area = [
                 0,
                 a[1].floor() as i32,
-                doc.width as i32,
+                doc.width() as i32,
                 a[1].floor() as i32 + 1,
             ];
         }
@@ -229,14 +239,14 @@ impl PeerBrush {
                 a[0].floor() as i32,
                 0,
                 a[0].floor() as i32 + 1,
-                doc.height as i32,
+                doc.height() as i32,
             ];
         }
         let polygon = ["lasso", "polygon", "magnetic"]
             .contains(&self.selection_kind.as_str())
             .then_some(points);
         let source = self.selection_gesture_source.as_ref();
-        json!({"op":"selection","document_id":source.map_or(doc.id.as_str(), |s| s.document.as_str()),"source_revision":source.map_or(doc.revision, |s| s.revision),"kind":self.selection_kind,"mode":mode,"rect":area,"polygon":polygon,"point":a,"points":points,"radius":self.selection_width,"feather":self.selection_feather,"tolerance":self.selection_tolerance,"contiguous":self.selection_contiguous,"sample_merged":self.selection_merged,"color_similarity":self.selection_color_similarity,"layer":source.map_or(self.selected.as_str(), |s| s.layer.as_str())})
+        json!({"op":"selection","document_id":source.map_or(doc.id(), |s| s.document.as_str()),"source_revision":source.map_or(doc.revision(), |s| s.revision),"kind":self.selection_kind,"mode":mode,"rect":area,"polygon":polygon,"point":a,"points":points,"radius":self.selection_width,"feather":self.selection_feather,"tolerance":self.selection_tolerance,"contiguous":self.selection_contiguous,"sample_merged":self.selection_merged,"color_similarity":self.selection_color_similarity,"layer":source.map_or(self.selected.as_str(), |s| s.layer.as_str())})
     }
     pub(super) fn selection_canvas(
         &mut self,

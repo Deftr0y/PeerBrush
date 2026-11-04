@@ -51,7 +51,7 @@ fn rich_tree() -> (Document, String, String) {
         id: engine::id(),
         kind: "invert".into(),
         enabled: true,
-        settings: json!({}),
+        settings: json!({}).into(),
     });
     let root = folder.id.clone();
     let ink = child.id.clone();
@@ -409,7 +409,7 @@ fn pasted_content_invalidates_cached_destination_folder_effects() {
         id: engine::id(),
         kind: "invert".into(),
         enabled: true,
-        settings: json!({}),
+        settings: json!({}).into(),
     });
     let target = doc.layers[0].id.clone();
     assert_eq!(doc.preview(None, 4, None, false).unwrap().2[3], 0);

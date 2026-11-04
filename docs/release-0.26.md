@@ -1,6 +1,6 @@
 # PeerBrush 0.26
 
-Application version 0.26.0 is prepared for stable release. Publication remains pending final reviewed promotion, exact-source builds, package inspection and the platform acceptance checks below. Published 0.25 artifacts and their provenance remain unchanged.
+[Version 0.26.0](https://github.com/Deftr0y/PeerBrush/releases/tag/v0.26.0) is published from `a00cf47accde87400fad3f0fcfc5fe96fc4f5be1`: verified public macOS arm64 and Linux x64 downloads and the matching website are live. The Mac distribution is a Developer ID signed, notarized and stapled app in a ZIP. Windows Store 0.26 is pending, with submission/certification unverified. A standard macOS DMG, installed distribution, safe updates and main-to-production automation remain [high-priority planned foundations](release-signing-plan.md#high-priority-installation-and-production-foundations); other unfinished development/acceptance moves to [v0.3](development-0.3.md). Published historical artifacts and provenance remain unchanged.
 
 ## Changes since 0.25
 

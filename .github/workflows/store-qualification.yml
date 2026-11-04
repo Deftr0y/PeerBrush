@@ -1,0 +1,181 @@
+name: PeerBrush native Store SDK qualification
+on:
+  workflow_dispatch:
+    inputs:
+      expected_commit:
+        description: Full reviewed stable main and workflow SHA
+        required: true
+        type: string
+      selection_json:
+        description: Exact public artifact, byte and SDK tool selections; no credentials
+        required: true
+        type: string
+      selection_sha256:
+        description: Independently reviewed SHA256 of exact UTF8 selection JSON
+        required: true
+        type: string
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+concurrency:
+  group: store-sdk-qualification-${{ github.sha }}
+  cancel-in-progress: false
+env:
+  SELECTED_COMMIT: ${{ inputs.expected_commit }}
+  SELECTION_JSON: ${{ inputs.selection_json }}
+  SELECTION_SHA256: ${{ inputs.selection_sha256 }}
+  PEERBRUSH_STORE_SDK_QUALIFICATION_ENABLED: ${{ vars.PEERBRUSH_STORE_SDK_QUALIFICATION_ENABLED }}
+jobs:
+  gate:
+    name: gate
+    # Source review and environment configuration are still required.
+    if: ${{ false }}
+    runs-on: windows-2025
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Require reviewed main invocation
+        run: |
+          python -I - <<'PY'
+          import os, re
+          selected = os.environ.get('SELECTED_COMMIT', '')
+          required = {
+              'GITHUB_REPOSITORY': 'Deftr0y/PeerBrush', 'GITHUB_REF': 'refs/heads/main',
+              'GITHUB_REPOSITORY_ID': '1407648785', 'GITHUB_REPOSITORY_OWNER_ID': '21202494',
+              'GITHUB_EVENT_NAME': 'workflow_dispatch',
+              'GITHUB_WORKFLOW_REF': 'Deftr0y/PeerBrush/.github/workflows/store-qualification.yml@refs/heads/main',
+              'GITHUB_SHA': selected, 'GITHUB_WORKFLOW_SHA': selected, 'GITHUB_RUN_ATTEMPT': '1',
+              'RUNNER_ENVIRONMENT': 'github-hosted', 'RUNNER_OS': 'Windows', 'RUNNER_ARCH': 'X64',
+              'PEERBRUSH_STORE_SDK_QUALIFICATION_ENABLED': 'true',
+          }
+          if not re.fullmatch('[0-9a-f]{40}', selected) or any(os.environ.get(key) != value for key, value in required.items()):
+              raise SystemExit('Require reviewed exact main and approved native invocation before checkout.')
+          PY
+      - name: Checkout reviewed main source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Require exact main source
+        run: python -B scripts/release_gate.py --commit "$SELECTED_COMMIT"
+      - name: Test fixed Store SDK qualification contracts
+        run: |
+          python -B scripts/test_store_sdk_qualification.py
+          python -B scripts/test_store_sdk_inputs.py
+          python -B scripts/test_store_sdk_final_inputs.py
+          python -B scripts/test_macos_qualification_attestation.py
+          python -B scripts/test_macos_qualification_job.py
+          python -B scripts/test_windows_qualification.py
+          python -B scripts/package.py --check-source
+  qualify:
+    name: qualify
+    needs: gate
+    if: ${{ false }}
+    runs-on: windows-2025
+    environment: store-native-qualification
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Require reviewed main invocation
+        run: |
+          python -I - <<'PY'
+          import os, re
+          selected = os.environ.get('SELECTED_COMMIT', '')
+          required = {
+              'GITHUB_REPOSITORY': 'Deftr0y/PeerBrush', 'GITHUB_REF': 'refs/heads/main',
+              'GITHUB_REPOSITORY_ID': '1407648785', 'GITHUB_REPOSITORY_OWNER_ID': '21202494',
+              'GITHUB_EVENT_NAME': 'workflow_dispatch',
+              'GITHUB_WORKFLOW_REF': 'Deftr0y/PeerBrush/.github/workflows/store-qualification.yml@refs/heads/main',
+              'GITHUB_SHA': selected, 'GITHUB_WORKFLOW_SHA': selected, 'GITHUB_RUN_ATTEMPT': '1',
+              'RUNNER_ENVIRONMENT': 'github-hosted', 'RUNNER_OS': 'Windows', 'RUNNER_ARCH': 'X64',
+              'PEERBRUSH_STORE_SDK_QUALIFICATION_ENABLED': 'true',
+          }
+          if not re.fullmatch('[0-9a-f]{40}', selected) or any(os.environ.get(key) != value for key, value in required.items()):
+              raise SystemExit('Require reviewed exact main and approved native invocation before checkout.')
+          PY
+      - name: Checkout reviewed main source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Require exact main source
+        run: python -B scripts/release_gate.py --commit "$SELECTED_COMMIT"
+      - name: Acquire selected Store assets
+        id: acquire
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python -I - <<'PY'
+          import hashlib, os, pathlib, re, sys
+          sys.path.insert(0, 'scripts')
+          from package_macos_dmg import private_inspection_directory
+          root = pathlib.Path(os.environ['GITHUB_WORKSPACE'])
+          area = private_inspection_directory(pathlib.Path(os.environ['RUNNER_TEMP']) / 'peerbrush-store-sdk-selector', root, fresh=True)
+          data = os.environ['SELECTION_JSON'].encode('utf-8')
+          selected = os.environ['SELECTION_SHA256']
+          if not 0 < len(data) <= 32768 or not re.fullmatch('[0-9a-f]{64}', selected) or hashlib.sha256(data).hexdigest() != selected:
+              raise SystemExit('Native SDK selection differs from its reviewed bytes.')
+          area.mkdir(mode=0o700)
+          area.chmod(0o700)
+          with (area / 'selection.json').open('xb') as stream:
+              stream.write(data)
+          PY
+          SHA=$(python -B scripts/acquire_store_qualification_inputs.py --source-root "$GITHUB_WORKSPACE" \
+            --selection "$RUNNER_TEMP/peerbrush-store-sdk-selector/selection.json" --selection-sha256 "$SELECTION_SHA256" \
+            --output "$RUNNER_TEMP/peerbrush-store-sdk-inputs")
+          [[ "$SHA" =~ ^[0-9a-f]{64}$ ]]
+          echo "selection_sha256=$SHA" >> "$GITHUB_OUTPUT"
+      - name: Qualify selected Store SDK package
+        run: |
+          python -B scripts/qualify_store_sdk.py --source-root "$GITHUB_WORKSPACE" \
+            --selection "$RUNNER_TEMP/peerbrush-store-sdk-inputs/qualification-selection.json" \
+            --selection-sha256 '${{ steps.acquire.outputs.selection_sha256 }}' \
+            --work "$RUNNER_TEMP/peerbrush-store-sdk-work" --output "$RUNNER_TEMP/peerbrush-store-sdk-report"
+      - name: Attest generated native qualification
+        id: attest
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-path: ${{ runner.temp }}/peerbrush-store-sdk-report/store-sdk-qualification.json
+          subject-name: store-sdk-qualification.json
+          push-to-registry: false
+          create-storage-record: false
+          show-summary: false
+      - name: Retain qualification and bundle
+        env:
+          SELECTED_BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          python -I - <<'PY'
+          import os, pathlib, sys
+          sys.path.insert(0, 'scripts')
+          from package_macos_dmg import bounded_file, private_inspection_directory
+          base, root = pathlib.Path(os.environ['RUNNER_TEMP']), pathlib.Path(os.environ['GITHUB_WORKSPACE'])
+          output = private_inspection_directory(base / 'peerbrush-store-sdk-evidence', root, fresh=True)
+          output.mkdir(mode=0o700)
+          output.chmod(0o700)
+          records = []
+          for source, name, limit in [
+              (base / 'peerbrush-store-sdk-report/store-sdk-qualification.json', 'store-sdk-qualification.json', 16384),
+              (pathlib.Path(os.environ['SELECTED_BUNDLE']), 'store-sdk-qualification.sigstore.json', 2097152),
+          ]:
+              checksum, size = bounded_file(source, limit, output / name)
+              if not size or bounded_file(source, limit) != (checksum, size) or bounded_file(output / name, limit) != (checksum, size):
+                  raise SystemExit('Native SDK evidence changed during retention.')
+              records.extend([(source, limit, checksum, size), (output / name, limit, checksum, size)])
+          if any(bounded_file(path, limit) != (checksum, size) for path, limit, checksum, size in records):
+              raise SystemExit('Original or retained native SDK evidence changed.')
+          PY
+      - name: Upload qualification evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: store-native-qualification-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/peerbrush-store-sdk-evidence/*
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0

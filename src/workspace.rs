@@ -1,5 +1,7 @@
 //! Stable project engines. Registry locks never acquire existing engine locks.
 pub mod lifecycle;
+pub(crate) mod native_dispatch;
+pub(crate) mod source_runtime;
 use crate::{
     engine::{self, Document, Engine, Scope},
     server::Shared,
@@ -36,11 +38,13 @@ struct Entry {
     handle: Handle,
 }
 pub struct Workspace {
+    pub(crate) source_runtime: Option<Arc<source_runtime::SourceRuntime>>,
     pub(crate) activation: crate::activation::Queue,
     pub(crate) open_warning: Option<String>,
     entries: Vec<Entry>,
     active: String,
     pub(crate) exiting: bool,
+    pub(crate) file_operations: Arc<std::sync::atomic::AtomicUsize>,
     pub brush_library: Arc<Mutex<crate::brush_library::Library>>,
     pub tool_settings: Arc<Mutex<crate::tool_settings::Store>>,
     pub filter_library: Arc<Mutex<crate::filter_library::Library>>,
@@ -52,6 +56,19 @@ pub struct Workspace {
 }
 pub type Registry = Arc<Mutex<Workspace>>;
 pub const MAX_PROJECTS: usize = 16;
+
+impl Workspace {
+    /// Inspect selection while the caller holds the registry through capture dequeue.
+    pub(crate) fn is_active_engine(&self, shared: &Shared) -> bool {
+        self.entries.iter().any(|entry| {
+            entry.id == self.active
+                && entry
+                    .handle
+                    .get()
+                    .is_some_and(|active| Arc::ptr_eq(&active, shared))
+        })
+    }
+}
 
 /// Queue native feedback without changing any document or presentation state.
 pub(crate) fn duplicate_warning(
@@ -105,14 +122,16 @@ pub fn attach(root: &Shared) -> Registry {
         return workspace;
     }
     let workspace = Arc::new(Mutex::new(Workspace {
+        source_runtime: None,
         activation: Default::default(),
         entries: vec![Entry {
             id: e.project_id.clone(),
-            name: e.doc.name.clone(),
+            name: engine::view::current(&e).name().to_owned(),
             handle: Handle::Root(Arc::downgrade(root)),
         }],
         active: e.project_id.clone(),
         exiting: false,
+        file_operations: Default::default(),
         brush_library: e.brush_library.clone(),
         tool_settings: e.tool_settings.clone(),
         filter_library: e.filter_library.clone(),
@@ -190,7 +209,7 @@ pub fn active(root: &Shared) -> Result<Shared, String> {
 }
 pub fn mutating(method: &str, p: &Value) -> bool {
     match method {
-        "observe" | "capabilities" | "brushes" => false,
+        "observe" | "capabilities" | "brushes" | "fonts" => false,
         "task" => !matches!(p["action"].as_str(), Some("status" | "recovery")),
         "history" => !matches!(p["action"].as_str(), None | Some("list" | "inspect_task")),
         "proposal" => matches!(p["action"].as_str(), Some("create" | "accept" | "reject")),
@@ -200,15 +219,16 @@ pub fn mutating(method: &str, p: &Value) -> bool {
 }
 pub fn validate_target(e: &Engine, p: &Value) -> Result<(), String> {
     e.ensure_open()?;
+    let view = engine::view::current(e);
     if let Some(document) = p.get("document_id") {
-        if document.as_str() != Some(&e.doc.id) {
+        if document.as_str() != Some(view.id()) {
             return Err("Project document changed; observe this project again".into());
         }
     }
     if p.get("project_id").is_some()
         && p["expected_revision"]
             .as_u64()
-            .is_some_and(|r| r != e.doc.revision)
+            .is_some_and(|r| r != view.revision())
     {
         return Err("Targeted project revision changed; observe this project again".into());
     }
@@ -291,7 +311,8 @@ pub fn state(root: &Shared) -> Value {
     let projects=handles(root).into_iter().filter_map(|shared| {
         let mut e=shared.lock().unwrap();e.expire();
         if e.closed {return None;}
-        Some(json!({"project_id":e.project_id,"document_id":e.doc.id,"name":e.doc.name,"revision":e.doc.revision,"dirty":e.doc.revision!=e.saved_revision,"path":e.path,"bit_depth":e.doc.bit_depth,"read_only":e.doc.read_only,"loading":e.loading.as_ref().map(|c|c.status().stage),"ai_change":e.ai_change}))
+        let view = engine::view::current(&e);
+        Some(json!({"project_id":e.project_id,"document_id":view.id(),"name":view.name(),"revision":view.revision(),"dirty":view.revision()!=e.saved_revision,"path":e.path,"bit_depth":view.depth(),"read_only":view.read_only(),"loading":e.loading.as_ref().map(|c|c.status().stage),"ai_change":e.ai_change}))
     }).collect::<Vec<_>>();
     let error = attach(root).lock().unwrap().recovery_error.clone();
     json!({"active_project_id":active,"projects":projects,"max_projects":MAX_PROJECTS,"autosave_error":error})
@@ -342,6 +363,18 @@ pub fn register_in(
     }
     Ok(shared)
 }
+/// Move the independently opened project, including its file ownership, into its tab.
+pub(crate) fn register_opened(
+    workspace: &Registry,
+    prepared: Shared,
+    activate_if: Option<&str>,
+) -> Result<Shared, String> {
+    let engine = Arc::try_unwrap(prepared)
+        .map_err(|_| "Opened project still has an active worker")?
+        .into_inner()
+        .map_err(|_| "Opened project worker failed")?;
+    register_in(workspace, engine, activate_if)
+}
 pub fn new_project(
     root: &Shared,
     width: u32,
@@ -349,16 +382,26 @@ pub fn new_project(
     depth: u16,
     activate_if: Option<&str>,
 ) -> Result<Shared, String> {
-    let mut e = Engine::new();
-    e.doc = Document::new_depth(width, height, depth)?;
-    register(root, e, activate_if)
+    let engine = Engine::from_document(Document::new_depth(width, height, depth)?);
+    register(root, engine, activate_if)
 }
 pub fn guard(e: &Engine, document: &str, revision: u64) -> Result<(), String> {
     e.ensure_open()?;
-    if e.doc.id != document || e.doc.revision != revision {
+    let view = engine::view::current(e);
+    if view.id() != document || view.revision() != revision {
         return Err("Project source changed; observe its document ID and revision again".into());
     }
     Ok(())
+}
+fn file_operations_idle(counter: &std::sync::atomic::AtomicUsize) -> Result<(), String> {
+    if counter.load(std::sync::atomic::Ordering::Acquire) != 0 {
+        return Err("Finish the active file or workspace operation before closing projects".into());
+    }
+    Ok(())
+}
+fn needs_save(e: &Engine) -> bool {
+    engine::view::current(e).revision() != e.saved_revision
+        || crate::file_safety::source_conflict(e.path.as_deref(), e.file_version)
 }
 pub fn close(
     root: &Shared,
@@ -388,10 +431,8 @@ pub fn close_in(
         .try_lock()
         .map_err(|_| "The project is still working. Try closing again when it finishes.")?;
     guard(&e, document, revision)?;
-    if (e.doc.revision != e.saved_revision
-        || crate::file_safety::source_conflict(e.path.as_deref(), e.file_version))
-        && !discard
-    {
+    file_operations_idle(&e.file_operations)?;
+    if !discard && needs_save(&e) {
         return Err("Unsaved project: save first, cancel, or explicitly choose Don't Save".into());
     }
     e.check(
@@ -402,6 +443,7 @@ pub fn close_in(
         }],
     )?;
     let mut workspace_guard = workspace.lock().unwrap();
+    file_operations_idle(&workspace_guard.file_operations)?;
     if workspace_guard.exiting {
         return Err("Workspace is exiting".into());
     }
@@ -413,13 +455,17 @@ pub fn close_in(
     }
     e.closed = true;
     e.release_file_ownership();
-    e.doc = Document::new(1, 1).unwrap();
+    // Closed handles must see an empty document immediately. Release the old
+    // pixels, histories and draft owners after releasing the workspace and project locks.
+    let retired = (
+        std::mem::replace(&mut e.doc, Document::new(1, 1).unwrap()),
+        std::mem::take(&mut e.undo),
+        std::mem::take(&mut e.redo),
+        std::mem::take(&mut e.proposals),
+    );
     e.saved_revision = 0;
-    e.undo.clear();
-    e.redo.clear();
     e.changes.clear();
     e.leases.clear();
-    e.proposals.clear();
     e.recent_tasks.clear();
     e.path = None;
     e.file_version = None;
@@ -443,6 +489,9 @@ pub fn close_in(
     } else if workspace_guard.active == id {
         workspace_guard.active = workspace_guard.entries[0].id.clone();
     }
+    drop(workspace_guard);
+    drop(e);
+    drop(retired);
     Ok(())
 }
 
@@ -483,12 +532,12 @@ pub fn transfer_in(workspace: &Registry, request: &Transfer<'_>) -> Result<Value
 fn transfer_locked(from: &mut Engine, to: &mut Engine, r: &Transfer<'_>) -> Result<Value, String> {
     guard(from, r.source_document, r.source_revision)?;
     guard(to, r.destination_document, r.destination_revision)?;
-    if from.doc.read_only {
+    if engine::view::current(from).read_only() {
         return Err("Protected Photoshop sources need an explicit compatible copy before transferring editable layers".into());
     }
-    let snapshot = crate::layer_clipboard::copy(&from.doc, r.layers)?;
+    let snapshot = crate::layer_clipboard::copy(from.resident()?, r.layers)?;
     let cut = if r.move_layers {
-        Some(crate::layer_clipboard::cut_commands(&from.doc, r.layers)?)
+        Some(crate::layer_clipboard::cut_commands(from.resident()?, r.layers)?)
     } else {
         None
     };
@@ -512,7 +561,7 @@ fn transfer_locked(from: &mut Engine, to: &mut Engine, r: &Transfer<'_>) -> Resu
             )?;
         }
         Ok(
-            json!({"source_project_id":from.project_id,"destination_project_id":to.project_id,"source_revision":from.doc.revision,"destination_revision":to.doc.revision,"moved":r.move_layers,"created_roots":pasted["created_roots"],"created":pasted["created"]}),
+            json!({"source_project_id":from.project_id,"destination_project_id":to.project_id,"source_revision":engine::view::current(from).revision(),"destination_revision":engine::view::current(to).revision(),"moved":r.move_layers,"created_roots":pasted["created_roots"],"created":pasted["created"]}),
         )
     })();
     if result.is_err() {
@@ -533,13 +582,20 @@ pub fn transfer_preview_in(workspace: &Registry, r: &Transfer<'_>) -> Result<Doc
     let destination = get_in(workspace, r.destination)?;
     let from = source.lock().unwrap();
     guard(&from, r.source_document, r.source_revision)?;
-    if from.doc.read_only {
+    if engine::view::current(&from).read_only() {
         return Err("Protected Photoshop sources need an explicit compatible copy before transferring editable layers".into());
     }
-    let snapshot = crate::layer_clipboard::copy(&from.doc, r.layers)?;
-    if r.move_layers {
-        let commands = crate::layer_clipboard::cut_commands(&from.doc, r.layers)?;
-        let mut source_draft = from.clone();
+    let snapshot = crate::layer_clipboard::copy(from.resident()?, r.layers)?;
+    let cut = if r.move_layers {
+        Some((
+            crate::layer_clipboard::cut_commands(from.resident()?, r.layers)?,
+            from.resident_draft()?,
+        ))
+    } else {
+        None
+    };
+    drop(from);
+    if let Some((commands, mut source_draft)) = cut {
         source_draft.edit(
             r.actor,
             &commands,
@@ -548,10 +604,9 @@ pub fn transfer_preview_in(workspace: &Registry, r: &Transfer<'_>) -> Result<Doc
             "Preview cross-project move",
         )?;
     }
-    drop(from);
     let to = destination.lock().unwrap();
     guard(&to, r.destination_document, r.destination_revision)?;
-    let mut draft = to.clone();
+    let mut draft = to.resident_draft()?;
     drop(to);
     draft.paste_layers(
         r.actor,
@@ -560,7 +615,7 @@ pub fn transfer_preview_in(workspace: &Registry, r: &Transfer<'_>) -> Result<Doc
         Some(r.destination_revision),
         r.destination_task,
     )?;
-    Ok(draft.doc)
+    draft.into_resident_document()
 }
 
 #[cfg(test)]
