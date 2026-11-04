@@ -221,6 +221,8 @@ class LinuxFacts(unittest.TestCase):
         self.assertEqual(len(service.calls), 2)
         self.assertNotIn('linux-installed-evidence-producer-not-authenticated', candidate.blockers)
         self.assertIn('native-gui-not-verified', candidate.assessment['linux_bound_installation']['blockers'])
+        self.assertEqual(candidate.assessment['linux_installed_gui_provenance'],
+                         'verified-pinned-workflow-oidc-attestation-and-successful-job')
         self.assertIn('installed-upgrade-interruption-and-visible-native-acceptance-not-established', candidate.blockers)
         self.assertFalse(candidate.assessment['production_ready'])
         self.assertTrue(all(channel['ready'] is False for channel in candidate.manifest['channels'].values()))

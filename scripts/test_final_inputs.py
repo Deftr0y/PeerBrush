@@ -250,7 +250,7 @@ class Handoff(unittest.TestCase):
         index = self.prepare()
         notes = self.fixture.fixture.base / 'public-notes.md'
         notes.write_text('Reviewed synthetic public release notes.', encoding='utf-8')
-        for execute in [False, True]:
+        for execute in [False, True, 'store']:
             count = len(self.commands)
             args = ['--source-root', str(self.fixture.root),
                 '--directory', str(self.work / 'data'),
@@ -262,6 +262,8 @@ class Handoff(unittest.TestCase):
                 '--notes', str(notes), '--notes-sha256', sha(notes.read_bytes())]
             if execute:
                 args.append('--execute')
+            if execute == 'store':
+                args.append('--submit-store')
             with self.seams(), mock.patch.object(publisher, 'GitHub') as credentials, \
                     mock.patch.object(final, 'from_selection', wraps=final.from_selection) as compose, \
                     contextlib.redirect_stdout(io.StringIO()) as output:
@@ -272,7 +274,8 @@ class Handoff(unittest.TestCase):
             result = json.loads(output.getvalue())
             self.assertEqual(result['phase'], 'blocked')
             self.assertFalse(result['production_ready'] or result['publication_performed'])
-            self.assertEqual(result['store'], final.store_channel())
+            if execute != 'store':
+                self.assertEqual(result['store'], final.store_channel())
 
     def test_publisher_refuses_mixed_selectors_or_bad_notes_and_index_before_native_work(self):
         index = self.prepare()
@@ -849,7 +852,9 @@ class DormantSource(unittest.TestCase):
         self.assertLess(producer.index('Provision source-pinned'), producer.index('Acquire and assemble'))
         production = (root / '.github/workflows/production.yml').read_text()
         compose = production.split('\n  compose:\n', 1)[1].split('\n  publish:\n', 1)[0]
-        self.assertIn('if: ${{ false }}', compose)
+        self.assertIn("github.event_name == 'workflow_dispatch'", compose)
+        self.assertIn("github.ref == 'refs/heads/main'", compose)
+        self.assertIn('environment: production-preparation', compose)
         self.assertIn('scripts/acquire_final_inputs.py', compose)
         self.assertIn('FINAL_INPUTS_RUN', compose)
         self.assertNotIn('actions/download-artifact@', compose)

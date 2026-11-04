@@ -312,29 +312,30 @@ class Transactions(unittest.TestCase):
         self.assertIn('--notes "$GITHUB_WORKSPACE/docs/release-0.30.md" --notes-sha256 "$RELEASE_NOTES_SHA256"', preflight)
         self.assertNotIn('--execute', preflight)
         self.assertNotIn('GH_TOKEN:', preflight)
-        for name in ['ci.yml', 'release.yml']:
-            caller = (root / '.github/workflows' / name).read_text(encoding='utf-8')
-            self.assertIn('python -B scripts/test_final_release.py', caller)
-            self.assertIn('python -B scripts/test_publish_release.py', caller)
 
-    def test_dormant_production_and_site_jobs_use_real_consumers_without_write_or_approval_authority(self):
+    def test_certification_is_protected_and_public_release_remains_disabled(self):
         root = Path(__file__).resolve().parents[1]
         text = (root / '.github/workflows/production.yml').read_text(encoding='utf-8')
         compose = text.split('\n  compose:\n', 1)[1].split('\n  publish:\n', 1)[0]
         publish = text.split('\n  publish:\n', 1)[1].split('\n  site:\n', 1)[0]
         site = text.split('\n  site:\n', 1)[1]
-        self.assertEqual(text.count('if: ${{ false }}'), 3)
+        self.assertEqual(text.count('if: ${{ false }}'), 2)
         self.assertNotIn('contents: write', text)
         self.assertNotIn('pages: write', text)
         self.assertNotIn('id-token: write', text)
         for job in [compose, publish, site]:
-            self.assertIn('if: ${{ false }}', job)
             self.assertIn('persist-credentials: false', job)
+            self.assertIn('environment: production-preparation', job)
             self.assertIn('scripts/release_gate.py --commit "$EXPECTED_COMMIT"', job)
             self.assertIn("os.environ.get('GITHUB_WORKFLOW_SHA') != expected", job)
             self.assertNotIn('continue-on-error:', job)
         self.assertIn('needs: compose', publish)
-        self.assertIn("PEERBRUSH_PRODUCTION_APPROVED: 'false'", publish)
+        self.assertIn("github.event_name == 'workflow_dispatch'", compose)
+        self.assertIn("github.ref == 'refs/heads/main'", compose)
+        self.assertIn("inputs.operation == 'submit-store'", publish)
+        self.assertIn("PEERBRUSH_PRODUCTION_APPROVED: 'true'", publish)
+        self.assertIn('--submit-store --execute', publish)
+        self.assertIn('if: ${{ false }}', site)
         self.assertIn('GH_TOKEN: ${{ github.token }}', publish)
         self.assertIn('scripts/acquire_final_inputs.py --source-root', publish)
         self.assertLess(publish.index('scripts/acquire_final_inputs.py'), publish.index('scripts/publish_release.py'))
@@ -578,6 +579,66 @@ class StoreWriteOwnership(unittest.TestCase):
             with self.assertRaises(store.SafeError):
                 store.submit(publishing._StoreWrites(provider), *fixture(), execute=True, journal=journal)
             self.assertEqual(sum(method == 'POST' for _, method, _ in provider.calls), 1)
+
+
+class CertificationPhase(unittest.TestCase):
+    def candidate(self):
+        # Model the trusted consumer boundary; native authentication itself is
+        # exercised by the existing final-input/native-origin fixtures.
+        candidate = mock.Mock(spec=final.Candidate)
+        candidate.manifest = dict(format=final.STORE_FORMAT, commit='a' * 40, version='0.30.0')
+        candidate.assessment = dict(store_package=dict(native_producer_authentication=
+            'verified-pinned-workflow-oidc-attestation-and-successful-job'),
+            installed_candidates={'macOS': {'installed_acceptance': 'verified-signed-two-version-sparkle-upgrade'}},
+            linux_installed_gui_provenance='verified-pinned-workflow-oidc-attestation-and-successful-job')
+        return candidate
+
+    def test_missing_native_acceptance_or_json_cannot_access_store_or_publish(self):
+        client = mock.Mock()
+        with mock.patch.object(publishing, '_prepare_store_handoff') as prepare:
+            with self.assertRaises(ValueError):
+                publishing.submit_store({'production_ready': True}, client, execute=True)
+            for field in ['store_package', 'installed_candidates', 'linux_installed_gui_provenance']:
+                candidate = self.candidate()
+                del candidate.assessment[field]
+                result = publishing.submit_store(candidate, client, execute=True)
+                self.assertEqual(result['phase'], 'blocked')
+                candidate.verify.assert_called_once()
+            prepare.assert_not_called()
+        self.assertFalse(client.method_calls)
+
+    def test_certification_uses_existing_guarded_handoff_without_github_publication(self):
+        candidate, client = self.candidate(), mock.Mock()
+        client.commit.side_effect = lambda ref: {'sha': 'a' * 40} if ref == 'main' else None
+        client.release.return_value = None
+        env = dict(GITHUB_REPOSITORY=publishing.REPOSITORY, GITHUB_REF='refs/heads/main',
+            GITHUB_SHA='a' * 40, GITHUB_WORKFLOW_SHA='a' * 40, GITHUB_EVENT_NAME='workflow_dispatch',
+            GITHUB_WORKFLOW_REF=publishing.REPOSITORY + '/.github/workflows/production.yml@refs/heads/main',
+            PEERBRUSH_PRODUCTION_APPROVED='true', GITHUB_RUN_ATTEMPT='1', PEERBRUSH_STORE_HANDOFF_ENABLED='true')
+        journal, provider = mock.Mock(), mock.Mock()
+        journal.state = {'service_status': 'PreProcessing'}
+        with mock.patch.object(publishing, '_store_journal', return_value=contextlib.nullcontext(journal)) as opened, \
+                mock.patch.object(publishing, '_prepare_store_handoff', return_value=provider), \
+                mock.patch.object(publishing, '_store_handoff') as submit, \
+                mock.patch('store_handoff_history.History') as history, \
+                mock.patch.object(publishing, '_transfer', side_effect=AssertionError('No public release')):
+            for changed in [dict(env, GITHUB_SHA='b' * 40), dict(env, PEERBRUSH_PRODUCTION_APPROVED='false')]:
+                with self.assertRaises(ValueError):
+                    publishing.submit_store(candidate, client, execute=True, environment=changed)
+            opened.assert_not_called()
+            self.assertEqual(publishing.submit_store(candidate, client)['phase'], 'prepared')
+            submit.assert_not_called()
+            client.release.return_value = {'tag_name': 'v0.30.0'}
+            with self.assertRaises(ValueError):
+                publishing.submit_store(candidate, client, execute=True, environment=env)
+            opened.assert_not_called()
+            client.release.return_value = None
+            result = publishing.submit_store(candidate, client, execute=True, environment=env)
+            history.return_value.check.assert_called_once_with()
+            submit.assert_called_once_with(candidate, provider, journal)
+        self.assertEqual(result['phase'], 'store-submitted')
+        self.assertFalse(result['production_ready'] or result['publication_performed'])
+        self.assertTrue(all(call[0] in {'commit', 'release'} for call in client.method_calls))
 
 
 if __name__ == '__main__':
