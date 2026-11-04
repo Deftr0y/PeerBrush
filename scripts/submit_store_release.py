@@ -232,9 +232,16 @@ def published_version(submission):
 
 def application(store):
     app = store.call()
-    if (app.get('id') != STORE_ID or app.get('packageIdentityName') != IDENTITY or
-            app.get('publisherName') != PUBLISHER or app.get('packageFamilyName') != FAMILY):
-        raise SafeError('Partner Center product identity mismatch.')
+    expected = dict(id=STORE_ID, packageIdentityName=IDENTITY, publisherName=PUBLISHER, packageFamilyName=FAMILY)
+    mismatches = []
+    for field, value in expected.items():
+        actual = app.get(field)
+        if actual != value:
+            reason = ('missing' if actual is None else 'type' if not isinstance(actual, str)
+                      else 'case-only' if actual.casefold() == value.casefold() else 'different')
+            mismatches.append(field + ':' + reason)
+    if mismatches:
+        raise SafeError('Partner Center product identity mismatch (' + ', '.join(mismatches) + ').')
     return app
 
 

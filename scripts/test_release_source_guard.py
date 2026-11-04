@@ -215,8 +215,16 @@ class FinalInputInvocation(unittest.TestCase):
                                ('GITHUB_WORKFLOW_REF', REPOSITORY + '/.github/workflows/release.yml@refs/heads/main')]:
                 with self.subTest(job=name, field=key), mock.patch.dict(os.environ, dict(environment, **{key: value}), clear=True), self.assertRaises(SystemExit):
                     exec(program, {})
-            self.assertLess(body.index('Require exact dormant data-producer invocation'), body.index('actions/checkout@'))
-            self.assertIn('if: ${{ false }}', body.split('    steps:', 1)[0])
+            self.assertLess(body.index('Require exact data-producer invocation'), body.index('actions/checkout@'))
+            header = body.split('    steps:', 1)[0]
+            if name == 'gate':
+                self.assertIn("github.repository == 'Deftr0y/PeerBrush'", header)
+                self.assertIn("github.ref == 'refs/heads/main'", header)
+                self.assertIn("github.event_name == 'workflow_dispatch'", header)
+            else:
+                self.assertIn("if: needs.gate.result == 'success'", header)
+                self.assertIn('needs: gate', header)
+                self.assertIn('environment: production-preparation', header)
 
     def test_actual_production_composition_guard_precedes_checkout_and_requires_exact_main(self):
         root = Path(__file__).resolve().parents[1]
@@ -236,7 +244,12 @@ class FinalInputInvocation(unittest.TestCase):
             with self.subTest(field=key), mock.patch.dict(os.environ, dict(environment, **{key: value}), clear=True), self.assertRaises(SystemExit):
                 exec(program, {})
         self.assertLess(body.index('Require exact reviewed production invocation'), body.index('actions/checkout@'))
-        self.assertIn('if: ${{ false }}', body.split('    steps:', 1)[0])
+        header = body.split('    steps:', 1)[0]
+        self.assertIn("github.event_name == 'workflow_dispatch'", header)
+        self.assertIn("github.repository == 'Deftr0y/PeerBrush'", header)
+        self.assertIn("github.ref == 'refs/heads/main'", header)
+        self.assertIn('needs: gate', header)
+        self.assertIn('environment: production-preparation', header)
 
 
 if __name__ == '__main__':
