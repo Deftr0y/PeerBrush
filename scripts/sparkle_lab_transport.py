@@ -1,4 +1,5 @@
 """Exchange a private fixture between two clean hosted Macs in the same reviewed signing run."""
+import json
 import os
 from pathlib import Path
 import re
@@ -39,7 +40,16 @@ def main(args):
     if action in ('fetch-cert', 'decrypt') and (not extra if cert else len(extra) == 1):
         inbox.mkdir(mode=0o700)
         deadline = time.monotonic() + 10800
+        peer = role if cert else ('editor' if role == 'signer' else 'signer')
+        peer_name = 'sign' if peer == 'signer' else 'Private installed Sparkle upgrade'
         while True:
+            # Observe the producer before artifacts so a final upload wins over completion.
+            jobs = json.loads(subprocess.check_output(
+                ['gh', 'api', f'repos/Deftr0y/PeerBrush/actions/runs/{run}/jobs?filter=latest&per_page=100'],
+                timeout=45))['jobs']
+            producers = [job for job in jobs if job['name'] == peer_name]
+            if len(producers) != 1:
+                raise ValueError('Missing or ambiguous same-run producer.')
             ids = subprocess.check_output(['gh', 'api', f'repos/Deftr0y/PeerBrush/actions/runs/{run}/artifacts?name={name}',
                                           '--jq', f'.artifacts[] | select(.name == "{name}" and (.expired | not)) | .id'],
                                          timeout=45).decode().split()
@@ -47,6 +57,8 @@ def main(args):
                 break
             if ids or time.monotonic() >= deadline:
                 raise ValueError('Missing or ambiguous same-run delivery.')
+            if producers[0]['status'] == 'completed':
+                raise ValueError('Same-run producer finished without the required delivery; stop and reconcile.')
             time.sleep(20)
         execute('gh', 'run', 'download', run, '--repo', 'Deftr0y/PeerBrush', '--name', name, '--dir', inbox)
         file = role + ('.pem' if cert else '.cms')
