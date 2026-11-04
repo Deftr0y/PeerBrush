@@ -184,10 +184,11 @@ class Workflow(unittest.TestCase):
     def setUp(self):
         self.text = (Path(__file__).resolve().parents[1] / '.github/workflows/store-qualification.yml').read_text()
 
-    def test_both_jobs_stay_literal_disabled_and_only_the_qualifier_declares_attestation_permissions(self):
+    def test_manual_main_gate_and_only_the_protected_qualifier_declares_attestation_permissions(self):
         gate, qualify = self.text.split('\n  gate:\n', 1)[1].split('\n  qualify:\n', 1)
+        self.assertIn("if: vars.PEERBRUSH_STORE_SDK_QUALIFICATION_ENABLED == 'true' && github.repository == 'Deftr0y/PeerBrush' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch'", gate)
+        self.assertIn("if: needs.gate.result == 'success'", qualify)
         for body in [gate, qualify]:
-            self.assertIn('if: ${{ false }}', body)
             self.assertIn('runs-on: windows-2025', body)
             self.assertLess(body.index('Require reviewed main invocation'), body.index('actions/checkout@'))
             self.assertIn('persist-credentials: false', body)
