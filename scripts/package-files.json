@@ -13,6 +13,7 @@
     ".github/workflows/release.yml",
     ".github/workflows/store-qualification.yml",
     ".github/workflows/store-submit.yml",
+    ".github/workflows/store-account-check.yml",
     ".github/workflows/svg-rows-qualification.yml",
     ".github/workflows/windows-qualification.yml",
     ".github/workflows/windows-release-signing.yml",

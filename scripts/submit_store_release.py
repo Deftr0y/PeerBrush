@@ -230,11 +230,27 @@ def published_version(submission):
     return max(version(p['version']) for p in packages)
 
 
-def submit(store, name, package, report, execute=False, journal=None):
+def application(store):
     app = store.call()
     if (app.get('id') != STORE_ID or app.get('packageIdentityName') != IDENTITY or
             app.get('publisherName') != PUBLISHER or app.get('packageFamilyName') != FAMILY):
         raise SafeError('Partner Center product identity mismatch.')
+    return app
+
+
+def check_account(store):
+    """Read only this product; never print service bodies or edit a pending draft."""
+    app = application(store)
+    published = app.get('lastPublishedApplicationSubmission', {}).get('id')
+    if not published or not re.fullmatch(r'[0-9]+', str(published)):
+        raise SafeError('A published baseline submission is required.')
+    current = published_version(store.call('/submissions/' + str(published)))
+    return dict(published_version='.'.join(map(str, current)),
+                pending_submission=bool(app.get('pendingApplicationSubmission')))
+
+
+def submit(store, name, package, report, execute=False, journal=None):
+    app = application(store)
     if app.get('pendingApplicationSubmission'):
         raise SafeError('A submission already exists. It was left untouched; inspect Partner Center before retrying.')
     published = app.get('lastPublishedApplicationSubmission', {}).get('id')
@@ -313,7 +329,9 @@ def await_commit(store, sid, timeout=600):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--tag', required=True)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument('--tag')
+    mode.add_argument('--check-account', action='store_true', help='Verify product access and published version without release assets or any submission writes.')
     parser.add_argument('--source-root', type=Path, help='Read-only exact-release source checkout; no scripts from this checkout are executed.')
     parser.add_argument('--portable-sha256', help='Independently reviewed Windows portable SHA-256; never take this from the MSIX report.')
     parser.add_argument('--msix-sha256', help='Independently reviewed final MSIX SHA-256; never take this from its report or checksum.')
@@ -321,6 +339,14 @@ def main():
     parser.add_argument('--state', type=Path, help='Durable private receipt; required for submission, never store it in public source or CI artifacts.')
     args = parser.parse_args()
     try:
+        if args.check_account:
+            if any((args.submit, args.state, args.source_root, args.portable_sha256, args.msix_sha256)):
+                raise SafeError('Account check cannot be combined with release or submission inputs.')
+            result = check_account(Store())
+            print('Store account access verified; published package ' + result['published_version']
+                  + '; pending submission ' + ('present' if result['pending_submission'] else 'absent')
+                  + '. No submission changed.')
+            return 0
         if args.submit and args.state is None:
             raise SafeError('Operator submission requires --state in durable private storage; protected publication has a separate receipt/history contract.')
         if args.state is not None:

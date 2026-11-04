@@ -1,0 +1,48 @@
+name: Microsoft Store account check (read-only)
+on:
+  workflow_dispatch:
+    inputs:
+      expected_commit:
+        description: Full reviewed main automation SHA
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  check:
+    if: github.repository == 'Deftr0y/PeerBrush' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && github.workflow_ref == 'Deftr0y/PeerBrush/.github/workflows/store-account-check.yml@refs/heads/main'
+    runs-on: ubuntu-24.04
+    environment: production-preparation
+    timeout-minutes: 10
+    steps:
+      - name: Require exact reviewed main invocation
+        env:
+          EXPECTED_COMMIT: ${{ inputs.expected_commit }}
+        run: |
+          python3 -I - <<'PY'
+          import os, re
+          selected = os.environ['EXPECTED_COMMIT']
+          required = {
+              'GITHUB_REPOSITORY': 'Deftr0y/PeerBrush', 'GITHUB_REF': 'refs/heads/main',
+              'GITHUB_EVENT_NAME': 'workflow_dispatch', 'GITHUB_SHA': selected,
+              'GITHUB_WORKFLOW_SHA': selected, 'GITHUB_RUN_ATTEMPT': '1',
+              'GITHUB_WORKFLOW_REF': 'Deftr0y/PeerBrush/.github/workflows/store-account-check.yml@refs/heads/main',
+              'RUNNER_ENVIRONMENT': 'github-hosted', 'RUNNER_OS': 'Linux', 'RUNNER_ARCH': 'X64',
+          }
+          if not re.fullmatch('[0-9a-f]{40}', selected) or any(os.environ.get(k) != v for k, v in required.items()):
+              raise SystemExit('Account check requires the exact reviewed manual main invocation.')
+          PY
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify checkout before using credentials
+        env:
+          EXPECTED_COMMIT: ${{ inputs.expected_commit }}
+        run: python3 -B scripts/release_gate.py --commit "$EXPECTED_COMMIT"
+      - name: Read PeerBrush account and published package
+        env:
+          MSSTORE_TENANT_ID: ${{ secrets.MSSTORE_TENANT_ID }}
+          MSSTORE_CLIENT_ID: ${{ secrets.MSSTORE_CLIENT_ID }}
+          MSSTORE_CLIENT_SECRET: ${{ secrets.MSSTORE_CLIENT_SECRET }}
+        run: python3 -B scripts/submit_store_release.py --check-account
