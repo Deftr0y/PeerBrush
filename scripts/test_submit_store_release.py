@@ -168,11 +168,17 @@ class Tests(unittest.TestCase):
             self.assertTrue(all(method == 'GET' for _, method, _ in store.calls))
 
     def test_identity(self):
-        store = FakeStore()
-        store.app['publisherName'] = 'other'
-        with self.assertRaises(ValueError):
-            s.submit(store, *fixture(), execute=True, journal=self.journal)
-        self.assertEqual(len(store.calls), 1)
+        for field in ['id', 'packageIdentityName', 'publisherName', 'packageFamilyName']:
+            for value, reason in [(None, 'missing'), (123, 'type'),
+                                  ('SYNTHETIC_PRIVATE_VALUE', 'different'),
+                                  (FakeStore().app[field].lower(), 'case-only')]:
+                store = FakeStore()
+                store.app[field] = value
+                with self.subTest(field=field, reason=reason), self.assertRaises(s.SafeError) as failure:
+                    s.submit(store, *fixture(), execute=True, journal=self.journal)
+                self.assertEqual(str(failure.exception),
+                                 'Partner Center product identity mismatch (' + field + ':' + reason + ').')
+                self.assertEqual(store.calls, [('', 'GET', None)])
 
     @patch.object(s, 'request', return_value=b'')
     def test_preserve_metadata_and_upload_before_commit(self, upload):

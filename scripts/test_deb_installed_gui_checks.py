@@ -408,15 +408,21 @@ class InstalledGuiContracts(unittest.TestCase):
     def test_all_native_callers_run_gui_only_after_real_migration_without_altering_authority(self):
         for name in ['ci.yml', 'release.yml', 'linux-qualification.yml']:
             source = (ROOT / '.github/workflows' / name).read_text(encoding='utf-8')
-            self.assertIn('python -B scripts/test_deb_installed_gui_checks.py' if name != 'linux-qualification.yml'
-                          else 'python3 -B scripts/test_deb_installed_gui_checks.py', source)
+            if name == 'linux-qualification.yml':
+                self.assertIn('python3 -B scripts/test_deb_installed_gui_checks.py', source)
             self.assertEqual(source.count('/checks/test_deb_installed_gui.py --package'), 1)
             self.assertLess(source.index('/checks/test_deb_version_upgrade.py --old-source-root'),
                             source.index('/checks/test_deb_installed_gui.py --package'))
             for tool in ['xvfb', 'xauth', 'dbus-x11', 'libglib2.0-bin', 'openbox', 'wmctrl', 'mesa-vulkan-drivers']:
                 self.assertIn(tool, source)
-        dormant = (ROOT / '.github/workflows/linux-qualification.yml').read_text(encoding='utf-8')
-        self.assertEqual(dormant.count('if: ${{ false }}'), 2)
+        workflow = (ROOT / '.github/workflows/linux-qualification.yml').read_text(encoding='utf-8')
+        gate = workflow.split('\n  gate:\n', 1)[1].split('    steps:', 1)[0]
+        for guard in ["vars.PEERBRUSH_LINUX_QUALIFICATION_ENABLED == 'true'",
+                      "github.repository == 'Deftr0y/PeerBrush'", "github.ref == 'refs/heads/main'",
+                      "github.event_name == 'workflow_dispatch'"]:
+            self.assertIn(guard, gate)
+        self.assertIn("if: needs.gate.result == 'success'", workflow)
+        self.assertIn('environment: linux-native-qualification', workflow)
         inventory = json.loads((ROOT / 'scripts/package-files.json').read_bytes())['source']
         self.assertIn('scripts/test_deb_installed_gui.py', inventory)
         self.assertIn('scripts/test_deb_installed_gui_checks.py', inventory)
