@@ -236,6 +236,9 @@ def application(store):
     mismatches = []
     for field, value in expected.items():
         actual = app.get(field)
+        # The service can omit the family; its exact name and publisher determine it.
+        if field == 'packageFamilyName' and actual is None and not mismatches:
+            actual = msix.derived_package_family(dict(name=app['packageIdentityName'], publisher=app['publisherName']))
         if actual != value:
             reason = ('missing' if actual is None else 'type' if not isinstance(actual, str)
                       else 'case-only' if actual.casefold() == value.casefold() else 'different')

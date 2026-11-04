@@ -472,6 +472,18 @@ class LegacyTransactions(Transactions):
 
 
 class StoreWriteOwnership(unittest.TestCase):
+    def test_writer_derives_omitted_family_but_rejects_conflicting_family(self):
+        import submit_store_release as store
+        from test_submit_store_release import FakeStore
+        provider = FakeStore()
+        del provider.app['packageFamilyName']
+        selected = publishing._StoreWrites(provider)
+        selected.call()  # Observe the published baseline.
+        selected.check()
+        provider.app['packageFamilyName'] = 'foreign_family'
+        with self.assertRaises(store.SafeError): selected.check()
+        self.assertTrue(all(method == 'GET' for _, method, _ in provider.calls))
+
     def test_lost_each_write_response_consumes_its_in_process_permission(self):
         import submit_store_release as store
         import store_release_state as state

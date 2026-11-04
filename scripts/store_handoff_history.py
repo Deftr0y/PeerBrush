@@ -233,10 +233,7 @@ class History:
             else: observed.append((run, None))
         if self.runs() != runs or (self.observed is not None and self.observed != observed):
             raise store.SafeError('Store prior history changed before mutation; no automatic retry.')
-        app = self.provider.call()
-        if (app.get('id') != store.STORE_ID or app.get('packageIdentityName') != store.IDENTITY
-                or app.get('publisherName') != store.PUBLISHER or app.get('packageFamilyName') != store.FAMILY):
-            raise store.SafeError('Store history product identity differs.')
+        app = store.application(self.provider)
         pending = app.get('pendingApplicationSubmission')
         if pending and (pending_id is None or not isinstance(pending, dict) or str(pending.get('id')) != pending_id):
             raise store.SafeError('Store history has a competing pending submission; no mutation retried.')

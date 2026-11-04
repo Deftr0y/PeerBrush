@@ -122,6 +122,13 @@ class Protocol(unittest.TestCase):
         self.assertEqual(result, dict(prior_attempts=1, mutation_authority=False, public_availability='unverified'))
         self.assertTrue(all(method == 'GET' for _, method, _ in self.provider.calls))
 
+    def test_history_derives_omitted_family_but_rejects_conflicting_family(self):
+        del self.provider.app['packageFamilyName']
+        self.assertEqual(self.selected.check()['prior_attempts'], 0)
+        self.provider.app['packageFamilyName'] = 'foreign_family'
+        with self.assertRaises(store.SafeError): self.selected.check()
+        self.assertTrue(all(method == 'GET' for _, method, _ in self.provider.calls))
+
     def test_genuine_service_observation_and_actual_package_bytes_are_required_and_rechecked(self):
         self.published()
         self.selected.check()
