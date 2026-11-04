@@ -1,5 +1,28 @@
 # Production composition and immutable publication (unreleased)
 
+## Current 0.30.0 preparation
+
+The manual main workflow now separates Store certification from public release.
+Its default `prepare` operation performs no submission. `submit-store` requires
+the protected `production-preparation` environment, an unchanged exact main
+commit, a new version, authenticated Store SDK and Linux installed-GUI evidence,
+and the signed two-version Mac upgrade qualification. It recomposes and checks
+actual selected bytes before accessing the Store. A readiness JSON cannot
+authorize this operation.
+
+Submission uses the existing ownership and write-ahead guards. Competing drafts,
+uncertain writes and missing historical evidence stop execution without retry.
+The receipt and exact Store input are retained separately for 90 days; expiry
+requires manual reconciliation. Windows packages remain excluded from public
+GitHub release downloads. Actions retention is not a confidential archive.
+
+The workflow still has no GitHub release-write permission. Certification does
+not establish Store-installed acceptance or finish public release, feed or site
+publication. Those checks remain incomplete. The sections below retain earlier
+implementation checkpoints; their literal-disabled descriptions are historical.
+
+## Composition contracts and earlier checkpoints
+
 The Windows release policy is Microsoft Store only. A selection with `store`
 emits `PeerBrushFinalReleaseV3`, with exactly `microsoft-store`, `macos-direct`
 and `linux-direct` channels. It binds the unsigned Store submission MSIX,

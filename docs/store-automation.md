@@ -1,4 +1,12 @@
-# Microsoft Store release submission (inactive draft)
+# Microsoft Store release submission (unreleased)
+
+The current protected `production.yml` offers a separate `submit-store`
+operation after authenticated native qualification; see the
+[current production contract](production-publishing.md#current-0300-preparation).
+The read-only `store-account-check.yml` verifies product access and the published
+package version without modifying submissions. Real certification, Store-installed
+upgrade acceptance and public release have not yet been established. The earlier
+inactive integration checkpoints below do not describe these activation controls.
 
 This infrastructure is **not an active end-to-end release integration**. Keep
 `MSSTORE_AUTOMATION_ENABLED` unset until all gates below are satisfied. It does
