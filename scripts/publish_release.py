@@ -1,7 +1,7 @@
-"""Protected immutable GitHub release transaction; current native gates keep it disabled.
+"""Protected Store certification and immutable GitHub release transactions.
 
 No ready-report input, replacement/delete API or automatic mutation retry.
-Store handoff is limited to the same fresh protected publication invocation.
+Store submission is separate from final installed acceptance and public release.
 """
 import hashlib
 from contextlib import contextmanager
@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import tempfile
 import time
 from urllib.parse import quote, urlsplit
 
@@ -118,14 +119,27 @@ class GitHub:
         return self.request('GET', PREFIX + '/releases/tags/' + tag)
 
     def receipt_bytes(self, identifier, size):
-        import acquire_macos_qualification_inputs as transport
         from store_handoff_history import MAX_ZIP
-        if type(identifier) is not int or not 0 < identifier < 10 ** 20 or type(size) is not int or not 22 <= size <= MAX_ZIP:
+        return self._artifact_bytes(identifier, size, MAX_ZIP)
+
+    def package_bytes(self, identifier, size):
+        from store_handoff_history import MAX_PACKAGE_ZIP
+        return self._artifact_bytes(identifier, size, MAX_PACKAGE_ZIP)
+
+    def _artifact_bytes(self, identifier, size, limit):
+        import acquire_macos_qualification_inputs as transport
+        if type(identifier) is not int or not 0 < identifier < 10 ** 20 or type(size) is not int or not 22 <= size <= limit:
             raise ValueError('Store history requires an exact bounded artifact ID and size.')
         location = transport.request('api.github.com', transport.API + 'artifacts/' + str(identifier) + '/zip',
                                      8192, token=self._token, redirect=True)
         parsed = urlsplit(location)
-        return transport.request(parsed.hostname, parsed.path + ('?' + parsed.query if parsed.query else ''), size)
+        target = parsed.path + ('?' + parsed.query if parsed.query else '')
+        if size <= 1024 * 1024:
+            return transport.request(parsed.hostname, target, size)
+        with tempfile.TemporaryDirectory(prefix='peerbrush-store-history-') as temporary:
+            path = Path(temporary) / 'package-artifact.zip'
+            transport.request(parsed.hostname, target, size, destination=path)
+            return read(path, size)
 
     def commit(self, ref):
         return self.request('GET', PREFIX + '/commits/' + ref)
@@ -381,7 +395,7 @@ def _prepare_store_handoff(candidate):
 
 @contextmanager
 def _store_journal(candidate, environment):
-    """Record no-attempt state before publication; a crash without upload still holds."""
+    """Record no-attempt state before submission; a crash without upload still holds."""
     from store_release_state import locked
     from package_macos_dmg import private_inspection_directory
     candidate.verify()
@@ -401,7 +415,7 @@ def _store_journal(candidate, environment):
 
 
 def _store_handoff(candidate, provider, journal):
-    """One fresh protected publication, one submission attempt; never replay receipts.
+    """One fresh protected invocation, one submission attempt; never replay receipts.
 
     Local write-ahead records aid diagnosis. Artifact retention is not write
     authority: a new process cannot resume this callback from a record. A lost
@@ -506,6 +520,59 @@ class _StoreWrites:
         return result
 
 
+def store_submission_blockers(candidate):
+    if not isinstance(candidate, Candidate):
+        raise ValueError('Store submission requires actual final composition, not a JSON report.')
+    candidate.verify()
+    assessment = candidate.assessment
+    blockers = []
+    if (candidate.manifest['format'] != STORE_FORMAT or
+            assessment.get('store_package', {}).get('native_producer_authentication') !=
+            'verified-pinned-workflow-oidc-attestation-and-successful-job'):
+        blockers.append('store-native-sdk-producer-not-authenticated')
+    if assessment.get('installed_candidates', {}).get('macOS', {}).get('installed_acceptance') != 'verified-signed-two-version-sparkle-upgrade':
+        blockers.append('macos-signed-two-version-upgrade-not-established')
+    if assessment.get('linux_installed_gui_provenance') != 'verified-pinned-workflow-oidc-attestation-and-successful-job':
+        blockers.append('linux-installed-gui-and-upgrade-not-authenticated')
+    return blockers
+
+
+def protected_invocation(candidate, environment):
+    env = os.environ if environment is None else environment
+    commit = candidate.manifest['commit']
+    required = {'GITHUB_REPOSITORY': REPOSITORY, 'GITHUB_REF': 'refs/heads/main',
+                'GITHUB_SHA': commit, 'GITHUB_WORKFLOW_SHA': commit, 'GITHUB_EVENT_NAME': 'workflow_dispatch',
+                'GITHUB_WORKFLOW_REF': REPOSITORY + '/.github/workflows/production.yml@refs/heads/main',
+                'PEERBRUSH_PRODUCTION_APPROVED': 'true', 'GITHUB_RUN_ATTEMPT': '1'}
+    if any(env.get(key) != value for key, value in required.items()):
+        raise ValueError('Publication requires the exact reviewed main workflow and protected explicit approval.')
+    if candidate.manifest['format'] != STORE_FORMAT or env.get('PEERBRUSH_STORE_HANDOFF_ENABLED') != 'true':
+        raise ValueError('Store-only publication requires its explicitly approved Store handoff.')
+    return env
+
+
+def submit_store(candidate, client, *, execute=False, environment=None):
+    blockers = store_submission_blockers(candidate)
+    if blockers:
+        return dict(phase='blocked', production_ready=False, publication_performed=False, blockers=blockers)
+    if not execute:
+        return dict(phase='prepared', production_ready=False, publication_performed=False)
+    env = protected_invocation(candidate, environment)
+    tag = 'v' + candidate.manifest['version']
+    head = client.commit('main')
+    if (not isinstance(head, dict) or head.get('sha') != candidate.manifest['commit']
+            or client.release(tag) is not None or client.commit(tag) is not None):
+        raise ValueError('Store certification requires unchanged main and a new, unpublished release version.')
+    from store_handoff_history import History
+    with _store_journal(candidate, env) as journal:
+        provider = _prepare_store_handoff(candidate)
+        provider.history = History(client, provider.provider, env)
+        provider.history.check()
+        _store_handoff(candidate, provider, journal)
+        return dict(phase='store-submitted', production_ready=False, publication_performed=False,
+                    service_status=journal.state['service_status'])
+
+
 def publish(candidate, client, notes, *, execute=False, environment=None):
     if not isinstance(candidate, Candidate):
         raise ValueError('A JSON report cannot authorize publication; compose actual final inputs.')
@@ -515,18 +582,7 @@ def publish(candidate, client, notes, *, execute=False, environment=None):
                     blockers=list(candidate.blockers), store=candidate.manifest['channels']['microsoft-store'])
     if not execute:
         return dict(phase='prepared', production_ready=False, publication_performed=False)
-    env = os.environ if environment is None else environment
-    commit = candidate.manifest['commit']
-    required = {'GITHUB_REPOSITORY': REPOSITORY, 'GITHUB_REF': 'refs/heads/main',
-                'GITHUB_SHA': commit, 'GITHUB_WORKFLOW_SHA': commit, 'GITHUB_EVENT_NAME': 'workflow_dispatch',
-                'GITHUB_WORKFLOW_REF': REPOSITORY + '/.github/workflows/production.yml@refs/heads/main',
-                'PEERBRUSH_PRODUCTION_APPROVED': 'true', 'GITHUB_RUN_ATTEMPT': '1'}
-    if any(env.get(key) != value for key, value in required.items()):
-        raise ValueError('Publication requires the exact reviewed main workflow and protected explicit approval.')
-    if candidate.manifest['format'] != STORE_FORMAT:
-        raise ValueError('Current production distribution requires Store-only Windows composition; historical direct layouts are readback only.')
-    if env.get('PEERBRUSH_STORE_HANDOFF_ENABLED') != 'true':
-        raise ValueError('Store-only publication requires its explicitly approved Store handoff before any GitHub write.')
+    env = protected_invocation(candidate, environment)
     from store_handoff_history import History
     with _store_journal(candidate, env) as journal:
         provider = _prepare_store_handoff(candidate)
@@ -550,6 +606,7 @@ def main(argv=None):
     parser.add_argument('--final-input-index-sha256')
     parser.add_argument('--work', type=Path)
     parser.add_argument('--execute', action='store_true', help='Still requires actual native authority and protected explicit approval; current source remains blocked.')
+    parser.add_argument('--submit-store', action='store_true', help='Submit the qualified package for certification without publishing GitHub assets.')
     args = parser.parse_args(argv)
     if args.final_input_index is not None:
         if args.final_input_index_sha256 is None or args.work is None:
@@ -565,9 +622,11 @@ def main(argv=None):
         else:
             candidate = from_selection(args.source_root, args.directory, args.output, args.selection, args.selection_sha256)
         # Missing native producers must stop before even requesting a write token.
-        client = GitHub(os.environ.get('GH_TOKEN')) if (args.execute and not candidate.blockers
-            and candidate.assessment.get('production_ready') is True) else None
-        result = publish(candidate, client, notes, execute=args.execute)
+        allowed = not store_submission_blockers(candidate) if args.submit_store else (
+            not candidate.blockers and candidate.assessment.get('production_ready') is True)
+        client = GitHub(os.environ.get('GH_TOKEN')) if args.execute and allowed else None
+        result = (submit_store(candidate, client, execute=args.execute) if args.submit_store else
+                  publish(candidate, client, notes, execute=args.execute))
     except Exception:
         parser.exit(1, 'Production transaction stopped. Preserve private work and reconcile remote state before retry; no mutation was automatically retried.\n')
     print(json.dumps(result, sort_keys=True))

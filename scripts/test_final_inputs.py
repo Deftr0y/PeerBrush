@@ -250,7 +250,7 @@ class Handoff(unittest.TestCase):
         index = self.prepare()
         notes = self.fixture.fixture.base / 'public-notes.md'
         notes.write_text('Reviewed synthetic public release notes.', encoding='utf-8')
-        for execute in [False, True]:
+        for execute in [False, True, 'store']:
             count = len(self.commands)
             args = ['--source-root', str(self.fixture.root),
                 '--directory', str(self.work / 'data'),
@@ -262,6 +262,8 @@ class Handoff(unittest.TestCase):
                 '--notes', str(notes), '--notes-sha256', sha(notes.read_bytes())]
             if execute:
                 args.append('--execute')
+            if execute == 'store':
+                args.append('--submit-store')
             with self.seams(), mock.patch.object(publisher, 'GitHub') as credentials, \
                     mock.patch.object(final, 'from_selection', wraps=final.from_selection) as compose, \
                     contextlib.redirect_stdout(io.StringIO()) as output:
@@ -272,7 +274,8 @@ class Handoff(unittest.TestCase):
             result = json.loads(output.getvalue())
             self.assertEqual(result['phase'], 'blocked')
             self.assertFalse(result['production_ready'] or result['publication_performed'])
-            self.assertEqual(result['store'], final.store_channel())
+            if execute != 'store':
+                self.assertEqual(result['store'], final.store_channel())
 
     def test_publisher_refuses_mixed_selectors_or_bad_notes_and_index_before_native_work(self):
         index = self.prepare()
@@ -834,21 +837,24 @@ class StoreUpstreamHandoff(unittest.TestCase):
 
 
 class DormantSource(unittest.TestCase):
-    def test_two_new_jobs_and_production_composition_stay_literal_disabled(self):
+    def test_protected_data_producer_keeps_publication_disabled(self):
         root = Path(__file__).resolve().parents[1]
         producer = (root / '.github/workflows/final-inputs.yml').read_text()
-        for name in ['gate', 'prepare']:
-            body = re.split(r'\n  [a-z][a-z-]*:\n', producer.split('\n  ' + name + ':\n', 1)[1], maxsplit=1)[0]
-            self.assertIn('if: ${{ false }}', body)
+        self.assertIn("github.repository == 'Deftr0y/PeerBrush' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch'", producer)
+        self.assertIn("if: needs.gate.result == 'success'", producer)
+        self.assertIn('environment: production-preparation', producer)
         self.assertNotIn('id-token: write', producer)
         self.assertNotIn('contents: write', producer)
         self.assertNotIn('artifact/*', producer)
         self.assertIn('scripts/assemble_final_inputs.py', producer)
         self.assertIn('inputs.upstream_selection_sha256', producer)
-        self.assertIn('peerbrush-final-trust/{macos,windows,linux}', producer)
+        self.assertIn('scripts/provision_release_verifier.py --output "$RUNNER_TEMP/peerbrush-final-trust"', producer)
+        self.assertLess(producer.index('Provision source-pinned'), producer.index('Acquire and assemble'))
         production = (root / '.github/workflows/production.yml').read_text()
         compose = production.split('\n  compose:\n', 1)[1].split('\n  publish:\n', 1)[0]
-        self.assertIn('if: ${{ false }}', compose)
+        self.assertIn("github.event_name == 'workflow_dispatch'", compose)
+        self.assertIn("github.ref == 'refs/heads/main'", compose)
+        self.assertIn('environment: production-preparation', compose)
         self.assertIn('scripts/acquire_final_inputs.py', compose)
         self.assertIn('FINAL_INPUTS_RUN', compose)
         self.assertNotIn('actions/download-artifact@', compose)
@@ -858,6 +864,17 @@ class DormantSource(unittest.TestCase):
         self.assertIn('--notes-sha256', compose)
         self.assertNotIn('--execute', compose)
         self.assertNotIn('GH_TOKEN:', compose)
+
+    def test_verifier_rejects_unreviewed_archive_before_parsing_or_extraction(self):
+        import provision_release_verifier as provision
+        with mock.patch.object(provision.tarfile, 'open') as opened:
+            with self.assertRaises(ValueError):
+                provision.verifier(b'untrusted executable archive')
+            opened.assert_not_called()
+        root = Path(__file__).resolve().parents[1]
+        public = final.read(root / 'packaging/attestation/trusted_root.jsonl',
+                            native.LIMITS['trusted-root'], provision.ROOT_SHA256)
+        self.assertEqual(len(public.splitlines()), 2)
 
 
 if __name__ == '__main__':

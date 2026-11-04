@@ -30,8 +30,7 @@ env:
 jobs:
   gate:
     name: gate
-    # Source review and environment configuration are still required.
-    if: ${{ false }}
+    if: vars.PEERBRUSH_STORE_SDK_QUALIFICATION_ENABLED == 'true' && github.repository == 'Deftr0y/PeerBrush' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch'
     runs-on: windows-2025
     timeout-minutes: 30
     permissions:
@@ -73,7 +72,7 @@ jobs:
   qualify:
     name: qualify
     needs: gate
-    if: ${{ false }}
+    if: needs.gate.result == 'success'
     runs-on: windows-2025
     environment: store-native-qualification
     timeout-minutes: 60

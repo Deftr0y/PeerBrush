@@ -221,6 +221,8 @@ class LinuxFacts(unittest.TestCase):
         self.assertEqual(len(service.calls), 2)
         self.assertNotIn('linux-installed-evidence-producer-not-authenticated', candidate.blockers)
         self.assertIn('native-gui-not-verified', candidate.assessment['linux_bound_installation']['blockers'])
+        self.assertEqual(candidate.assessment['linux_installed_gui_provenance'],
+                         'verified-pinned-workflow-oidc-attestation-and-successful-job')
         self.assertIn('installed-upgrade-interruption-and-visible-native-acceptance-not-established', candidate.blockers)
         self.assertFalse(candidate.assessment['production_ready'])
         self.assertTrue(all(channel['ready'] is False for channel in candidate.manifest['channels'].values()))
@@ -640,9 +642,11 @@ class LinuxFacts(unittest.TestCase):
                 installation.selected_package(renamed, expected)
             native.assert_not_called()
 
-    def test_dormant_workflow_guards_before_checkout_and_attests_only_after_both_actual_drivers(self):
+    def test_protected_workflow_guards_before_checkout_and_attests_only_after_both_actual_drivers(self):
         source = (ROOT / '.github/workflows/linux-qualification.yml').read_text(encoding='utf-8')
-        self.assertEqual(source.count('if: ${{ false }}'), 2)
+        self.assertIn("if: vars.PEERBRUSH_LINUX_QUALIFICATION_ENABLED == 'true' && github.repository == 'Deftr0y/PeerBrush' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch'", source)
+        self.assertIn("if: needs.gate.result == 'success'", source)
+        self.assertIn('environment: linux-native-qualification', source)
         self.assertEqual(source.count('runs-on: ubuntu-24.04'), 2)
         guards = re.findall(r"python3 -I - <<'PY'\n(.*?)\n          PY", source, re.S)
         required = dict(GITHUB_REPOSITORY='Deftr0y/PeerBrush', GITHUB_REF='refs/heads/main',

@@ -16,9 +16,11 @@ WRITER = 'Publish only through actual composition and immutable reconciliation'
 STEPS = ['Require exact reviewed production invocation', 'Checkout reviewed production source',
     'Require exact source', 'Acquire separate exact final-input producer data', WRITER,
     'Retain final manifest only after exact public release readback',
-    'Retain sanitized Store intent and submission receipt for reconciliation']
+    'Retain sanitized Store intent and submission receipt for reconciliation',
+    'Retain private Store submission input for future reconciliation']
 GENERATED_STEPS = {'Set up job', 'Post Checkout reviewed production source', 'Complete job'}
 MAX_ZIP = 64 * 1024
+MAX_PACKAGE_ZIP = store.msix.PACKAGE_LIMIT + 1024
 CONCLUSIONS = {'success', 'failure', 'neutral', 'cancelled', 'skipped', 'timed_out', 'action_required', 'stale'}
 
 
@@ -44,28 +46,32 @@ def run_identity(run):
     return {key: run.get(key) for key in ['id', 'run_number', 'run_attempt', 'head_sha', 'head_branch', 'path', 'event', 'status', 'conclusion']}
 
 
-def receipt_bytes(raw):
-    if not isinstance(raw, bytes) or not 22 <= len(raw) <= MAX_ZIP:
-        raise store.SafeError('Store history artifact exceeds its bounded receipt contract.')
+def artifact_member(raw, name, limit, archive_limit):
+    if not isinstance(raw, bytes) or not 22 <= len(raw) <= archive_limit:
+        raise store.SafeError('Store history artifact exceeds its bounded contract.')
     signature, disk, directory_disk, count_disk, count, size, offset, comment = struct.unpack('<4s4H2IH', raw[-22:])
     if (signature != b'PK\x05\x06' or disk or directory_disk or count_disk != 1 or count != 1
             or not 0 < size <= 512 or comment or offset + size != len(raw) - 22):
-        raise store.SafeError('Store history requires one ordinary bounded receipt member.')
+        raise store.SafeError('Store history requires one ordinary bounded artifact member.')
     with zipfile.ZipFile(io.BytesIO(raw)) as archive:
         members = archive.infolist()
         if len(members) != 1:
-            raise store.SafeError('Store history receipt inventory differs.')
+            raise store.SafeError('Store history artifact inventory differs.')
         member = members[0]
-        if (member.filename != 'submission.json' or member.is_dir() or member.external_attr & 0x10
+        if (member.filename != name or member.is_dir() or member.external_attr & 0x10
                 or stat.S_IFMT(member.external_attr >> 16) not in {0, stat.S_IFREG}
                 or member.flag_bits & 1 or member.compress_type not in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}
-                or not 0 < member.file_size <= 8192 or not 0 < member.compress_size <= MAX_ZIP):
-            raise store.SafeError('Store history receipt is not its exact bounded regular JSON member.')
+                or not 0 < member.file_size <= limit or not 0 < member.compress_size <= archive_limit):
+            raise store.SafeError('Store history artifact is not its exact bounded regular member.')
         with archive.open(member) as stream:
-            value = stream.read(8193)
+            value = stream.read(limit + 1)
         if len(value) != member.file_size:
-            raise store.SafeError('Store history receipt changed during extraction.')
-    return state.receipt(value)
+            raise store.SafeError('Store history artifact changed during extraction.')
+    return value
+
+
+def receipt_bytes(raw):
+    return state.receipt(artifact_member(raw, 'submission.json', 8192, MAX_ZIP))
 
 
 class History:
@@ -162,7 +168,7 @@ class History:
             raise store.SafeError('Store historical publisher steps differ from the fixed order.')
         return steps[names.index(WRITER)]['conclusion'] != 'skipped'
 
-    def selected_receipt(self, run):
+    def selected_artifact(self, run, name, limit):
         run_id = str(run['id'])
         value = self.read('runs/' + run_id + '/artifacts?per_page=100&page=1')
         artifacts = value.get('artifacts')
@@ -170,13 +176,13 @@ class History:
                 or not isinstance(artifacts, list) or len(artifacts) != value['total_count']
                 or any(not isinstance(a, dict) for a in artifacts)):
             raise store.SafeError('Store prior receipt listing is missing or incomplete.')
-        selected = [a for a in artifacts if a.get('name') == 'store-submission-reconciliation-' + run_id + '-1']
+        selected = [a for a in artifacts if a.get('name') == name]
         if len(selected) != 1: raise store.SafeError('Store prior receipt is missing or ambiguous; reconcile manually.')
         artifact = selected[0]
         identifier = artifact.get('id')
         origin = artifact.get('workflow_run')
         if (type(identifier) is not int or not 0 < identifier < 10 ** 20 or artifact.get('expired') is not False
-                or type(artifact.get('size_in_bytes')) is not int or not 22 <= artifact['size_in_bytes'] <= MAX_ZIP
+                or type(artifact.get('size_in_bytes')) is not int or not 22 <= artifact['size_in_bytes'] <= limit
                 or type(artifact.get('digest')) is not str or not re.fullmatch('sha256:[0-9a-f]{64}', artifact['digest'])
                 or artifact.get('url') != 'https://api.github.com' + transport.API + 'artifacts/' + str(identifier)
                 or artifact.get('archive_download_url') != artifact['url'] + '/zip'
@@ -184,6 +190,11 @@ class History:
                     for k, v in dict(id=run['id'], repository_id=transport.REPOSITORY_ID,
                         head_repository_id=transport.REPOSITORY_ID, head_branch='main', head_sha=run['head_sha']).items())):
             raise store.SafeError('Store receipt artifact origin, expiry or bounded byte identity differs.')
+        return artifact
+
+    def selected_receipt(self, run):
+        artifact = self.selected_artifact(run, 'store-submission-reconciliation-' + str(run['id']) + '-1', MAX_ZIP)
+        identifier = artifact['id']
         raw = self.client.receipt_bytes(identifier, artifact['size_in_bytes'])
         if (len(raw) != artifact['size_in_bytes'] or hashlib.sha256(raw).hexdigest() != artifact['digest'][7:]
                 or self.read('artifacts/' + str(identifier)) != artifact):
@@ -193,13 +204,31 @@ class History:
             raise store.SafeError('Store receipt source differs from the historical workflow source.')
         return receipt, artifact['digest']
 
+    def verify_package(self, run, receipt):
+        artifact = self.selected_artifact(run, 'store-submission-input-' + str(run['id']) + '-1', MAX_PACKAGE_ZIP)
+        if receipt['tag'] in self.packages:
+            if self.packages[receipt['tag']] != artifact:
+                raise store.SafeError('Store prior private package identity changed before mutation.')
+            return
+        self.package_bytes += artifact['size_in_bytes']
+        if self.package_bytes > 2 * MAX_PACKAGE_ZIP:
+            raise store.SafeError('Store history exceeds its bounded package readback window; reconcile manually.')
+        raw = self.client.package_bytes(artifact['id'], artifact['size_in_bytes'])
+        if (len(raw) != artifact['size_in_bytes'] or hashlib.sha256(raw).hexdigest() != artifact['digest'][7:]
+                or self.read('artifacts/' + str(artifact['id'])) != artifact):
+            raise store.SafeError('Store prior private package bytes or metadata changed.')
+        package = artifact_member(raw, receipt['package'], store.msix.PACKAGE_LIMIT, MAX_PACKAGE_ZIP)
+        if hashlib.sha256(package).hexdigest() != receipt['sha256']:
+            raise store.SafeError('Store prior actual package bytes differ from its receipt.')
+        self.packages[receipt['tag']] = artifact
+
     def check(self, pending_id=None):
         self.deadline = time.monotonic() + 180
         runs, observed, receipts = self.runs(), [], []
         for run in runs:
             if self.writer_started(run):
                 receipt, digest = self.selected_receipt(run)
-                receipts.append(receipt)
+                receipts.append((run, receipt))
                 observed.append((run, digest))
             else: observed.append((run, None))
         if self.runs() != runs or (self.observed is not None and self.observed != observed):
@@ -215,7 +244,7 @@ class History:
         if not re.fullmatch('[1-9][0-9]{0,31}', published): raise store.SafeError('Store history needs its actual published baseline.')
         current = store.published_version(self.provider.call('/submissions/' + published))
         identifiers = set()
-        for receipt in receipts:
+        for run, receipt in receipts:
             if receipt['phase'] == 'new': continue
             sid = receipt['submission_id']
             if sid is None or sid in identifiers:
@@ -229,22 +258,7 @@ class History:
                     or not isinstance(commit, dict) or commit.get('sha') != receipt['commit']
                     or not isinstance(release.get('assets'), list) or not 1 <= len(release['assets']) <= 64):
                 raise store.SafeError('Store prior attempt no longer has its exact published release source.')
-            assets = [a for a in release['assets'] if isinstance(a, dict) and a.get('name') == receipt['package']]
-            if (len(assets) != 1 or type(assets[0].get('id')) is not int or not 0 < assets[0]['id'] < 10 ** 20
-                    or assets[0].get('state') != 'uploaded' or type(assets[0].get('size')) is not int
-                    or not 0 < assets[0]['size'] <= store.msix.PACKAGE_LIMIT
-                    or assets[0].get('digest') != 'sha256:' + receipt['sha256']):
-                raise store.SafeError('Store prior attempt package differs from its published hash or byte identity.')
-            identity = (assets[0]['id'], assets[0]['size'], receipt['sha256'])
-            if receipt['tag'] not in self.packages:
-                self.package_bytes += assets[0]['size']
-                if self.package_bytes > 2 * store.msix.PACKAGE_LIMIT:
-                    raise store.SafeError('Store history exceeds its bounded package readback window; reconcile manually.')
-                if self.client.asset_hash(assets[0]) != receipt['sha256']:
-                    raise store.SafeError('Store prior attempt actual published package bytes differ from its receipt.')
-                self.packages[receipt['tag']] = identity
-            elif self.packages[receipt['tag']] != identity:
-                raise store.SafeError('Store prior published package identity changed before mutation.')
+            self.verify_package(run, receipt)
             submission = self.provider.call('/submissions/' + sid)
             packages = submission.get('applicationPackages')
             if (str(submission.get('id')) != sid or not isinstance(packages, list)

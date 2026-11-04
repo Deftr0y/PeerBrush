@@ -50,6 +50,25 @@ class Tests(unittest.TestCase):
         self.journal = Journal(Path(directory.name).resolve() / 'receipt.json')
         self.journal.bind('v0.26.0', fixture()[0], fixture()[2])
 
+    def test_account_check_preserves_pending_draft_and_redacts_service_data(self):
+        store = FakeStore()
+        store.app['pendingApplicationSubmission'] = {'id': 'private-draft'}
+        store.app['private_field'] = 'private-data'
+        output = io.StringIO()
+        with patch.object(s.sys, 'argv', ['submit', '--check-account']), patch.object(s, 'Store', return_value=store), patch.object(s.sys, 'stdout', output):
+            self.assertEqual(s.main(), 0)
+        self.assertEqual(store.calls, [('', 'GET', None), ('/submissions/123', 'GET', None)])
+        self.assertEqual(output.getvalue(), 'Store account access verified; published package 1.25.0.0; pending submission present. No submission changed.\n')
+        for flags in [['--submit'], ['--state', 'private.json'], ['--source-root', '.'], ['--msix-sha256', 'a' * 64]]:
+            with patch.object(s.sys, 'argv', ['submit', '--check-account', *flags]), patch.object(s, 'Store') as auth, patch.object(s.sys, 'stderr', io.StringIO()):
+                self.assertEqual(s.main(), 1)
+                auth.assert_not_called()
+        store.app['id'] = 'another-product'
+        store.calls.clear()
+        with self.assertRaises(s.SafeError):
+            s.check_account(store)
+        self.assertEqual(store.calls, [('', 'GET', None)])
+
     def test_protocol_fixture_has_identical_bytes_across_wall_clock_changes(self):
         results = []
         for clock in [(2025, 1, 2, 3, 4, 6, 3, 2, -1),

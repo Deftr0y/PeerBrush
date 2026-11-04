@@ -482,6 +482,8 @@ def compose(root, directory, output, *, commit, version, macos, maintainer,
         report['installed_candidates']['Linux']['producer_provenance'] = linux['installation_receipt_provenance']
         report['linux_bound_installation'] = linux
         report['linux_native_origin'] = linux_origin
+        if 'gui' in linux_native:
+            report['linux_installed_gui_provenance'] = linux['installation_receipt_provenance']
     report['publication_phases'] = readiness._publication_phases(report['blockers'])
     report.update(format='PeerBrushFinalCompositionAssessmentV1', production_ready=False,
         final_files_bound=True, windows_native_signature=('store-signs-after-submission' if store_only else

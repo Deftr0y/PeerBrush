@@ -5,6 +5,12 @@ on:
     branches: [main]
   workflow_dispatch:
     inputs:
+      operation:
+        description: Prepare only, or submit authenticated packages to Store certification
+        type: choice
+        options: [prepare, submit-store]
+        default: prepare
+        required: true
       expected_commit:
         description: Exact reviewed main SHA; all final inputs must bind this source
         type: string
@@ -45,7 +51,7 @@ on:
       site_selection_json:
         description: Reviewed public site_commit, final_inventory_sha256, notes and caution JSON; no readiness claims
         type: string
-        required: true
+        required: false
 
 permissions:
   contents: read
@@ -69,13 +75,12 @@ jobs:
           persist-credentials: false
       - name: Require exact source and existing version checks
         run: python -B scripts/release_gate.py --commit "$EXPECTED_COMMIT"
-      - name: Report disabled production authority
+      - name: Report publication phases
         run: |
-          echo 'Final composition and immutable transaction are prepared. Windows signing/qualification handoff is prepared but inactive and unverified. Authenticated installed producers and complete native acceptance remain source work; publication and Store submission are disabled.' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Manual protected preparation can submit authenticated packages for Store certification. Certification, installed Store acceptance and final public release remain separate gates.' >> "$GITHUB_STEP_SUMMARY"
 
   compose:
-    # Explicit activation and independent authority provisioning remain required.
-    if: ${{ false }}
+    if: github.event_name == 'workflow_dispatch' && github.repository == 'Deftr0y/PeerBrush' && github.ref == 'refs/heads/main'
     needs: gate
     runs-on: ubuntu-24.04
     environment: production-preparation
@@ -144,9 +149,9 @@ jobs:
 
 
   publish:
-    # Reviewable calls only: activation, write permission, native acceptance and
-    # explicit protected approval remain independent unconfigured requirements.
-    if: ${{ false }}
+    # This protected phase writes only to Store certification. GitHub publication
+    # remains unavailable until certification and installed Store acceptance.
+    if: github.event_name == 'workflow_dispatch' && inputs.operation == 'submit-store'
     needs: compose
     runs-on: ubuntu-24.04
     environment: production-preparation
@@ -160,8 +165,8 @@ jobs:
       FINAL_INPUTS_INDEX_SHA256: ${{ inputs.final_inputs_index_sha256 }}
       SELECTION_SHA256: ${{ inputs.selection_sha256 }}
       RELEASE_NOTES_SHA256: ${{ inputs.release_notes_sha256 }}
-      PEERBRUSH_PRODUCTION_APPROVED: 'false'
-      PEERBRUSH_STORE_HANDOFF_ENABLED: 'false'
+      PEERBRUSH_PRODUCTION_APPROVED: 'true'
+      PEERBRUSH_STORE_HANDOFF_ENABLED: 'true'
     steps:
       - name: Require exact reviewed production invocation
         run: |
@@ -207,8 +212,9 @@ jobs:
             --final-input-index "$RUNNER_TEMP/peerbrush-final-inputs/final-inputs.json" \
             --final-input-index-sha256 "$FINAL_INPUTS_INDEX_SHA256" \
             --notes "$GITHUB_WORKSPACE/docs/release-0.30.md" --notes-sha256 "$RELEASE_NOTES_SHA256" \
-            --work "$RUNNER_TEMP/peerbrush-final-verification" --output "$RUNNER_TEMP/peerbrush-final-candidate" --execute
+            --work "$RUNNER_TEMP/peerbrush-final-verification" --output "$RUNNER_TEMP/peerbrush-final-candidate" --submit-store --execute
       - name: Retain final manifest only after exact public release readback
+        if: ${{ false }} # Certification submission does not publish a GitHub release.
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: published-final-manifest-${{ github.run_id }}-${{ github.run_attempt }}
@@ -221,6 +227,16 @@ jobs:
           name: store-submission-reconciliation-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/peerbrush-store-handoff/submission.json
           if-no-files-found: ignore
+          retention-days: 90
+
+      - name: Retain private Store submission input for future reconciliation
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: store-submission-input-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/peerbrush-final-candidate/*-Windows-x64.msix
+          if-no-files-found: ignore
+          compression-level: 0
           retention-days: 90
 
   site:
