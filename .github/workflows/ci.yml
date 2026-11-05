@@ -130,6 +130,13 @@ jobs:
             ~/.cargo/registry/src
             target
           key: ${{ steps.cargo_cache.outputs.cache-primary-key }}
+      - name: Check hotfix first-launch consent and Mac installation layout
+        shell: bash
+        run: |
+          cargo test --locked --lib ui::associations::welcome::tests:: -- --test-threads=1
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            python -B -m unittest discover -s scripts -p test_macos_dmg_native.py
+          fi
       - name: Run the essential release cases once
         run: python -B scripts/release_essentials.py
       - name: Verify native macOS document delivery and icon

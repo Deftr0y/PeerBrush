@@ -3,6 +3,7 @@ mod about;
 mod activation;
 mod animation;
 mod associations;
+pub(crate) use associations::welcome::validate_file as validate_association_preferences;
 mod brush;
 #[cfg(test)]
 mod brush_toolbar_tests;
@@ -591,6 +592,10 @@ impl PeerBrush {
     #[cfg(any(windows, target_os = "macos"))]
     pub fn set_update_profile(&mut self, profile: Option<crate::settings::UpdateProfile>) {
         self.updates.set_update_profile(profile);
+    }
+
+    pub fn enable_first_launch(&mut self, preferences: &Path) {
+        self.associations = associations::Choice::load(preferences);
     }
 
     pub fn new_with_preferences(
