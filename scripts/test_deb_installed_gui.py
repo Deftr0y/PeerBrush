@@ -401,7 +401,6 @@ def display_check(fixture):
         gui_phase('projects-and-native-oracles')
         opened = window.projects(paths)
         if tuple(map(int, facts['expected']['version'].split('.'))) >= (0, 30, 1):
-            gui_phase('first-launch-default-editor-choice')
             choice = QA_HOME / 'config/peerbrush/settings-v1/associations.json'
             require(not choice.exists() and not choice.is_symlink(),
                     'First-launch consent must start unanswered in the disposable profile.')
@@ -418,7 +417,6 @@ def display_check(fixture):
             require(json.loads(choice.read_bytes(), object_pairs_hook=unique_fields)
                     == {'version': 1, 'answered': True},
                     'Declining the first-launch choice did not persist its answer.')
-            gui_phase('projects-and-native-oracles')
         require(window.rpc('tool_settings', dict(action='get', tool='brush'))['profile'] == facts['profile'],
                 'GUI default launch changed the migrated real tool preferences.')
         for index, ((depth, extension), path) in enumerate(zip(CELLS, paths)):
