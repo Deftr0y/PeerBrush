@@ -304,7 +304,7 @@ def create_image(payload, image, mount, volume, verify_app=None):
         arrange(writable, mount, run, SUPPORT)
         run(['/usr/bin/hdiutil', 'convert', str(writable), '-format', 'UDZO', '-o', str(image)], timeout=600)
         expected = {key: value for key, value in expected.items() if key not in ('.background', '.background/installer.png')}
-        verify_image(image, mount, expected, verify_app,
+        expected = verify_image(image, mount, expected, verify_app,
                      presentation_source=payload / '.background/installer.png')
         writable.unlink()
         return expected
@@ -341,6 +341,7 @@ def verify_image(image, mount, expected, verify_app=None, presentation_source=No
             raise ValueError('Mounted DMG differs from the original payload bytes, modes or layout')
         if verify_app is not None:
             verify_app(mount / APP)
+        return expected
     finally:
         # Bind the device to this exact image before detaching the whole image,
         # including an unexpected second volume or a partially failed attach.
