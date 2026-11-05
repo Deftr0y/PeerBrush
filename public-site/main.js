@@ -1,6 +1,6 @@
-import { detectPlatform, safeAvailableDownload, latestRelease, availableDownloads } from './platform.js?release=v0.30.0&downloads=3';
+import { detectPlatform, safeAvailableDownload, latestRelease, availableDownloads } from './platform.js?release=v0.30.1&downloads=4';
 import './showcase.js';
-import { renderHistory } from './releases.js?release=v0.30.0&downloads=3';
+import { renderHistory } from './releases.js?release=v0.30.1&downloads=4';
 
 const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
 const views = {
@@ -123,7 +123,7 @@ async function loadDownloads() {
     const response = await fetch(feedUrl, { cache: 'no-store' });
     if (response.ok) {const data=await response.json();renderHistory(data);const build=latestRelease(data);if(build)loaded=renderDownloads({ ...build, caution: data.caution || build.caution }, availableDownloads(data));}
   } catch { /* Keep the verified static download links when the feed is unavailable. */ }
-  if (!loaded) document.querySelector('#build-label').textContent = 'PeerBrush 0.30.0 · Stable';
+  if (!loaded) document.querySelector('#build-label').textContent = 'PeerBrush 0.30.1 · Stable';
 }
 loadDownloads();
 

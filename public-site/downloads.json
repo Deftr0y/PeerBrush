@@ -1,16 +1,16 @@
 {
-  "version": "v0.30.0",
-  "label": "PeerBrush 0.30.0 · Stable",
-  "commit": "f3a26eadfa4a911da11860293182d4c36d5cc5fa",
-  "releaseUrl": "https://github.com/Deftr0y/PeerBrush/releases/tag/v0.30.0",
+  "version": "v0.30.1",
+  "label": "PeerBrush 0.30.1 · Stable",
+  "commit": "2ea41951a19abf32d080498bbe7d9d85e20fced3",
+  "releaseUrl": "https://github.com/Deftr0y/PeerBrush/releases/tag/v0.30.1",
   "platforms": [
     {
       "id": "linux",
       "name": "Linux",
       "architecture": "x64",
-      "url": "https://github.com/Deftr0y/PeerBrush/releases/download/v0.30.0/peerbrush_0.30.0-1_amd64.deb",
-      "bytes": 31560716,
-      "sha256": "fbe2013abc496d7670683ad590e2fda499e1542c68096d15b410c7b57c02d6ed",
+      "url": "https://github.com/Deftr0y/PeerBrush/releases/download/v0.30.1/peerbrush_0.30.1-1_amd64.deb",
+      "bytes": 31605692,
+      "sha256": "73a578ee7fe85a8b66913a0b743e5a46ccb687d9be8e809325a855f6caac8bdb",
       "description": "amd64 · Ubuntu 24.04 DEB · Manual updates",
       "nativeSigning": "unsigned"
     },
@@ -18,15 +18,53 @@
       "id": "macos",
       "name": "macOS",
       "architecture": "arm64",
-      "url": "https://github.com/Deftr0y/PeerBrush/releases/download/v0.30.0/PeerBrush-0.30.0-macOS-arm64-apple-signed-r1-dmg-signed-r1.dmg",
-      "bytes": 67045139,
-      "sha256": "71da5f512a11e970810dd37edcf97a7034491b226c8e6f0991fda81976db2d1a",
+      "url": "https://github.com/Deftr0y/PeerBrush/releases/download/v0.30.1/PeerBrush-0.30.1-macOS-arm64-apple-signed-r1-dmg-signed-r1.dmg",
+      "bytes": 66042942,
+      "sha256": "3eb1155c30b46ca5a64e4b2f40d58e73bf022167865a33911ff0e9322d05c24c",
       "description": "Apple silicon · arm64 · Signed and notarized DMG",
       "nativeSigning": "developer-id-notarized"
     }
   ],
   "schema": 2,
   "history": [
+    {
+      "version": "v0.30.1",
+      "label": "PeerBrush 0.30.1 · Stable",
+      "kind": "stable",
+      "publishedAt": "2026-11-05T18:59:50Z",
+      "commit": "2ea41951a19abf32d080498bbe7d9d85e20fced3",
+      "releaseUrl": "https://github.com/Deftr0y/PeerBrush/releases/tag/v0.30.1",
+      "platforms": [
+        {
+          "id": "linux",
+          "name": "Linux",
+          "architecture": "x64",
+          "url": "https://github.com/Deftr0y/PeerBrush/releases/download/v0.30.1/peerbrush_0.30.1-1_amd64.deb",
+          "bytes": 31605692,
+          "sha256": "73a578ee7fe85a8b66913a0b743e5a46ccb687d9be8e809325a855f6caac8bdb",
+          "description": "amd64 · Ubuntu 24.04 DEB · Manual updates",
+          "nativeSigning": "unsigned"
+        },
+        {
+          "id": "macos",
+          "name": "macOS",
+          "architecture": "arm64",
+          "url": "https://github.com/Deftr0y/PeerBrush/releases/download/v0.30.1/PeerBrush-0.30.1-macOS-arm64-apple-signed-r1-dmg-signed-r1.dmg",
+          "bytes": 66042942,
+          "sha256": "3eb1155c30b46ca5a64e4b2f40d58e73bf022167865a33911ff0e9322d05c24c",
+          "description": "Apple silicon · arm64 · Signed and notarized DMG",
+          "nativeSigning": "developer-id-notarized"
+        }
+      ],
+      "sourceUrl": "https://github.com/Deftr0y/PeerBrush/releases/download/v0.30.1/PeerBrush-0.30.1-source.zip",
+      "checksumsUrl": "https://github.com/Deftr0y/PeerBrush/releases/download/v0.30.1/SHA256SUMS",
+      "caution": "macOS Apple silicon and Ubuntu 24.04 amd64 downloads are available. The Microsoft Store currently offers Windows 0.30.0 (package 1.30.0.0). Windows package 1.30.1.0 has passed certification and is publishing. Unsupported Photoshop structures remain read-only.",
+      "notes": [
+        "The macOS disk image shows PeerBrush next to Applications. Drag the app to Applications, then open the installed copy.",
+        "On first launch, PeerBrush asks whether it should open PSD and PSB files by default. Choose Not now to keep your current editor. Reopen the choice from File → PSD/PSB default editor…",
+        "macOS handles any required system confirmation. Windows opens Default apps for the final selection, and Ubuntu uses the file handler registered by the DEB package."
+      ]
+    },
     {
       "version": "v0.30.0",
       "label": "PeerBrush 0.30.0 · Stable",
@@ -328,16 +366,16 @@
       "caution": "Historical checkpoint. Rebuilt packages remain unsigned; Windows/macOS may show security warnings. Manual desktop verification of the rebuilt executables remains pending."
     }
   ],
-  "caution": "macOS Apple silicon and Ubuntu 24.04 amd64 downloads are available. Windows Store package 1.30.0.0 (application 0.30.0) is in certification; the previous Store version remains available. Unsupported Photoshop structures remain read-only.",
-  "sourceUrl": "https://github.com/Deftr0y/PeerBrush/releases/download/v0.30.0/PeerBrush-0.30.0-source.zip",
-  "checksumsUrl": "https://github.com/Deftr0y/PeerBrush/releases/download/v0.30.0/SHA256SUMS",
+  "caution": "macOS Apple silicon and Ubuntu 24.04 amd64 downloads are available. The Microsoft Store currently offers Windows 0.30.0 (package 1.30.0.0). Windows package 1.30.1.0 has passed certification and is publishing. Unsupported Photoshop structures remain read-only.",
+  "sourceUrl": "https://github.com/Deftr0y/PeerBrush/releases/download/v0.30.1/PeerBrush-0.30.1-source.zip",
+  "checksumsUrl": "https://github.com/Deftr0y/PeerBrush/releases/download/v0.30.1/SHA256SUMS",
   "windowsStore": {
     "id": "windows",
     "name": "Windows",
     "architecture": "x64",
     "channel": "microsoft-store",
-    "version": "0.25",
+    "version": "0.30.0",
     "url": "https://apps.microsoft.com/detail/9PNR6T1Q2ZL9",
-    "description": "x64 · Microsoft Store · 0.30.0 update in certification"
+    "description": "x64 · Microsoft Store · Package 1.30.0.0"
   }
 }
