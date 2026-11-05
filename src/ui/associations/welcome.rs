@@ -122,7 +122,7 @@ impl Welcome {
                 ui.add_space(12.);
                 ui.label(RichText::new("WELCOME TO PEERBRUSH").size(11.).color(ACCENT).strong());
                 ui.add_space(8.);
-                ui.label(RichText::new("Your files. Your editor.").size(27.).strong());
+                ui.label(RichText::new("Make PeerBrush your default?").size(27.).strong());
                 ui.add_space(10.);
                 ui.label("Would you like PSD and PSB files to open in PeerBrush when you double-click them?");
                 ui.add_space(18.);

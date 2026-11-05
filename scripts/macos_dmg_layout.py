@@ -49,14 +49,15 @@ tell application "Finder"
     set current view of installerWindow to icon view
     set toolbar visible of installerWindow to false
     set statusbar visible of installerWindow to false
-    set bounds of installerWindow to {160, 120, 840, 590}
+    set bounds of installerWindow to {160, 120, 840, 550}
     set options to icon view options of installerWindow
     set arrangement of options to not arranged
     set icon size of options to 104
     set text size of options to 14
+    set label position of options to bottom
     set background picture of options to file ".background:installer.png" of destination
-    set position of item "PeerBrush.app" of destination to {180, 232}
-    set position of item "Applications" of destination to {500, 232}
+    set position of item "PeerBrush.app" of destination to {180, 230}
+    set position of item "Applications" of destination to {500, 230}
     update destination without registering applications
     delay 2
     close installerWindow

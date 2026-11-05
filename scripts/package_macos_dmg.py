@@ -449,7 +449,8 @@ def prepare(archive, output, commit, version, expected_sha256, revision, source_
         elif (copied.is_symlink() or digest(regular_file(bundle, relative)) != digest(copied)
               or stat.S_IMODE(copied.stat().st_mode) != mode):
             raise ValueError('DMG staging changed original archive bytes or modes')
-    expected = create_image(payload, image, work / 'mounted', f'PeerBrush {version}',
+    expected = create_image(payload, image, work / 'mounted',
+                            'Install PeerBrush' if tuple(map(int, version.split('.'))) >= (0, 30, 1) else f'PeerBrush {version}',
                             verify_app=lambda mounted_app: verify_native(mounted_app, manifest['macos_signing']['team_id'], notarized=True))
     if digest(archive) != expected_sha256:
         raise ValueError('Signed archive changed during DMG preparation')
