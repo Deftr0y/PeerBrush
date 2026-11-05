@@ -64,7 +64,8 @@ tell application "Finder"
 end tell
 end run'''
         run(['/usr/bin/osascript', '-e', script, str(mount)], timeout=60)
-        run(['/usr/sbin/bless', '--folder', str(mount), '--openfolder', str(mount)])
+        # Read-only DMG roots open in Finder by default. The legacy bless
+        # openfolder option is unsupported on Apple Silicon (macOS 12.3+).
         run(['/bin/sync'])
         # Finder may leave these OS-owned empty directories on a writable volume.
         # They contain no application payload; remove only empty directories.
@@ -81,4 +82,5 @@ end run'''
                 raise ValueError('Installer layout volume remains attached; preserve work')
         if mount.is_mount():
             raise ValueError('Installer mount remains active; preserve work')
-        mount.rmdir()
+        if mount.exists():
+            mount.rmdir()

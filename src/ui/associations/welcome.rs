@@ -147,6 +147,10 @@ impl Welcome {
             if !macos::installed() {
                 ui.colored_label(ACCENT, "First drag PeerBrush into Applications, then open it from there.");
             }
+            #[cfg(target_os = "linux")]
+            if !self.can_apply() {
+                ui.colored_label(ACCENT, "Install the PeerBrush DEB package first so your desktop can open PSD and PSB files with it.");
+            }
             if let Some(error) = &self.error { ui.colored_label(ACCENT, error); }
             if self.pending.is_some() { ui.spinner(); ui.label("Waiting for macOS to confirm your choice…"); }
             ui.add_space(12.);
@@ -172,11 +176,16 @@ impl Welcome {
     fn can_apply(&self) -> bool {
         #[cfg(target_os = "macos")]
         return macos::installed();
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
+        return Path::new("/usr/share/applications/com.peerbrush.PeerBrush.desktop").is_file();
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         true
     }
 
     fn apply(&mut self, _ctx: &egui::Context) -> Result<(), String> {
+        if !self.can_apply() {
+            return Err("Install PeerBrush first, then reopen it to choose your defaults.".into());
+        }
         #[cfg(target_os = "macos")]
         {
             self.pending = Some(macos::request(_ctx)?);
