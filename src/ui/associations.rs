@@ -1,5 +1,7 @@
-//! OS-owned file associations. Guidance never changes defaults or document state.
+//! Explicit, per-user file-association consent; never part of document history.
 use super::*;
+
+pub(super) mod welcome;
 
 const WINDOWS_DEFAULTS_URI: &str = "ms-settings:defaultapps";
 
@@ -8,13 +10,24 @@ pub(super) struct Choice {
     open: bool,
     registration: Option<Result<bool, String>>,
     error: Option<String>,
+    welcome: Option<welcome::Welcome>,
 }
 
 impl Choice {
+    pub(super) fn load(preferences: &Path) -> Self {
+        Self {
+            welcome: Some(welcome::Welcome::load(preferences)),
+            ..Default::default()
+        }
+    }
+
     pub(super) fn menu(&mut self, ui: &mut egui::Ui) {
         let response = ui.button("PSD/PSB default editor…");
         if response.clicked() {
-            self.open = true;
+            self.open = self.welcome.is_none();
+            if let Some(welcome) = &mut self.welcome {
+                welcome.offer();
+            }
             self.error = None;
             #[cfg(windows)]
             {
@@ -25,6 +38,9 @@ impl Choice {
     }
 
     pub(super) fn show(&mut self, ctx: &egui::Context) {
+        if let Some(welcome) = &mut self.welcome {
+            welcome.show(ctx);
+        }
         self.show_for(ctx, std::env::consts::OS, open_windows_defaults);
     }
 

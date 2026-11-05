@@ -302,6 +302,9 @@ fn run() -> Result<(), String> {
             activation::macos::install_termination(&shared, &cc.egui_ctx)?;
             #[allow(unused_mut)]
             let mut app = PeerBrush::new_with_preferences(cc, shared, connection, &preferences);
+            if !local_preferences {
+                app.enable_first_launch(&preferences);
+            }
             #[cfg(any(windows, target_os = "macos"))]
             app.set_update_profile(update_profile);
             Ok(Box::new(app))

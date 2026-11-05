@@ -257,7 +257,9 @@ def inspect_final(root, archive, image, *, commit, version, archive_sha256, imag
             stage.mkdir(mode=0o700)
             run(['/usr/bin/ditto', str(app), str(stage / APP)])
             verify_native(stage / APP, team_id, notarized=True)
-    verify_image(copied_image, mount, expected, verify_app=verify_mounted)
+    verify_image(copied_image, mount, expected, verify_app=verify_mounted,
+                 presentation_source=(root / 'packaging/macos/installer-background.png'
+                                      if tuple(map(int, version.split('.'))) >= (0, 30, 1) else None))
     if mount.is_mount():
         raise ValueError('DMG remains mounted; preserve inspection work')
     for path, checksum in [(archive, archive_sha256), (image, image_sha256),
@@ -293,13 +295,26 @@ def create_image(payload, image, mount, volume, verify_app=None):
     if image.exists() or image.is_symlink() or mount.exists() or mount.is_symlink():
         raise ValueError('Use fresh DMG image and mount paths')
     expected = payload_inventory(payload)
+    decorated = (payload / '.background/installer.png').is_file()
+    if decorated:
+        from macos_dmg_layout import arrange
+        writable = image.with_suffix('.writable.dmg')
+        run(['/usr/bin/hdiutil', 'create', '-srcfolder', str(payload), '-volname', volume,
+             '-fs', 'HFS+', '-format', 'UDRW', str(writable)], timeout=600)
+        arrange(writable, mount, run, SUPPORT)
+        run(['/usr/bin/hdiutil', 'convert', str(writable), '-format', 'UDZO', '-o', str(image)], timeout=600)
+        expected = {key: value for key, value in expected.items() if key not in ('.background', '.background/installer.png')}
+        verify_image(image, mount, expected, verify_app,
+                     presentation_source=payload / '.background/installer.png')
+        writable.unlink()
+        return expected
     run(['/usr/bin/hdiutil', 'create', '-srcfolder', str(payload), '-volname', volume,
          '-fs', 'HFS+', '-format', 'UDZO', str(image)], timeout=600)
     verify_image(image, mount, expected, verify_app)
     return expected
 
 
-def verify_image(image, mount, expected, verify_app=None):
+def verify_image(image, mount, expected, verify_app=None, presentation_source=None):
     """Recheck a final signed/stapled image against its original payload."""
     if sys.platform != 'darwin' or mount.exists() or mount.is_symlink():
         raise ValueError('Native DMG verification needs a fresh macOS mount path')
@@ -319,6 +334,9 @@ def verify_image(image, mount, expected, verify_app=None):
                 or not mount.is_mount()
                 or [entity['mount-point'] for entity in entities if 'mount-point' in entity] != [str(mount)]):
             raise ValueError('DMG must mount exactly one volume at the explicitly selected path')
+        if presentation_source is not None:
+            from macos_dmg_layout import presentation
+            expected = expected | presentation(mount, presentation_source)
         if payload_inventory(mount) != expected:
             raise ValueError('Mounted DMG differs from the original payload bytes, modes or layout')
         if verify_app is not None:
@@ -407,6 +425,15 @@ def prepare(archive, output, commit, version, expected_sha256, revision, source_
         else:
             shutil.copy2(path, destination)
     (payload / 'Applications').symlink_to('/Applications', target_is_directory=True)
+    if tuple(map(int, version.split('.'))) >= (0, 30, 1):
+        background = payload / '.background/installer.png'
+        background.parent.mkdir()
+        shutil.copyfile(root / 'packaging/macos/installer-background.png', background)
+        background.chmod(0o644)
+        (payload / '.fseventsd').mkdir()
+        for name in ('.metadata_never_index', '.fseventsd/no_log'):
+            (payload / name).write_bytes(b'')
+            (payload / name).chmod(0o644)
     image = work / filename
     # Prove that repackaging did not alter a signed app, its ticket or support
     # material, before asking the OS to create the image.

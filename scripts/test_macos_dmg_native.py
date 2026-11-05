@@ -28,6 +28,13 @@ class NativeImage(unittest.TestCase):
         support.mkdir()
         (support / 'LICENSE').write_text('Synthetic GPL notice fixture\n')
         (payload / 'Applications').symlink_to('/Applications', target_is_directory=True)
+        from macos_dmg_layout import BACKGROUND
+        background = payload / BACKGROUND
+        background.parent.mkdir()
+        shutil.copyfile(pathlib.Path(__file__).resolve().parents[1] / 'packaging/macos/installer-background.png', background)
+        (payload / '.fseventsd').mkdir()
+        for name in ('.metadata_never_index', '.fseventsd/no_log'):
+            (payload / name).write_bytes(b'')
         def check_read_only(mounted_app):
             with self.assertRaises(OSError):
                 (mounted_app / 'Contents/MacOS/peerbrush').write_bytes(b'MUST_NOT_REPLACE')

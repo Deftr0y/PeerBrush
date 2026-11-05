@@ -1,6 +1,6 @@
 # PeerBrush development
 
-- Develop directly on the appropriate `version/<version>` branch; the active milestone is `version/0.3` (application version 0.30.0). Do not create routine feature/fix PRs or run development CI. Production is `main`; a version-to-`main` release candidate receives the essential gate once before promotion. `dev` and existing feature branches retain historical/WIP work. Never force-push or delete that history. Historical maintenance and website content have separate roles in the [development guide](docs/development-guide.md).
+- Develop directly on the appropriate `version/<version>` branch; the active milestone is `version/0.3` (application hotfix version 0.30.1). Do not create routine feature/fix PRs or run development CI. Production is `main`; a version-to-`main` release candidate receives the essential gate once before promotion. `dev` and existing feature branches retain historical/WIP work. Never force-push or delete that history. Historical maintenance and website content have separate roles in the [development guide](docs/development-guide.md).
 
 - Git attribution belongs to the human contributor. Never register an LLM or AI tool as a commit author, committer, co-author or contributor, or add automated contributor badges. Use an approved human identity from `.github/human-contributors.json`; adding another identity requires the maintainer to verify that it belongs to a human. GitHub's signing service is allowed only as a committer. Keep the README's AI-development disclosure.
 
