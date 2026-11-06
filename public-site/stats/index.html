@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <meta name="robots" content="noindex,nofollow,noarchive">
+  <meta name="theme-color" content="#161417">
+  <title>Statistics  -  PeerBrush</title>
+  <link rel="icon" type="image/png" href="/assets/peerbrush-logo.png">
+  <link rel="stylesheet" href="/styles.css">
+  <link rel="stylesheet" href="/stats/dashboard.css">
+  <script src="/stats/dashboard.js" type="module"></script>
+</head>
+<body class="statistics-page">
+  <a class="skip-link" href="#main">Skip to statistics</a>
+  <header class="stats-header wrap">
+    <a class="brand" href="https://peerbrush.com/"><img src="/assets/peerbrush-logo.png" alt="" width="28" height="34"><span>Peer<span class="ember">Brush</span></span></a>
+    <span class="private-label">Public statistics  -  Unlisted</span><a class="sign-out" href="/">Back to website ?</a>
+  </header>
+  <main id="main" class="wrap">
+    <div id="demo-banner" class="demo-banner" hidden>LOCAL DEMO - Every number on this page is synthetic. No analytics accounts are connected.</div>
+    <section class="stats-intro" aria-labelledby="page-title">
+      <div><span class="section-label">PROJECT STATISTICS</span><h1 id="page-title">A little perspective<br>on PeerBrush<span class="ember">.</span></h1><p>Website reach, release downloads and community interest. A clear view of what we can measure.</p></div>
+      <div class="period-tools">
+        <div class="period-picker" role="group" aria-label="Website traffic period">
+          <button type="button" data-days="7" aria-pressed="false">7 days</button><button type="button" data-days="30" aria-pressed="true">30 days</button><button type="button" data-days="90" aria-pressed="false">90 days</button>
+        </div>
+        <p id="period-label">Last complete UTC days</p>
+        <button id="refresh" class="refresh-button" type="button">Refresh <span aria-hidden="true">?</span></button>
+      </div>
+    </section>
+    <div id="status" class="load-status" role="status" aria-live="polite">Loading source availability.</div>
+    <nav class="section-nav" aria-label="Statistics sections"><a href="#overview">Overview</a><a href="#audience">Audience</a><a href="#downloads">Downloads &amp; releases</a><a href="#sources">Sources &amp; coverage</a></nav>
+    <noscript><p class="load-status error">JavaScript is needed to load these statistics. The website remains available using the link above.</p></noscript><section id="overview" class="overview" aria-label="Key performance indicators">
+      <article class="metric"><span class="metric-label">Counted website visits</span><strong id="visits">-</strong><p id="visit-change">GoatCounter  -  selected period</p></article>
+      <article class="metric"><span class="metric-label">GitHub package requests</span><strong id="requests">-</strong><p>All published releases  -  lifetime</p></article>
+      <article class="metric"><span class="metric-label">GitHub stars</span><strong id="stars">-</strong><p>Current repository snapshot</p></article>
+      <article class="metric"><span class="metric-label">Store acquisitions</span><strong id="acquisitions">-</strong><p>Partner Center  -  not connected</p></article>
+    </section>
+    <section class="traffic-section" aria-labelledby="traffic-title">
+      <div class="block-heading"><div><span class="section-label">WEBSITE</span><h2 id="traffic-title">Traffic over time</h2></div><span id="traffic-source" class="source-caption">GoatCounter  -  awaiting source</span></div>
+      <div class="chart-heading"><p>Counted visits per day</p><span id="traffic-peak"></span></div>
+      <div id="traffic-chart" class="traffic-chart"><p class="empty">Loading the daily traffic series.</p></div>
+      <details id="daily-details" class="daily-details" hidden><summary>Daily values</summary><div class="table-scroll"><table><caption class="sr-only">Daily counted website visits</caption><thead><tr><th scope="col">Date (UTC)</th><th scope="col">Visits</th></tr></thead><tbody id="daily-values"></tbody></table></div></details>
+      <p class="chart-note">Complete UTC days. Counts can miss privacy protected visits and do not identify individual people.</p>
+    </section>
+    <section id="audience" class="audience-section" aria-labelledby="audience-title">
+      <div class="block-heading"><div><span class="section-label">AUDIENCE</span><h2 id="audience-title">Where interest comes from</h2></div><p class="source-caption">Website visitors  -  selected period</p></div>
+      <div class="audience-grid">
+        <article class="ranking"><h3>Visitor countries</h3><p>Approximate visitor location. Downloader countries are unavailable.</p><div id="countries" class="ranking-data"></div></article>
+        <article class="ranking"><h3>Referring sites</h3><p>Referrer origins and source groups reported by GoatCounter.</p><div id="referrers" class="ranking-data"></div></article>
+        <article class="ranking"><h3>Pages visited</h3><p>Visits per tracked page; people may appear on several pages.</p><div id="pages" class="ranking-data"></div></article>
+        <article class="ranking"><h3>Visitor operating systems</h3><p>Browser reported systems, independent of downloaded platforms.</p><div id="systems" class="ranking-data"></div></article>
+      </div>
+      <details class="browser-details"><summary>Browser breakdown</summary><div id="browsers" class="ranking-data"></div></details>
+    </section>
+    <section id="downloads" class="downloads-section" aria-labelledby="downloads-title">
+      <div class="block-heading"><div><span class="section-label">DISTRIBUTION</span><h2 id="downloads-title">Downloads &amp; releases</h2></div><span id="github-source" class="source-caption">GitHub  -  awaiting source</span></div>
+      <p class="section-description">GitHub reports requests for package files. These can include repeat downloads, bots and build validation. They measure neither unique downloaders nor installations.</p>
+      <div class="distribution-grid">
+        <article><h3>Package requests by platform</h3><p class="source-caption">Lifetime  -  traffic filter does not apply</p><div id="platforms" class="ranking-data"></div></article>
+        <article class="store-note"><span class="section-label">MICROSOFT STORE</span><h3>A separate Windows channel</h3><p id="store-notice">Store acquisitions, installs and country reports require authorized Partner Center access. Not connected.</p><a class="text-link" href="https://apps.microsoft.com/detail/9PNR6T1Q2ZL9" rel="noreferrer">View public Store listing <span aria-hidden="true">?</span></a></article>
+      </div>
+      <div class="releases-heading"><h3>Published releases</h3><p>Package requests by version  -  lifetime</p></div>
+      <div class="table-scroll"><table class="release-table"><caption class="sr-only">Published GitHub release package request totals</caption><thead><tr><th scope="col">Release</th><th scope="col">Published (UTC)</th><th scope="col">Windows</th><th scope="col">macOS</th><th scope="col">Linux</th><th scope="col">Total</th></tr></thead><tbody id="release-rows"><tr><td colspan="6">Waiting for GitHub data.</td></tr></tbody></table></div>
+      <p class="chart-note">A dash means that release has no recognized package for the platform. Source archives, checksums and other files are excluded from package totals.</p>
+      <div class="repo-signals"><span>Forks <strong id="forks">-</strong></span><span>Open issues &amp; pull requests <strong id="issues">-</strong></span><span>Published releases <strong id="release-count">-</strong></span></div>
+    </section>
+    <section id="sources" class="sources-section" aria-labelledby="sources-title">
+      <div class="block-heading"><div><span class="section-label">MEASUREMENT</span><h2 id="sources-title">Know what is counted</h2></div></div>
+      <div id="source-health" class="source-health"></div>
+      <ul id="coverage" class="coverage-list"></ul>
+      <div id="source-notices" class="source-notices"></div>
+    </section>
+  </main>
+  <footer class="stats-footer wrap"><span>Peer<span class="ember">Brush</span> <span class="footer-separator">/</span> Public aggregate statistics</span><a href="https://peerbrush.com/privacy.html" rel="noreferrer">Privacy <span aria-hidden="true">?</span></a></footer>
+</body>
+</html>
