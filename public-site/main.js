@@ -1,6 +1,6 @@
-import { detectPlatform, safeAvailableDownload, latestRelease, availableDownloads } from './platform.js?release=v0.30.1&downloads=4';
+import { detectPlatform, safeAvailableDownload, latestRelease, availableDownloads } from './platform.js?release=v0.30.1&downloads=5';
 import './showcase.js';
-import { renderHistory } from './releases.js?release=v0.30.1&downloads=4';
+import { renderHistory } from './releases.js?release=v0.30.1&downloads=5';
 
 const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
 const views = {

@@ -1,4 +1,4 @@
-import { availableDownloads } from './platform.js?release=v0.30.1&downloads=4';
+import { availableDownloads } from './platform.js?release=v0.30.1&downloads=5';
 
 export function renderPlatformLinks(data, document = globalThis.document) {
   for (const platform of availableDownloads(data)) {
@@ -13,6 +13,6 @@ export function renderPlatformLinks(data, document = globalThis.document) {
 }
 
 try {
-  const response = await fetch('./downloads.json?release=v0.30.1&downloads=4', { cache: 'no-store' });
+  const response = await fetch('./downloads.json?release=v0.30.1&downloads=5', { cache: 'no-store' });
   if (response.ok) renderPlatformLinks(await response.json());
 } catch { /* Keep functional static downloads when the feed is unavailable. */ }

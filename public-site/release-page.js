@@ -1,5 +1,5 @@
-import { renderHistory } from './releases.js?release=v0.30.1&downloads=4';
-import { latestRelease, releaseHistory } from './platform.js?release=v0.30.1&downloads=4';
+import { renderHistory } from './releases.js?release=v0.30.1&downloads=5';
+import { latestRelease, releaseHistory } from './platform.js?release=v0.30.1&downloads=5';
 
 const status = document.querySelector('#history-status');
 try {

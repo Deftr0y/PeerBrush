@@ -1,4 +1,4 @@
-import { releaseHistory, latestRelease, safeDownloadUrl } from './platform.js?release=v0.30.1&downloads=4';
+import { releaseHistory, latestRelease, safeDownloadUrl, safeAvailableDownload } from './platform.js?release=v0.30.1&downloads=5';
 
 function historyDownloadLink(platform) {
   const link = document.createElement('a');
@@ -33,7 +33,17 @@ export function renderHistory(data) {
       else row.append(document.createTextNode(' · Checksum not recorded'));
       downloads.append(row);
     }
-    const missing=['Windows','Linux','macOS'].filter(name=>!release.platforms.some(p=>p.name===name));
+    const store = data.windowsStore;
+    const storePackage = release.storePackageVersion;
+    const hasStorePackage = /^\d+\.\d+\.\d+\.0$/.test(storePackage || '') && store?.channel === 'microsoft-store' && safeAvailableDownload(store);
+    if (hasStorePackage) {
+      const row = document.createElement('p');
+      const link = historyDownloadLink(store);
+      link.textContent = 'Windows · Microsoft Store';
+      row.append(link, document.createTextNode(' · x64 · Package ' + storePackage + ' · Store serves the current version'));
+      downloads.append(row);
+    }
+    const missing=['Windows','Linux','macOS'].filter(name=>!(name==='Windows' && hasStorePackage) && !release.platforms.some(p=>p.name===name));
     if(missing.length) {const line=document.createElement('p');line.textContent=`No published ${missing.join(' / ')} package for this checkpoint.`;downloads.append(line);}
     const docs = document.createElement('a');
     docs.className = 'text-link';
