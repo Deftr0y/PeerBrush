@@ -1,3 +1,4 @@
+import { drawTraffic, drawPlatforms, drawReleases } from './charts.js';
 const $ = id => document.getElementById(id);
 const number = value => Number.isFinite(value) ? value.toLocaleString('en-US') : '-';
 const formatTime = value => value && !Number.isNaN(Date.parse(value)) ? new Date(value).toLocaleString('en-GB', { timeZone: 'UTC', dateStyle: 'medium', timeStyle: 'short' }) + ' UTC' : 'No successful read';
@@ -33,27 +34,13 @@ function ranking(id, result, missing, names = {}) {
     svg.append(svgNode('rect', { width: 1000, height: 4, rx: 2, class: 'rank-background' }), svgNode('rect', { width: Math.round(row.count / maximum * 1000), height: 4, rx: 2, class: 'rank-value' }));
     li.append(svg); list.append(li);
   }
-  $(id).replaceChildren(list, node('p', result.more ? 'Top 10 results. More results exist at the source. Bars scale to the largest result.' : 'Bars scale to the largest result.', 'rank-caption'));
+  $(id).replaceChildren(list, node('p', result.more ? 'Top source results. More results exist at the source. Bars scale to the largest result.' : 'Bars scale to the largest result.', 'rank-caption'));
 }
 function chart(series) {
   if (!series) { empty('traffic-chart', 'Traffic is unavailable until GoatCounter can be read.'); $('daily-details').hidden = true; $('traffic-peak').textContent = ''; return; }
   if (!series.length) { empty('traffic-chart', 'No daily statistics were returned.'); $('daily-details').hidden = true; return; }
-  const width = Math.max(320, $('traffic-chart').clientWidth);
-  const height = 240, left = 60, right = width - 14, top = 16, bottom = height - 34;
-  const peak = Math.max(...series.map(row => row.count)), maximum = Math.max(1, peak);
-  const step = 10 ** Math.floor(Math.log10(maximum));
-  const limit = Math.ceil(maximum / step) * step;
-  const svg = svgNode('svg', { viewBox: `0 0 ${width} ${height}`, role: 'img', 'aria-labelledby': 'chart-title chart-description' });
-  svg.append(svgNode('title', { id: 'chart-title' }, 'Daily counted website visits'), svgNode('desc', { id: 'chart-description' }, `${formatDay(series[0].date)} to ${formatDay(series.at(-1).date)}. Peak ${number(peak)} counted visits in one day. Exact values are in the Daily values table below.`));
-  for (const value of [0, limit / 2, limit]) {
-    const y = bottom - value / limit * (bottom - top);
-    svg.append(svgNode('line', { x1: left, x2: right, y1: y, y2: y, class: 'grid-line' }), svgNode('text', { x: left - 10, y: y + 4, 'text-anchor': 'end' }, number(value)));
-  }
-  const coordinates = series.map((row, i) => [left + i / Math.max(1, series.length - 1) * (right - left), bottom - row.count / limit * (bottom - top)]);
-  svg.append(svgNode('polygon', { points: `${left},${bottom} ${coordinates.map(pair => pair.join(',')).join(' ')} ${right},${bottom}`, class: 'area' }), svgNode('polyline', { points: coordinates.map(pair => pair.join(',')).join(' '), class: 'trend-line' }));
-  for (const i of [0, Math.floor(series.length / 2), series.length - 1]) svg.append(svgNode('text', { x: coordinates[i][0], y: height - 7, 'text-anchor': i === 0 ? 'start' : i === series.length - 1 ? 'end' : 'middle' }, formatDay(series[i].date)));
-  $('traffic-chart').replaceChildren(svg);
-  $('traffic-peak').textContent = `Daily peak ${number(peak)}`;
+  drawTraffic($('traffic-chart'), series);
+  $('traffic-peak').textContent = `Daily peak ${number(Math.max(...series.map(row => row.count)))}`;
   $('daily-values').replaceChildren(...series.map(row => { const tr = node('tr'); tr.append(node('td', row.date), node('td', number(row.count))); return tr; }));
   $('daily-details').hidden = false;
 }
@@ -98,6 +85,8 @@ function render(data) {
   chart(t.trend);
   for (const id of ['countries', 'referrers', 'pages', 'systems', 'browsers']) ranking(id, t[id], 'GoatCounter data is not available.', id === 'pages' ? pageNames : {});
   ranking('platforms', g.platforms ? { rows: g.platforms.map(row => ({ name: row.id, count: row.requests })), more: false } : null, 'GitHub package statistics are unavailable.', platformNames);
+  drawPlatforms($('platform-chart'), g.platforms);
+  drawReleases($('release-chart'), g.releases);
   $('store-notice').textContent = data.store.notice;
   releaseRows(g.releases);
   $('forks').textContent = number(g.forks); $('issues').textContent = number(g.openIssuesAndPRs); $('release-count').textContent = g.releases ? number(g.releases.length) : '-';
@@ -107,7 +96,7 @@ function clear() {
   lastData = null;
   for (const id of ['visits', 'requests', 'stars', 'acquisitions', 'forks', 'issues', 'release-count']) $(id).textContent = '-';
   for (const id of ['countries', 'referrers', 'pages', 'systems', 'browsers', 'platforms']) empty(id, 'Waiting for statistics.');
-  chart(null); releaseRows(null); $('source-health').replaceChildren(); $('coverage').replaceChildren(); $('source-notices').replaceChildren();
+  chart(null); drawPlatforms($('platform-chart'), null); drawReleases($('release-chart'), null); releaseRows(null); $('source-health').replaceChildren(); $('coverage').replaceChildren(); $('source-notices').replaceChildren();
   $('traffic-source').textContent = 'GoatCounter  -  awaiting source'; $('github-source').textContent = 'GitHub  -  awaiting source'; $('visit-change').textContent = 'GoatCounter  -  selected period';
 }
 async function load() {
