@@ -62,7 +62,7 @@ You stay in control while AI works directly alongside you inside the same editin
 
 ## Run PeerBrush
 
-PeerBrush 0.30.0 is an unpublished release candidate. Windows users can install the earlier [Microsoft Store version](https://apps.microsoft.com/detail/9PNR6T1Q2ZL9) (MSIX 1.25.0.0). Apple silicon Mac and x64 Linux users can download [release 0.26.0](https://github.com/Deftr0y/PeerBrush/releases/tag/v0.26.0).
+PeerBrush 0.30.1 is available. Windows users can install the [Microsoft Store version](https://apps.microsoft.com/detail/9PNR6T1Q2ZL9) (MSIX 1.30.1.0). Apple silicon Mac and Ubuntu 24.04 amd64 users can download the signed and notarized DMG or DEB from [release 0.30.1](https://github.com/Deftr0y/PeerBrush/releases/tag/v0.30.1).
 
 To develop from source:
 
@@ -131,7 +131,7 @@ PeerBrush includes retained regional and broader GPU previews, folder transforms
 
 ## Status
 
-🚧 **Experimental prerelease — [PeerBrush 0.25](docs/release-0.25.md)**
+🚧 **Experimental software — [PeerBrush 0.30.1](https://github.com/Deftr0y/PeerBrush/releases/tag/v0.30.1)**
 
 PeerBrush is currently experimental and under active development. Features, APIs, and project structure are expected to change.
 
