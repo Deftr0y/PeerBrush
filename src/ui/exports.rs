@@ -4,6 +4,10 @@ use crate::production_export::{
     self as export, jobs::Existing, Control, Crop, DuplicateNames, Format, Settings,
     Variant,
 };
+use egui::{
+    text::{CCursor, CCursorRange},
+    TextBuffer,
+};
 use std::time::Instant;
 
 const PREVIEW_DELAY: Duration = Duration::from_millis(150);
@@ -14,7 +18,7 @@ fn filename_template(ui: &mut egui::Ui, template: &mut String) {
     let mut input = egui::TextEdit::singleline(template)
         .desired_width(ui.available_width())
         .show(ui);
-    input.response.labelled_by(label.id);
+    let response = input.response.labelled_by(label.id);
     let mut insert = None;
     ui.horizontal_wrapped(|ui| {
         for (icon, label, token, help) in [
@@ -32,18 +36,17 @@ fn filename_template(ui: &mut egui::Ui, template: &mut String) {
     });
     if let Some(token) = insert {
         let count = template.chars().count();
-        let [start, end] = input.cursor_range.map_or([count; 2], |range| {
-            let a = range.primary.index.min(count);
-            let b = range.secondary.index.min(count);
-            [a.min(b), a.max(b)]
+        let [start, end] = input.state.cursor.char_range().map_or([count; 2], |range| {
+            range.sorted().map(|cursor| cursor.index.min(count))
         });
-        let offset = |index| template.char_indices().nth(index).map_or(template.len(), |(i, _)| i);
-        let bytes = offset(start)..offset(end);
-        template.replace_range(bytes, token);
-        use egui::text::{CCursor, CCursorRange};
-        input.state.cursor.set_char_range(Some(CCursorRange::one(CCursor::new(start + token.len()))));
-        input.state.store(ui.ctx(), input.response.id);
-        input.response.request_focus();
+        template.delete_char_range(start..end);
+        let inserted = template.insert_text(token, start);
+        input
+            .state
+            .cursor
+            .set_char_range(Some(CCursorRange::one(CCursor::new(start + inserted))));
+        input.state.store(ui.ctx(), response.id);
+        response.request_focus();
         ui.ctx().request_repaint();
     }
 }

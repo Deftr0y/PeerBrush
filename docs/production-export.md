@@ -8,11 +8,13 @@ Choose PNG, **WebP · lossless 8-bit** or **JPEG XL · native 8/16-bit**. JPEG X
 
 Illustrated **Lossless** and **Lossy** choices distinguish exact samples from reduced color detail. The adjacent preview shows the actual output for the chosen settings.
 
+In **Filename template**, use **Document**, **Layer** or **Size variant** to insert a placeholder at the caret or replace selected text. The output list shows the resulting filenames.
+
 Use **Duplicate names** to resolve two planned outputs with the same filename. Use **Existing files** to choose what happens when an output filename already exists in the destination folder. The trash button on a size variant removes that row from the export settings.
 
 Canvas bounds retain document alignment. Alpha trimming uses actual rendered nonzero alpha, including low native16 alpha values; an entirely transparent target requires canvas bounds. Padding is measured in document pixels before scaling and may extend beyond the canvas. Output metadata reports `[left, top, right, bottom]` in document coordinates and actual rounded scale ratios. An output pixel center maps to `left + (x + 0.5) / scale_x`, `top + (y + 0.5) / scale_y`. Rendering is clipped to the document canvas; padding adds transparency rather than revealing off-canvas artwork.
 
-Variants use scales from 0.01× to 8×. The **Sampling** buttons show how Nearest preserves hard pixel steps and how premultiplied-alpha Bilinear smooths them. The actual output preview uses the selected method. The maximum is 12 variants and 64 outputs per batch. Each output shares the document limit of an 8192-pixel edge and 32 × 1024 × 1024 pixels, including an 8192 × 4096 canvas. Only one batch runs per instance; completed receipts for the latest eight runs remain available during that instance.
+Variants use scales from 0.01× to 8×. The **Sampling** buttons show how Nearest preserves hard pixel steps and how premultiplied-alpha Bilinear smooths them. The actual output preview uses the selected method. A batch supports up to 12 variants and 64 outputs. The native export planner allows up to 16,000 pixels per edge. The resident planner allows up to 8,192 pixels per edge and 32 × 1024 × 1024 pixels total. Rendering and encoding still depend on the document's resource budget. One batch runs at a time per instance, which keeps receipts for the latest eight completed runs.
 
 ## Source and precision
 
