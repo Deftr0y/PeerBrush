@@ -209,6 +209,99 @@ fn conflicting_server_names_are_kept_and_local_name_is_stable() {
 }
 
 #[test]
+fn previous_package_targets_migrate_without_losing_client_settings_or_backups() {
+    for previous in [
+        "/nix/store/00000000000000000000000000000000-peerbrush-old/bin/.peerbrush-wrapped",
+        r"C:\Scoop user space\apps\peerbrush\0.30.0\peerbrush.exe",
+        "/opt/homebrew/Caskroom/peerbrush/0.30.0/PeerBrush-0.30.0-macOS-arm64/PeerBrush.app/Contents/MacOS/peerbrush",
+    ] {
+        let mut f = Fixture::new(&[ClientKind::Codex, ClientKind::Cursor]);
+        if previous.starts_with("C:") {
+            f.executable = f.root.join("apps/peerbrush/current/peerbrush.exe");
+            fs::create_dir_all(f.executable.parent().unwrap()).unwrap();
+            fs::write(&f.executable, b"synthetic stable launcher; never executed").unwrap();
+        }
+        if previous.starts_with("/opt/homebrew/") {
+            f.executable = f.root.join("brew prefix/bin/peerbrush");
+            fs::create_dir_all(f.executable.parent().unwrap()).unwrap();
+            fs::write(&f.executable, b"synthetic stable launcher; never executed").unwrap();
+        }
+        let codex = format!("# preserve human settings\n[mcp_servers.peerbrush]\ncommand = '{previous}'\nargs = ['mcp']\ntool_timeout_sec = 123\n[mcp_servers.other]\ncommand = 'other'\n");
+        let cursor = json!({"theme":"dark", "mcpServers":{
+            "peerbrush":{"command":previous,"args":["mcp"],"env":{"CUSTOM_VALUE":"retain-me"}},
+            "other":{"command":"other","args":["serve"]}
+        }})
+        .to_string();
+        f.write(0, &codex);
+        f.write(1, &cursor);
+        let report = f.connect();
+        assert_eq!(report.registered_count, 2);
+        for (index, original) in [&codex, &cursor].iter().enumerate() {
+            assert_eq!(report.clients[index].server_name, "peerbrush");
+            assert_eq!(
+                fs::read_to_string(report.clients[index].backup.as_ref().unwrap()).unwrap(),
+                **original
+            );
+        }
+        let codex = f.text(0).parse::<toml_edit::DocumentMut>().unwrap();
+        assert_eq!(
+            codex["mcp_servers"]["peerbrush"]["command"].as_str(),
+            f.executable.to_str()
+        );
+        assert_eq!(
+            codex["mcp_servers"]["peerbrush"]["tool_timeout_sec"].as_integer(),
+            Some(123)
+        );
+        assert_eq!(
+            codex["mcp_servers"]["other"]["command"].as_str(),
+            Some("other")
+        );
+        let cursor: Value = serde_json::from_str(&f.text(1)).unwrap();
+        assert_eq!(
+            cursor["mcpServers"]["peerbrush"]["command"],
+            f.executable.to_str().unwrap()
+        );
+        assert_eq!(
+            cursor["mcpServers"]["peerbrush"]["env"]["CUSTOM_VALUE"],
+            "retain-me"
+        );
+        assert_eq!(cursor["mcpServers"]["other"]["command"], "other");
+        assert_eq!(cursor["theme"], "dark");
+        let manifest: Manifest =
+            serde_json::from_str(&fs::read_to_string(&f.paths.manifest).unwrap()).unwrap();
+        assert_eq!(manifest.command, f.executable);
+        assert_eq!(manifest.connection_file, f.state.join("connection.json"));
+        assert!(f.connect().clients.iter().all(|client| !client.changed));
+    }
+}
+
+#[test]
+fn lookalike_or_non_mcp_wrapped_commands_remain_unrelated_servers() {
+    for (command, arguments) in [
+        ("/tmp/bin/.peerbrush-wrapped", json!(["mcp"])),
+        (
+            "/nix/store/invalid-digest/bin/.peerbrush-wrapped",
+            json!(["mcp"]),
+        ),
+        (
+            "/nix/store/00000000000000000000000000000000-peerbrush/bin/.peerbrush-wrapped",
+            json!(["serve"]),
+        ),
+    ] {
+        let f = Fixture::new(&[ClientKind::Cursor]);
+        let original = json!({"command":command,"args":arguments,"env":{"KEEP":"original"}});
+        f.write(0, &json!({"mcpServers":{"peerbrush":original}}).to_string());
+        let report = f.connect();
+        assert_eq!(report.registered_count, 1);
+        assert!(report.clients[0]
+            .server_name
+            .starts_with("peerbrush-local-"));
+        let updated: Value = serde_json::from_str(&f.text(0)).unwrap();
+        assert_eq!(updated["mcpServers"]["peerbrush"], original);
+    }
+}
+
+#[test]
 fn partial_invalid_configs_leave_files_unchanged_and_successful_clients_work() {
     let f = Fixture::new(&[
         ClientKind::Codex,
@@ -626,5 +719,14 @@ fn discovery_status_cli_keeps_raw_discovery_and_never_starts_a_workspace() {
     let status: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(status["manifest_status"], "ready");
     assert_eq!(status["connection"]["category"], "connection_missing");
+    let connect = invoke(&[
+        "discover".as_ref(),
+        "--connect".as_ref(),
+        "--state-dir".as_ref(),
+        f.state.as_os_str(),
+    ]);
+    assert!(!connect.status.success());
+    assert!(connect.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&connect.stderr).contains("connection information is missing"));
     assert_eq!(file_snapshot(&f.root), before);
 }

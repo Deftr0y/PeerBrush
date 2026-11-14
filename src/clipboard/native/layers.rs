@@ -46,6 +46,7 @@ impl LayerCopyPlan {
         check: &dyn Fn() -> Result<(), String>,
     ) -> Result<Self, String> {
         check()?;
+        crate::layer_clipboard::check_copy_source(source.into())?;
         if ids.is_empty() || ids.len() > 100 {
             return Err("Choose 1-100 layers to copy".into());
         }
@@ -180,6 +181,21 @@ impl LayerCopyPlan {
             unlocked(self.document.metadata(), *index, work, check)?;
         }
         Ok(())
+    }
+
+    pub(crate) fn cut_commands(
+        &self,
+        work: &mut Work,
+        check: &dyn Fn() -> Result<(), String>,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        self.check_cut(work, check)?;
+        self.roots()
+            .iter()
+            .map(|&index| {
+                let layer = self.layer(index)?;
+                Ok(serde_json::json!({"op":"layer.delete","layer":layer.id()}))
+            })
+            .collect()
     }
 }
 fn flags(count: usize) -> Result<Vec<bool>, String> {
@@ -320,81 +336,62 @@ impl PastePlacement {
             return Err("This PSD is read-only".into());
         }
         let count = metadata.layers().len();
-        let found = lookup(metadata, target, work, check)?;
-        if found.is_none() && !target.is_empty() && count > 0 {
-            return Err(
-                "Paste destination no longer exists; choose a layer or folder again".into(),
-            );
-        }
-        let selected = found.or_else(|| (count > 0).then_some(0));
-        if let Some(index) = selected {
-            unlocked(metadata, index, work, check)?;
-        }
-        let selected_layer = selected
-            .map(|index| metadata.layer(index).ok_or("Paste destination is missing"))
-            .transpose()?;
-        let wrap =
-            selected_layer.is_some_and(|layer| layer.kind() != "group" && layer.parent().is_none());
-        if count + source.members.len() + usize::from(wrap) > 100 {
-            return Err("Initial version supports up to 100 layers".into());
-        }
         let bytes = count
             .checked_mul(std::mem::size_of::<RasterSlot>() + 64)
-            .and_then(|n| n.checked_add(4096))
+            .and_then(|n| {
+                n.checked_add(
+                    4096 + metadata
+                        .layers()
+                        .map(|l| l.id().len().max(l.parent().map_or(0, str::len)))
+                        .max()
+                        .unwrap_or(0),
+                )
+            })
             .ok_or("Clipboard placement admission overflow")?;
         let charge = destination
             .budget()
             .reserve_bytes(bytes, bytes)
             .map_err(|e| e.to_string())?;
+        let plan =
+            crate::clipboard::paste::Plan::layers(target, count, source.members.len(), |i| {
+                let l = metadata.layer(i).unwrap();
+                crate::clipboard::paste::Layer {
+                    id: l.id(),
+                    parent: l.parent(),
+                    kind: l.kind(),
+                    clip_to: l.clip_to(),
+                    locked: l.locked(),
+                }
+            })?;
+        let selected_layer = plan.selected.and_then(|i| metadata.layer(i));
         let mut wrap_members = Vec::new();
         wrap_members
             .try_reserve_exact(count)
             .map_err(|_| "Clipboard clipping unit allocation refused")?;
-        let (mut at, mut parent, mut wrap_base) = (0, None, None);
-        if let Some(index) = selected {
-            let current = metadata
-                .layer(index)
-                .ok_or("Paste destination is missing")?;
-            if wrap {
-                let id = current.clip_to().unwrap_or(current.id());
-                let base =
-                    lookup(metadata, id, work, check)?.ok_or("Paste clipping base is missing")?;
-                wrap_base = Some(
-                    metadata
-                        .layer(base)
-                        .ok_or("Paste clipping base is missing")?
-                        .pixels()
-                        .slot(),
-                );
-                at = usize::MAX;
-                for (index, layer) in metadata.layers().enumerate() {
-                    check()?;
-                    work.claim(1)?;
-                    if layer.parent() == current.parent()
-                        && (layer.id() == id || layer.clip_to() == Some(id))
-                    {
-                        at = at.min(index);
-                        wrap_members.push(layer.pixels().slot());
-                    }
+        let wrap_base = plan
+            .wrap_base
+            .and_then(|i| metadata.layer(i))
+            .map(|l| l.pixels().slot());
+        let parent = plan
+            .parent
+            .as_deref()
+            .map(|id| {
+                lookup(metadata, id, work, check)?
+                    .and_then(|i| metadata.layer(i))
+                    .map(|l| l.pixels().slot())
+                    .ok_or_else(|| String::from("Paste parent is missing"))
+            })
+            .transpose()?;
+        if let Some(base) = plan.wrap_base {
+            let base = metadata.layer(base).unwrap();
+            for layer in metadata.layers() {
+                check()?;
+                work.claim(1)?;
+                if layer.parent() == base.parent()
+                    && (layer.id() == base.id() || layer.clip_to() == Some(base.id()))
+                {
+                    wrap_members.push(layer.pixels().slot());
                 }
-                if at == usize::MAX {
-                    return Err("Paste clipping unit is empty".into());
-                }
-                at += 1;
-            } else if current.kind() == "group" {
-                at = index + 1;
-                parent = Some(current.pixels().slot());
-            } else {
-                at = index;
-                parent = current
-                    .parent()
-                    .map(|id| {
-                        lookup(metadata, id, work, check)?
-                            .and_then(|index| metadata.layer(index))
-                            .map(|layer| layer.pixels().slot())
-                            .ok_or_else(|| String::from("Paste parent is missing"))
-                    })
-                    .transpose()?;
             }
         }
         if wrap_members.capacity() * std::mem::size_of::<RasterSlot>() > charge.bytes() {
@@ -404,7 +401,7 @@ impl PastePlacement {
         Ok(Self {
             destination: destination.key(),
             selected: selected_layer.map(|layer| layer.pixels().slot()),
-            at,
+            at: plan.index,
             parent,
             wrap_base,
             wrap_members,

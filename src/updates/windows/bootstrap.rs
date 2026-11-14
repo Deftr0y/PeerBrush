@@ -44,7 +44,8 @@ impl Offer {
         self.policy.validate()?;
         let version = semver::Version::parse(&self.version).map_err(|_| HOLD)?;
         // Current native source/payload layout supports stable 0.x only.
-        let expected = [1, version.minor as u16, version.patch as u16, 0];
+        let package_major = if version.minor == 4 { 2 } else { 1 };
+        let expected = [package_major, version.minor as u16, version.patch as u16, 0];
         let suffix = self
             .policy
             .family

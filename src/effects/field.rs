@@ -1,11 +1,117 @@
 //! Legacy f64 smoothing keeps its full-origin addition/subtraction order.
 //! A streamed prefix and bounded row rings avoid a full-canvas scalar buffer.
 use super::regional::RegionalImage;
+use crate::workspace::source_runtime::{SessionScalar, SourceSession};
 use crate::{
     large_document::{Reservation, ResidentBudget},
     raster::backed::{Region, MAX_REGION_PIXELS},
 };
 use std::{collections::VecDeque, sync::Arc};
+
+/// One complete smoothing pass retained for every tile of a captured stage.
+/// The source session and stage binding must survive until explicit retirement.
+pub(crate) struct SessionField<'a> {
+    completed: SessionScalar<'a>,
+    emission: RowEmission,
+    frame: [u32; 2],
+    origin: [i32; 2],
+}
+impl SessionField<'_> {
+    pub(crate) fn tile(
+        &self,
+        session: &SourceSession,
+        stage_binding: [u8; 32],
+        bounds: [i32; 4],
+        check: Check<'_>,
+    ) -> Result<PreparedField, String> {
+        self.completed.check_session(session)?;
+        let local = |i: usize| bounds[i].checked_sub(self.origin[i % 2])
+            .ok_or("Style field tile coordinate overflow");
+        let mut tile = prepare_owned(
+            self.completed.scalar(),
+            &self.emission,
+            stage_binding,
+            [local(0)?, local(1)?, local(2)?, local(3)?],
+            &session.resident(),
+            &session.disk(),
+            &mut || {
+                self.completed.check()?;
+                check()
+            },
+        )?;
+        tile.frame = self.frame;
+        tile.bounds = bounds;
+        Ok(tile)
+    }
+    pub(crate) fn retire(self, cleanup: Check<'_>) -> Result<(), String> {
+        self.completed.retire(cleanup)
+    }
+}
+pub(crate) fn prepare_session<'a>(
+    session: &'a SourceSession,
+    stage_binding: [u8; 32],
+    frame: [u32; 2],
+    bounds: [i32; 4],
+    radii: &[u32],
+    depth: u16,
+    check: Check<'_>,
+    mut prepare_source: impl FnMut(Region, Check<'_>) -> Result<RegionalImage, String>,
+) -> Result<SessionField<'a>, String> {
+    validate(frame, radii, depth)?;
+    let size = footprint_size(frame, bounds)?;
+    if stage_binding == [0; 32] {
+        return Err("Style field lacks its captured stage binding".into());
+    }
+    check()?;
+    let spec =
+        crate::large_document::ScalarSpec::new(size[0], size[1]).map_err(|e| e.to_string())?;
+    let mut scratch = session.scalar_temporary(spec)?;
+    let check = std::cell::RefCell::new(check);
+    let emission = emit_checked(
+        frame,
+        bounds,
+        radii,
+        depth,
+        &session.resident(),
+        &mut || {
+            session.check()?;
+            (*check.borrow_mut())()
+        },
+        |region| prepare_source(region, &mut **check.borrow_mut()),
+        |y, bytes, guard| scratch.append_rows(y, bytes, guard),
+    );
+    let emission = match emission {
+        Ok(result) => result,
+        Err(error) => {
+            return match scratch.abort(&mut || Ok(())) {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(format!("{error}; style field cleanup: {cleanup}")),
+            };
+        }
+    };
+    // Finish the private seal under source admission, then observe cancellation.
+    // Interrupting its consuming finish would discard the explicit retire owner.
+    let completed = scratch.finish(stage_binding, &mut || session.check())?;
+    if let Err(error) = (*check.borrow_mut())() {
+        return match completed.retire(&mut || Ok(())) {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(format!("{error}; style field cleanup: {cleanup}")),
+        };
+    }
+    if completed.scalar().value_sha256() != emission.sha256() {
+        let error = "Completed style field differs from its emitted values";
+        return match completed.retire(&mut || Ok(())) {
+            Ok(()) => Err(error.into()),
+            Err(cleanup) => Err(format!("{error}; style field cleanup: {cleanup}")),
+        };
+    }
+    Ok(SessionField {
+        completed,
+        emission,
+        frame,
+        origin: [bounds[0], bounds[1]],
+    })
+}
 
 struct Row {
     values: Vec<f64>,
@@ -78,6 +184,11 @@ fn validate(frame: [u32; 2], radii: &[u32], depth: u16) -> Result<(), String> {
         return Err("Invalid style field frame or smoothing support".into());
     }
     Ok(())
+}
+
+fn prefix_size(frame: [u32; 2], bounds: [i32; 4], radii: &[u32]) -> [usize; 2] {
+    let halo = radii.iter().map(|&radius| radius as usize).sum::<usize>();
+    std::array::from_fn(|axis| (bounds[axis + 2] as usize + halo).min(frame[axis] as usize))
 }
 
 struct Source<'a, F> {
@@ -386,11 +497,7 @@ pub(crate) fn prepare(
         return Err("Invalid style field frame, support or output geometry".into());
     }
     check()?;
-    let halo = radii.iter().map(|v| *v as usize).sum::<usize>();
-    let prefix = [
-        (bounds[2] as usize + halo).min(frame[0] as usize),
-        (bounds[3] as usize + halo).min(frame[1] as usize),
-    ];
+    let prefix = prefix_size(frame, bounds, radii);
     let mut stream = pipeline(frame, prefix, radii, depth, budget, prepare_source)?;
     let shape = stream.shape();
     if shape[0] < bounds[2] as usize || shape[1] < bounds[3] as usize {
@@ -444,8 +551,9 @@ pub(crate) fn emit_full(
     prepare_source: impl FnMut(Region) -> Result<RegionalImage, String>,
     mut append_row: impl FnMut(u32, &[u8]) -> Result<(), String>,
 ) -> Result<RowEmission, String> {
-    emit_full_checked(
+    emit_checked(
         frame,
+        full_bounds(frame),
         radii,
         depth,
         budget,
@@ -455,8 +563,22 @@ pub(crate) fn emit_full(
     )
 }
 
-fn emit_full_checked(
+fn full_bounds(frame: [u32; 2]) -> [i32; 4] {
+    [0, 0, frame[0] as i32, frame[1] as i32]
+}
+
+fn footprint_size(frame: [u32; 2], [left, top, right, bottom]: [i32; 4]) -> Result<[u32; 2], String> {
+    if left < 0 || top < 0 || left >= right || top >= bottom
+        || right > frame[0] as i32 || bottom > frame[1] as i32
+    {
+        return Err("Invalid style field footprint".into());
+    }
+    Ok([(right - left) as u32, (bottom - top) as u32])
+}
+
+fn emit_checked(
     frame: [u32; 2],
+    bounds: [i32; 4],
     radii: &[u32],
     depth: u16,
     budget: &ResidentBudget,
@@ -465,45 +587,59 @@ fn emit_full_checked(
     mut append_row: impl FnMut(u32, &[u8], Check<'_>) -> Result<(), String>,
 ) -> Result<RowEmission, String> {
     validate(frame, radii, depth)?;
+    let size = footprint_size(frame, bounds)?;
+    let [left, top, right, bottom] = bounds.map(|value| value as usize);
     check()?;
     let mut stream = pipeline(
         frame,
-        [frame[0] as usize, frame[1] as usize],
+        prefix_size(frame, bounds, radii),
         radii,
         depth,
         budget,
         prepare_source,
     )?;
-    let length = frame[0] as usize * 8;
+    let [width, height] = stream.shape();
+    if width < right || height < bottom {
+        return Err("Style prefix does not cover its declared output".into());
+    }
+    let length = size[0] as usize * 8;
     let mut bytes = crate::large_document::ScratchBytes::new(budget, length, length)
         .map_err(|e| e.to_string())?;
     let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
-    for y in 0..frame[1] {
+    for y in 0..bottom {
         check()?;
         let row = stream
             .next(check)?
-            .ok_or("Style field ended before full-frame emission")?;
-        if row.values.len() != frame[0] as usize {
+            .ok_or("Style field ended before its declared output")?;
+        if row.values.len() != width {
             return Err("Style emitted row width changed".into());
         }
-        for (value, out) in row.values.iter().zip(bytes.chunks_exact_mut(8)) {
-            if !value.is_finite() {
-                return Err("Style field generated a non-finite scalar".into());
-            }
-            out.copy_from_slice(&value.to_bits().to_be_bytes());
+        let retained = if y >= top { left..right } else { 0..0 };
+        if row.values[..retained.start].iter().chain(&row.values[retained.end..])
+            .any(|value| !value.is_finite())
+        {
+            return Err("Style field generated a non-finite scalar".into());
         }
-        append_row(y, &bytes, check)?;
-        digest.update(&bytes);
+        if !retained.is_empty() {
+            for (value, out) in row.values[retained].iter().zip(bytes.chunks_exact_mut(8)) {
+                if !value.is_finite() {
+                    return Err("Style field generated a non-finite scalar".into());
+                }
+                out.copy_from_slice(&value.to_bits().to_be_bytes());
+            }
+            append_row((y - top) as u32, &bytes, check)?;
+            digest.update(&bytes);
+        }
         check()?;
     }
-    if stream.next(check)?.is_some() {
+    if bottom == height && stream.next(check)?.is_some() {
         return Err("Style field emitted excess source rows".into());
     }
     drop(stream);
     check()?;
     let mut sha256 = [0; 32];
     sha256.copy_from_slice(digest.finish().as_ref());
-    Ok(RowEmission { frame, sha256 })
+    Ok(RowEmission { frame: size, sha256 })
 }
 
 /// Fill an already admitted, exclusive derived scratch. On failure its owner
@@ -521,8 +657,10 @@ pub(crate) fn append_to_owned(
     if !scratch.uses_budgets(budget, disk) {
         return Err("Style field scratch belongs to another resource pool".into());
     }
-    emit_full_checked(
-        scratch.frame(),
+    let frame = scratch.frame();
+    emit_checked(
+        frame,
+        full_bounds(frame),
         radii,
         depth,
         budget,

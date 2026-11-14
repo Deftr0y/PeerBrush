@@ -2,6 +2,8 @@
 use super::*;
 use crate::engine::{AiChange, Scope};
 use std::borrow::Cow;
+mod controls;
+mod native_clock;
 
 const DURATION: f64 = 0.36;
 const HIGHLIGHT: f64 = 3.0;
@@ -10,8 +12,11 @@ struct Transition {
     change: RuntimeValue<AiChange>,
     before: DocumentSnapshot,
     after: DocumentSnapshot,
+    arriving_layers: HashSet<String>,
     started: f64,
     interpolated_canvas: bool,
+    native: native_clock::Clock,
+    native_failed: bool,
 }
 struct Fade {
     from: Vec<u8>,
@@ -74,7 +79,9 @@ fn values(before: &Value, after: &mut Value, t: f32) {
             }
         }
         (Value::Object(a), Value::Object(b)) => {
+            let linked_shadow = b.contains_key("global_light");
             for (key, value) in b.iter_mut() {
+                if matches!(key.as_str(), "preset" | "global_light") || linked_shadow && key == "angle" { continue; }
                 if let Some(old) = a.get(key) {
                     values(old, value, t);
                 }
@@ -110,21 +117,30 @@ impl Animation {
             if change.serial != self.serial {
                 self.serial = change.serial;
                 if let Some(before) = self.observed.clone() {
-                    let interpolated_canvas = ["move", "opacity", "fill"]
-                        .contains(&change.tool.as_str())
-                        && doc.layers().any(|l| {
-                            before.view().find_layer(l.id()).is_some_and(|old| {
-                                old.opacity() != l.opacity()
-                                    || old.origin() != l.origin()
-                                    || old.color() != l.color()
-                            })
-                        });
+                    let previous_layers: HashMap<_, _> = before.view().layers()
+                        .map(|layer| (layer.id(), layer)).collect();
+                    let compare_canvas = ["move", "opacity", "fill"].contains(&change.tool.as_str());
+                    let mut arriving_layers = HashSet::new();
+                    let mut interpolated_canvas = false;
+                    for layer in doc.layers() {
+                        if let Some(old) = previous_layers.get(layer.id()) {
+                            interpolated_canvas = interpolated_canvas || compare_canvas
+                                && (old.opacity() != layer.opacity() || old.origin() != layer.origin()
+                                    || old.color() != layer.color());
+                        } else {
+                            arriving_layers.insert(layer.id().to_owned());
+                        }
+                    }
+                    drop(previous_layers);
                     self.transition = Some(Transition {
                         change,
                         before,
                         after: source.snapshot(),
+                        arriving_layers,
                         started: time,
                         interpolated_canvas,
+                        native: native_clock::Clock::default(),
+                        native_failed: false,
                     });
                     self.fade = None;
                     started = true;
@@ -137,6 +153,13 @@ impl Animation {
                 // A later human edit takes precedence, including while a render is pending.
                 self.cancel();
             }
+        }
+        if self
+            .transition
+            .as_ref()
+            .is_some_and(|transition| !transition.after.view().same_observation(doc))
+        {
+            self.cancel();
         }
         self.observed = Some(source.snapshot());
         if self
@@ -189,9 +212,7 @@ impl Animation {
             .map_or_else(Vec::new, |t| t.change.scopes.clone())
     }
     pub(super) fn arrival(&self, id: &str, time: f64) -> f32 {
-        if self.transition.as_ref().is_some_and(|t| {
-            t.before.view().find_layer(id).is_none() && t.after.view().find_layer(id).is_some()
-        }) {
+        if self.transition.as_ref().is_some_and(|t| t.arriving_layers.contains(id)) {
             self.progress(time)
         } else {
             1.0
@@ -212,6 +233,109 @@ impl Animation {
             .as_ref()
             .filter(|t| t.interpolated_canvas)
             .map_or_else(String::new, |t| format!("ai:{}", t.change.serial))
+    }
+    pub(super) fn native_presentation(
+        &mut self,
+        doc: &crate::engine::native::NativeDocument,
+        time: f64,
+    ) -> Result<Option<crate::engine::scene::presentation::Presentation>, String> {
+        let Some(transition) = &mut self.transition else {
+            return Ok(None);
+        };
+        if !transition.interpolated_canvas
+            || transition.native_failed
+            || !transition.after.view().same_observation(doc.into())
+        {
+            return Ok(None);
+        }
+        if !time.is_finite() {
+            return Err("Native presentation time is invalid".into());
+        }
+        let t = ease(transition.native.fraction(time));
+        if t >= 1. {
+            return Ok(None);
+        }
+        let DocumentSnapshot::Native(before) = &transition.before else {
+            return Ok(None);
+        };
+        let presentation =
+            crate::engine::scene::presentation::Presentation::capture(before, doc, t, &|| Ok(()))?;
+        Ok(Some(presentation))
+    }
+    pub(super) fn native_before(
+        &self,
+        document: &crate::engine::native::NativeDocument,
+    ) -> Option<&crate::engine::native::NativeDocument> {
+        let transition = self.transition.as_ref()?;
+        if transition.interpolated_canvas
+            || transition.native_failed
+            || !transition.after.view().same_observation(document.into())
+        {
+            return None;
+        }
+        let DocumentSnapshot::Native(before) = &transition.before else {
+            return None;
+        };
+        let a = before.metadata();
+        let b = document.metadata();
+        (a.width() == b.width() && a.height() == b.height() && a.depth() == b.depth())
+            .then_some(before)
+    }
+    pub(super) fn native_blend(
+        &mut self,
+        document: &crate::engine::native::NativeDocument,
+        time: f64,
+    ) -> Result<Option<crate::render::native_preview::crossfade::Blend>, String> {
+        if self.native_before(document).is_none() {
+            return Ok(None);
+        }
+        if !time.is_finite() {
+            return Err("Native presentation time is invalid".into());
+        }
+        let Some(transition) = self.transition.as_mut() else {
+            return Ok(None);
+        };
+        let t = ease(transition.native.fraction(time));
+        if t >= 1. {
+            return Ok(None);
+        }
+        let DocumentSnapshot::Native(before) = &transition.before else {
+            return Ok(None);
+        };
+        crate::render::native_preview::crossfade::Blend::capture(before, document, t, &|| Ok(()))
+            .map(Some)
+    }
+    pub(super) fn stop_native_canvas(&mut self) {
+        if let Some(transition) = &mut self.transition {
+            transition.native_failed = true;
+        }
+    }
+    pub(super) fn native_captured(
+        &mut self,
+        document: &crate::engine::native::NativeDocument,
+        signature: [u8; 32],
+    ) {
+        if let Some(transition) = self
+            .transition
+            .as_mut()
+            .filter(|transition| transition.after.view().same_observation(document.into()))
+        {
+            transition.native.captured(signature);
+        }
+    }
+    pub(super) fn native_presented(
+        &mut self,
+        document: &crate::engine::native::NativeDocument,
+        signature: [u8; 32],
+        time: f64,
+    ) {
+        if let Some(transition) = self
+            .transition
+            .as_mut()
+            .filter(|transition| transition.after.view().same_observation(document.into()))
+        {
+            transition.native.presented(signature, time);
+        }
     }
     pub(super) fn document<'a>(
         &self,
@@ -332,6 +456,9 @@ impl Animation {
         preview: &Preview,
         time: f64,
     ) -> bool {
+        // An accepted replacement can change sampling grids during a fade.
+        // Its pixels must take precedence over the older fade endpoint.
+        self.fade = None;
         let Some(t) = &self.transition else {
             return false;
         };
@@ -398,45 +525,37 @@ fn crossfade(from: &[u8], to: &[u8], t: f32) -> Vec<u8> {
     out
 }
 impl PeerBrush {
-    pub(super) fn ai_reserved(&self, id: &str) -> bool {
-        let e = self.shared.lock().unwrap();
-        e.leases
-            .iter()
-            .filter(|l| l.owner != "human" && l.expires > crate::engine::now())
-            .any(|l| {
-                l.scopes
-                    .iter()
-                    .any(|s| e.scope_overlap(s, &Scope::layer(id)))
-            })
+    pub(super) fn interrupt_animation(&mut self) {
+        if self.animation.fading() {
+            // The canvas may still contain an intermediate blend. Schedule
+            // the committed frame even if the document revision is unchanged.
+            self.canvas_preview = None;
+            self.last_preview = None;
+        }
+        self.animation.cancel();
     }
-    pub(super) fn ai_layer(&self, id: &str, time: f64) -> bool {
-        self.ai_reserved(id) || self.animation.layer(id, time)
-    }
-    pub(super) fn ai_canvas<'a>(
+
+    pub(super) fn canvas_reservations(
         &self,
         ui: &egui::Ui,
         painter: &egui::Painter,
-        doc: impl Into<DocumentView<'a>>,
-        rect: Rect,
-        scale: f32,
+        doc: DocumentView<'_>,
+        projection: &view::Projection,
+        ai_scopes: &[Scope],
+        human_regions: &[[i32; 4]],
     ) {
-        let doc = doc.into();
-        let time = ui.input(|i| i.time);
-        let mut scopes = self.animation.scopes(time);
-        scopes.extend(
-            self.shared
-                .lock()
-                .unwrap()
-                .leases
-                .iter()
-                .filter(|l| l.owner != "human")
-                .flat_map(|l| l.scopes.clone()),
-        );
-        scopes.sort_by_key(|s| (s.target.clone(), s.rect));
-        scopes.dedup();
-        if scopes.is_empty() {
+        let clip = painter.clip_rect();
+        if !clip.is_positive() {
             return;
         }
+        let clip = clip.expand(2. + 2. / ui.ctx().pixels_per_point());
+        let time = ui.input(|i| i.time);
+        let mut scopes = self.animation.scopes(time);
+        scopes.extend_from_slice(ai_scopes);
+        scopes.sort_unstable_by(|a, b| (&a.target, a.rect).cmp(&(&b.target, b.rect)));
+        scopes.dedup();
+        let color = AI_BLUE.gamma_multiply(0.7 + 0.2 * (time as f32 * 4.0).sin());
+        let mut pulse_visible = false;
         for scope in scopes {
             let bounds = scope.rect.or_else(|| {
                 scope
@@ -454,37 +573,72 @@ impl PeerBrush {
                     })
             });
             let Some(bounds) = bounds else { continue };
-            let color = AI_BLUE.gamma_multiply(0.7 + 0.2 * (time as f32 * 4.0).sin());
-            let length = (((bounds[2] - bounds[0]).min(bounds[3] - bounds[1])) as f32 * scale)
-                .clamp(2.0, 14.0);
-            for (p, x, y) in [
-                ([bounds[0] as f32, bounds[1] as f32], 1.0, 1.0),
-                ([bounds[2] as f32, bounds[1] as f32], -1.0, 1.0),
-                ([bounds[0] as f32, bounds[3] as f32], 1.0, -1.0),
-                ([bounds[2] as f32, bounds[3] as f32], -1.0, -1.0),
-            ] {
-                let p = self.view.point(p, rect, scale);
-                painter.line_segment(
-                    [p + self.view.vector(Vec2::new(length * x, 0.0)), p],
-                    Stroke::new(1.5_f32, color),
-                );
-                painter.line_segment(
-                    [p, p + self.view.vector(Vec2::new(0.0, length * y))],
-                    Stroke::new(1.5_f32, color),
-                );
+            pulse_visible |= paint_ai_brackets(painter, projection, bounds, clip, color);
+        }
+        for &bounds in human_regions {
+            let corners = projection.region_corners(bounds);
+            if (0..corners.len()).any(|i| {
+                clip.intersects(Rect::from_two_pos(corners[i], corners[(i + 1) % corners.len()]))
+            }) {
+                painter.add(egui::Shape::closed_line(corners.to_vec(), Stroke::new(2.0, ACCENT)));
             }
         }
-        ui.ctx().request_repaint_after(Duration::from_millis(30));
+        if pulse_visible {
+            ui.ctx().request_repaint_after(Duration::from_millis(30));
+        }
     }
+}
+
+fn paint_ai_brackets(
+    painter: &egui::Painter,
+    projection: &view::Projection,
+    bounds: [i32; 4],
+    clip: Rect,
+    color: Color32,
+) -> bool {
+    let [left, top, right, bottom] = bounds.map(i64::from);
+    let length = ((right - left).min(bottom - top) as f32 * projection.scale()).clamp(2., 14.);
+    let x = projection.vector(Vec2::new(length, 0.));
+    let y = projection.vector(Vec2::new(0., length));
+    let mut visible = false;
+    for (point, (dx, dy)) in projection.region_corners(bounds).into_iter()
+        .zip([(x, y), (-x, y), (-x, -y), (x, -y)])
+    {
+        for [a, b] in [[point + dx, point], [point, point + dy]] {
+            if clip.intersects(Rect::from_two_pos(a, b)) {
+                painter.line_segment([a, b], Stroke::new(1.5, color));
+                visible = true;
+            }
+        }
+    }
+    visible
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
+    fn ai_brackets_keep_rotated_visible_arms_and_skip_offscreen_corners() {
+        let ctx = egui::Context::default();
+        let clip = Rect::from_min_size(Pos2::ZERO, Vec2::splat(10.));
+        let view = view::View { angle: 90., mirror_h: true, mirror_v: false };
+        let projection = view.projection(Rect::from_min_size(Pos2::ZERO, Vec2::splat(100.)), 1.);
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            let painter = ctx.layer_painter(egui::LayerId::background()).with_clip_rect(clip);
+            assert!(!paint_ai_brackets(&painter, &projection, [-50, -50, 50, 50], clip, AI_BLUE));
+            assert!(paint_ai_brackets(&painter, &projection, [4, -4, 40, 45], clip, AI_BLUE));
+        });
+        let arms = output.shapes.iter().filter_map(|clipped| match &clipped.shape {
+            egui::Shape::LineSegment { points, stroke } if stroke.color == AI_BLUE => Some(*points),
+            _ => None,
+        });
+        assert_eq!(arms.collect::<Vec<_>>(), [[egui::pos2(-4., 4.), egui::pos2(10., 4.)]]);
+    }
+
+    #[test]
     fn ai_document_filters_highlight_whole_image_and_interpolate_only_controls() {
         let mut e = crate::engine::Engine::new();
-        e.doc = Document::new_depth(12, 8, 16).unwrap();
+        e.resident_state_mut().expect("resident fixture").document = Document::new_depth(12, 8, 16).unwrap();
         e.edit(
             "human",
             &[json!({"op":"filter.add","kind":"posterize","settings":{"levels":3},"weight":1.0})],
@@ -493,9 +647,9 @@ mod tests {
             "Posterize",
         )
         .unwrap();
-        let id = e.doc.filters[0].id.clone();
+        let id = e.resident_state().expect("resident fixture").document.filters[0].id.clone();
         let mut a = Animation::default();
-        a.observe(&e.doc, None, 0.);
+        a.observe(&e.resident_state().expect("resident fixture").document, None, 0.);
         e.edit(
             "agent",
             &[json!({"op":"filter.update","filter":id,"weight":0.2})],
@@ -504,18 +658,18 @@ mod tests {
             "Soften posterize",
         )
         .unwrap();
-        let history = e.undo.len();
-        let saved = e.doc.export_png().unwrap();
-        a.observe(&e.doc, e.ai_change.clone(), 1.);
-        assert!(a.layer(&e.doc.layers[0].id, 1.18));
+        let history = e.resident_state().expect("resident fixture").undo.len();
+        let saved = e.resident_state().expect("resident fixture").document.export_png().unwrap();
+        a.observe(&e.resident_state().expect("resident fixture").document, e.ai_change.clone(), 1.);
+        assert!(a.layer(&e.resident_state().expect("resident fixture").document.layers[0].id, 1.18));
         assert_eq!(a.tool(1.18), Some("effects"));
-        assert!((a.document(&e.doc, 1.18, false).filters[0].weight - 0.6).abs() < 0.001);
-        assert_eq!(a.document(&e.doc, 1.18, true).filters[0].weight, 0.2);
-        assert_eq!(e.doc.export_png().unwrap(), saved);
-        assert_eq!(e.undo.len(), history);
+        assert!((a.document(&e.resident_state().expect("resident fixture").document, 1.18, false).filters[0].weight - 0.6).abs() < 0.001);
+        assert_eq!(a.document(&e.resident_state().expect("resident fixture").document, 1.18, true).filters[0].weight, 0.2);
+        assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), saved);
+        assert_eq!(e.resident_state().expect("resident fixture").undo.len(), history);
         a.cancel();
         assert!(!a.active(1.18));
-        assert_eq!(e.doc.filters[0].weight, 0.2);
+        assert_eq!(e.resident_state().expect("resident fixture").document.filters[0].weight, 0.2);
     }
     #[test]
     fn fade_preserves_transparency_and_does_not_leave_old_pixels() {
@@ -535,7 +689,7 @@ mod tests {
     #[test]
     fn ai_wand_parameters_animate_only_runtime_presentation_and_interrupt_cleanly() {
         let mut e = crate::engine::Engine::new();
-        e.doc = Document::new_depth(16, 12, 16).unwrap();
+        e.resident_state_mut().expect("resident fixture").document = Document::new_depth(16, 12, 16).unwrap();
         e.edit(
             "human",
             &[json!({"op":"selection","kind":"wand","point":[3,3],"tolerance":0})],
@@ -545,7 +699,7 @@ mod tests {
         )
         .unwrap();
         let mut animation = Animation::default();
-        animation.observe(&e.doc, None, 0.);
+        animation.observe(&e.resident_state().expect("resident fixture").document, None, 0.);
         e.edit(
             "agent",
             &[json!({"op":"selection.wand_update","tolerance":200,"feather":8})],
@@ -554,28 +708,36 @@ mod tests {
             "Wand parameters",
         )
         .unwrap();
-        let history = e.undo.len();
-        let saved = crate::psd::encode(&e.doc).unwrap();
-        animation.observe(&e.doc, e.ai_change.clone(), 1.);
-        let display = animation.document(&e.doc, 1.18, false);
+        let history = e.resident_state().expect("resident fixture").undo.len();
+        let saved = crate::psd::encode(&e.resident_state().expect("resident fixture").document).unwrap();
+        animation.observe(&e.resident_state().expect("resident fixture").document, e.ai_change.clone(), 1.);
+        let display = animation.document(&e.resident_state().expect("resident fixture").document, 1.18, false);
         let source = crate::selection::wand_source(&display).unwrap();
         assert!((source.command["tolerance"].as_f64().unwrap() - 100.).abs() < 0.01);
         assert!((source.command["feather"].as_f64().unwrap() - 4.).abs() < 0.01);
+        let numbers = animation.controls(&e.resident_state().expect("resident fixture").document, 1.18);
+        let current = DocumentView::from(&e.resident_state().expect("resident fixture").document).wand_source().unwrap();
+        assert!((numbers.wand_number(current, "tolerance", 24.) - 100.).abs() < 0.01);
+        assert!((numbers.wand_number(current, "feather", 0.) - 4.).abs() < 0.01);
+        assert_eq!(
+            numbers.wand_number(("another-click", current.1), "tolerance", 24.),
+            200.
+        );
         assert!(animation.layer("@selection", 1.18));
         assert_eq!(
-            crate::selection::wand_source(&e.doc).unwrap().command["tolerance"],
+            crate::selection::wand_source(&e.resident_state().expect("resident fixture").document).unwrap().command["tolerance"],
             200.
         );
         assert_eq!(
-            animation.document(&e.doc, 1.18, true).selection,
-            e.doc.selection
+            animation.document(&e.resident_state().expect("resident fixture").document, 1.18, true).selection,
+            e.resident_state().expect("resident fixture").document.selection
         );
-        assert_eq!(crate::psd::encode(&e.doc).unwrap(), saved);
-        assert_eq!(e.undo.len(), history);
+        assert_eq!(crate::psd::encode(&e.resident_state().expect("resident fixture").document).unwrap(), saved);
+        assert_eq!(e.resident_state().expect("resident fixture").undo.len(), history);
         animation.cancel();
         assert!(!animation.active(1.18));
         assert_eq!(
-            crate::selection::wand_source(&animation.document(&e.doc, 1.18, false))
+            crate::selection::wand_source(&animation.document(&e.resident_state().expect("resident fixture").document, 1.18, false))
                 .unwrap()
                 .command["tolerance"],
             200.
@@ -584,7 +746,7 @@ mod tests {
     #[test]
     fn ai_parameters_interpolate_only_the_presentation_and_human_edits_cancel() {
         let mut engine = crate::engine::Engine::new();
-        let layer = engine.doc.layers[0].id.clone();
+        let layer = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
         engine
             .edit(
                 "human",
@@ -594,19 +756,22 @@ mod tests {
                 "Blur",
             )
             .unwrap();
-        let effect = engine.doc.layers[0].effects[0].id.clone();
+        let effect = engine.resident_state().expect("resident fixture").document.layers[0].effects[0].id.clone();
         let mut animation = Animation::default();
-        animation.observe(&engine.doc, None, 0.0);
+        animation.observe(&engine.resident_state().expect("resident fixture").document, None, 0.0);
         engine.edit("agent", &[
             json!({"op":"layer.update","layer":layer,"opacity":0.2}),
             json!({"op":"effect.update","layer":layer,"effect":effect,"settings":{"radius":24.0}}),
         ], None, None, "Soften").unwrap();
-        animation.observe(&engine.doc, engine.ai_change.clone(), 1.0);
-        let display = animation.document(&engine.doc, 1.18, false);
+        animation.observe(&engine.resident_state().expect("resident fixture").document, engine.ai_change.clone(), 1.0);
+        let display = animation.document(&engine.resident_state().expect("resident fixture").document, 1.18, false);
         assert!(matches!(display, Cow::Owned(_)));
         let mut other = Document::new(1, 1).unwrap();
-        other.revision = engine.doc.revision;
-        assert!(matches!(animation.document(&other, 1.18, false), Cow::Borrowed(_)));
+        other.revision = engine.resident_state().expect("resident fixture").document.revision;
+        assert!(matches!(
+            animation.document(&other, 1.18, false),
+            Cow::Borrowed(_)
+        ));
         assert!((display.layers[0].opacity - 0.6).abs() < 0.001);
         assert!(
             (display.layers[0].effects[0].settings["radius"]
@@ -616,8 +781,8 @@ mod tests {
                 .abs()
                 < 0.01
         );
-        assert_eq!(engine.doc.layers[0].opacity, 0.2);
-        assert_eq!(engine.undo.len(), 2);
+        assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].opacity, 0.2);
+        assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), 2);
         assert!(animation.layer(&layer, 1.18));
         engine
             .edit(
@@ -628,10 +793,13 @@ mod tests {
                 "My opacity",
             )
             .unwrap();
-        animation.observe(&engine.doc, engine.ai_change.clone(), 1.2);
-        assert!(matches!(animation.document(&engine.doc, 1.2, false), Cow::Borrowed(_)));
+        animation.observe(&engine.resident_state().expect("resident fixture").document, engine.ai_change.clone(), 1.2);
+        assert!(matches!(
+            animation.document(&engine.resident_state().expect("resident fixture").document, 1.2, false),
+            Cow::Borrowed(_)
+        ));
         assert_eq!(
-            animation.document(&engine.doc, 1.2, false).layers[0].opacity,
+            animation.document(&engine.resident_state().expect("resident fixture").document, 1.2, false).layers[0].opacity,
             0.8
         );
         assert!(!animation.layer(&layer, 1.2));
@@ -639,10 +807,10 @@ mod tests {
     #[test]
     fn intermediate_opacity_under_effected_group_cannot_poison_actual_render_cache() {
         let mut engine = crate::engine::Engine::new();
-        engine.doc = Document::new(32, 32).unwrap();
-        let layer = engine.doc.layers[0].id.clone();
-        engine.doc.layers[0].kind = "fill".into();
-        engine.doc.layers[0].color = [200, 100, 50, 255];
+        engine.resident_state_mut().expect("resident fixture").document = Document::new(32, 32).unwrap();
+        let layer = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
+        engine.resident_state_mut().expect("resident fixture").document.layers[0].kind = "fill".into();
+        engine.resident_state_mut().expect("resident fixture").document.layers[0].color = [200, 100, 50, 255];
         let folder = engine
             .edit(
                 "human",
@@ -660,7 +828,7 @@ mod tests {
             json!({"op":"effect.add","layer":folder,"kind":"adjust","settings":{"brightness":0.1,"contrast":1.0,"saturation":1.0}}),
         ], None, None, "Group effect").unwrap();
         let mut animation = Animation::default();
-        animation.observe(&engine.doc, None, 0.0);
+        animation.observe(&engine.resident_state().expect("resident fixture").document, None, 0.0);
         engine
             .edit(
                 "agent",
@@ -670,18 +838,18 @@ mod tests {
                 "Opacity",
             )
             .unwrap();
-        animation.observe(&engine.doc, engine.ai_change.clone(), 1.0);
-        let mut reference = engine.doc.clone();
+        animation.observe(&engine.resident_state().expect("resident fixture").document, engine.ai_change.clone(), 1.0);
+        let mut reference = engine.resident_state().expect("resident fixture").document.clone();
         for l in &mut reference.layers {
             l.effect_key = crate::engine::id();
         }
         let expected = reference.preview(None, 32, None, false).unwrap().2;
         let intermediate = animation
-            .document(&engine.doc, 1.18, true)
+            .document(&engine.resident_state().expect("resident fixture").document, 1.18, true)
             .preview(None, 32, None, false)
             .unwrap()
             .2;
-        let actual = engine.doc.preview(None, 32, None, false).unwrap().2;
+        let actual = engine.resident_state().expect("resident fixture").document.preview(None, 32, None, false).unwrap().2;
         assert_ne!(intermediate, expected);
         assert_eq!(actual, expected);
         assert_eq!(actual[3], 51);

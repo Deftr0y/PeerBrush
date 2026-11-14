@@ -1,19 +1,22 @@
 //! Source spools retain authenticated session admission through closed save I/O.
-use super::CompletedSave36;
 #[cfg(test)]
-use super::OwnedRoots;
+use super::{CompletedSave36, OwnedRoots};
+#[cfg(test)]
+use crate::large_document::BytesCursor;
 use crate::{
     engine::scene::SceneSnapshot,
-    large_document::{ByteRole, BytesCursor, CompletedBytes, LargeSourceTemporary},
+    large_document::{ByteRole, CompletedBytes, LargeSourceTemporary},
     workspace::source_runtime::{SessionBytes, SessionTemporary, SourceSession},
 };
-use std::{
-    io::{self, Read, Seek, SeekFrom},
-    ops::Deref,
-};
+#[cfg(test)]
+use std::io::{self, Read, Seek, SeekFrom};
+use std::ops::Deref;
 
 pub(super) trait StagingFactory<'a> {
     fn check(&self) -> Result<(), String>;
+    fn check_pinned_work(&self) -> Result<(), String> {
+        self.check()
+    }
     fn cleanup_check(&self) -> Result<(), String>;
     fn create(
         &self,
@@ -25,6 +28,9 @@ pub(super) trait StagingFactory<'a> {
 impl<'a> StagingFactory<'a> for &'a SourceSession {
     fn check(&self) -> Result<(), String> {
         SourceSession::check(self)
+    }
+    fn check_pinned_work(&self) -> Result<(), String> {
+        SourceSession::check_pinned_work(self)
     }
     fn cleanup_check(&self) -> Result<(), String> {
         SourceSession::cleanup_check(self)
@@ -169,15 +175,18 @@ impl Deref for StagedBytes<'_> {
 }
 
 /// A cursor cannot outlive the closed save or clone/export an unguarded source.
-pub(crate) struct SaveCursor<'read, 'source> {
+#[cfg(test)]
+pub(super) struct SaveCursor<'read, 'source> {
     input: BytesCursor<'read>,
     owner: &'read CompletedSave36<'source>,
 }
+#[cfg(test)]
 impl<'read, 'source> SaveCursor<'read, 'source> {
     pub(super) fn new(owner: &'read CompletedSave36<'source>, input: BytesCursor<'read>) -> Self {
         Self { owner, input }
     }
 }
+#[cfg(test)]
 impl Read for SaveCursor<'_, '_> {
     fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
         self.owner.check_cursor_guard().map_err(io::Error::other)?;
@@ -186,6 +195,7 @@ impl Read for SaveCursor<'_, '_> {
         Ok(count)
     }
 }
+#[cfg(test)]
 impl Seek for SaveCursor<'_, '_> {
     fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
         self.owner.check_cursor_guard().map_err(io::Error::other)?;

@@ -95,7 +95,7 @@ fn history(engine: &crate::engine::Engine) -> serde_json::Value {
         "task":entry.task,"scopes":entry.scopes,"gesture":entry.gesture,"reverted":entry.reverted
     })).collect::<Vec<_>>()
     };
-    json!({"undo":entries(&engine.undo),"redo":entries(&engine.redo)})
+    json!({"undo":entries(&engine.resident_state().expect("resident fixture").undo),"redo":entries(&engine.resident_state().expect("resident fixture").redo)})
 }
 
 #[test]
@@ -108,9 +108,9 @@ fn actual_preparation_progress_prepared_later_and_late_cancel_preserve_owned_nat
         app.recovery.open = false;
         let (raster_id, source_id, source_before) = {
             let mut engine = app.shared.lock().unwrap();
-            engine.doc = Document::new_depth(32, 24, depth).unwrap();
-            let raster_id = engine.doc.layers[0].id.clone();
-            engine.doc.layers[0]
+            engine.resident_state_mut().expect("resident fixture").document = Document::new_depth(32, 24, depth).unwrap();
+            let raster_id = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
+            engine.resident_state_mut().expect("resident fixture").document.layers[0]
                 .pixels
                 .set16(3, 4, [12347, 23459, 34567, 45679]);
             let source = Source {
@@ -137,7 +137,7 @@ fn actual_preparation_progress_prepared_later_and_late_cancel_preserve_owned_nat
                 )
                 .unwrap();
             let source_layer = engine
-                .doc
+                .resident_state().expect("resident fixture").document
                 .layers
                 .iter()
                 .find(|layer| layer.source.is_some())
@@ -146,17 +146,17 @@ fn actual_preparation_progress_prepared_later_and_late_cancel_preserve_owned_nat
             let source_before = serde_json::to_value(source_layer).unwrap();
             fs::write(
                 directory.join("owned.psd"),
-                crate::psd::encode(&engine.doc).unwrap(),
+                crate::psd::encode(&engine.resident_state().expect("resident fixture").document).unwrap(),
             )
             .unwrap();
-            engine.saved_revision = engine.doc.revision;
+            engine.saved_revision = engine.resident_state().expect("resident fixture").document.revision;
             (raster_id, source_id, source_before)
         };
         crate::server::open(&app.shared, &directory.join("owned.psd")).unwrap();
         {
             let mut engine = app.shared.lock().unwrap();
             let raster = engine
-                .doc
+                .resident_state().expect("resident fixture").document
                 .layers
                 .iter()
                 .find(|layer| layer.id == raster_id)
@@ -169,9 +169,9 @@ fn actual_preparation_progress_prepared_later_and_late_cancel_preserve_owned_nat
                 engine.edit("human",&[json!({"op":"paint","layer":app.selected,"points":[[x,4]],"radius":1,"color":[231,73,31,255]})],None,None,"Human stroke").unwrap();
             }
             engine.undo("human").unwrap();
-            assert!(!engine.undo.is_empty() && !engine.redo.is_empty());
+            assert!(!engine.resident_state().expect("resident fixture").undo.is_empty() && !engine.resident_state().expect("resident fixture").redo.is_empty());
             let source_layer = engine
-                .doc
+                .resident_state().expect("resident fixture").document
                 .layers
                 .iter()
                 .find(|layer| layer.id == source_id)
@@ -180,8 +180,8 @@ fn actual_preparation_progress_prepared_later_and_late_cancel_preserve_owned_nat
         }
         let (document, png, path, version, ownership, marker, previous_history) = {
             let engine = app.shared.lock().unwrap();
-            assert!(engine.doc.layers.iter().any(|layer| layer.source.is_some()));
-            let png = engine.doc.export_png().unwrap();
+            assert!(engine.resident_state().expect("resident fixture").document.layers.iter().any(|layer| layer.source.is_some()));
+            let png = engine.resident_state().expect("resident fixture").document.export_png().unwrap();
             assert_eq!(
                 image::load_from_memory(&png).unwrap().color(),
                 if depth == 16 {
@@ -191,14 +191,14 @@ fn actual_preparation_progress_prepared_later_and_late_cancel_preserve_owned_nat
                 }
             );
             if depth == 16 {
-                assert!(engine.doc.layers.iter().any(|layer| layer
+                assert!(engine.resident_state().expect("resident fixture").document.layers.iter().any(|layer| layer
                     .pixels
                     .rgba16()
                     .iter()
                     .any(|v| v % 257 != 0)));
             }
             (
-                serde_json::to_value(&engine.doc).unwrap(),
+                serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap(),
                 png,
                 engine.path.clone(),
                 engine.file_version,
@@ -326,8 +326,8 @@ fn actual_preparation_progress_prepared_later_and_late_cancel_preserve_owned_nat
             assert!(!app.exit_approved && app.update_restart_blocker().is_some());
         }
         let engine = app.shared.lock().unwrap();
-        assert_eq!(serde_json::to_value(&engine.doc).unwrap(), document);
-        assert_eq!(engine.doc.export_png().unwrap(), png);
+        assert_eq!(serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap(), document);
+        assert_eq!(engine.resident_state().expect("resident fixture").document.export_png().unwrap(), png);
         assert_eq!(
             (
                 engine.path.clone(),
@@ -365,7 +365,7 @@ fn actual_default_disabled_control_cannot_create_a_cache_or_claim_the_github_tar
     app.updates = Panel::load(&directory);
     app.updates.owner = Owner::WindowsAppInstaller;
     app.updates.open = true;
-    let before = serde_json::to_value(&app.shared.lock().unwrap().doc).unwrap();
+    let before = serde_json::to_value(&app.shared.lock().unwrap().resident_state().expect("resident fixture").document).unwrap();
     click_button(&mut app, &ctx, "Prepare signed Windows update", false);
     click_button(&mut app, &ctx, "Stage verified Windows package", false);
     assert!(
@@ -383,7 +383,7 @@ fn actual_default_disabled_control_cannot_create_a_cache_or_claim_the_github_tar
         );
     }
     assert_eq!(
-        serde_json::to_value(&app.shared.lock().unwrap().doc).unwrap(),
+        serde_json::to_value(&app.shared.lock().unwrap().resident_state().expect("resident fixture").document).unwrap(),
         before
     );
     drop(app);
@@ -397,8 +397,8 @@ fn actual_reopened_stage_state_and_human_close_cancel_preserve_joint_native_proj
             let engine = shared.lock().unwrap();
             (
                 engine.project_id.clone(),
-                engine.doc.id.clone(),
-                engine.doc.revision,
+                engine.resident_state().expect("resident fixture").document.id.clone(),
+                engine.resident_state().expect("resident fixture").document.revision,
             )
         };
         let report = crate::server::dispatch(
@@ -475,18 +475,18 @@ fn actual_reopened_stage_state_and_human_close_cancel_preserve_joint_native_proj
             },
         );
         app.recovery.open = false;
-        app.shared.lock().unwrap().doc = Document::new_depth(32, 24, 8).unwrap();
-        app.selected = app.shared.lock().unwrap().doc.layers[0].id.clone();
+        app.shared.lock().unwrap().resident_state_mut().expect("resident fixture").document = Document::new_depth(32, 24, 8).unwrap();
+        app.selected = app.shared.lock().unwrap().resident_state().expect("resident fixture").document.layers[0].id.clone();
         let second = crate::workspace::new_project(&app.shared, 32, 24, 16, None).unwrap();
         let projects = [app.shared.clone(), second];
         let mut hidden_samples = Vec::new();
         for (index, shared) in projects.iter().enumerate() {
             let mut engine = shared.lock().unwrap();
-            let raster = engine.doc.layers[0].id.clone();
-            engine.doc.layers[0]
+            let raster = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
+            engine.resident_state_mut().expect("resident fixture").document.layers[0]
                 .pixels
                 .set16(25, 20, [12347, 23459, 34567, 0]);
-            let hidden = engine.doc.layers[0].pixels.get16(25, 20);
+            let hidden = engine.resident_state().expect("resident fixture").document.layers[0].pixels.get16(25, 20);
             assert_eq!(hidden[3], 0);
             assert!(hidden[..3].iter().any(|value| *value != 0));
             hidden_samples.push((raster.clone(), hidden));
@@ -520,9 +520,9 @@ fn actual_reopened_stage_state_and_human_close_cancel_preserve_joint_native_proj
                 engine.edit("human", &[json!({"op":"paint","layer":raster,"points":[[x,4]],"radius":1,"color":[231,73,31,255]})],None,None,"Human stroke").unwrap();
             }
             engine.undo("human").unwrap();
-            assert!(!engine.undo.is_empty() && !engine.redo.is_empty());
+            assert!(!engine.resident_state().expect("resident fixture").undo.is_empty() && !engine.resident_state().expect("resident fixture").redo.is_empty());
             let paint = engine
-                .doc
+                .resident_state().expect("resident fixture").document
                 .layers
                 .iter()
                 .find(|layer| layer.id == raster)
@@ -543,18 +543,18 @@ fn actual_reopened_stage_state_and_human_close_cancel_preserve_joint_native_proj
             .iter()
             .map(|shared| {
                 let engine = shared.lock().unwrap();
-                assert!(engine.doc.layers.iter().any(|layer| layer.source.is_some()));
+                assert!(engine.resident_state().expect("resident fixture").document.layers.iter().any(|layer| layer.source.is_some()));
                 assert!(!engine.leases.is_empty());
-                if engine.doc.bit_depth == 16 {
-                    assert!(engine.doc.layers.iter().any(|layer| layer
+                if engine.resident_state().expect("resident fixture").document.bit_depth == 16 {
+                    assert!(engine.resident_state().expect("resident fixture").document.layers.iter().any(|layer| layer
                         .pixels
                         .rgba16()
                         .iter()
                         .any(|v| v % 257 != 0)));
                 }
                 (
-                    serde_json::to_value(&engine.doc).unwrap(),
-                    engine.doc.export_png().unwrap(),
+                    serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap(),
+                    engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
                     history(&engine),
                     serde_json::to_value(&engine.leases).unwrap(),
                     engine.path.clone(),
@@ -670,8 +670,8 @@ fn actual_reopened_stage_state_and_human_close_cancel_preserve_joint_native_proj
         for (shared, expected) in projects.iter().zip(&before) {
             let engine = shared.lock().unwrap();
             assert!(!engine.closed);
-            assert_eq!(serde_json::to_value(&engine.doc).unwrap(), expected.0);
-            assert_eq!(engine.doc.export_png().unwrap(), expected.1);
+            assert_eq!(serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap(), expected.0);
+            assert_eq!(engine.resident_state().expect("resident fixture").document.export_png().unwrap(), expected.1);
             assert_eq!(history(&engine), expected.2);
             assert_eq!(serde_json::to_value(&engine.leases).unwrap(), expected.3);
             assert_eq!(
@@ -699,19 +699,19 @@ fn actual_reopened_stage_state_and_human_close_cancel_preserve_joint_native_proj
             save_accepted(shared, &path);
             let engine = shared.lock().unwrap();
             let reopened = crate::psd::decode(&fs::read(&path).unwrap()).unwrap();
-            assert_eq!(reopened.bit_depth, engine.doc.bit_depth);
+            assert_eq!(reopened.bit_depth, engine.resident_state().expect("resident fixture").document.bit_depth);
             let paint = reopened
                 .layers
                 .iter()
                 .find(|layer| &layer.id == raster)
                 .unwrap();
-            assert_eq!(paint.pixels.depth, engine.doc.bit_depth);
+            assert_eq!(paint.pixels.depth, engine.resident_state().expect("resident fixture").document.bit_depth);
             assert_eq!(paint.pixels.get16(25, 20), *hidden);
             assert_eq!(
                 reopened.export_png().unwrap(),
-                engine.doc.export_png().unwrap()
+                engine.resident_state().expect("resident fixture").document.export_png().unwrap()
             );
-            assert!(!engine.doc.export_png().unwrap().is_empty());
+            assert!(!engine.resident_state().expect("resident fixture").document.export_png().unwrap().is_empty());
         }
         app.updates.open = false;
         app.request_close(crate::ui::lifecycle::Intent::Exit);
@@ -752,12 +752,12 @@ fn actual_native_download_controls_and_late_ready_keep_unsaved_newer_native_proj
             .unwrap();
         let (raster_id, source_id, source_before, sample) = {
             let mut e = app.shared.lock().unwrap();
-            e.doc = Document::new_depth(32, 24, depth).unwrap();
-            let raster_id = e.doc.layers[0].id.clone();
-            e.doc.layers[0]
-                .pixels
-                .set16(25, 20, [12347, 23459, 34567, 0]);
-            let sample = e.doc.layers[0].pixels.get16(25, 20);
+            let resident = e.resident_state_mut().unwrap();
+            resident.document = Document::new_depth(32, 24, depth).unwrap();
+            let raster = &mut resident.document.layers[0];
+            let raster_id = raster.id.clone();
+            raster.pixels.set16(25, 20, [12347, 23459, 34567, 0]);
+            let sample = raster.pixels.get16(25, 20);
             let source = Source {
                 width: 16,
                 height: 16,
@@ -781,7 +781,7 @@ fn actual_native_download_controls_and_late_ready_keep_unsaved_newer_native_proj
             )
             .unwrap();
             let layer = e
-                .doc
+                .resident_state().unwrap().document
                 .layers
                 .iter()
                 .find(|layer| layer.source.is_some())
@@ -796,7 +796,8 @@ fn actual_native_download_controls_and_late_ready_keep_unsaved_newer_native_proj
         let path = directory.join("owned.psd");
         let (project, document, revision) = {
             let e = app.shared.lock().unwrap();
-            (e.project_id.clone(), e.doc.id.clone(), e.doc.revision)
+            let doc = &e.resident_state().unwrap().document;
+            (e.project_id.clone(), doc.id.clone(), doc.revision)
         };
         let report = crate::server::dispatch(
             &app.shared,
@@ -834,25 +835,25 @@ fn actual_native_download_controls_and_late_ready_keep_unsaved_newer_native_proj
         }
         let snapshot = |app: &PeerBrush| {
             let e = app.shared.lock().unwrap();
-            assert!(!e.undo.is_empty() && !e.redo.is_empty() && !e.leases.is_empty());
-            assert!(!e.closed && e.doc.revision != e.saved_revision);
-            let raster = e
-                .doc
+            let resident = e.resident_state().unwrap();
+            let doc = &resident.document;
+            assert!(!resident.undo.is_empty() && !resident.redo.is_empty() && !e.leases.is_empty());
+            assert!(!e.closed && doc.revision != e.saved_revision);
+            let raster = doc
                 .layers
                 .iter()
                 .find(|layer| layer.id == raster_id)
                 .unwrap();
             assert_eq!(raster.pixels.depth, depth);
             assert_eq!(raster.pixels.get16(25, 20), sample);
-            let source = e
-                .doc
+            let source = doc
                 .layers
                 .iter()
                 .find(|layer| layer.id == source_id)
                 .unwrap();
             assert_eq!(serde_json::to_value(source).unwrap(), source_before);
-            json!({"doc":e.doc,"history":history(&e),"leases":e.leases,"saved":e.saved_revision,
-                "path":e.path,"png":e.doc.export_png().unwrap(),"bytes":fs::read(&path).unwrap()})
+            json!({"doc":doc,"history":history(&e),"leases":e.leases,"saved":e.saved_revision,
+                "path":e.path,"png":doc.export_png().unwrap(),"bytes":fs::read(&path).unwrap()})
         };
         let ownership = app.shared.lock().unwrap().file_ownership.clone().unwrap();
         let file_version = app.shared.lock().unwrap().file_version;
@@ -981,8 +982,8 @@ fn human_later_drops_pending_windows_preflight_without_touching_native_pixels_or
         app.recovery.open = false;
         {
             let mut e = app.shared.lock().unwrap();
-            e.doc = Document::new_depth(16, 12, depth).unwrap();
-            let layer = e.doc.layers[0].id.clone();
+            e.resident_state_mut().expect("resident fixture").document = Document::new_depth(16, 12, depth).unwrap();
+            let layer = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
             e.edit(
                 "human",
                 &[json!({"op":"fill","layer":layer,"rect":[1,1,2,2],"color":[17,71,129,255]})],
@@ -992,7 +993,7 @@ fn human_later_drops_pending_windows_preflight_without_touching_native_pixels_or
             )
             .unwrap();
             if depth == 16 {
-                e.doc.layers[0]
+                e.resident_state_mut().expect("resident fixture").document.layers[0]
                     .pixels
                     .set16(3, 3, [12347, 23459, 34567, 45679]);
             }
@@ -1006,9 +1007,9 @@ fn human_later_drops_pending_windows_preflight_without_touching_native_pixels_or
         let before = {
             let e = app.shared.lock().unwrap();
             (
-                serde_json::to_value(&e.doc).unwrap(),
+                serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap(),
                 history(&e),
-                e.doc.export_png().unwrap(),
+                e.resident_state().expect("resident fixture").document.export_png().unwrap(),
             )
         };
         click_button(&mut app, &ctx, "Later", true);
@@ -1018,9 +1019,9 @@ fn human_later_drops_pending_windows_preflight_without_touching_native_pixels_or
             .is_err());
         let e = app.shared.lock().unwrap();
         assert!(!e.closed);
-        assert_eq!(serde_json::to_value(&e.doc).unwrap(), before.0);
+        assert_eq!(serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap(), before.0);
         assert_eq!(history(&e), before.1);
-        assert_eq!(e.doc.export_png().unwrap(), before.2);
+        assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), before.2);
         drop(e);
         drop(app);
         drop(profile);

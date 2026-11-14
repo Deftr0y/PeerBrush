@@ -596,6 +596,7 @@ impl<T> Manifest<T> {
             },
         )
     }
+    #[cfg(test)]
     pub(crate) fn verify_standard<L: Read, C: Read>(
         &self,
         layer: &mut L,
@@ -604,22 +605,25 @@ impl<T> Manifest<T> {
         composite_bytes: u64,
         check: &dyn Fn() -> Result<(), String>,
     ) -> Result<CompletedStandard, String> {
+        let sha = bulk36::standard_digest(layer, layer_bytes, composite, composite_bytes, check)?;
+        self.verify_standard_digest(layer_bytes, composite_bytes, sha)
+    }
+
+    pub(super) fn verify_standard_digest(
+        &self,
+        layer_bytes: u64,
+        composite_bytes: u64,
+        sha: Digest,
+    ) -> Result<CompletedStandard, String> {
         if layer_bytes != self.standard_layer_bytes
             || composite_bytes != self.standard_composite_bytes
         {
             return Err("Source36 indexed standard lengths differ from manifest".into());
         }
-        if bulk36::standard_digest(layer, layer_bytes, composite, composite_bytes, check)?
-            != self.standard_sha256
-        {
+        if sha != self.standard_sha256 {
             return Err("Source36 original standard SHA256 differs".into());
         }
-        Ok(CompletedStandard {
-            core: self.core.sha256,
-            layer_bytes,
-            composite_bytes,
-            sha256: self.standard_sha256,
-        })
+        Ok(CompletedStandard::from_digest(self.core.sha256, layer_bytes, composite_bytes, sha))
     }
 }
 
@@ -668,6 +672,24 @@ pub(crate) struct CompletedStandard {
     sha256: Digest,
 }
 impl CompletedStandard {
+    pub(super) fn from_digest(
+        core: Digest,
+        layer_bytes: u64,
+        composite_bytes: u64,
+        sha256: Digest,
+    ) -> Self {
+        Self {
+            core,
+            layer_bytes,
+            composite_bytes,
+            sha256,
+        }
+    }
+
+    pub(super) fn sha256(&self) -> Digest {
+        self.sha256
+    }
+
     pub(crate) fn check<T>(&self, manifest: &Manifest<T>) -> Result<(), String> {
         if self.core != manifest.core.sha256
             || self.layer_bytes != manifest.standard_layer_bytes

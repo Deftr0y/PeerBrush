@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex};
 
 fn engine(layers: Vec<Layer>) -> Engine {
     let mut e = Engine::new();
-    e.doc = Document::new(8, 6).unwrap();
-    e.doc.layers = layers;
+    e.resident_state_mut().expect("resident fixture").document = Document::new(8, 6).unwrap();
+    e.resident_state_mut().expect("resident fixture").document.layers = layers;
     e
 }
 fn paint(name: &str, color: [u8; 4]) -> Layer {
@@ -17,7 +17,7 @@ fn paint(name: &str, color: [u8; 4]) -> Layer {
     l
 }
 fn view(e: &Engine) -> Vec<u8> {
-    e.doc.preview(None, 8192, None, false).unwrap().2
+    e.resident_state().expect("resident fixture").document.preview(None, 8192, None, false).unwrap().2
 }
 fn near(a: &[u8], b: &[u8]) {
     assert_eq!(a.len(), b.len());
@@ -52,38 +52,38 @@ fn merge_bakes_masks_effects_opacity_and_preserves_undo_redo_psd() {
         "Prepare",
     )
     .unwrap();
-    let before = e.doc.clone();
+    let before = e.resident_state().expect("resident fixture").document.clone();
     let pixels = view(&e);
-    let n = e.undo.len();
+    let n = e.resident_state().expect("resident fixture").undo.len();
     let r = e
         .edit(
             "artist",
             &[json!({"op":"layer.merge","layers":ids,"name":"Baked"})],
-            Some(e.doc.revision),
+            Some(e.resident_state().expect("resident fixture").document.revision),
             None,
             "Merge",
         )
         .unwrap();
-    assert_eq!(e.undo.len(), n + 1);
-    assert_eq!(e.doc.layers.len(), 1);
-    let merged = &e.doc.layers[0];
+    assert_eq!(e.resident_state().expect("resident fixture").undo.len(), n + 1);
+    assert_eq!(e.resident_state().expect("resident fixture").document.layers.len(), 1);
+    let merged = &e.resident_state().expect("resident fixture").document.layers[0];
     assert_eq!(r["created"][0], merged.id);
     assert_eq!(merged.kind, "paint");
     assert!(merged.effects.is_empty() && merged.mask.is_none());
     assert_eq!(merged.opacity, 1.);
     assert_eq!(view(&e), pixels);
-    let decoded = psd::decode(&psd::encode(&e.doc).unwrap()).unwrap();
+    let decoded = psd::decode(&psd::encode(&e.resident_state().expect("resident fixture").document).unwrap()).unwrap();
     assert_eq!(decoded.preview(None, 8192, None, false).unwrap().2, pixels);
     e.undo("artist").unwrap();
-    assert_eq!(e.doc.layers.len(), before.layers.len());
+    assert_eq!(e.resident_state().expect("resident fixture").document.layers.len(), before.layers.len());
     assert_eq!(
-        e.doc.layers[0].effects[0].id,
+        e.resident_state().expect("resident fixture").document.layers[0].effects[0].id,
         before.layers[0].effects[0].id
     );
-    assert!(e.doc.layers[0].mask.is_some());
+    assert!(e.resident_state().expect("resident fixture").document.layers[0].mask.is_some());
     assert_eq!(view(&e), pixels);
     e.redo("artist").unwrap();
-    assert_eq!(e.doc.layers.len(), 1);
+    assert_eq!(e.resident_state().expect("resident fixture").document.layers.len(), 1);
     assert_eq!(view(&e), pixels);
     assert_eq!(e.ai_change.as_ref().unwrap().tool, "history");
 }
@@ -109,9 +109,9 @@ fn single_paint_merges_down_in_its_folder_and_keeps_siblings() {
         "Merge down",
     )
     .unwrap();
-    assert_eq!(e.doc.layers.len(), 3);
-    assert_eq!(e.doc.layers[0].parent.as_deref(), Some(folder.as_str()));
-    assert!(e.doc.layers.iter().any(|l| l.id == outside_id));
+    assert_eq!(e.resident_state().expect("resident fixture").document.layers.len(), 3);
+    assert_eq!(e.resident_state().expect("resident fixture").document.layers[0].parent.as_deref(), Some(folder.as_str()));
+    assert!(e.resident_state().expect("resident fixture").document.layers.iter().any(|l| l.id == outside_id));
     assert_eq!(view(&e), pixels);
 }
 
@@ -152,9 +152,9 @@ fn flatten_folder_bakes_nested_stacks_and_keeps_external_blend() {
         "Flatten",
     )
     .unwrap();
-    assert_eq!(e.doc.layers.len(), 2);
-    assert_eq!(e.doc.layers[0].blend, "screen");
-    assert_eq!(e.doc.layers[0].name, "Folder");
+    assert_eq!(e.resident_state().expect("resident fixture").document.layers.len(), 2);
+    assert_eq!(e.resident_state().expect("resident fixture").document.layers[0].blend, "screen");
+    assert_eq!(e.resident_state().expect("resident fixture").document.layers[0].name, "Folder");
     near(&pixels, &view(&e));
 }
 
@@ -168,7 +168,7 @@ fn merge_keeps_off_canvas_pixels_and_selection() {
     let bottom = Layer::new("Empty", "paint", 8, 6);
     let id = top.id.clone();
     let mut e = engine(vec![top, bottom]);
-    e.doc.selection = Some([1, 1, 4, 4]);
+    e.resident_state_mut().expect("resident fixture").document.selection = Some([1, 1, 4, 4]);
     e.edit(
         "human",
         &[json!({"op":"layer.merge","layer":id})],
@@ -177,11 +177,11 @@ fn merge_keeps_off_canvas_pixels_and_selection() {
         "Merge",
     )
     .unwrap();
-    let l = &e.doc.layers[0];
+    let l = &e.resident_state().expect("resident fixture").document.layers[0];
     assert_eq!((l.x, l.y), (-2, -1));
     assert_eq!(l.pixels.get(0, 0), [100, 150, 220, 255]);
     assert_eq!(l.pixels.get(3, 3), [240, 60, 20, 255]);
-    assert_eq!(e.doc.selection, Some([1, 1, 4, 4]));
+    assert_eq!(e.resident_state().expect("resident fixture").document.selection, Some([1, 1, 4, 4]));
 }
 
 #[test]
@@ -191,7 +191,7 @@ fn merge_rejects_locks_reservations_stale_revisions_and_cross_folders() {
     let id = top.id.clone();
     let mut e = engine(vec![top, down]);
     let before = view(&e);
-    e.doc.layers[1].locked = true;
+    e.resident_state_mut().expect("resident fixture").document.layers[1].locked = true;
     assert!(e
         .edit(
             "human",
@@ -201,13 +201,13 @@ fn merge_rejects_locks_reservations_stale_revisions_and_cross_folders() {
             "Merge"
         )
         .is_err());
-    assert!(e.undo.is_empty());
+    assert!(e.resident_state().expect("resident fixture").undo.is_empty());
     assert_eq!(view(&e), before);
-    e.doc.layers[1].locked = false;
+    e.resident_state_mut().expect("resident fixture").document.layers[1].locked = false;
     e.reserve(
         "other",
         "Painting",
-        vec![Scope::layer(&e.doc.layers[1].id.clone())],
+        vec![Scope::layer(&e.resident_state().expect("resident fixture").document.layers[1].id.clone())],
     )
     .unwrap();
     assert!(e
@@ -224,9 +224,9 @@ fn merge_rejects_locks_reservations_stale_revisions_and_cross_folders() {
     assert!(merge::edit(&shared, "human", &[id.clone()], Some(100), None, None).is_err());
     let mut e = shared.lock().unwrap();
     let group = Layer::new("Folder", "group", 8, 6);
-    e.doc.layers[1].parent = Some(group.id.clone());
-    e.doc.layers.push(group);
-    let ids = e.doc.layers[..2]
+    e.resident_state_mut().expect("resident fixture").document.layers[1].parent = Some(group.id.clone());
+    e.resident_state_mut().expect("resident fixture").document.layers.push(group);
+    let ids = e.resident_state().expect("resident fixture").document.layers[..2]
         .iter()
         .map(|l| l.id.clone())
         .collect::<Vec<_>>();
@@ -239,7 +239,7 @@ fn merge_rejects_locks_reservations_stale_revisions_and_cross_folders() {
             "Merge"
         )
         .is_err());
-    assert!(e.undo.is_empty());
+    assert!(e.resident_state().expect("resident fixture").undo.is_empty());
 }
 
 #[test]
@@ -250,7 +250,7 @@ fn merge_enforces_bounds_and_rolls_back_entire_failed_batch() {
     down.x = 4100;
     let id = top.id.clone();
     let mut e = engine(vec![top, down]);
-    let before = serde_json::to_value(&e.doc).unwrap();
+    let before = serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap();
     assert!(e
         .edit(
             "human",
@@ -260,11 +260,11 @@ fn merge_enforces_bounds_and_rolls_back_entire_failed_batch() {
             "Merge"
         )
         .is_err());
-    assert_eq!(serde_json::to_value(&e.doc).unwrap(), before);
-    assert!(e.undo.is_empty());
-    e.doc.layers[0].x = 0;
-    e.doc.layers[1].x = 0;
-    let before = serde_json::to_value(&e.doc).unwrap();
+    assert_eq!(serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap(), before);
+    assert!(e.resident_state().expect("resident fixture").undo.is_empty());
+    e.resident_state_mut().expect("resident fixture").document.layers[0].x = 0;
+    e.resident_state_mut().expect("resident fixture").document.layers[1].x = 0;
+    let before = serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap();
     assert!(e
         .edit(
             "human",
@@ -277,8 +277,8 @@ fn merge_enforces_bounds_and_rolls_back_entire_failed_batch() {
             "Failed batch"
         )
         .is_err());
-    assert_eq!(serde_json::to_value(&e.doc).unwrap(), before);
-    assert!(e.undo.is_empty());
+    assert_eq!(serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap(), before);
+    assert!(e.resident_state().expect("resident fixture").undo.is_empty());
 }
 
 #[test]
@@ -342,10 +342,10 @@ fn merge_refuses_gaps_and_backdrop_dependent_blends_without_changing_the_documen
         .unwrap_err()
         .contains("adjacent"));
     assert_eq!(view(&e), before);
-    assert_eq!(e.doc.revision, 0);
-    assert!(e.undo.is_empty());
-    e.doc.layers[0].blend = "multiply".into();
-    let ids = vec![e.doc.layers[0].id.clone(), e.doc.layers[1].id.clone()];
+    assert_eq!(e.resident_state().expect("resident fixture").document.revision, 0);
+    assert!(e.resident_state().expect("resident fixture").undo.is_empty());
+    e.resident_state_mut().expect("resident fixture").document.layers[0].blend = "multiply".into();
+    let ids = vec![e.resident_state().expect("resident fixture").document.layers[0].id.clone(), e.resident_state().expect("resident fixture").document.layers[1].id.clone()];
     let before = view(&e);
     assert!(e
         .edit(
@@ -358,5 +358,5 @@ fn merge_refuses_gaps_and_backdrop_dependent_blends_without_changing_the_documen
         .unwrap_err()
         .contains("folder"));
     assert_eq!(view(&e), before);
-    assert!(e.undo.is_empty());
+    assert!(e.resident_state().expect("resident fixture").undo.is_empty());
 }

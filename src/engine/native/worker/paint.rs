@@ -6,13 +6,10 @@ use crate::edit_bounds::{
     output::BuiltTiles,
 };
 
-fn cleanup(reason: String, result: Result<()>) -> String {
-    match result {
-        Ok(()) => reason,
-        Err(error) => format!("{reason}; provisional source retirement refused: {error}"),
-    }
-}
-fn seal(built: BuiltTiles<'_, '_>, check: &dyn Fn() -> Result<()>) -> Result<Option<StagedOutput>> {
+pub(super) fn seal(
+    built: BuiltTiles<'_, '_>,
+    check: &dyn Fn() -> Result<()>,
+) -> Result<Option<StagedOutput>> {
     match built {
         BuiltTiles::Unchanged => Ok(None),
         BuiltTiles::Draft(draft) => match draft.seal(check) {
@@ -24,27 +21,12 @@ fn seal(built: BuiltTiles<'_, '_>, check: &dyn Fn() -> Result<()>) -> Result<Opt
         },
     }
 }
-fn apply_batch(
-    edit: CapturedEdit,
-    batch: RasterBatch,
-    session: &SourceSession,
-    check: &dyn Fn() -> Result<()>,
-) -> Result<PreparedDelta> {
-    match edit.batch(batch, check) {
-        Ok(delta) => Ok(delta),
-        Err(refused) => {
-            let reason = refused.reason().to_owned();
-            Err(cleanup(
-                reason,
-                refused.abort(session, &|| session.cleanup_check()),
-            ))
-        }
-    }
-}
 pub(super) fn prepare(
     edit: CapturedEdit,
     session: &SourceSession,
+    raster_damage: &mut Option<[i32; 4]>,
     check: &dyn Fn() -> Result<()>,
+    check_active: &dyn Fn() -> Result<()>,
 ) -> Result<PreparedDelta> {
     let base = edit.document().clone();
     let _header_ticket = base
@@ -67,11 +49,18 @@ pub(super) fn prepare(
         .ok_or("Choose a target layer")?;
     super::super::patch::unlocked(&base.core.metadata, target)?;
     let input = RasterInput::from_parameters(&base, parameters)?;
+    if operation == "fill"
+        && !input.is_mask()
+        && input.layer_metadata().kind() == "fill"
+        && base.metadata().selection().is_none()
+    {
+        return edit.metadata_command(token, check);
+    }
     if input.layer_metadata().kind() == "group" && !input.is_mask() {
         if operation == "paint.clear_selection" {
             return clear_folder(edit, session, check);
         }
-        if operation != "paint.fill" {
+        if !matches!(operation, "paint.fill" | "fill") {
             return Err("Paint on a raster layer or its mask".into());
         }
         if base.metadata().layers().len() >= 100 {
@@ -106,16 +95,14 @@ pub(super) fn prepare(
     };
     let frame = if let Some(points) = &points {
         input.stroke_frame(command, points, &mut || check())?
-    } else if operation == "paint.fill" {
+    } else if matches!(
+        operation,
+        "paint.fill" | "shape" | "gradient" | "fill" | "pixels.replace"
+    ) {
         input.fill_frame(command)?
     } else {
         None
     };
-    // The complete frame coordinator must additionally preserve every linked
-    // plane, original pose and typed local clip before this route is enabled.
-    if frame.is_some() {
-        return Err("Native expanded paint requires its complete linked-frame producer".into());
-    }
     let mut raster_headers = Vec::new();
     raster_headers
         .try_reserve_exact(1)
@@ -124,19 +111,26 @@ pub(super) fn prepare(
     layer_headers
         .try_reserve_exact(1)
         .map_err(|_| "Native fill metadata allocation refused")?;
-    let guard = WriteGuard::new(&edit, command, &input, None)?;
+    let guard = WriteGuard::new(&edit, command, &input, frame.as_ref())?;
     let mut materializes = false;
     let built = match operation {
+        "image.patch" => super::image_patch::stage(&input, &guard, session, &mut || check())?,
+        "shape" | "gradient" | "fill" | "adjust" | "pixels.replace" => {
+            let result = super::primitive::stage(&input, frame.as_ref(), &guard, session,
+                &mut || check(), check_active)?;
+            materializes = result.materializes_fill();
+            result.into_parts().0
+        }
         "paint" | "smudge" | "clone" | "heal" => {
             let stroke = points
                 .as_ref()
                 .unwrap()
-                .local(&input, None, &mut || check())?;
+                .local(&input, frame.as_ref(), &mut || check())?;
             match operation {
                 "paint" => crate::brush::input::stage_guarded(
                     &input,
                     &stroke,
-                    None,
+                    frame.as_ref(),
                     &guard,
                     session,
                     &mut || check(),
@@ -144,34 +138,30 @@ pub(super) fn prepare(
                 "smudge" => crate::smudge::input::stage_guarded(
                     &input,
                     &stroke,
-                    None,
+                    frame.as_ref(),
                     &guard,
                     session,
                     &mut || check(),
                 )?,
-                _ => {
-                    let crate::edit_bounds::input::RetouchInput::Raster(source) =
-                        input.retouch_source(parameters)?
-                    else {
-                        return Err("Native retouch requires its prepared composed-mask or merged-artwork provider".into());
-                    };
-                    crate::retouch::input::stage_guarded(
-                        &input,
-                        &source,
-                        &stroke,
-                        None,
-                        &guard,
-                        session,
-                        &mut || check(),
-                    )?
-                }
+                _ => crate::retouch::input::stage_guarded(
+                    &input,
+                    &stroke,
+                    frame.as_ref(),
+                    &guard,
+                    session,
+                    &mut || check(),
+                )?,
             }
         }
         "paint.fill" | "paint.clear_selection" => {
             let result = if operation == "paint.fill" {
-                crate::fill::input::stage_fill_guarded(&input, None, &guard, session, &mut || {
-                    check()
-                })?
+                crate::fill::input::stage_fill_guarded(
+                    &input,
+                    frame.as_ref(),
+                    &guard,
+                    session,
+                    &mut || check(),
+                )?
             } else {
                 crate::fill::input::stage_clear_guarded(&input, &guard, session, &mut || check())?
             };
@@ -180,22 +170,47 @@ pub(super) fn prepare(
         }
         _ => return Err("Unsupported guarded paint producer".into()),
     };
-    let changed = guard.write_bounds().is_some();
+    let writes = guard.write_bounds();
+    let changed = writes.is_some();
     let output = seal(built, check)?;
     drop(guard);
     let Some(output) = output else {
         return edit.unchanged(token, check);
     };
+    let retained = if let Some(writes) = writes {
+        let origin = frame.as_ref().map_or_else(|| input.origin(), |frame| frame.geometry().new_origin());
+        match super::paint_mask_original::update(&input, output.surface(), origin, writes, session, check) {
+            Ok(retained) => retained.unwrap_or(RetainedUpdate::Clear),
+            Err(reason) => return Err(cleanup(reason, output.abort(session, &|| session.cleanup_check()))),
+        }
+    } else if materializes {
+        RetainedUpdate::Clear
+    } else {
+        RetainedUpdate::Keep
+    };
     let patch = RasterPatch {
         target: input.metadata().slot(),
         output,
-        retained: if changed || materializes {
-            RetainedUpdate::Clear
-        } else {
-            RetainedUpdate::Keep
-        },
+        retained,
         layer_origin: None,
     };
+    if let Some(frame) = &frame {
+        raster_headers.push(patch);
+        return super::frame::prepare(
+            edit,
+            &input,
+            frame,
+            RasterBatch {
+                rasters: raster_headers,
+                layers: layer_headers,
+                effects: vec![],
+                selection: None,
+            },
+            changed || materializes,
+            session,
+            check,
+        );
+    }
     if materializes {
         raster_headers.push(patch);
         layer_headers.push(LayerPatch {
@@ -217,7 +232,10 @@ pub(super) fn prepare(
         )
     } else {
         match edit.raster_patch(patch, check) {
-            Ok(delta) => Ok(delta),
+            Ok(delta) => {
+                *raster_damage = writes.filter(|_| local_display_write(&input));
+                Ok(delta)
+            }
             Err(refused) => {
                 let reason = refused.reason().to_owned();
                 Err(cleanup(
@@ -227,6 +245,18 @@ pub(super) fn prepare(
             }
         }
     }
+}
+fn local_display_write(input: &RasterInput<'_>) -> bool {
+    // An alias can draw the same slot at a different document origin.
+    let slot = input.metadata().slot();
+    let owners = input.document().metadata().layers().flat_map(|layer| {
+        std::iter::once(layer.pixels().slot()).chain(layer.mask().into_iter()
+            .flat_map(|mask| mask.steps().map(|step| step.pixels().slot())))
+    }).filter(|&owner| owner == slot).take(2).count();
+    owners == 1 && (!input.is_mask() || input.layer_metadata().mask().is_some_and(|mask| {
+        mask.steps().all(|step| !step.enabled() || step.weight() == 0.
+            || matches!(step.kind(), "fill" | "paint" | "density" | "invert" | "levels"))
+    }))
 }
 fn clear_folder(
     edit: CapturedEdit,

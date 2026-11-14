@@ -259,6 +259,12 @@ impl Footprint for crate::psd::GlobalMaskSettings {
         self.data.heap(measure)
     }
 }
+impl Footprint for crate::psd::GlobalMetadata {
+    fn heap(&self, measure: &mut Measure<'_>) -> Result<()> {
+        self.key.heap(measure)?;
+        self.data.heap(measure)
+    }
+}
 impl Footprint for super::Content36 {
     fn heap(&self, measure: &mut Measure<'_>) -> Result<()> {
         measure.node()?;

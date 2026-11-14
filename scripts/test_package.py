@@ -495,6 +495,13 @@ class Packages(unittest.TestCase):
             with self.subTest(key=key, changed=changed), self.assertRaises(ValueError):
                 verify_release.inspect_archive(path, commit, '0.30.0-dev.1', self.root)
         self.assertNotIn('PeerBrushDevelopmentVersion', packaging.macos_info('0.30.0'))
+        updated = packaging.macos_info('0.4.0')
+        self.assertEqual(updated['CFBundleShortVersionString'], '0.4.0')
+        self.assertEqual(updated['CFBundleVersion'], '1.4.0')
+        self.assertLess(packaging.release_version_order('0.30.1'),
+                        packaging.release_version_order('0.4.0'))
+        self.assertLess(packaging.release_version_order('0.4.0'),
+                        packaging.release_version_order('0.4.1'))
         for version in ['0.30.0-beta.1', '0.30.0-dev.01', '0.30.0+build', '00.30.0-dev.1']:
             with self.subTest(version=version), self.assertRaises(ValueError):
                 packaging.macos_info(version)
@@ -815,6 +822,33 @@ class Packages(unittest.TestCase):
             packaging.write_zip(archive_path, files, 1700000000)
             with self.subTest(name=name), self.assertRaisesRegex(ValueError, 'Required Rust runtime notice is empty'):
                 verify_release.inspect_archive(archive_path, commit, '0.2.0', self.root)
+
+    def test_upstream_workspace_notices_are_required_independently_of_the_portable_inventory(self):
+        (self.root / 'Cargo.lock').write_text('version=4\n[[package]]\nname="atspi-proxies"\nversion="0.6.0"\n')
+        notice_dir = self.root / 'packaging/notices/atspi'
+        notice_dir.mkdir(parents=True)
+        for name in ['LICENSE-APACHE2.txt', 'LICENSE-MIT.txt']:
+            path = notice_dir / name
+            path.write_bytes(f'Synthetic upstream {name}'.encode())
+            self.policy['source'].append(path.relative_to(self.root).as_posix())
+        self.policy['source'].sort()
+        self.save_policy()
+        self.commit()
+        archive_path = self.build('Windows')
+        commit = packaging.git(self.root, 'rev-parse', 'HEAD').decode().strip()
+        verify_release.inspect_archive(archive_path, commit, '0.2.0', self.root)
+        prefix = archive_path.stem + '/'
+        notice = 'licenses/atspi/LICENSE-MIT.txt'
+        with zipfile.ZipFile(archive_path) as archive:
+            original = [(i.filename, archive.read(i.filename), i.external_attr >> 16 & 0o777) for i in archive.infolist()]
+            manifest = json.loads(archive.read(prefix + 'release.json'))
+            self.assertEqual(archive.read(prefix + notice), (notice_dir / 'LICENSE-MIT.txt').read_bytes())
+        del manifest['notice_files'][notice]
+        files = [(name, json.dumps(manifest).encode() if name == prefix + 'release.json' else data, mode)
+                 for name, data, mode in original if name != prefix + notice]
+        packaging.write_zip(archive_path, files, 1700000000)
+        with self.assertRaisesRegex(ValueError, 'Missing exact upstream crate notice'):
+            verify_release.inspect_archive(archive_path, commit, '0.2.0', self.root)
 
     def test_embedded_font_notice_inventory_preserves_real_upstream_names(self):
         (self.root / 'Cargo.lock').write_text('version=4\n[[package]]\nname="epaint_default_fonts"\nversion="0.31.1"\nsource="registry+https://example.invalid"\n')

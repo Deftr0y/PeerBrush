@@ -93,7 +93,8 @@ pub(crate) struct SourceAdmission {
 
 pub(crate) struct SourceOperation {
     // Release the workspace counter before allowing instance drain to finish.
-    _operation: super::FileOperation,
+    _operation: Option<super::FileOperation>,
+    activity: Arc<std::sync::atomic::AtomicUsize>,
     request: Request,
     identity: Arc<()>,
 }
@@ -122,7 +123,8 @@ impl SourceAdmission {
         let workspace = self.workspace()?;
         let operation = super::FileOperation::begin_workspace(&workspace)?;
         let permit = SourceOperation {
-            _operation: operation,
+            activity: operation.0.clone(),
+            _operation: Some(operation),
             request,
             identity: Arc::new(()),
         };
@@ -132,6 +134,16 @@ impl SourceAdmission {
 }
 
 impl SourceOperation {
+    /// Only the uniquely owned, completed preparation can become idle. The
+    /// actual request remains admitted and still participates in instance drain.
+    pub(crate) fn park_activity(&mut self) {
+        drop(self._operation.take());
+    }
+    pub(crate) fn activity(&self) -> Option<super::FileOperation> {
+        self._operation
+            .is_none()
+            .then(|| super::FileOperation::track(self.activity.clone()))
+    }
     /// Final memory-only publication while this exact request is still live.
     /// The closure must not perform I/O, call admission/check methods, or drop a
     /// final Request/SourceOperation owner (which reenters this state mutex).
@@ -214,6 +226,10 @@ pub struct InstanceLock {
 }
 
 impl InstanceLock {
+    #[cfg(test)]
+    pub(crate) fn stop_recovery_for_test(&mut self) {
+        self.recovery.stop();
+    }
     pub(crate) fn source_admission_for(
         &self,
         dir: &std::path::Path,
@@ -243,6 +259,7 @@ impl InstanceLock {
         shared: Shared,
         workspace: crate::workspace::Registry,
         dir: std::path::PathBuf,
+        current_cache: std::path::PathBuf,
         auth: String,
         port: u16,
         availability: Arc<AtomicBool>,
@@ -267,6 +284,13 @@ impl InstanceLock {
                 }
             })
             .map_err(|e| e.to_string())?;
+        if let Some(request) = requests.begin() {
+            let _ = thread::Builder::new()
+                .name("peerbrush-cache-cleanup".into())
+                .spawn(move || {
+                    crate::disk_cache::clean_abandoned(&current_cache, || request.check().is_err());
+                });
+        }
         Ok(Self {
             requests,
             availability,
@@ -524,7 +548,13 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 503"), "{response}");
         dropper.join().unwrap();
         assert!(!dir.join("brushes.json").exists());
-        assert!(shared.lock().unwrap().undo.is_empty());
+        assert!(shared
+            .lock()
+            .unwrap()
+            .resident_state()
+            .expect("resident fixture")
+            .undo
+            .is_empty());
         let next_owner = lock(&dir);
         next_owner.try_lock().unwrap();
         drop(next_owner);

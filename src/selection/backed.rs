@@ -374,8 +374,23 @@ impl PreparedCoverageRegion {
                 "Selection row differs from its prepared footprint",
             ));
         }
-        for (x, value) in (left..right).zip(output) {
-            *value = (self.value(x, y)? * 255.).round() as u8;
+        let [ox, oy] = self.source.origin;
+        let y = y - oy;
+        let start = (left - ox).max(0);
+        let end = (right - ox).min(self.source.mask.width() as i32);
+        if y < 0 || y >= self.source.mask.height() as i32 || start >= end {
+            output.fill(0);
+            return Ok(());
+        }
+        let pixels = self.pixels.as_ref().ok_or(Error::Invalid(
+            "Selection source footprint was not prepared",
+        ))?;
+        let from = (start + ox - left) as usize;
+        let to = (end + ox - left) as usize;
+        output[..from].fill(0);
+        output[to..].fill(0);
+        for (x, value) in (start..end).zip(&mut output[from..to]) {
+            *value = pixels.pixel(x, y)?[0];
         }
         Ok(())
     }
@@ -445,9 +460,11 @@ mod tests {
             }
         }
         assert!(prepared.value(8, 1).is_err());
-        let mut row = vec![0; 8];
+        let mut row = vec![255; 8];
         prepared.copy_row(1, &mut row).unwrap();
-        assert_eq!(row[3], 31);
+        assert_eq!(row, [0, 0, 0, 31, 48, 65, 82, 0]);
+        prepared.copy_row(0, &mut row).unwrap();
+        assert_eq!(row, [0; 8]);
         assert!(prepared.copy_row(1, &mut row[..2]).is_err());
         drop(source);
         drop(store);

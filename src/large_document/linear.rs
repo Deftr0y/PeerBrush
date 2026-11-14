@@ -19,7 +19,7 @@ const SEAL: usize = 144;
 type Digest = [u8; 32];
 type Check<'a> = &'a mut dyn FnMut() -> Result<()>;
 
-use super::bytes::ByteRole;
+use super::bytes::{verified_transfer_buffer, ByteRole, VERIFIED_BATCH_BYTES};
 use super::planar::PlanarRole;
 #[derive(Clone, Copy)]
 pub(super) enum Kind {
@@ -214,6 +214,8 @@ pub(super) struct Scratch {
     chunk_bytes: usize,
     chunk_count: usize,
     poisoned: bool,
+    footer_written: usize,
+    seal: [u8; SEAL],
 }
 
 impl Scratch {
@@ -275,6 +277,8 @@ impl Scratch {
             chunk_bytes: 0,
             chunk_count: 0,
             poisoned: false,
+            footer_written: 0,
+            seal: [0; SEAL],
         })
     }
 
@@ -334,11 +338,21 @@ impl Scratch {
         let result = (|| {
             let mut at = HEADER + self.written;
             let mut input = bytes;
-            while !input.is_empty() {
+            let batch = !input.is_empty()
+                && input.len() <= VERIFIED_BATCH_BYTES
+                && matches!(self.spec.kind, Kind::Bytes(role, _) if role.photoshop_transfer());
+            if batch {
                 check()?;
+                write_all_at(&self.owned.file, at, input)?;
+            }
+            // Record a completed write before checking cancellation again.
+            while !input.is_empty() {
                 let count = input.len().min(CHUNK - self.chunk_bytes);
                 let part = &input[..count];
-                write_all_at(&self.owned.file, at, part)?;
+                if !batch {
+                    check()?;
+                    write_all_at(&self.owned.file, at, part)?;
+                }
                 self.content.update(part);
                 self.chunk.update(part);
                 self.written = self
@@ -375,7 +389,35 @@ impl Scratch {
 
     /// The codec supplies `binding` after its independent source/completion checks.
     /// Sealing proves storage bytes, never permission to edit or recover them.
-    pub fn finish(mut self, binding: Digest, check: Check<'_>) -> Result<Arc<Complete>> {
+    pub fn finish(self, binding: Digest, check: Check<'_>) -> Result<Arc<Complete>> {
+        self.finish_recoverable(binding, check)
+            .map_err(|(error, _)| error)
+    }
+
+    pub(super) fn finish_recoverable(
+        mut self,
+        binding: Digest,
+        check: Check<'_>,
+    ) -> std::result::Result<Arc<Complete>, (Error, Self)> {
+        let content = match self.write_seal(binding, check) {
+            Ok(content) => content,
+            Err(error) => {
+                self.poisoned = true;
+                return Err((error, self));
+            }
+        };
+        Ok(Arc::new(Complete {
+            owned: self.owned,
+            spec: self.spec,
+            content_sha256: content,
+            binding,
+            header: self.header,
+            index: self.index.freeze(),
+            budget: self.budget,
+        }))
+    }
+
+    fn write_seal(&mut self, binding: Digest, check: Check<'_>) -> Result<Digest> {
         if self.poisoned {
             return Err(Error::Interrupted);
         }
@@ -390,7 +432,7 @@ impl Scratch {
         }
         check()?;
         self.owned.check()?;
-        let content = finish(self.content);
+        let content = finish(self.content.clone());
         let mut index_hash = hash_start(self.spec.kind.index_domain(), &self.header);
         index_hash.update(&self.index);
         let index_hash = finish(index_hash);
@@ -403,13 +445,16 @@ impl Scratch {
         sealed.update(&seal[..104]);
         seal[104..136].copy_from_slice(&finish(sealed));
         seal[136..].copy_from_slice(b"PBPLEND1");
+        self.seal = seal;
         let index_at = HEADER + self.spec.payload_bytes();
         for (n, part) in self.index.chunks(CHUNK).enumerate() {
             check()?;
             write_all_at(&self.owned.file, index_at + (n * CHUNK) as u64, part)?;
+            self.footer_written += part.len();
         }
         check()?;
         write_all_at(&self.owned.file, index_at + self.index.len() as u64, &seal)?;
+        self.footer_written += SEAL;
         self.owned.file.sync_all()?;
         self.owned.expected = stamp(&self.owned.file)?;
         if self.owned.expected.bytes != self.spec.encoded_bytes() {
@@ -427,15 +472,7 @@ impl Scratch {
         )?;
         check()?;
         self.owned.check()?;
-        Ok(Arc::new(Complete {
-            owned: self.owned,
-            spec: self.spec,
-            content_sha256: content,
-            binding,
-            header: self.header,
-            index: self.index.freeze(),
-            budget: self.budget,
-        }))
+        Ok(content)
     }
 
     /// Never-published writers only. Reconcile only a byte-exact known prefix;
@@ -444,7 +481,12 @@ impl Scratch {
         check()?;
         self.owned.check_identity()?;
         let before = stamp(&self.owned.file)?;
-        if before.bytes != HEADER.checked_add(self.written).ok_or(Error::Budget)? {
+        let footer_at = HEADER.checked_add(self.written).ok_or(Error::Budget)?;
+        if before.bytes
+            != footer_at
+                .checked_add(self.footer_written as u64)
+                .ok_or(Error::Budget)?
+        {
             return Err(Error::Changed);
         }
         let expected = finish(self.content);
@@ -464,6 +506,33 @@ impl Scratch {
         }
         if finish(observed) != expected {
             return Err(Error::Corrupt);
+        }
+        // Only writes whose complete success was observed enter this proof.
+        // A partial unknown write changes the expected length and stays held.
+        let index_bytes = self.footer_written.min(self.index.len());
+        for (n, expected) in self.index[..index_bytes].chunks(CHUNK).enumerate() {
+            check()?;
+            read_exact_at(
+                &self.owned.file,
+                footer_at + (n * CHUNK) as u64,
+                &mut buffer[..expected.len()],
+            )?;
+            if &buffer[..expected.len()] != expected {
+                return Err(Error::Corrupt);
+            }
+        }
+        if self.footer_written > index_bytes {
+            if self.footer_written - index_bytes != SEAL {
+                return Err(Error::Corrupt);
+            }
+            read_exact_at(
+                &self.owned.file,
+                footer_at + index_bytes as u64,
+                &mut buffer[..SEAL],
+            )?;
+            if buffer[..SEAL] != self.seal {
+                return Err(Error::Corrupt);
+            }
         }
         check()?;
         self.owned.check_identity()?;
@@ -594,24 +663,65 @@ impl Complete {
             ));
         }
         let row_bytes = width as usize * 8;
-        if output.len() != row_bytes * height as usize || !output.uses_budget(&self.budget) {
+        if output.len() != row_bytes * height as usize {
             return Err(Error::Budget);
         }
+        let row_stride = self.spec.row_bytes() as u64;
+        self.read_strided_into(
+            u64::from(y) * row_stride + u64::from(x) * 8,
+            row_bytes,
+            row_stride,
+            output,
+            check,
+        )
+    }
+
+    /// Copy ordered, nonoverlapping rows into a tightly packed provisional
+    /// destination. A verified chunk is retained only for this read.
+    pub(super) fn read_strided_into(
+        &self,
+        start: u64,
+        row_bytes: usize,
+        row_stride: u64,
+        output: &mut ScratchBytes,
+        check: Check<'_>,
+    ) -> Result<()> {
+        if output.len() > 64 * 1024 * 1024 || !output.uses_budget(&self.budget) {
+            return Err(Error::Budget);
+        }
+        if row_bytes == 0
+            || row_bytes as u64 > row_stride
+            || output.is_empty()
+            || output.len() % row_bytes != 0
+        {
+            return Err(Error::Invalid("Invalid strided source read shape"));
+        }
+        let rows = (output.len() / row_bytes) as u64;
+        let end = (rows - 1)
+            .checked_mul(row_stride)
+            .and_then(|skip| start.checked_add(skip))
+            .and_then(|last| last.checked_add(row_bytes as u64))
+            .filter(|&end| end <= self.spec.payload_bytes())
+            .ok_or(Error::Invalid("Strided source read exceeds its sealed payload"))?;
         check()?;
         self.owned.check()?;
         let mut buffer = ScratchBytes::new(&self.budget, CHUNK, CHUNK)?;
         let mut cached = None;
-        for row in 0..height {
-            check()?;
-            let start = (y as u64 + row as u64) * self.spec.row_bytes() as u64 + x as u64 * 8;
-            self.copy_range(
-                start,
-                start + row_bytes as u64,
-                &mut output[row as usize * row_bytes..(row as usize + 1) * row_bytes],
-                &mut buffer,
-                &mut cached,
-                check,
-            )?;
+        if row_bytes as u64 == row_stride {
+            self.copy_range(start, end, output, &mut buffer, &mut cached, check)?;
+        } else {
+            for (row, output) in output.chunks_exact_mut(row_bytes).enumerate() {
+                check()?;
+                let start = start + row as u64 * row_stride;
+                self.copy_range(
+                    start,
+                    start + row_bytes as u64,
+                    output,
+                    &mut buffer,
+                    &mut cached,
+                    check,
+                )?;
+            }
         }
         check()?;
         self.owned.check()
@@ -666,6 +776,61 @@ impl Complete {
         self.owned.check()
     }
 
+    pub(super) fn read_complete_chunks_into(
+        &self,
+        start: u64,
+        count: usize,
+        output: &mut ScratchBytes,
+        check: Check<'_>,
+    ) -> Result<()> {
+        if !(CHUNK..=VERIFIED_BATCH_BYTES).contains(&output.len())
+            || output.len() % CHUNK != 0
+            || !output.uses_budget(&self.budget)
+        {
+            return Err(Error::Budget);
+        }
+        if start >= self.spec.payload_bytes()
+            || count != (self.spec.payload_bytes() - start).min(output.len() as u64) as usize
+        {
+            return Err(Error::Invalid("Byte read requires complete sealed chunks"));
+        }
+        self.read_complete_chunks(start, &mut output[..count], check)
+    }
+
+    // Also used by the cursor, whose Read caller admits the destination buffer.
+    pub(super) fn read_complete_chunks(
+        &self,
+        start: u64,
+        output: &mut [u8],
+        check: Check<'_>,
+    ) -> Result<()> {
+        let bytes = self.spec.payload_bytes();
+        if !matches!(self.spec.kind, Kind::Bytes(..))
+            || start >= bytes
+            || start % CHUNK as u64 != 0
+            || output.is_empty()
+            || output.len() > VERIFIED_BATCH_BYTES
+            || output.len() as u64 > bytes - start
+            || (output.len() % CHUNK != 0 && output.len() as u64 != bytes - start)
+        {
+            return Err(Error::Invalid("Byte read requires complete sealed chunks"));
+        }
+        check()?;
+        self.owned.check()?;
+        read_exact_at(&self.owned.file, HEADER + start, output)?;
+        let first = start / CHUNK as u64;
+        for (offset, chunk) in output.chunks(CHUNK).enumerate() {
+            verify_chunk(&self.header, &self.index, first as usize + offset, chunk)?;
+        }
+        check()?;
+        self.owned.check()
+    }
+
+    fn read_authenticated_chunk(&self, number: u64, bytes: &mut [u8]) -> Result<()> {
+        read_exact_at(&self.owned.file, HEADER + number * CHUNK as u64, bytes)?;
+        verify_chunk(&self.header, &self.index, number as usize, bytes)
+    }
+
     fn copy_range(
         &self,
         start: u64,
@@ -676,18 +841,11 @@ impl Complete {
         check: Check<'_>,
     ) -> Result<()> {
         for number in start / CHUNK as u64..end.div_ceil(CHUNK as u64) {
-            check()?;
             let at = number * CHUNK as u64;
             let count = (self.spec.payload_bytes() - at).min(CHUNK as u64) as usize;
             if *cached != Some(number) {
-                read_exact_at(&self.owned.file, HEADER + at, &mut buffer[..count])?;
-                let mut hash = chunk_start(&self.header, number as usize);
-                hash.update(&buffer[..count]);
-                if hash.finish().as_ref()
-                    != &self.index[number as usize * 32..number as usize * 32 + 32]
-                {
-                    return Err(Error::Corrupt);
-                }
+                check()?;
+                self.read_authenticated_chunk(number, &mut buffer[..count])?;
                 *cached = Some(number);
             }
             let left = start.max(at);
@@ -709,12 +867,13 @@ pub(super) fn unlink_owned(_file: &File, path: &Path) -> Result<()> {
 
 #[cfg(windows)]
 pub(super) fn unlink_owned(file: &File, _path: &Path) -> Result<()> {
+    use ::windows::Win32::Storage::FileSystem::{FileDispositionInfoEx, FILE_INFO_BY_HANDLE_CLASS};
     use std::os::windows::io::AsRawHandle;
     #[link(name = "kernel32")]
     extern "system" {
         fn SetFileInformationByHandle(
             handle: *mut std::ffi::c_void,
-            class: u32,
+            class: FILE_INFO_BY_HANDLE_CLASS,
             info: *const std::ffi::c_void,
             bytes: u32,
         ) -> i32;
@@ -725,12 +884,39 @@ pub(super) fn unlink_owned(file: &File, _path: &Path) -> Result<()> {
     // SAFETY: File owns the live DELETE-capable handle. The one-DWORD structure
     // matches FileDispositionInfoEx and remains initialized for this call.
     if unsafe {
-        SetFileInformationByHandle(file.as_raw_handle(), 21, (&flags as *const u32).cast(), 4)
+        SetFileInformationByHandle(
+            file.as_raw_handle(),
+            FileDispositionInfoEx,
+            (&flags as *const u32).cast(),
+            4,
+        )
     } == 0
     {
         return Err(std::io::Error::last_os_error().into());
     }
     Ok(())
+}
+
+/// Delete through the admitted physical handle. A POSIX name is insufficient.
+pub(crate) fn unlink_owned_at(file: &File, directory: &File, name: &Path) -> Result<()> {
+    if name.components().count() != 1
+        || !matches!(
+            name.components().next(),
+            Some(std::path::Component::Normal(_))
+        )
+    {
+        return Err(Error::Changed);
+    }
+    #[cfg(windows)]
+    {
+        let _ = directory;
+        unlink_owned(file, name)
+    }
+    #[cfg(unix)]
+    {
+        let _ = (file, directory);
+        Err(Error::Changed)
+    }
 }
 
 fn hash_start(domain: &[u8], header: &[u8; 64]) -> Context {
@@ -753,6 +939,15 @@ fn finish(hash: Context) -> Digest {
     hash.finish().as_ref().try_into().unwrap()
 }
 
+fn verify_chunk(header: &[u8; 64], index: &[u8], number: usize, bytes: &[u8]) -> Result<()> {
+    let mut hash = chunk_start(header, number);
+    hash.update(bytes);
+    if hash.finish().as_ref() != &index[number * 32..number * 32 + 32] {
+        return Err(Error::Corrupt);
+    }
+    Ok(())
+}
+
 fn verify(
     file: &File,
     spec: Spec,
@@ -762,23 +957,29 @@ fn verify(
     budget: &ResidentBudget,
     check: Check<'_>,
 ) -> Result<()> {
-    let mut buffer = ScratchBytes::new(budget, CHUNK, CHUNK)?;
+    let payload = spec.payload_bytes();
+    let mut buffer = if matches!(spec.kind, Kind::Bytes(role, _) if role.photoshop_transfer()) {
+        verified_transfer_buffer(budget, payload)?
+    } else {
+        ScratchBytes::new(budget, CHUNK, CHUNK)?
+    };
     read_exact_at(file, 0, &mut buffer[..64])?;
     if &buffer[..64] != header {
         return Err(Error::Corrupt);
     }
     let mut content = spec.kind.content_start(header);
-    for n in 0..spec.chunks() {
+    let mut at = 0;
+    while at < payload {
         check()?;
-        let at = n as u64 * CHUNK as u64;
-        let count = (spec.payload_bytes() - at).min(CHUNK as u64) as usize;
-        read_exact_at(file, HEADER + at, &mut buffer[..count])?;
-        content.update(&buffer[..count]);
-        let mut chunk = chunk_start(header, n);
-        chunk.update(&buffer[..count]);
-        if chunk.finish().as_ref() != &index[n * 32..n * 32 + 32] {
-            return Err(Error::Corrupt);
+        let count = (payload - at).min(buffer.len() as u64) as usize;
+        let batch = &mut buffer[..count];
+        read_exact_at(file, HEADER + at, batch)?;
+        content.update(batch);
+        let first = (at / CHUNK as u64) as usize;
+        for (offset, chunk) in batch.chunks(CHUNK).enumerate() {
+            verify_chunk(header, index, first + offset, chunk)?;
         }
+        at += count as u64;
     }
     if content.finish().as_ref() != &seal[40..72] {
         return Err(Error::Corrupt);

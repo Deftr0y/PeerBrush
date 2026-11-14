@@ -138,8 +138,8 @@ mod tests {
             app.recovery.open = false;
             {
                 let mut engine = app.shared.lock().unwrap();
-                engine.doc = Document::new_depth(32, 24, depth).unwrap();
-                app.selected = engine.doc.layers[0].id.clone();
+                engine.resident_state_mut().expect("resident fixture").document = Document::new_depth(32, 24, depth).unwrap();
+                app.selected = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
                 for point in [[8, 8], [16, 16]] {
                     engine.edit("human", &[json!({"op":"paint","layer":app.selected,"points":[point],"radius":3,"color":[233,84,32,255]})], None, None, "Human artwork").unwrap();
                 }
@@ -148,10 +148,10 @@ mod tests {
             let (before, pixels, undo, redo) = {
                 let engine = app.shared.lock().unwrap();
                 (
-                    serde_json::to_value(&engine.doc).unwrap(),
-                    engine.doc.export_png().unwrap(),
-                    engine.undo.len(),
-                    engine.redo.len(),
+                    serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap(),
+                    engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
+                    engine.resident_state().expect("resident fixture").undo.len(),
+                    engine.resident_state().expect("resident fixture").redo.len(),
                 )
             };
             let frame = |app: &mut PeerBrush, events| ctx.run(input(events), |ctx| app.draw(ctx));
@@ -203,9 +203,9 @@ mod tests {
                 Some("unfinished human gesture")
             );
             let engine = app.shared.lock().unwrap();
-            assert_eq!(serde_json::to_value(&engine.doc).unwrap(), before);
-            assert_eq!(engine.doc.export_png().unwrap(), pixels);
-            assert_eq!((engine.undo.len(), engine.redo.len()), (undo, redo));
+            assert_eq!(serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap(), before);
+            assert_eq!(engine.resident_state().expect("resident fixture").document.export_png().unwrap(), pixels);
+            assert_eq!((engine.resident_state().expect("resident fixture").undo.len(), engine.resident_state().expect("resident fixture").redo.len()), (undo, redo));
             assert!(!engine.closed);
         }
     }

@@ -82,13 +82,13 @@ mod tests {
             app.recovery.open = false;
             let root = app.shared.clone();
             let project = app.project_id.clone();
-            let layer = root.lock().unwrap().doc.layers[0].id.clone();
+            let layer = root.lock().unwrap().resident_state().expect("resident fixture").document.layers[0].id.clone();
             server::dispatch(&root,"edit",&json!({"actor":"human","commands":[{"op":"paint","layer":layer,"points":[[10,10],[30,30]],"radius":5,"color":[233,84,32,255]},{"op":"selection","kind":"rectangle","rect":[3,4,40,50]}]})).unwrap();
             frame(&mut app, &ctx, Default::default());
             app.zoom = 1.7;
             app.pan = Vec2::new(13., -17.);
-            let before = root.lock().unwrap().state();
-            let history = root.lock().unwrap().undo.len();
+            let before = crate::server::state(&root).unwrap();
+            let history = root.lock().unwrap().resident_state().expect("resident fixture").undo.len();
             let path = std::env::temp_dir().join(format!(
                 "café שלום مرحبا हिन्दी 漢字 あいう 한글-{}.png",
                 crate::engine::id()
@@ -132,9 +132,9 @@ mod tests {
                 frame(&mut app, &ctx, Default::default());
             }
             frame(&mut app, &ctx, Default::default());
-            assert_eq!(app.shared.lock().unwrap().doc.bit_depth, depth);
+            assert_eq!(app.shared.lock().unwrap().resident_state().expect("resident fixture").document.bit_depth, depth);
             assert_eq!(
-                app.shared.lock().unwrap().doc.layers[0].pixels.get16(0, 0),
+                app.shared.lock().unwrap().resident_state().expect("resident fixture").document.layers[0].pixels.get16(0, 0),
                 if depth == 16 {
                     [12345, 23457, 45679, 32123]
                 } else {
@@ -142,12 +142,12 @@ mod tests {
                 }
             );
             assert_eq!(
-                app.shared.lock().unwrap().doc.name,
+                app.shared.lock().unwrap().resident_state().expect("resident fixture").document.name,
                 path.file_name().unwrap().to_str().unwrap()
             );
             assert_eq!(std::fs::read(&path).unwrap(), bytes);
-            assert_eq!(root.lock().unwrap().state(), before);
-            assert_eq!(root.lock().unwrap().undo.len(), history);
+            assert_eq!(crate::server::state(&root).unwrap(), before);
+            assert_eq!(root.lock().unwrap().resident_state().expect("resident fixture").undo.len(), history);
             crate::workspace::select(&root, &project).unwrap();
             app.switch_project(&project);
             assert_eq!(app.zoom, 1.7);
@@ -166,16 +166,16 @@ mod tests {
                 },
             );
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
-            while root.lock().unwrap().doc.layers.len() < 2 || app.busy {
+            while root.lock().unwrap().resident_state().expect("resident fixture").document.layers.len() < 2 || app.busy {
                 assert!(std::time::Instant::now() < deadline, "{}", app.message);
                 std::thread::sleep(Duration::from_millis(5));
                 frame(&mut app, &ctx, Default::default());
             }
             assert_eq!(crate::workspace::handles(&root).len(), 2);
-            assert_eq!(root.lock().unwrap().undo.len(), history + 1);
+            assert_eq!(root.lock().unwrap().resident_state().expect("resident fixture").undo.len(), history + 1);
             root.lock().unwrap().undo("human").unwrap();
-            assert_eq!(root.lock().unwrap().doc.layers.len(), 1);
-            assert_eq!(root.lock().unwrap().doc.selection, Some([3, 4, 40, 50]));
+            assert_eq!(root.lock().unwrap().resident_state().expect("resident fixture").document.layers.len(), 1);
+            assert_eq!(root.lock().unwrap().resident_state().expect("resident fixture").document.selection, Some([3, 4, 40, 50]));
             std::fs::remove_file(path).unwrap();
         }
     }
@@ -183,7 +183,7 @@ mod tests {
     fn ambiguous_multi_file_tab_drop_and_unsupported_single_file_preserve_projects() {
         let (mut app, ctx) = super::super::tests::fixture();
         app.recovery.open = false;
-        let before = app.shared.lock().unwrap().state();
+        let before = crate::server::state(&app.shared).unwrap();
         app.drop_project_file(vec!["One.png".into(), "Two.jpg".into()]);
         assert!(app.message.contains("Drop one file"));
         assert!(!app.busy);
@@ -198,7 +198,7 @@ mod tests {
             frame(&mut app, &ctx, Default::default());
         }
         assert!(app.message.contains("Unsupported"));
-        assert_eq!(app.shared.lock().unwrap().state(), before);
+        assert_eq!(crate::server::state(&app.shared).unwrap(), before);
         assert_eq!(crate::workspace::handles(&app.shared).len(), 1);
         std::fs::remove_file(path).unwrap();
     }

@@ -1,2 +1,3 @@
 scripts/sparkle-baseline.patch -text whitespace=-blank-at-eol
 packaging/attestation/trusted_root.jsonl -text
+packaging/notices/** -text

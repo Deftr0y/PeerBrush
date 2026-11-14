@@ -537,7 +537,7 @@ fn native_enumeration_reports_exact_selectable_faces_without_paths() {
             crate::source::TextLayout::Shaped,
         ] {
             let mut engine = crate::engine::Engine::new();
-            engine.doc = crate::engine::Document::new_depth(96, 64, depth).unwrap();
+            engine.resident_state_mut().expect("resident fixture").document = crate::engine::Document::new_depth(96, 64, depth).unwrap();
             let source = crate::source::Source {
                 width: 80,
                 height: 40,
@@ -562,8 +562,8 @@ fn native_enumeration_reports_exact_selectable_faces_without_paths() {
                     "Native installed font",
                 )
                 .unwrap();
-            assert_eq!(engine.undo.len(), 1);
-            let before = engine.doc.clone();
+            assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), 1);
+            let before = engine.resident_state().expect("resident fixture").document.clone();
             let words = before.layers[0].pixels.rgba16();
             assert!(words.chunks_exact(4).any(|pixel| pixel[3] > 0));
             if depth == 16 {

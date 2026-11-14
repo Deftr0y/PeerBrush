@@ -1,6 +1,7 @@
 use super::state::Plane;
 use crate::{
     engine::native::{LayerMetadata, LayerPatch, NativeDocument, RasterBatch, SourceUpdate},
+    large_document::Result as SourceResult,
     retained::transaction::Session,
     transform::native::{
         selected::{Placement, Selection},
@@ -57,9 +58,9 @@ impl<'a> Layer<'a> {
         if self
             .masks
             .iter()
-            .any(|m| !matches!(m.kind, "fill" | "paint"))
+            .any(|m| !matches!(m.kind, "fill" | "paint" | "density"))
         {
-            return Err("Independent or selected linked transforms require a fill/paint mask; mask effects are preserved unchanged. Unlink and choose a paint step for a mask-only transform.".into());
+            return Err("Independent or selected linked transforms support fill, paint and density steps. Unlink and choose a paint step for a mask-only transform.".into());
         }
         Ok(())
     }
@@ -73,6 +74,7 @@ impl<'a> Layer<'a> {
         session: &impl Session,
         work: &mut Work,
         check: &dyn Fn() -> Result<(), String>,
+        pinned: &dyn Fn() -> SourceResult<()>,
     ) -> Result<(), String> {
         let linked = self.metadata.mask().is_some_and(|m| m.linked());
         let mask = select_mask && !linked;
@@ -87,14 +89,10 @@ impl<'a> Layer<'a> {
             if paints == 0 {
                 return Err("Select a paint mask step to transform".into());
             }
-            let count = paints
-                .checked_mul(1 + self.masks.len())
-                .ok_or("Selected mask work overflow")?;
-            crate::transform::work_budget(self.frame[0], self.frame[1], count)?;
         }
         if linked {
             let (mut masked_origin, mut masked_frame) = (self.origin, self.frame);
-            self.edit_color(base, selection, placement, false, session, work, check)?;
+            self.edit_color(base, selection, placement, false, session, work, check, pinned)?;
             for index in 0..self.masks.len() {
                 if self.masks[index].kind == "paint" {
                     self.edit_mask(
@@ -108,11 +106,7 @@ impl<'a> Layer<'a> {
                         session,
                         work,
                         check,
-                    )?;
-                    crate::transform::work_budget(
-                        masked_frame[0],
-                        masked_frame[1],
-                        paints * (1 + self.masks.len()),
+                        pinned,
                     )?;
                 }
             }
@@ -127,7 +121,7 @@ impl<'a> Layer<'a> {
                 ];
                 for mask in &mut self.masks {
                     mask.pixels
-                        .reframe(base, self.frame, offset, session, work, check)?;
+                        .reframe(base, self.frame, offset, session, work, check, pinned)?;
                 }
             }
         } else if mask {
@@ -164,20 +158,14 @@ impl<'a> Layer<'a> {
                         session,
                         work,
                         check,
+                        pinned,
                     )?;
-                    if named.is_none() {
-                        crate::transform::work_budget(
-                            frame[0],
-                            frame[1],
-                            count * (1 + self.masks.len()),
-                        )?;
-                    }
                 }
             }
             self.origin = origin;
             self.frame = frame;
         } else {
-            self.edit_color(base, selection, placement, true, session, work, check)?;
+            self.edit_color(base, selection, placement, true, session, work, check, pinned)?;
         }
         Ok(())
     }
@@ -190,12 +178,9 @@ impl<'a> Layer<'a> {
         session: &impl Session,
         work: &mut Work,
         check: &dyn Fn() -> Result<(), String>,
+        pinned: &dyn Fn() -> SourceResult<()>,
     ) -> Result<(), String> {
         let (next, frame) = after(self.origin, self.frame, placement)?;
-        let count = if shift_masks { 1 + self.masks.len() } else { 1 };
-        if !placement.noop {
-            crate::transform::work_budget(frame[0], frame[1], count)?;
-        }
         self.color.edit(
             base,
             selection,
@@ -206,6 +191,7 @@ impl<'a> Layer<'a> {
             session,
             work,
             check,
+            pinned,
         )?;
         if !placement.noop && self.fill {
             self.fill = false;
@@ -215,7 +201,7 @@ impl<'a> Layer<'a> {
             let offset = [self.origin[0] - next[0], self.origin[1] - next[1]];
             for mask in &mut self.masks {
                 mask.pixels
-                    .shift(base, frame, offset, None, session, work, check)?;
+                    .shift(base, frame, offset, None, session, work, check, pinned)?;
             }
         }
         self.origin = next;
@@ -235,13 +221,11 @@ impl<'a> Layer<'a> {
         session: &impl Session,
         work: &mut Work,
         check: &dyn Fn() -> Result<(), String>,
+        pinned: &dyn Fn() -> SourceResult<()>,
     ) -> Result<(), String> {
         let (next, next_frame) = after(*origin, *frame, placement)?;
-        if !placement.noop {
-            crate::transform::work_budget(next_frame[0], next_frame[1], 1 + self.masks.len())?;
-        }
         self.masks[index].pixels.edit(
-            base, selection, placement, *origin, *frame, None, session, work, check,
+            base, selection, placement, *origin, *frame, None, session, work, check, pinned,
         )?;
         if next != *origin || next_frame != *frame {
             let offset = [origin[0] - next[0], origin[1] - next[1]];
@@ -249,7 +233,7 @@ impl<'a> Layer<'a> {
                 if other != index {
                     self.masks[other]
                         .pixels
-                        .shift(base, next_frame, offset, None, session, work, check)?;
+                        .shift(base, next_frame, offset, None, session, work, check, pinned)?;
                 }
             }
             if shift_color {
@@ -261,6 +245,7 @@ impl<'a> Layer<'a> {
                     session,
                     work,
                     check,
+                    pinned,
                 )?;
                 if self.fill {
                     self.fill = false;
@@ -299,6 +284,7 @@ impl<'a> Layer<'a> {
         command: crate::engine::native::Command<'_>,
         work: &mut Work,
         check: &dyn Fn() -> Result<(), String>,
+        pinned: &dyn Fn() -> SourceResult<()>,
     ) -> Result<(), String> {
         for mask in &self.masks {
             mask.pixels.check_reframed_write(
@@ -308,6 +294,7 @@ impl<'a> Layer<'a> {
                 self.origin,
                 work,
                 check,
+                pinned,
             )?;
         }
         Ok(())
@@ -362,6 +349,6 @@ pub(super) fn after(
         return Err("Invalid selected transform frame".into());
     }
     let frame = frame.map(|v| v as u32);
-    crate::raster::check_size(frame[0], frame[1])?;
+    crate::raster::CanvasLimits::Native.check(frame[0], frame[1])?;
     Ok((next, frame))
 }

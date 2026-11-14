@@ -15,6 +15,7 @@ pub(crate) const FILES: &[&str] = &[
     "tool-settings.json",
     "updates.json",
     "associations.json",
+    "preview.json",
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -498,6 +499,7 @@ fn validate(name: &str, path: &Path) -> Result<(), String> {
         "shortcuts.json" => crate::ui::validate_shortcut_preferences(path).err(),
         "updates.json" => crate::updates::validate_preferences(path).err(),
         "associations.json" => crate::ui::validate_association_preferences(path).err(),
+        "preview.json" => crate::ui::validate_preview_preferences(path).err(),
         _ => return Err("Unknown settings file".into()),
     };
     error.map_or(Ok(()), |e| Err(format!("Cannot migrate {name}: {e}")))

@@ -6,6 +6,9 @@ use std::{
     io::{self, Read, Seek, SeekFrom, Write},
     path::PathBuf,
 };
+#[path = "recovery_marker/pending.rs"]
+mod pending;
+pub(crate) use pending::RetiredPendingMarker;
 
 const MAX_MARKER: u64 = 128 * 1024 * 1024;
 
@@ -37,7 +40,7 @@ pub(crate) struct NativeMarker<'a> {
     modified: std::time::SystemTime,
 }
 impl NativeMarker<'_> {
-    pub(super) fn check_session(&self, session: &SourceSession) -> Result<(), String> {
+    pub(crate) fn check_session(&self, session: &SourceSession) -> Result<(), String> {
         if !std::ptr::eq(self.session, session) {
             return Err("Checkpoint marker belongs to another operation".into());
         }
@@ -131,24 +134,38 @@ impl Seek for NativeMarker<'_> {
 }
 
 struct Writer<'a> {
-    file: &'a mut File,
-    remaining: u64,
+    pending: &'a mut pending::Pending,
     session: &'a SourceSession,
     check: &'a dyn Fn() -> Result<(), String>,
+}
+struct PublicationAttempt<'a> {
+    session: &'a SourceSession,
+    settled: bool,
+}
+impl Drop for PublicationAttempt<'_> {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        // Publication may already be visible. An incomplete in-memory inventory
+        // must report uncertainty rather than an empty recovery catalog.
+        let mut state = self
+            .session
+            .runtime
+            .inventory
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(inventory) = state.as_mut() {
+            inventory.checkpoints.retain_uncertain_publication();
+        }
+    }
 }
 impl Write for Writer<'_> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         (self.check)()
             .and_then(|_| self.session.check())
             .map_err(io::Error::other)?;
-        if bytes.len() as u64 > self.remaining {
-            return Err(io::Error::other(
-                "Native recovery marker exceeds admitted length",
-            ));
-        }
-        let written = self.file.write(&bytes[..bytes.len().min(64 * 1024)])?;
-        self.remaining -= written as u64;
-        Ok(written)
+        self.pending.write(bytes)
     }
     fn flush(&mut self) -> io::Result<()> {
         (self.check)()
@@ -181,6 +198,9 @@ impl SourceSession {
             .try_lock()
             .map_err(|_| "Source inventory is busy")?;
         let inventory = state.as_ref().ok_or("Source inventory unavailable")?;
+        if inventory.checkpoints.ambiguous() {
+            return Err("Recovery checkpoint registration is uncertain; files retained".into());
+        }
         for held in &inventory.files {
             let Some(name) = held.path.file_name().and_then(|n| n.to_str()) else {
                 continue;
@@ -217,50 +237,63 @@ impl SourceSession {
         producer: &mut dyn FnMut(&mut dyn Write) -> Result<(), String>,
         check: &dyn Fn() -> Result<(), String>,
     ) -> Result<(), String> {
+        self.publish_recovery_marker_with_completion(
+            snapshot, bytes, sha256, producer, check, check,
+        )
+    }
+    pub(crate) fn publish_recovery_marker_with_completion(
+        &self,
+        snapshot: [u8; 16],
+        bytes: u64,
+        sha256: [u8; 32],
+        producer: &mut dyn FnMut(&mut dyn Write) -> Result<(), String>,
+        check: &dyn Fn() -> Result<(), String>,
+        complete: &dyn Fn() -> Result<(), String>,
+    ) -> Result<(), String> {
         if snapshot == [0; 16] || bytes == 0 || bytes > MAX_MARKER {
             return Err("Invalid native recovery marker admission".into());
         }
         check()?;
         self.check()?;
-        let directory = Directory::open(&self.directory)?;
-        let charge = self.disk().reserve(bytes).map_err(|e| e.to_string())?;
-        let uuid = uuid::Uuid::from_bytes(snapshot);
-        let from = format!("pending-{uuid}");
-        let to = format!("recovery-v3-{uuid}.pbr");
-        let mut file = owned_rename::staging_options()
-            .open(self.directory.join(&from))
-            .map_err(|_| "Cannot create exclusive native recovery marker")?;
-        charge.bind(&file).map_err(|e| e.to_string())?;
+        {
+            let state = self
+                .runtime
+                .inventory
+                .try_lock()
+                .map_err(|_| "Source inventory is busy")?;
+            let inventory = state.as_ref().ok_or("Source inventory unavailable")?;
+            if inventory.checkpoints.ambiguous() {
+                return Err(
+                    "Recovery publication is uncertain; restart before retrying, files retained"
+                        .into(),
+                );
+            }
+            if inventory.files.len() >= self.runtime.limits.max_files
+                || inventory.files.len() == inventory.files.capacity()
+            {
+                return Err("Native recovery marker inventory capacity exceeded".into());
+            }
+        }
+        let mut pending = pending::Pending::new(self, snapshot, bytes)?;
         let mut writer = Writer {
-            file: &mut file,
-            remaining: bytes,
+            pending: &mut pending,
             session: self,
             check,
         };
-        producer(&mut writer)?;
-        if writer.remaining != 0 {
-            return Err("Native recovery marker producer ended before its admitted length".into());
-        }
+        let produced = producer(&mut writer);
         drop(writer);
-        let proof =
-            owned_rename::Sealed::verify(&file, bytes, sha256, &self.resident(), &mut || {
-                check()?;
-                self.check()
-            })?;
-        owned_rename::publish_new(
-            directory.path(),
-            directory.held(),
-            std::path::Path::new(&from),
-            std::path::Path::new(&to),
-            &file,
-            &proof,
-            &mut || {
-                check()?;
-                self.check()
-            },
-        )?;
-        let held = HeldFile::new(self.directory.join(to), file)?;
-        check()?;
+        let proof = match produced.and_then(|_| pending.seal(self, sha256, check)) {
+            Ok(proof) => proof,
+            Err(error) => return Err(pending.abort(self, error)),
+        };
+        // Once publication is attempted, neither a path rollback nor unpublished
+        // cleanup may infer whether the canonical marker became visible.
+        let mut publication = PublicationAttempt {
+            session: self,
+            settled: false,
+        };
+        let held = pending.publish(self, &proof, check)?;
+        complete()?;
         self.check()?;
         let mut state = self
             .runtime
@@ -273,13 +306,16 @@ impl SourceSession {
                 "Native recovery marker inventory capacity exceeded; bytes retained".into(),
             );
         }
-        inventory
-            .files
-            .try_reserve(1)
-            .map_err(|_| "Native recovery marker inventory allocation refused")?;
+        if inventory.files.len() == inventory.files.capacity() {
+            return Err(
+                "Native recovery marker inventory admission changed; bytes retained".into(),
+            );
+        }
         inventory.files.push(held);
         drop(state);
-        self.check()
+        let result = self.check();
+        publication.settled = result.is_ok();
+        result
     }
 
     pub(crate) fn open_recovery_marker(
@@ -344,7 +380,22 @@ impl SourceSession {
         if offset >= held.bytes {
             return Err("Test offset exceeds marker".into());
         }
-        let mut file = &held.file;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.share_mode(7).custom_flags(0x00200000);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+        }
+        let mut file = options.open(&path).map_err(|e| e.to_string())?;
+        if crate::file_safety::identity(&file)? != held.identity {
+            return Err("Test marker owner changed".into());
+        }
         file.seek(SeekFrom::Start(offset))
             .map_err(|e| e.to_string())?;
         let mut byte = [0];
@@ -353,7 +404,29 @@ impl SourceSession {
         file.seek(SeekFrom::Start(offset))
             .map_err(|e| e.to_string())?;
         file.write_all(&byte).map_err(|e| e.to_string())?;
-        file.set_times(std::fs::FileTimes::new().set_modified(held.modified))
+        file.sync_all().map_err(|e| e.to_string())?;
+        drop(file);
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options
+                .access_mode(0x100)
+                .share_mode(7)
+                .custom_flags(0x00200000);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+        }
+        let stamp = options.open(&path).map_err(|e| e.to_string())?;
+        if crate::file_safety::identity(&stamp)? != held.identity {
+            return Err("Test marker owner changed".into());
+        }
+        stamp
+            .set_times(std::fs::FileTimes::new().set_modified(held.modified))
             .map_err(|e| e.to_string())?;
         Ok(())
     }

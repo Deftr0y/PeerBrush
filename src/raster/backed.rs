@@ -36,6 +36,13 @@ impl Region {
     pub fn pixels(self) -> usize {
         (self.0[2] - self.0[0]) as usize * (self.0[3] - self.0[1]) as usize
     }
+
+    pub(super) fn tile_ranges(self, width: u32, height: u32) -> [std::ops::Range<u32>; 2] {
+        let [left, top, right, bottom] = self.0;
+        let x = |edge: i32| edge.clamp(0, width as i32) as u32;
+        let y = |edge: i32| edge.clamp(0, height as i32) as u32;
+        [x(left) / TILE..x(right).div_ceil(TILE), y(top) / TILE..y(bottom).div_ceil(TILE)]
+    }
     fn contains(self, x: i32, y: i32) -> bool {
         x >= self.0[0] && y >= self.0[1] && x < self.0[2] && y < self.0[3]
     }
@@ -152,20 +159,10 @@ impl Plane {
         check: &mut dyn FnMut() -> Result<()>,
     ) -> Result<PinnedRegion> {
         check()?;
-        let [left, top, right, bottom] = region.0;
-        let x0 = left.max(0).min(self.width as i32) as u32 / TILE;
-        let y0 = top.max(0).min(self.height as i32) as u32 / TILE;
-        let x1 = (right.max(0).min(self.width as i32) as u32).div_ceil(TILE);
-        let y1 = (bottom.max(0).min(self.height as i32) as u32).div_ceil(TILE);
-        if u64::from(x1.saturating_sub(x0)) * u64::from(y1.saturating_sub(y0))
-            > MAX_REGION_TILES as u64
-        {
-            return Err(Error::Budget);
-        }
-        let count = (x1.saturating_sub(x0) as usize) * (y1.saturating_sub(y0) as usize);
-        let mut tiles = RegionPins::new(&self.store.resident_budget(), count)?;
-        for y in y0..y1 {
-            for x in x0..x1 {
+        let [xs, ys] = region.tile_ranges(self.width, self.height);
+        let mut tiles = RegionPins::new(&self.store.resident_budget(), xs.len() * ys.len())?;
+        for y in ys {
+            for x in xs.clone() {
                 check()?;
                 if let Some(reference) = self.blocks.get(&(x, y)) {
                     let tile = self.store.pin(*reference, check)?;
@@ -312,21 +309,36 @@ impl PinnedRegion {
 
     /// Caller owns the bounded row buffer. Native16 output remains big endian.
     pub fn copy_row(&self, y: i32, output: &mut [u8]) -> Result<()> {
-        let width = (self.region.0[2] - self.region.0[0]) as usize;
+        let [left, top, right, bottom] = self.region.0;
+        let width = (right - left) as usize;
         let stride = if self.depth == 16 { 8 } else { 4 };
-        if output.len() != width * stride || y < self.region.0[1] || y >= self.region.0[3] {
+        if output.len() != width * stride || y < top || y >= bottom {
             return Err(Error::Invalid(
                 "Native row does not match its pinned window/depth",
             ));
         }
-        for (x, out) in (self.region.0[0]..self.region.0[2]).zip(output.chunks_exact_mut(stride)) {
-            let pixel = self.pixel16(x, y)?;
-            if self.depth == 16 {
-                for (word, bytes) in pixel.into_iter().zip(out.chunks_exact_mut(2)) {
-                    bytes.copy_from_slice(&word.to_be_bytes());
-                }
+        let start = left.max(0);
+        let end = right.min(self.width as i32);
+        if start >= end || y < 0 || y >= self.height as i32 {
+            output.fill(0);
+            return Ok(());
+        }
+        output[..(start - left) as usize * stride].fill(0);
+        output[(end - left) as usize * stride..].fill(0);
+        let y = y as u32;
+        let row_offset = ((y % TILE) * TILE) as usize;
+        for tx in start as u32 / TILE..(end as u32).div_ceil(TILE) {
+            let tile_left = tx * TILE;
+            let from = (start as u32).max(tile_left);
+            let to = (end as u32).min(tile_left + TILE);
+            let output_start = (from as i32 - left) as usize * stride;
+            let length = (to - from) as usize * stride;
+            let span = &mut output[output_start..output_start + length];
+            if let Some(tile) = self.tiles.get((tx, y / TILE)) {
+                let source_start = (row_offset + (from - tile_left) as usize) * stride;
+                span.copy_from_slice(&tile.bytes()[source_start..source_start + length]);
             } else {
-                out.copy_from_slice(&pixel.map(project16));
+                span.fill(0);
             }
         }
         Ok(())
@@ -359,6 +371,45 @@ mod tests {
         .unwrap();
         (store, path)
     }
+    #[test]
+    fn native_row_copies_across_sparse_tiles_and_clips_physical_padding() {
+        for depth in [8, 16] {
+            let (store, path) = make_store(4 * 1024 * 1024);
+            let mut raster = Raster::new_depth(513, 257, depth);
+            raster.set16(255, 256, [12347, 23521, 43217, 0]);
+            raster.set16(512, 256, [13453, 24733, 45117, 49153]);
+            if depth == 16 {
+                std::sync::Arc::make_mut(raster.samples16.get_mut(&(2, 1)).unwrap())[4] = 54321;
+            } else {
+                std::sync::Arc::make_mut(raster.tiles.get_mut(&(2, 1)).unwrap())[4] = 211;
+            }
+            let plane = Plane::from_resident(&raster, store.clone(), &mut || Ok(())).unwrap();
+            let view = plane
+                .pin(Region::new([-2, 255, 515, 259]).unwrap(), &mut || Ok(()))
+                .unwrap();
+            let stride = if depth == 16 { 8 } else { 4 };
+            let mut row = vec![0xa5; 517 * stride];
+            for y in 255..259 {
+                row.fill(0xa5);
+                view.copy_row(y, &mut row).unwrap();
+                for (x, bytes) in (-2..515).zip(row.chunks_exact(stride)) {
+                    let expected = raster.get16(x, y);
+                    if depth == 16 {
+                        for (sample, word) in bytes.chunks_exact(2).zip(expected) {
+                            assert_eq!(sample, word.to_be_bytes());
+                        }
+                    } else {
+                        assert_eq!(bytes, expected.map(project16));
+                    }
+                }
+            }
+            assert!(view.copy_row(259, &mut row).is_err());
+            assert!(view.copy_row(256, &mut row[1..]).is_err());
+            drop((view, plane, store));
+            std::fs::remove_dir_all(path).unwrap();
+        }
+    }
+
     #[test]
     fn native_planes_preserve_edge_stride_low_bits_and_explicit_window() {
         for depth in [8, 16] {

@@ -225,43 +225,25 @@ fn run(queue: Arc<Queue>) {
                 uploads,
             } => {
                 let tag = request.tag();
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    request.render(&mut || {
+                let mut result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut check = || {
                         if epoch.load(Ordering::Relaxed) == job {
                             Ok(())
                         } else {
                             Err("Preview superseded".into())
                         }
-                    })
+                    };
+                    if let Some((retirement, side)) = uploads {
+                        super::native_texture::Prepared::from_request(&request, &retirement, side, None, None, &mut check)
+                            .map(NativeOutput::Uploads)
+                    } else {
+                        request.render(&mut check).map(NativeOutput::Pixels)
+                    }
                 }))
                 .unwrap_or_else(|_| Err("Native preview could not complete".into()));
                 // No scene, Surface, source session or profile operation escapes
                 // into the UI reply. Release all of them before notifying UI.
                 drop(request);
-                let mut result = result.and_then(|frame| {
-                    if let Some((retirement, side)) = uploads {
-                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            super::native_texture::Prepared::from_frame(
-                                frame,
-                                &retirement,
-                                side,
-                                &mut || {
-                                    if epoch.load(Ordering::Relaxed) == job {
-                                        Ok(())
-                                    } else {
-                                        Err("Preview superseded".into())
-                                    }
-                                },
-                            )
-                            .map(NativeOutput::Uploads)
-                        }))
-                        .unwrap_or_else(|_| {
-                            Err("Native display upload preparation could not complete".into())
-                        })
-                    } else {
-                        Ok(NativeOutput::Pixels(frame))
-                    }
-                });
                 if epoch.load(Ordering::Relaxed) != job {
                     result = Err("Preview superseded".into());
                 }

@@ -200,6 +200,78 @@ fn source(depth: u16) -> Document {
     source.layers[0].pixels.set16(8, 6, [7, 11, 13, 0]);
     source
 }
+
+#[test]
+fn sparse_brush_expansion_keeps_aligned_source_and_discards_former_padding() {
+    let f = Fixture::new();
+    let (runtime, _connection) = f.runtime();
+    let session = runtime.begin().unwrap();
+    for depth in [8, 16] {
+        let mut source = Document::new_depth(513, 257, depth).unwrap();
+        source.width = 16000;
+        source.height = 9000;
+        let layer = &mut source.layers[0];
+        layer.pixels.set16(17, 17, [12347, 23521, 43217, 0]);
+        layer.pixels.set16(512, 256, [13453, 24733, 45117, 49153]);
+        if depth == 16 {
+            Arc::make_mut(layer.pixels.samples16.get_mut(&(2, 1)).unwrap())[4..8]
+                .copy_from_slice(&[52123, 12837, 29831, 60117]);
+        } else {
+            Arc::make_mut(layer.pixels.tiles.get_mut(&(2, 1)).unwrap())[4..8]
+                .copy_from_slice(&[201, 50, 118, 233]);
+        }
+        let document = native(&source, &session);
+        let input = RasterInput::layer(&document, &source.layers[0].id).unwrap();
+        let frame = input
+            .project_frame([15986, 8986, 15996, 8996])
+            .unwrap()
+            .unwrap();
+        let stroke =
+            LocalStroke::for_frame(&input, &frame, &[[15991.5, 8991.5]], None, &mut || Ok(()))
+                .unwrap();
+        let original = input.surface().physical_tile((0, 0)).unwrap();
+        let mut checks = 0;
+        let BuiltTiles::Draft(draft) = crate::brush::input::stage(
+            &input,
+            &stroke,
+            crate::brush::Settings {
+                radius: 2.,
+                ..Default::default()
+            },
+            [17, 83, 219, 255],
+            false,
+            Some(&frame),
+            &session,
+            &mut || {
+                checks += 1;
+                Ok(())
+            },
+        )
+        .unwrap() else {
+            panic!("Missing expanded stroke output");
+        };
+        assert!(checks < 2000, "Sparse frame visited too many tiles or rows");
+        let output = draft.seal(&|| Ok(())).ok().unwrap();
+        let surface = output.surface();
+        assert_eq!([surface.width(), surface.height()], [16000, 9000]);
+        assert_eq!(surface.physical_tiles().count(), 3);
+        let retained = surface.physical_tile((0, 0)).unwrap();
+        assert!(retained.owner().same_owner(original.owner()));
+        assert_eq!(retained.reference(), original.reference());
+        let pixel = |x, y| {
+            surface
+                .prepare_region(Region::new([x, y, x + 1, y + 1]).unwrap(), &mut || Ok(()))
+                .unwrap()
+                .pixel16(x, y)
+                .unwrap()
+        };
+        assert_eq!(pixel(17, 17), source.layers[0].pixels.get16(17, 17));
+        assert_eq!(pixel(512, 256), source.layers[0].pixels.get16(512, 256));
+        assert_eq!(pixel(513, 256), [0; 4]);
+        assert!(pixel(15991, 8991)[3] > 0);
+        output.abort(&session, &|| Ok(())).unwrap();
+    }
+}
 fn input_failure(case: &str, phase: &str, depth: u16, mode: &str, category: &str, count: usize) {
     assert!(count <= 1_048_576);
     eprintln!("PB_NATIVE_INPUT_FAILURE case={case} phase={phase} depth={depth} mode={mode} category={category} count={count}");
@@ -225,6 +297,18 @@ fn projected_tiles_are_generation_bound_native_and_preserve_physical_padding() {
             source.layers[0].pixels.get16(0, 0)
         );
         assert!(region.pixel16(9, 0).is_err());
+        let mut outer = true;
+        let reason = input
+            .prepare_region([0, 0, 9, 7], &mut || {
+                if std::mem::take(&mut outer) {
+                    Ok(())
+                } else {
+                    Err("Source inventory is busy".into())
+                }
+            })
+            .err()
+            .unwrap();
+        assert_eq!(reason, "Source inventory is busy");
         let halo = input
             .prepare_halo([-2, -3, 12, 10], &mut || Ok(()))
             .unwrap();
@@ -308,7 +392,13 @@ fn actual_session_brush_stages_exact_native_pixels_without_changing_document_or_
         .unwrap();
         let local = LocalStroke::new(&input, &points, Some(&pressures), &mut || Ok(())).unwrap();
         let plan = local
-            .brush(&input, settings, [17, 83, 219, 127], false, &mut || Ok(()))
+            .brush(
+                &input,
+                settings,
+                input.color([17, 83, 219, 127]).map(|v| u16::from(v) * 257),
+                false,
+                &mut || Ok(()),
+            )
             .unwrap();
         let before = input.prepare_tile((0, 0), &mut || Ok(())).unwrap();
         let output = plan
@@ -355,6 +445,87 @@ fn actual_session_brush_stages_exact_native_pixels_without_changing_document_or_
     }
 }
 #[test]
+fn working_smudge_reads_combine_staged_zero_staged_pixels_and_original_tiles() {
+    let f = Fixture::new();
+    let (runtime, _connection) = f.runtime();
+    let session = runtime.begin().unwrap();
+    for depth in [8, 16] {
+        let mut source = Document::new_depth(513, 1, depth).unwrap();
+        let pixels = &mut source.layers[0].pixels;
+        pixels.set16(255, 0, [771, 2827, 4883, 65535]);
+        pixels.set16(256, 0, [12347, 23521, 43217, 49153]);
+        pixels.set16(512, 0, [13453, 24733, 45117, 53153]);
+        let document = native(&source, &session);
+        let input = RasterInput::layer(&document, &source.layers[0].id).unwrap();
+        let baseline = runtime.disk().used().unwrap();
+        let mut generated = TileOutput::new(&input, &session).unwrap();
+        let before = input.prepare_tile((0, 0), &mut || Ok(())).unwrap();
+        let erase = input.prepare_tile((1, 0), &mut || Ok(())).unwrap();
+        let left = [8317u16, 19411, 31419, 61459];
+        let encode = |pixel: [u16; 4]| {
+            if depth == 16 {
+                pixel
+                    .into_iter()
+                    .flat_map(u16::to_be_bytes)
+                    .collect::<Vec<_>>()
+            } else {
+                pixel.map(project16).to_vec()
+            }
+        };
+        let changed = encode(left);
+        let bpp = changed.len();
+        let length = before.bytes().len();
+        let mut tile = ScratchBytes::new(input.pool(), length, length).unwrap();
+        tile.copy_from_slice(before.bytes());
+        tile[255 * bpp..256 * bpp].copy_from_slice(&changed);
+        generated
+            .replace_tile(&before, tile.freeze(), &mut || Ok(()))
+            .unwrap();
+        let zero = ScratchBytes::new(input.pool(), length, length)
+            .unwrap()
+            .freeze();
+        generated
+            .replace_tile(&erase, zero, &mut || Ok(()))
+            .unwrap();
+
+        let area = [255, 0, 513, 1];
+        let read = generated
+            .prepare_working_strip(area, &mut || Ok(()))
+            .unwrap();
+        assert_eq!(&read[..bpp], changed.as_slice());
+        assert!(read[bpp..257 * bpp].iter().all(|&byte| byte == 0));
+        assert_eq!(
+            &read[257 * bpp..],
+            encode(source.layers[0].pixels.get16(512, 0))
+        );
+        let tile = generated
+            .prepare_working_tile((0, 0), &mut || Ok(()))
+            .unwrap();
+        assert_eq!(&tile[255 * bpp..256 * bpp], changed.as_slice());
+        assert!(generated
+            .prepare_working_tile((3, 0), &mut || Ok(()))
+            .is_err());
+        assert!(generated
+            .prepare_working_strip(area, &mut || Err("cancelled".into()))
+            .is_err());
+
+        generated
+            .replace_tile(&erase, erase.bytes().clone(), &mut || Ok(()))
+            .unwrap();
+        let read = generated
+            .prepare_working_strip(area, &mut || Ok(()))
+            .unwrap();
+        assert_eq!(
+            &read[bpp..2 * bpp],
+            encode(source.layers[0].pixels.get16(256, 0))
+        );
+        assert_eq!(&read[..bpp], changed.as_slice());
+        generated.abort().unwrap();
+        assert_eq!(runtime.disk().used().unwrap(), baseline);
+    }
+}
+
+#[test]
 fn refused_output_poison_preserves_baseline_and_retires_only_owned_staging() {
     let f = Fixture::new();
     let (runtime, _connection) = f.runtime();
@@ -377,6 +548,9 @@ fn refused_output_poison_preserves_baseline_and_retires_only_owned_staging() {
         Err("cancelled".into())
     });
     assert!(error.is_err());
+    assert!(generated
+        .prepare_working_tile((0, 0), &mut || Ok(()))
+        .is_err());
     let refused = generated.finish(&mut || Ok(())).err().unwrap();
     assert!(refused.reason().contains("partial work"));
     refused.abort().unwrap();
@@ -589,17 +763,12 @@ fn projected_frame_and_brush_share_one_complete_output_with_the_legacy_soft_base
         // Disk quota grows BEFORE append completes. Cancel only after a full
         // owned frame exists; an interrupted append has a separate retention
         // oracle below and must never be mistaken for confirmed retirement.
-        let seed = crate::edit_bounds::output::stage_frame_seed(
-            &input,
-            &frame,
-            &session,
-            &mut || Ok(()),
-            |_, bytes, _| Ok(bytes.clone()),
-        )
-        .unwrap_or_else(|_| {
-            input_failure("frame_brush", "cancel", depth, "brush", "refused", 1);
-            panic!("Complete frame preparation refused")
-        });
+        let seed =
+            crate::edit_bounds::output::stage_frame_seed(&input, &frame, &session, &mut || Ok(()))
+                .unwrap_or_else(|_| {
+                    input_failure("frame_brush", "cancel", depth, "brush", "refused", 1);
+                    panic!("Complete frame preparation refused")
+                });
         assert!(runtime.disk().used().unwrap() > baseline);
         let error = match seed
             .finish(&mut || Err("Cancelled after completed native frame staging".into()))
@@ -733,23 +902,79 @@ fn fill_visual_baseline_fixes_unselected_loss_and_keeps_one_real_undo_redo() {
         crate::selection::restrict_document(&mut unsafe_order, &raw_before, &coverage);
         assert_eq!(unsafe_order.layers[0].pixels.get16(7, 5), [0; 4]);
         let mut legacy = crate::engine::Engine::new();
-        legacy.doc = source.clone();
+        legacy
+            .resident_state_mut()
+            .expect("resident fixture")
+            .document = source.clone();
         legacy
             .edit("human", &[command], None, None, "Fill")
             .unwrap();
         let literal = source.layers[0].color.map(|v| u16::from(v) * 257);
-        assert_eq!(legacy.doc.layers[0].pixels.get16(7, 5), literal);
-        assert_eq!(legacy.doc.layers[0].kind, "paint");
-        assert_eq!(legacy.undo.len(), 1);
-        let after = legacy.doc.layers[0].pixels.clone();
-        legacy.undo("human").unwrap();
-        assert_eq!(legacy.doc.layers[0].kind, "fill");
         assert_eq!(
-            legacy.doc.layers[0].pixels.get16(0, 0),
+            legacy
+                .resident_state()
+                .expect("resident fixture")
+                .document
+                .layers[0]
+                .pixels
+                .get16(7, 5),
+            literal
+        );
+        assert_eq!(
+            legacy
+                .resident_state()
+                .expect("resident fixture")
+                .document
+                .layers[0]
+                .kind,
+            "paint"
+        );
+        assert_eq!(
+            legacy
+                .resident_state()
+                .expect("resident fixture")
+                .undo
+                .len(),
+            1
+        );
+        let after = legacy
+            .resident_state()
+            .expect("resident fixture")
+            .document
+            .layers[0]
+            .pixels
+            .clone();
+        legacy.undo("human").unwrap();
+        assert_eq!(
+            legacy
+                .resident_state()
+                .expect("resident fixture")
+                .document
+                .layers[0]
+                .kind,
+            "fill"
+        );
+        assert_eq!(
+            legacy
+                .resident_state()
+                .expect("resident fixture")
+                .document
+                .layers[0]
+                .pixels
+                .get16(0, 0),
             source.layers[0].pixels.get16(0, 0)
         );
         legacy.redo("human").unwrap();
-        assert_eq!(legacy.doc.layers[0].pixels.get16(7, 5), literal);
+        assert_eq!(
+            legacy
+                .resident_state()
+                .expect("resident fixture")
+                .document
+                .layers[0]
+                .pixels
+                .get16(7, 5),
+            literal
+        );
         let document = native(&source, &session);
         let input = RasterInput::layer(&document, &source.layers[0].id).unwrap();
         let generated = crate::fill::input::stage_fill(
@@ -808,16 +1033,50 @@ fn corrected_fill_frame_keeps_visible_pixels_at_original_document_coordinates() 
         });
         let command = serde_json::json!({"op":"paint.fill","layer":source.layers[0].id,"rect":[0,0,2,2],"color":[240,16,48,255]});
         let mut legacy = crate::engine::Engine::new();
-        legacy.doc = source.clone();
+        legacy
+            .resident_state_mut()
+            .expect("resident fixture")
+            .document = source.clone();
         legacy
             .edit("human", &[command], None, None, "Fill")
             .unwrap();
-        assert_eq!([legacy.doc.layers[0].x, legacy.doc.layers[0].y], [0, 0]);
         assert_eq!(
-            legacy.doc.layers[0].pixels.get16(6, 5),
+            [
+                legacy
+                    .resident_state()
+                    .expect("resident fixture")
+                    .document
+                    .layers[0]
+                    .x,
+                legacy
+                    .resident_state()
+                    .expect("resident fixture")
+                    .document
+                    .layers[0]
+                    .y
+            ],
+            [0, 0]
+        );
+        assert_eq!(
+            legacy
+                .resident_state()
+                .expect("resident fixture")
+                .document
+                .layers[0]
+                .pixels
+                .get16(6, 5),
             [32, 96, 160, 128].map(|v| v * 257)
         );
-        assert_eq!(legacy.doc.layers[0].pixels.get16(0, 5), [0; 4]);
+        assert_eq!(
+            legacy
+                .resident_state()
+                .expect("resident fixture")
+                .document
+                .layers[0]
+                .pixels
+                .get16(0, 5),
+            [0; 4]
+        );
         let document = native(&source, &session);
         let input = RasterInput::layer(&document, &source.layers[0].id).unwrap();
         let frame = input.project_frame([0, 0, 2, 2]).unwrap().unwrap();
@@ -854,7 +1113,13 @@ fn corrected_fill_frame_keeps_visible_pixels_at_original_document_coordinates() 
             for x in 0..12 {
                 assert_eq!(
                     region.pixel16(x, y).unwrap(),
-                    legacy.doc.layers[0].pixels.get16(x, y)
+                    legacy
+                        .resident_state()
+                        .expect("resident fixture")
+                        .document
+                        .layers[0]
+                        .pixels
+                        .get16(x, y)
                 );
             }
         }
@@ -883,12 +1148,36 @@ fn fill_clear_consumes_soft_coverage_once_and_keeps_transparent_baseline_rgb() {
                 contours: vec![],
             });
             let mut legacy = crate::engine::Engine::new();
-            legacy.doc = source.clone();
+            legacy
+                .resident_state_mut()
+                .expect("resident fixture")
+                .document = source.clone();
             legacy.edit("human",&[serde_json::json!({"op":"paint.clear_selection","layer":source.layers[0].id})],None,None,"Clear").unwrap();
-            assert_eq!(legacy.undo.len(), 1);
-            assert_eq!(legacy.doc.layers[0].kind, "paint");
             assert_eq!(
-                legacy.doc.layers[0].pixels.get16(7, 5),
+                legacy
+                    .resident_state()
+                    .expect("resident fixture")
+                    .undo
+                    .len(),
+                1
+            );
+            assert_eq!(
+                legacy
+                    .resident_state()
+                    .expect("resident fixture")
+                    .document
+                    .layers[0]
+                    .kind,
+                "paint"
+            );
+            assert_eq!(
+                legacy
+                    .resident_state()
+                    .expect("resident fixture")
+                    .document
+                    .layers[0]
+                    .pixels
+                    .get16(7, 5),
                 color.map(|v| u16::from(v) * 257)
             );
             let document = native(&source, &session);
@@ -908,11 +1197,90 @@ fn fill_clear_consumes_soft_coverage_once_and_keeps_transparent_baseline_rgb() {
                 for x in 0..9 {
                     assert_eq!(
                         region.pixel16(x, y).unwrap(),
-                        legacy.doc.layers[0].pixels.get16(x, y)
+                        legacy
+                            .resident_state()
+                            .expect("resident fixture")
+                            .document
+                            .layers[0]
+                            .pixels
+                            .get16(x, y)
                     );
                 }
             }
             drop(region);
+            staged.abort(&session, &|| Ok(())).unwrap();
+        }
+    }
+}
+
+#[test]
+fn sparse_clear_keeps_unselected_tiles_and_skips_missing_raster_tiles() {
+    let fixture = Fixture::new();
+    let (runtime, _connection) = fixture.runtime();
+    let session = runtime.begin().unwrap();
+    for depth in [8, 16] {
+        for mask in [false, true] {
+            let mut source = Document::new_depth(4096, 132, depth).unwrap();
+            let layer = &mut source.layers[0];
+            layer.x = 5;
+            layer.y = 3;
+            let target = layer.id.clone();
+            let mut pixels = Raster::new_depth(4096, 132, depth);
+            for (x, pixel) in [
+                (5, [12347, 23459, 34571, 65535]),
+                (2043, [34571, 45673, 56789, 0]),
+                (4075, [45673, 34571, 23459, 50001]),
+            ] {
+                pixels.set16(x, 1, pixel);
+            }
+            if mask {
+                layer.mask = Some(crate::engine::Mask {
+                    enabled: true, linked: true, cache_key: crate::engine::id(),
+                    steps: vec![crate::engine::MaskStep {
+                        id: "clear-step".into(), kind: "paint".into(), enabled: false,
+                        weight: 1., value: 0., pixels, settings: serde_json::Value::Null,
+                    }],
+                });
+            } else {
+                layer.pixels = pixels;
+            }
+            let bounds = [10, 4, 4081, 131];
+            let mut coverage = Raster::new(4089, 131);
+            for (x, value) in [(3, 91), (1033, 255), (4073, 173)] {
+                coverage.set(x, 3, [value; 4]);
+            }
+            source.selection = Some(bounds);
+            source.selection_coverage = Some(crate::selection::Coverage {
+                mask: coverage, bounds, origin: [7, 1], contours: vec![],
+            });
+            let step = mask.then_some("clear-step");
+            let command = serde_json::json!({"op":"paint.clear_selection","layer":target,"mask":mask,"step":step});
+            let mut expected = source.clone();
+            crate::fill::clear_selection(&mut expected, &command).unwrap();
+            let layer = &expected.layers[0];
+            let expected = if let Some(mask) = &layer.mask { &mask.steps[0].pixels } else { &layer.pixels };
+            let document = native(&source, &session);
+            let input = RasterInput::from_parameters(&document, &command).unwrap();
+            let mut checks = 0;
+            let generated = crate::fill::input::stage_clear(&input, &session, &mut || {
+                checks += 1;
+                if checks > 900 { Err("Clear visited empty tiles".into()) } else { Ok(()) }
+            }).unwrap();
+            let (BuiltTiles::Draft(draft), _) = generated.into_parts() else {
+                panic!("Sparse clear produced no changed tiles");
+            };
+            let staged = draft.seal(&|| Ok(())).ok().unwrap();
+            let middle = (2043 / crate::raster::TILE, 0);
+            assert_eq!(
+                staged.surface().physical_tile(middle).unwrap().reference(),
+                input.surface().physical_tile(middle).unwrap().reference(),
+            );
+            for x in [5, 1035, 2043, 4075] {
+                let view = staged.surface().prepare_region(
+                    Region::new([x, 1, x + 1, 2]).unwrap(), &mut || Ok(()),
+                ).unwrap();
+                assert_eq!(view.pixel16(x, 1).unwrap(), expected.get16(x, 1));
+            }
             staged.abort(&session, &|| Ok(())).unwrap();
         }
     }
@@ -983,11 +1351,21 @@ fn ordered_session_smudge_matches_native_resident_with_one_final_soft_selection(
         let (points, pressures) = crate::brush::points_from_command(&command).unwrap();
         let settings = crate::brush::Settings::from_command(&command).unwrap();
         let mut legacy = crate::engine::Engine::new();
-        legacy.doc = source.clone();
+        legacy
+            .resident_state_mut()
+            .expect("resident fixture")
+            .document = source.clone();
         legacy
             .edit("human", &[command], None, None, "Smudge")
             .unwrap();
-        assert_eq!(legacy.undo.len(), 1);
+        assert_eq!(
+            legacy
+                .resident_state()
+                .expect("resident fixture")
+                .undo
+                .len(),
+            1
+        );
         let document = native(&source, &session);
         let input = RasterInput::layer(&document, &source.layers[0].id).unwrap();
         let stroke =
@@ -1013,7 +1391,13 @@ fn ordered_session_smudge_matches_native_resident_with_one_final_soft_selection(
             for x in 0..9 {
                 assert_eq!(
                     region.pixel16(x, y).unwrap(),
-                    legacy.doc.layers[0].pixels.get16(x, y),
+                    legacy
+                        .resident_state()
+                        .expect("resident fixture")
+                        .document
+                        .layers[0]
+                        .pixels
+                        .get16(x, y),
                     "depth{depth} at{x},{y}"
                 );
             }
@@ -1049,7 +1433,7 @@ fn prepared_bilinear_native_source_preserves_origin_edges_and_explicit_query_err
         let document = native(&source, &session);
         let input = RasterInput::layer(&document, &source.layers[0].id).unwrap();
         let pixels = input
-            .prepare_samples([-4., 1., 6.5, 9.], &mut || Ok(()))
+            .prepare_samples([-4., 1., 6.5, 9.], None, &mut || Ok(()))
             .unwrap();
         for y in [1., 1.25, 2., 3.75, 8., 9.] {
             for x in [-4., -3.75, -3., -0.5, 5., 6.5] {
@@ -1062,7 +1446,9 @@ fn prepared_bilinear_native_source_preserves_origin_edges_and_explicit_query_err
         assert!(pixels.sample16(6.75, 9.).is_err());
         let before = runtime.resident().used();
         let exterior = input
-            .prepare_samples([300_000., 300_000., 300_383., 300_383.], &mut || Ok(()))
+            .prepare_samples([300_000., 300_000., 300_383., 300_383.], None, &mut || {
+                Ok(())
+            })
             .unwrap();
         assert_eq!(runtime.resident().used(), before);
         assert_eq!(exterior.sample16(300_127.5, 300_271.25).unwrap(), [0; 4]);
@@ -1148,22 +1534,49 @@ fn session_clone_and_heal_match_resident_source_offsets_and_soft_selection() {
             let (points, pressures) = crate::brush::points_from_command(&command).unwrap();
             let settings = crate::brush::Settings::from_command(&command).unwrap();
             let mut legacy = crate::engine::Engine::new();
-            legacy.doc = source.clone();
+            legacy
+                .resident_state_mut()
+                .expect("resident fixture")
+                .document = source.clone();
             legacy
                 .edit("human", &[command], None, None, "Retouch")
                 .unwrap();
-            if legacy.undo.len() != 1 {
+            if legacy
+                .resident_state()
+                .expect("resident fixture")
+                .undo
+                .len()
+                != 1
+            {
                 input_failure(
                     "retouch",
                     "legacy_history",
                     depth,
                     mode,
                     "history_count",
-                    legacy.undo.len(),
+                    legacy
+                        .resident_state()
+                        .expect("resident fixture")
+                        .undo
+                        .len(),
                 );
             }
-            assert_eq!(legacy.undo.len(), 1);
-            assert_eq!(legacy.doc.revision, 1);
+            assert_eq!(
+                legacy
+                    .resident_state()
+                    .expect("resident fixture")
+                    .undo
+                    .len(),
+                1
+            );
+            assert_eq!(
+                legacy
+                    .resident_state()
+                    .expect("resident fixture")
+                    .document
+                    .revision,
+                1
+            );
             let document = native(&source, &session);
             let input = RasterInput::layer(&document, &source.layers[0].id).unwrap();
             let sampling = RasterInput::layer(&document, &source_id).unwrap();
@@ -1194,13 +1607,25 @@ fn session_clone_and_heal_match_resident_source_offsets_and_soft_selection() {
                     for y in 0..7 {
                         for x in 0..9 {
                             if source.layers[0].pixels.get16(x, y)
-                                != legacy.doc.layers[0].pixels.get16(x, y)
+                                != legacy
+                                    .resident_state()
+                                    .expect("resident fixture")
+                                    .document
+                                    .layers[0]
+                                    .pixels
+                                    .get16(x, y)
                             {
                                 input_failure("retouch", "pixels", depth, mode, "pixel_count", 1);
                             }
                             assert_eq!(
                                 source.layers[0].pixels.get16(x, y),
-                                legacy.doc.layers[0].pixels.get16(x, y)
+                                legacy
+                                    .resident_state()
+                                    .expect("resident fixture")
+                                    .document
+                                    .layers[0]
+                                    .pixels
+                                    .get16(x, y)
                             );
                         }
                     }
@@ -1211,7 +1636,13 @@ fn session_clone_and_heal_match_resident_source_offsets_and_soft_selection() {
             if textured {
                 assert!(
                     (0..7).any(|y| (0..9).any(|x| source.layers[0].pixels.get16(x, y)
-                        != legacy.doc.layers[0].pixels.get16(x, y)))
+                        != legacy
+                            .resident_state()
+                            .expect("resident fixture")
+                            .document
+                            .layers[0]
+                            .pixels
+                            .get16(x, y)))
                 );
             }
             let output = draft.seal(&|| Ok(())).unwrap_or_else(|_| {
@@ -1224,12 +1655,26 @@ fn session_clone_and_heal_match_resident_source_offsets_and_soft_selection() {
                 .unwrap();
             for y in 0..7 {
                 for x in 0..9 {
-                    if region.pixel16(x, y).unwrap() != legacy.doc.layers[0].pixels.get16(x, y) {
+                    if region.pixel16(x, y).unwrap()
+                        != legacy
+                            .resident_state()
+                            .expect("resident fixture")
+                            .document
+                            .layers[0]
+                            .pixels
+                            .get16(x, y)
+                    {
                         input_failure("retouch", "pixels", depth, mode, "pixel_count", 1);
                     }
                     assert_eq!(
                         region.pixel16(x, y).unwrap(),
-                        legacy.doc.layers[0].pixels.get16(x, y),
+                        legacy
+                            .resident_state()
+                            .expect("resident fixture")
+                            .document
+                            .layers[0]
+                            .pixels
+                            .get16(x, y),
                         "depth{depth} heal{heal} at{x},{y}"
                     );
                 }
@@ -1290,7 +1735,10 @@ fn framed_healing_uses_original_document_source_and_translated_destination_halo(
         let (points, pressures) = crate::brush::points_from_command(&command).unwrap();
         let settings = crate::brush::Settings::from_command(&command).unwrap();
         let mut legacy = crate::engine::Engine::new();
-        legacy.doc = source.clone();
+        legacy
+            .resident_state_mut()
+            .expect("resident fixture")
+            .document = source.clone();
         legacy
             .edit("human", &[command], None, None, "Heal")
             .unwrap();
@@ -1325,13 +1773,38 @@ fn framed_healing_uses_original_document_source_and_translated_destination_halo(
         assert_eq!(
             shape,
             [
-                legacy.doc.layers[0].pixels.width,
-                legacy.doc.layers[0].pixels.height
+                legacy
+                    .resident_state()
+                    .expect("resident fixture")
+                    .document
+                    .layers[0]
+                    .pixels
+                    .width,
+                legacy
+                    .resident_state()
+                    .expect("resident fixture")
+                    .document
+                    .layers[0]
+                    .pixels
+                    .height
             ]
         );
         assert_eq!(
             frame.geometry().new_origin(),
-            [legacy.doc.layers[0].x, legacy.doc.layers[0].y]
+            [
+                legacy
+                    .resident_state()
+                    .expect("resident fixture")
+                    .document
+                    .layers[0]
+                    .x,
+                legacy
+                    .resident_state()
+                    .expect("resident fixture")
+                    .document
+                    .layers[0]
+                    .y
+            ]
         );
         let region = output
             .surface()
@@ -1344,7 +1817,13 @@ fn framed_healing_uses_original_document_source_and_translated_destination_halo(
             for x in 0..shape[0] as i32 {
                 assert_eq!(
                     region.pixel16(x, y).unwrap(),
-                    legacy.doc.layers[0].pixels.get16(x, y),
+                    legacy
+                        .resident_state()
+                        .expect("resident fixture")
+                        .document
+                        .layers[0]
+                        .pixels
+                        .get16(x, y),
                     "depth{depth} at{x},{y}"
                 );
             }
@@ -1371,14 +1850,9 @@ fn owned_frame_seed_reads_prior_updates_and_retires_unreferenced_blocks_before_s
         let input = RasterInput::layer(&document, &source.layers[0].id).unwrap();
         let frame = input.project_frame([0, 0, 9, 7]).unwrap().unwrap();
         let before = runtime.disk().used().unwrap();
-        let mut seed = crate::edit_bounds::output::stage_frame_seed(
-            &input,
-            &frame,
-            &session,
-            &mut || Ok(()),
-            |_, bytes, _| Ok(bytes.clone()),
-        )
-        .unwrap();
+        let mut seed =
+            crate::edit_bounds::output::stage_frame_seed(&input, &frame, &session, &mut || Ok(()))
+                .unwrap();
         let tile = seed.prepare_tile((0, 0), &mut || Ok(())).unwrap();
         let bpp = if depth == 16 { 8 } else { 4 };
         let mut changed =
@@ -1410,18 +1884,96 @@ fn owned_frame_seed_reads_prior_updates_and_retires_unreferenced_blocks_before_s
         output.abort(&session, &|| Ok(())).unwrap();
         assert_eq!(runtime.disk().used().unwrap(), before);
 
-        let seed = crate::edit_bounds::output::stage_frame_seed(
-            &input,
-            &frame,
-            &session,
-            &mut || Ok(()),
-            |_, bytes, _| Ok(bytes.clone()),
-        )
-        .unwrap();
+        let seed =
+            crate::edit_bounds::output::stage_frame_seed(&input, &frame, &session, &mut || Ok(()))
+                .unwrap();
         assert!(seed
             .finish(&mut || Err("Cancelled after complete frame writes".into()))
             .is_err());
         assert_eq!(runtime.disk().used().unwrap(), before);
+    }
+}
+
+#[test]
+fn sparse_reframed_smudge_restricts_only_staged_tiles() {
+    let f = Fixture::new();
+    let (runtime, _connection) = f.runtime();
+    let session = runtime.begin().unwrap();
+    for depth in [8, 16] {
+        let mut source = Document::new_depth(512, 256, depth).unwrap();
+        source.width = 16000;
+        source.height = 9000;
+        source.layers[0]
+            .pixels
+            .set16(17, 17, [12347, 23521, 43217, 49153]);
+        let bounds = [15980, 8980, 15996, 8996];
+        source.selection = Some(bounds);
+        let mut mask = Raster::new_depth(16, 16, 16);
+        for y in 0..16 {
+            for x in 0..16 {
+                mask.set16(x, y, [32896, 0, 0, 0]);
+            }
+        }
+        source.selection_coverage = Some(crate::selection::Coverage {
+            mask,
+            bounds,
+            origin: [bounds[0], bounds[1]],
+            contours: vec![],
+        });
+        let document = native(&source, &session);
+        let input = RasterInput::layer(&document, &source.layers[0].id).unwrap();
+        let frame = input.project_frame(bounds).unwrap().unwrap();
+        let stroke = LocalStroke::for_frame(
+            &input,
+            &frame,
+            &[[15989.5, 8991.5], [15991.5, 8991.5]],
+            None,
+            &mut || Ok(()),
+        )
+        .unwrap();
+        let mut checks = 0;
+        let BuiltTiles::Draft(draft) = crate::smudge::input::stage_in_frame(
+            &input,
+            &stroke,
+            crate::brush::Settings {
+                radius: 2.,
+                spacing: 0.5,
+                wetness: 1.,
+                load: 1.,
+                pickup: 0.,
+                ..Default::default()
+            },
+            [37, 83, 127, 255],
+            Some(&frame),
+            &session,
+            &mut || {
+                checks += 1;
+                Ok(())
+            },
+        )
+        .unwrap() else {
+            panic!("Missing expanded smudge output");
+        };
+        assert!(
+            checks < 2000,
+            "Soft selection visited the full smudge frame"
+        );
+        let output = draft.seal(&|| Ok(())).ok().unwrap();
+        let surface = output.surface();
+        assert_eq!(surface.physical_tiles().count(), 2);
+        let pixel = |x, y| {
+            surface
+                .prepare_region(Region::new([x, y, x + 1, y + 1]).unwrap(), &mut || Ok(()))
+                .unwrap()
+                .pixel16(x, y)
+                .unwrap()
+        };
+        assert_eq!(pixel(17, 17), source.layers[0].pixels.get16(17, 17));
+        assert_eq!(
+            pixel(15991, 8991),
+            [37u8, 83, 127, 128].map(|v| u16::from(v) * 257)
+        );
+        output.abort(&session, &|| Ok(())).unwrap();
     }
 }
 
@@ -1464,11 +2016,21 @@ fn reframed_session_smudge_matches_resident_after_all_dabs_and_once_only_soft_co
         let (points, pressures) = crate::brush::points_from_command(&command).unwrap();
         let settings = crate::brush::Settings::from_command(&command).unwrap();
         let mut legacy = crate::engine::Engine::new();
-        legacy.doc = source.clone();
+        legacy
+            .resident_state_mut()
+            .expect("resident fixture")
+            .document = source.clone();
         legacy
             .edit("human", &[command], None, None, "Smudge")
             .unwrap();
-        assert_eq!(legacy.undo.len(), 1);
+        assert_eq!(
+            legacy
+                .resident_state()
+                .expect("resident fixture")
+                .undo
+                .len(),
+            1
+        );
         let document = native(&source, &session);
         let input = RasterInput::layer(&document, &source.layers[0].id).unwrap();
         let frame = input.project_frame([0, 0, 9, 7]).unwrap().unwrap();
@@ -1508,8 +2070,20 @@ fn reframed_session_smudge_matches_resident_after_all_dabs_and_once_only_soft_co
         assert_eq!(
             shape,
             [
-                legacy.doc.layers[0].pixels.width,
-                legacy.doc.layers[0].pixels.height
+                legacy
+                    .resident_state()
+                    .expect("resident fixture")
+                    .document
+                    .layers[0]
+                    .pixels
+                    .width,
+                legacy
+                    .resident_state()
+                    .expect("resident fixture")
+                    .document
+                    .layers[0]
+                    .pixels
+                    .height
             ]
         );
         let region = output
@@ -1523,7 +2097,13 @@ fn reframed_session_smudge_matches_resident_after_all_dabs_and_once_only_soft_co
             for x in 0..shape[0] as i32 {
                 assert_eq!(
                     region.pixel16(x, y).unwrap(),
-                    legacy.doc.layers[0].pixels.get16(x, y),
+                    legacy
+                        .resident_state()
+                        .expect("resident fixture")
+                        .document
+                        .layers[0]
+                        .pixels
+                        .get16(x, y),
                     "depth{depth} at{x},{y}"
                 );
             }
@@ -1780,7 +2360,10 @@ fn captured_command_workers_use_the_same_parameters_and_preserve_native_results(
             "color":[37,83,127,193],"radius":1.8,"spacing":0.8,"hardness":0.4,"flow":0.6,"opacity":0.7,
             "load":0.3,"pickup":0.4,"wetness":0.8,"heal_radius":2});
             let mut legacy = crate::engine::Engine::new();
-            legacy.doc = source.clone();
+            legacy
+                .resident_state_mut()
+                .expect("resident fixture")
+                .document = source.clone();
             legacy
                 .edit("human", &[parameters.clone()], None, None, "Operator")
                 .unwrap();
@@ -1856,7 +2439,6 @@ fn captured_command_workers_use_the_same_parameters_and_preserve_native_results(
                 .unwrap(),
                 "clone" => crate::retouch::input::stage_guarded(
                     &input,
-                    &input,
                     stroke.as_ref().unwrap(),
                     frame.as_ref(),
                     &guard,
@@ -1878,7 +2460,13 @@ fn captured_command_workers_use_the_same_parameters_and_preserve_native_results(
                 for x in 0..9 {
                     assert_eq!(
                         region.pixel16(x, y).unwrap(),
-                        legacy.doc.layers[0].pixels.get16(x, y),
+                        legacy
+                            .resident_state()
+                            .expect("resident fixture")
+                            .document
+                            .layers[0]
+                            .pixels
+                            .get16(x, y),
                         "{operation} depth{depth} at{x},{y}"
                     );
                 }
@@ -2012,7 +2600,10 @@ fn folder_fill_prepares_a_new_zero_baseline_canvas_without_replacing_the_folder_
                 let parameters = serde_json::json!({"op":"paint.fill","layer":source.layers[0].id,
             "rect":if empty {[20,20,22,22]}else{[2,2,8,7]},"color":[37,83,127,alpha]});
                 let mut legacy = crate::engine::Engine::new();
-                legacy.doc = source.clone();
+                legacy
+                    .resident_state_mut()
+                    .expect("resident fixture")
+                    .document = source.clone();
                 legacy
                     .edit("human", &[parameters.clone()], None, None, "Fill")
                     .unwrap();
@@ -2034,9 +2625,25 @@ fn folder_fill_prepares_a_new_zero_baseline_canvas_without_replacing_the_folder_
                         .unwrap();
                 if empty {
                     assert!(matches!(output, BuiltTiles::Unchanged));
-                    assert_eq!(legacy.doc.layers.len(), 2);
+                    assert_eq!(
+                        legacy
+                            .resident_state()
+                            .expect("resident fixture")
+                            .document
+                            .layers
+                            .len(),
+                        2
+                    );
                 } else {
-                    assert_eq!(legacy.doc.layers.len(), 3);
+                    assert_eq!(
+                        legacy
+                            .resident_state()
+                            .expect("resident fixture")
+                            .document
+                            .layers
+                            .len(),
+                        3
+                    );
                     let BuiltTiles::Draft(draft) = output else {
                         panic!("A nonempty folder fill must insert a real child")
                     };
@@ -2057,7 +2664,13 @@ fn folder_fill_prepares_a_new_zero_baseline_canvas_without_replacing_the_folder_
                         for x in 0..12 {
                             assert_eq!(
                                 region.pixel16(x, y).unwrap(),
-                                legacy.doc.layers[1].pixels.get16(x, y),
+                                legacy
+                                    .resident_state()
+                                    .expect("resident fixture")
+                                    .document
+                                    .layers[1]
+                                    .pixels
+                                    .get16(x, y),
                                 "depth{depth} alpha{alpha} at{x},{y}"
                             );
                         }
@@ -2130,13 +2743,26 @@ fn editable_definitions_keep_legacy_explicit_rasterize_refusal_and_allow_mask_pa
         let body = serde_json::json!({"op":operation,"layer":source.layers[0].id,"rect":[1,1,7,6],
             "points":[[2,2],[6,4]],"source":[3,1],"color":[37,83,127,193],"radius":1.8});
         let mut legacy = crate::engine::Engine::new();
-        legacy.doc = source.clone();
+        legacy
+            .resident_state_mut()
+            .expect("resident fixture")
+            .document = source.clone();
         assert!(legacy
             .edit("human", &[body.clone()], None, None, "Pixels")
             .unwrap_err()
             .contains("explicitly rasterize"));
-        assert!(legacy.undo.is_empty());
-        assert!(legacy.doc.layers[0].source.is_some());
+        assert!(legacy
+            .resident_state()
+            .expect("resident fixture")
+            .undo
+            .is_empty());
+        assert!(legacy
+            .resident_state()
+            .expect("resident fixture")
+            .document
+            .layers[0]
+            .source
+            .is_some());
         let descriptor =
             CommandDescriptor::from_normalized(&document, 0, &[body], &|| Ok(())).unwrap();
         let captured = document
@@ -2151,11 +2777,20 @@ fn editable_definitions_keep_legacy_explicit_rasterize_refusal_and_allow_mask_pa
     }
     let body = serde_json::json!({"op":"paint","layer":source.layers[0].id,"mask":true,"points":[[2,2],[6,4]],"radius":1.8,"color":[200,10,20,255]});
     let mut legacy = crate::engine::Engine::new();
-    legacy.doc = source.clone();
+    legacy
+        .resident_state_mut()
+        .expect("resident fixture")
+        .document = source.clone();
     legacy
         .edit("human", &[body.clone()], None, None, "Mask")
         .unwrap();
-    assert!(legacy.doc.layers[0].source.is_some());
+    assert!(legacy
+        .resident_state()
+        .expect("resident fixture")
+        .document
+        .layers[0]
+        .source
+        .is_some());
     let descriptor = CommandDescriptor::from_normalized(&document, 0, &[body], &|| Ok(())).unwrap();
     let captured = document
         .capture_descriptor(descriptor.clone(), "human", &[], 1, false, true)
@@ -2184,7 +2819,15 @@ fn editable_definitions_keep_legacy_explicit_rasterize_refusal_and_allow_mask_pa
         for x in 0..9 {
             assert_eq!(
                 region.pixel16(x, y).unwrap(),
-                legacy.doc.layers[0].mask.as_ref().unwrap().steps[0]
+                legacy
+                    .resident_state()
+                    .expect("resident fixture")
+                    .document
+                    .layers[0]
+                    .mask
+                    .as_ref()
+                    .unwrap()
+                    .steps[0]
                     .pixels
                     .get16(x, y)
             );
@@ -2216,7 +2859,10 @@ fn real_child_producer_typed_insertion_and_native_history_keep_one_undo_redo() {
         source.layers.push(existing);
         let body = serde_json::json!({"op":"paint.fill","layer":source.layers[0].id,"rect":[2,2,8,7],"color":[37,83,127,193]});
         let mut legacy = crate::engine::Engine::new();
-        legacy.doc = source.clone();
+        legacy
+            .resident_state_mut()
+            .expect("resident fixture")
+            .document = source.clone();
         legacy
             .edit("human", &[body.clone()], None, None, "Fill")
             .unwrap();
@@ -2298,7 +2944,13 @@ fn real_child_producer_typed_insertion_and_native_history_keep_one_undo_redo() {
             for x in 0..12 {
                 assert_eq!(
                     region.pixel16(x, y).unwrap(),
-                    legacy.doc.layers[1].pixels.get16(x, y)
+                    legacy
+                        .resident_state()
+                        .expect("resident fixture")
+                        .document
+                        .layers[1]
+                        .pixels
+                        .get16(x, y)
                 );
             }
         }
@@ -2498,18 +3150,56 @@ fn expanded_fill_mask_preserves_old_visible_color_and_pairs_one_native_history_e
         let body = serde_json::json!({"op":"paint","layer":source.layers[0].id,"mask":true,"points":[[1.,1.],[2.,2.]],
             "radius":1.5,"opacity":0.7,"flow":0.6,"color":[200,10,20,255]});
         let mut legacy = crate::engine::Engine::new();
-        legacy.doc = source.clone();
+        legacy
+            .resident_state_mut()
+            .expect("resident fixture")
+            .document = source.clone();
         legacy
             .edit("human", &[body.clone()], None, None, "Mask")
             .unwrap();
-        assert_eq!(legacy.undo.len(), 1);
-        assert_eq!(legacy.doc.layers[0].kind, "paint");
-        assert_eq!(legacy.doc.layers[0].pixels.get16(1, 1), [0; 4]);
         assert_eq!(
-            legacy.doc.layers[0].pixels.get16(6, 5),
+            legacy
+                .resident_state()
+                .expect("resident fixture")
+                .undo
+                .len(),
+            1
+        );
+        assert_eq!(
+            legacy
+                .resident_state()
+                .expect("resident fixture")
+                .document
+                .layers[0]
+                .kind,
+            "paint"
+        );
+        assert_eq!(
+            legacy
+                .resident_state()
+                .expect("resident fixture")
+                .document
+                .layers[0]
+                .pixels
+                .get16(1, 1),
+            [0; 4]
+        );
+        assert_eq!(
+            legacy
+                .resident_state()
+                .expect("resident fixture")
+                .document
+                .layers[0]
+                .pixels
+                .get16(6, 5),
             [32, 96, 160, 128].map(|v| v * 257)
         );
-        let (_, _, fixed_pixels, _) = legacy.doc.preview(None, 12, None, false).unwrap();
+        let (_, _, fixed_pixels, _) = legacy
+            .resident_state()
+            .expect("resident fixture")
+            .document
+            .preview(None, 12, None, false)
+            .unwrap();
         assert_eq!(&fixed_pixels[(12 + 1) * 4..(12 + 1) * 4 + 4], &[0; 4]);
         let mut document = native(&source, &session);
         let descriptor =
@@ -2629,10 +3319,27 @@ fn expanded_fill_mask_preserves_old_visible_color_and_pairs_one_native_history_e
             .pixels()
             .slot();
         for (slot, expected) in [
-            (color_slot, &legacy.doc.layers[0].pixels),
+            (
+                color_slot,
+                &legacy
+                    .resident_state()
+                    .expect("resident fixture")
+                    .document
+                    .layers[0]
+                    .pixels,
+            ),
             (
                 mask_slot,
-                &legacy.doc.layers[0].mask.as_ref().unwrap().steps[0].pixels,
+                &legacy
+                    .resident_state()
+                    .expect("resident fixture")
+                    .document
+                    .layers[0]
+                    .mask
+                    .as_ref()
+                    .unwrap()
+                    .steps[0]
+                    .pixels,
             ),
         ] {
             let region = document
@@ -2699,11 +3406,21 @@ fn guarded_brush_transaction_replans_working_sources_and_publishes_one_history_e
             serde_json::json!({"op":"paint","layer":source.layers[0].id,"points":[[4,3],[5,3]],"radius":1.0,"color":[37,83,219,127],"source_revision":0}),
         ];
         let mut legacy = crate::engine::Engine::new();
-        legacy.doc = source.clone();
+        legacy
+            .resident_state_mut()
+            .expect("resident fixture")
+            .document = source.clone();
         legacy
             .edit("human", &commands, None, None, "Two strokes")
             .unwrap();
-        assert_eq!(legacy.undo.len(), 1);
+        assert_eq!(
+            legacy
+                .resident_state()
+                .expect("resident fixture")
+                .undo
+                .len(),
+            1
+        );
         let mut document = native(&source, &session);
         let original_key = document.key();
         let source_bytes = session.disk().used().unwrap();
@@ -2815,7 +3532,13 @@ fn guarded_brush_transaction_replans_working_sources_and_publishes_one_history_e
             for x in 0..9 {
                 assert_eq!(
                     region.pixel16(x, y).unwrap(),
-                    legacy.doc.layers[0].pixels.get16(x, y)
+                    legacy
+                        .resident_state()
+                        .expect("resident fixture")
+                        .document
+                        .layers[0]
+                        .pixels
+                        .get16(x, y)
                 );
             }
         }
@@ -2878,12 +3601,29 @@ fn guarded_unchanged_heal_preserves_physical_sources_and_records_command_history
         let command = serde_json::json!({"op":"heal","layer":source.layers[0].id,
             "points":[[4.,3.]],"source":[4.,3.],"radius":1.,"heal_radius":2});
         let mut legacy = crate::engine::Engine::new();
-        legacy.doc = source.clone();
+        legacy
+            .resident_state_mut()
+            .expect("resident fixture")
+            .document = source.clone();
         legacy
             .edit("human", &[command.clone()], None, None, "Unchanged heal")
             .unwrap();
-        assert_eq!(legacy.undo.len(), 1);
-        assert_eq!(legacy.doc.revision, 1);
+        assert_eq!(
+            legacy
+                .resident_state()
+                .expect("resident fixture")
+                .undo
+                .len(),
+            1
+        );
+        assert_eq!(
+            legacy
+                .resident_state()
+                .expect("resident fixture")
+                .document
+                .revision,
+            1
+        );
         let mut document = native(&source, &session);
         let original_slot = document.metadata().layer(0).unwrap().pixels().slot();
         let source_key = document.source(original_slot).unwrap().key();
@@ -2905,7 +3645,6 @@ fn guarded_unchanged_heal_preserves_physical_sources_and_records_command_history
             let stroke = points.local(&input, None, &mut || Ok(())).unwrap();
             let guard = WriteGuard::new(&captured, command, &input, None).unwrap();
             let built = crate::retouch::input::stage_guarded(
-                &input,
                 &input,
                 &stroke,
                 None,
@@ -2994,7 +3733,13 @@ fn guarded_unchanged_heal_preserves_physical_sources_and_records_command_history
                     );
                     assert_eq!(
                         pixels.pixel16(x, y).unwrap(),
-                        legacy.doc.layers[0].pixels.get16(x, y)
+                        legacy
+                            .resident_state()
+                            .expect("resident fixture")
+                            .document
+                            .layers[0]
+                            .pixels
+                            .get16(x, y)
                     );
                 }
             }

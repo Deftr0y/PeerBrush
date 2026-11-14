@@ -11,29 +11,43 @@ pub fn serialize<S: Serializer>(
     profile: &Option<MetadataPayload<Vec<u8>>>,
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
+    serialize_bounded(profile, serializer, MAX_BYTES, "Source36 ICC profile exceeds its decoded byte bound")
+}
+
+fn serialize_bounded<S: Serializer>(
+    asset: &Option<MetadataPayload<Vec<u8>>>,
+    serializer: S,
+    limit: usize,
+    oversized: &str,
+) -> Result<S::Ok, S::Error> {
     struct Text<'a>(&'a [u8]);
     impl Serialize for Text<'_> {
         fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
             serializer.collect_str(&Base64Display::new(self.0, &STANDARD))
         }
     }
-    match profile {
+    match asset {
         None => serializer.serialize_none(),
-        Some(bytes) if bytes.len() <= MAX_BYTES => serializer.serialize_some(&Text(bytes)),
-        Some(_) => Err(serde::ser::Error::custom(
-            "Source36 ICC profile exceeds its decoded byte bound",
-        )),
+        Some(bytes) if bytes.len() <= limit => serializer.serialize_some(&Text(bytes)),
+        Some(_) => Err(serde::ser::Error::custom(oversized)),
     }
 }
 
 pub fn deserialize<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<MetadataPayload<Vec<u8>>>, D::Error> {
-    struct OptionalProfile;
-    impl<'de> Visitor<'de> for OptionalProfile {
+    deserialize_bounded(deserializer, MAX_BYTES)
+}
+
+fn deserialize_bounded<'de, D: Deserializer<'de>>(
+    deserializer: D,
+    limit: usize,
+) -> Result<Option<MetadataPayload<Vec<u8>>>, D::Error> {
+    struct OptionalAsset(usize);
+    impl<'de> Visitor<'de> for OptionalAsset {
         type Value = Option<MetadataPayload<Vec<u8>>>;
         fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.write_str("null or a bounded canonical STANDARD base64 ICC profile")
+            f.write_str("null or a bounded canonical STANDARD base64 asset")
         }
         fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
             Ok(None)
@@ -42,25 +56,25 @@ pub fn deserialize<'de, D: Deserializer<'de>>(
             Ok(None)
         }
         fn visit_some<D: Deserializer<'de>>(self, input: D) -> Result<Self::Value, D::Error> {
-            struct Profile;
-            impl Visitor<'_> for Profile {
+            struct Asset(usize);
+            impl Visitor<'_> for Asset {
                 type Value = MetadataPayload<Vec<u8>>;
                 fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                    f.write_str("a bounded canonical STANDARD base64 ICC string")
+                    f.write_str("a bounded canonical STANDARD base64 string")
                 }
                 fn visit_str<E: serde::de::Error>(self, text: &str) -> Result<Self::Value, E> {
-                    decode(text).map(MetadataPayload::from).map_err(E::custom)
+                    decode(text, self.0).map(MetadataPayload::from).map_err(E::custom)
                 }
             }
-            input.deserialize_str(Profile).map(Some)
+            input.deserialize_str(Asset(self.0)).map(Some)
         }
     }
-    deserializer.deserialize_option(OptionalProfile)
+    deserializer.deserialize_option(OptionalAsset(limit))
 }
 
-fn decode(text: &str) -> Result<Vec<u8>, &'static str> {
+fn decode(text: &str, limit: usize) -> Result<Vec<u8>, &'static str> {
     // Both lengths are checked before allocating or decoding any payload byte.
-    if text.len() > MAX_ENCODED || text.len() % 4 != 0 {
+    if text.len() > limit.div_ceil(3) * 4 || text.len() % 4 != 0 {
         return Err("Source36 ICC encoded length or padding is invalid");
     }
     let padding = text
@@ -71,14 +85,14 @@ fn decode(text: &str) -> Result<Vec<u8>, &'static str> {
         .take_while(|&&b| b == b'=')
         .count();
     let decoded = text.len() / 4 * 3 - padding;
-    if decoded > MAX_BYTES {
+    if decoded > limit {
         return Err("Source36 ICC profile exceeds its decoded byte bound");
     }
     let mut bytes = Vec::new();
     bytes
         .try_reserve_exact(decoded)
         .map_err(|_| "Source36 ICC allocation refused")?;
-    if bytes.capacity() > MAX_BYTES {
+    if bytes.capacity() > limit {
         return Err("Source36 ICC allocation exceeds its byte bound");
     }
     bytes.resize(decoded, 0);
@@ -89,6 +103,24 @@ fn decode(text: &str) -> Result<Vec<u8>, &'static str> {
         return Err("Source36 ICC decoded length differs");
     }
     Ok(bytes)
+}
+
+pub(super) mod file_info {
+    use super::*;
+    use crate::psd::file_info::MAX_BYTES;
+
+    pub fn serialize<S: Serializer>(
+        asset: &Option<MetadataPayload<Vec<u8>>>, serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serialize_bounded(asset, serializer, MAX_BYTES, "Source36 Photoshop File Info exceeds 1 MiB")
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<MetadataPayload<Vec<u8>>>, D::Error> {
+        deserialize_bounded(deserializer, MAX_BYTES)
+            .map_err(|_| serde::de::Error::custom("Invalid or oversized Source36 Photoshop File Info"))
+    }
 }
 
 #[cfg(test)]
@@ -175,11 +207,11 @@ mod tests {
         let mut excess = "A".repeat(MAX_ENCODED);
         excess.replace_range(MAX_ENCODED - 1.., "=");
         assert_eq!(
-            decode(&excess).unwrap_err(),
+            decode(&excess, MAX_BYTES).unwrap_err(),
             "Source36 ICC profile exceeds its decoded byte bound"
         );
         excess.push('A');
-        assert!(decode(&excess).is_err());
+        assert!(decode(&excess, MAX_BYTES).is_err());
         let oversized = Profile {
             bytes: Some(vec![0; MAX_BYTES + 1].into()),
         };

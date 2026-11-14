@@ -6,6 +6,7 @@ use super::{
 };
 use crate::{
     engine::{native::Metadata, scene::SceneSnapshot},
+    large_document::Error,
     raster::surface::PhysicalTile,
 };
 use ring::digest::{Context, SHA256};
@@ -240,11 +241,21 @@ impl<'a> SourceIndex<'a> {
             reference_root: manifest36::hex(self.reference_root),
         }
     }
+    pub(crate) fn header(&self, ordinal: usize, core: Digest) -> Result<bulk36::Header, String> {
+        let chunk = self.chunks.get(ordinal).ok_or("Missing Source36 chunk plan")?;
+        Ok(bulk36::Header {
+            ordinal: ordinal as u32,
+            total: self.chunks.len() as u32,
+            records: chunk.records.len() as u32,
+            core,
+        })
+    }
     pub(crate) fn write(
         &self,
         ordinal: usize,
         core: Digest,
         output: &mut dyn Write,
+        pinned: &dyn Fn() -> Result<(), String>,
         check: &dyn Fn() -> Result<(), String>,
     ) -> Result<Descriptor, String> {
         check()?;
@@ -252,27 +263,30 @@ impl<'a> SourceIndex<'a> {
             .chunks
             .get(ordinal)
             .ok_or("Missing Source36 chunk plan")?;
-        let header = bulk36::Header {
-            ordinal: ordinal as u32,
-            total: self.chunks.len() as u32,
-            records: chunk.records.len() as u32,
-            core,
-        };
+        let header = self.header(ordinal, core)?;
         // Keep the trait object behind a sized reference for ChunkWriter's sink.
         let mut output = output;
-        let mut writer = ChunkWriter::begin(&mut output, header, chunk.bytes, check)?;
+        let mut writer = ChunkWriter::begin(&mut output, header, chunk.bytes, pinned)?;
         for record in chunk.records.clone() {
-            check()?;
+            pinned()?;
             if record < self.unique.len() {
                 let location = &self.locations[self.unique[record]];
-                let mut guarded = || {
-                    check().map_err(|e| crate::large_document::Error::Io(std::io::Error::other(e)))
+                let failure = std::cell::RefCell::new(None);
+                let guarded = |result: Result<(), String>| {
+                    result.map_err(|reason| {
+                        *failure.borrow_mut() = Some(reason);
+                        Error::Cancelled
+                    })
                 };
                 let pin = location
                     .tile
                     .owner()
-                    .pin(location.tile.reference(), &mut guarded)
-                    .map_err(|e| e.to_string())?;
+                    .pin_guarded(
+                        location.tile.reference(),
+                        &mut || guarded(pinned()),
+                        &mut || guarded(check()),
+                    )
+                    .map_err(|error| failure.into_inner().unwrap_or_else(|| error.to_string()))?;
                 if !location
                     .tile
                     .owner()
@@ -288,7 +302,7 @@ impl<'a> SourceIndex<'a> {
                         digest: location.tile.reference().digest(),
                         payload: pin.bytes(),
                     },
-                    check,
+                    pinned,
                 )?;
             } else {
                 let location = &self.locations[record - self.unique.len()];
@@ -300,11 +314,13 @@ impl<'a> SourceIndex<'a> {
                         y,
                         tile: location.tile.reference().digest(),
                     }),
-                    check,
+                    pinned,
                 )?;
             }
         }
-        writer.finish(check)
+        let descriptor = writer.finish(pinned)?;
+        check()?;
+        Ok(descriptor)
     }
     pub(crate) fn check_core<T>(&self, core: &StagedCore<T>) -> Result<(), String> {
         if core.source_id() != self.scene.metadata().id()

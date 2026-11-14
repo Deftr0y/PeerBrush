@@ -20,8 +20,15 @@ pub use payload::MetadataPayload;
 pub(crate) mod assets;
 #[path = "scene/metadata.rs"]
 mod metadata;
+#[path = "scene/effect_wire.rs"]
+mod effect_wire;
+pub(crate) mod presentation;
 #[path = "scene/runtime.rs"]
 mod runtime;
+pub(crate) mod source_copy;
+pub(crate) use capture::legacy_coverage_bytes;
+pub(crate) use capture::seal_native_sources;
+pub(crate) use capture::{seal_decoded, stage_decoded, stage_resident_clipboard};
 pub use capture::{CapturedScene, LegacyTileCache};
 pub(crate) use capture::{StageRuntime, StageSession, StagedScene};
 
@@ -46,6 +53,9 @@ impl RasterRoster {
     }
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+    pub(crate) fn as_slice(&self) -> &[Surface] {
+        &self.entries
     }
     pub(crate) fn descriptor_bytes(&self) -> Result<usize> {
         self.entries
@@ -167,7 +177,7 @@ impl PendingScene {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SceneIdentity {
     pub project_id: String,
     pub document_id: String,
@@ -194,6 +204,10 @@ pub struct SceneSnapshot {
 enum SnapshotDocument {
     Pending(PendingScene),
     Native(super::native::NativeDocument),
+    Presentation {
+        base: super::native::NativeDocument,
+        metadata: Admitted<Document36>,
+    },
 }
 #[derive(Default)]
 struct RuntimeViews {
@@ -245,6 +259,14 @@ fn native_scene_leases(
     MetadataCharge::reserve(pool, bytes, &|| Ok(()))
 }
 impl SceneSnapshot {
+    pub(crate) fn native_document(&self) -> Result<&super::native::NativeDocument> {
+        match &self.document {
+            SnapshotDocument::Native(document) => Ok(document),
+            SnapshotDocument::Pending(_) | SnapshotDocument::Presentation { .. } => {
+                Err("This scene has no editable native document authority".into())
+            }
+        }
+    }
     /// Exact immutable source generation; document ID/revision alone cannot
     /// distinguish a captured in-progress gesture or a different native owner.
     pub(crate) fn key(&self) -> super::native::DocumentKey {
@@ -284,6 +306,51 @@ impl SceneSnapshot {
             .chain(self._header_charge.iter())
             .map(|c| c.bytes())
             .sum()
+    }
+    /// Admit the live borrowed headers before copying any identity/lease payload.
+    pub(crate) fn capture_native(
+        project_id: &str,
+        document: &super::native::NativeDocument,
+        leases: &[super::Lease],
+        file_version: Option<crate::file_safety::Version>,
+        file_ownership: Option<Arc<crate::file_ownership::Ownership>>,
+    ) -> Result<Self> {
+        #[derive(Serialize)]
+        struct Identity<'a> {
+            project_id: &'a str,
+            document_id: &'a str,
+            revision: u64,
+        }
+        let pool = document.budget();
+        let (identity, header_charge) = super::native::project_admitted(
+            &Identity {
+                project_id,
+                document_id: document.metadata().id(),
+                revision: document.metadata().revision(),
+            },
+            pool,
+            false,
+            &|| Ok(()),
+            |identity: SceneIdentity, charge| (identity, charge),
+        )?;
+        let (leases, lease_charge) = super::native::project_admitted(
+            &leases,
+            pool,
+            true,
+            &|| Ok(()),
+            |leases: Vec<super::Lease>, charge| (Arc::new(leases), charge),
+        )?;
+        Ok(Self {
+            identity,
+            leases,
+            file_version,
+            _file_ownership: file_ownership,
+            runtime_views: RuntimeViews::default(),
+            document: SnapshotDocument::Native(document.clone()),
+            binding: document.key(),
+            _lease_charge: Some(lease_charge),
+            _header_charge: Some(header_charge),
+        })
     }
     pub(crate) fn from_native(
         identity: SceneIdentity,
@@ -379,12 +446,16 @@ impl SceneSnapshot {
                 super::native::Metadata::from_wire(pending.metadata(), self.binding)
             }
             SnapshotDocument::Native(document) => document.metadata(),
+            SnapshotDocument::Presentation { metadata, .. } => {
+                super::native::Metadata::from_wire(metadata, self.binding)
+            }
         }
     }
     pub fn rasters(&self) -> &RasterRoster {
         match &self.document {
             SnapshotDocument::Pending(p) => p.rasters(),
             SnapshotDocument::Native(n) => n.roster(),
+            SnapshotDocument::Presentation { base, .. } => base.roster(),
         }
     }
     pub fn raster(&self, slot: super::native::RasterSlot) -> Result<&Surface> {
@@ -394,18 +465,21 @@ impl SceneSnapshot {
         match &self.document {
             SnapshotDocument::Native(document) => document.source(slot),
             SnapshotDocument::Pending(pending) => pending.roster.ordinal(slot.ordinal),
+            SnapshotDocument::Presentation { base, .. } => base.roster().ordinal(slot.ordinal),
         }
     }
     pub fn budget(&self) -> &ResidentBudget {
         match &self.document {
             SnapshotDocument::Pending(p) => p.budget(),
             SnapshotDocument::Native(n) => n.budget(),
+            SnapshotDocument::Presentation { base, .. } => base.budget(),
         }
     }
     pub fn disk_budget(&self) -> &DiskBudget {
         match &self.document {
             SnapshotDocument::Pending(p) => p.disk_budget(),
             SnapshotDocument::Native(n) => n.disk_budget(),
+            SnapshotDocument::Presentation { base, .. } => base.disk_budget(),
         }
     }
     pub fn leases(&self) -> &[super::Lease] {
@@ -415,10 +489,28 @@ impl SceneSnapshot {
         self.file_version
     }
     pub fn source_structure(&self) -> &[crate::psd::SourceLayerInfo] {
-        &self.runtime_views.structure
+        match &self.document {
+            SnapshotDocument::Native(document) => document.protected_structure().unwrap_or_default(),
+            _ => &self.runtime_views.structure,
+        }
     }
     pub fn source_patterns(&self) -> &[crate::psd::patterns::Source] {
         &self.runtime_views.patterns
+    }
+    pub(crate) fn validate_provisional_editable(
+        &self,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<()> {
+        let SnapshotDocument::Pending(pending) = &self.document else {
+            return Err("Editable import validation requires a provisional scene".into());
+        };
+        super::native::validation::validate_editable(
+            pending.metadata(),
+            pending.rasters(),
+            pending.budget(),
+            self.binding,
+            check,
+        )
     }
     /// Codec-only provisional handoff. Live guards/inspection owners must never
     /// be discarded through this path, and Native authority cannot be demoted.
@@ -435,7 +527,7 @@ impl SceneSnapshot {
         }
         match self.document {
             SnapshotDocument::Pending(pending) => Ok(pending),
-            SnapshotDocument::Native(_) => {
+            SnapshotDocument::Native(_) | SnapshotDocument::Presentation { .. } => {
                 Err("Native document cannot become provisional import data".into())
             }
         }
@@ -535,8 +627,7 @@ pub struct Coverage36 {
     #[serde(deserialize_with = "payload::contours")]
     pub contours: MetadataPayload<Vec<Vec<[f32; 2]>>>,
 }
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug)]
 pub struct Effect36 {
     pub id: String,
     pub kind: String,
@@ -645,7 +736,35 @@ pub struct Document36 {
     #[serde(with = "icc")]
     pub icc_profile: Option<MetadataPayload<Vec<u8>>>,
     pub srgb_tagged: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub psd_intentionally_untagged: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub psd_rgb8_multiply: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub psd_resolution: Option<[u8; 16]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub psd_print_scale: Option<[u8; 14]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub psd_pixel_aspect: Option<[u8; 12]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub psd_grid: Option<[u8; 16]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub psd_layer_id_seed: Option<[u8; 4]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub psd_print_flags: Option<[u8; 9]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub psd_print_flags_info: Option<[u8; 10]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub psd_copyright: Option<[u8; 1]>,
+    #[serde(default, with = "icc::file_info", skip_serializing_if = "Option::is_none")]
+    pub psd_file_info: Option<MetadataPayload<Vec<u8>>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub psd_global_angle: Option<[u8; 4]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub psd_global_altitude: Option<[u8; 4]>,
     pub psd_global_mask: Option<MetadataPayload<crate::psd::GlobalMaskSettings>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub psd_global_metadata: Option<MetadataPayload<Vec<crate::psd::GlobalMetadata>>>,
     pub layers: Vec<Layer36>,
     pub filters: Vec<Effect36>,
     pub selection: Option<[i32; 4]>,
@@ -712,41 +831,20 @@ impl Document36 {
         &mut self,
         mut visit: impl FnMut(&mut RasterRef36) -> Result<()>,
     ) -> Result<()> {
-        fn walk(
-            reference: &mut RasterRef36,
-            visit: &mut impl FnMut(&mut RasterRef36) -> Result<()>,
-        ) -> Result<()> {
-            visit(reference)?;
-            if let Some(original) = &mut reference.retained {
-                visit(&mut original.pixels)?;
-            }
-            Ok(())
-        }
         for layer in &mut self.layers {
-            walk(&mut layer.pixels, &mut visit)?;
-            if let Some(mask) = &mut layer.mask {
-                for step in &mut mask.steps {
-                    walk(&mut step.pixels, &mut visit)?;
-                }
-            }
-            for effect in &mut layer.effects {
-                effect.checked_clips()?;
-                for clip in &mut effect.clips {
-                    walk(&mut clip.coverage.mask, &mut visit)?;
-                }
-            }
+            layer.remap_rasters(&mut visit)?;
         }
         for effect in &mut self.filters {
             effect.checked_clips()?;
             for clip in &mut effect.clips {
-                walk(&mut clip.coverage.mask, &mut visit)?;
+                remap_raster(&mut clip.coverage.mask, &mut visit)?;
             }
         }
         for coverage in [&mut self.selection_coverage, &mut self.selection_previous]
             .into_iter()
             .flatten()
         {
-            walk(&mut coverage.mask, &mut visit)?;
+            remap_raster(&mut coverage.mask, &mut visit)?;
         }
         Ok(())
     }
@@ -765,7 +863,22 @@ impl Document36 {
                 .as_ref()
                 .map(|value| MetadataPayload::from((**value).clone())),
             srgb_tagged: doc.srgb_tagged,
+            psd_intentionally_untagged: doc.psd_intentionally_untagged,
+            psd_rgb8_multiply: doc.psd_rgb8_multiply,
+            psd_resolution: doc.psd_resolution,
+            psd_print_scale: doc.psd_print_scale,
+            psd_pixel_aspect: doc.psd_pixel_aspect,
+            psd_grid: doc.psd_grid,
+            psd_layer_id_seed: doc.psd_layer_id_seed,
+            psd_print_flags: doc.psd_print_flags,
+            psd_print_flags_info: doc.psd_print_flags_info,
+            psd_copyright: doc.psd_copyright,
+            psd_file_info: doc.psd_file_info.as_deref().cloned().map(MetadataPayload::from),
+            psd_global_angle: doc.psd_global_angle,
+            psd_global_altitude: doc.psd_global_altitude,
             psd_global_mask: doc.psd_global_mask.clone().map(MetadataPayload::from),
+            psd_global_metadata: (!doc.psd_global_metadata.is_empty())
+                .then(|| doc.psd_global_metadata.clone().into()),
             layers: doc
                 .layers
                 .iter()
@@ -860,7 +973,35 @@ fn visit_one<'a>(
     *next += 1;
     visit(r)
 }
+fn remap_raster(
+    reference: &mut RasterRef36,
+    visit: &mut impl FnMut(&mut RasterRef36) -> Result<()>,
+) -> Result<()> {
+    visit(reference)?;
+    if let Some(original) = &mut reference.retained {
+        visit(&mut original.pixels)?;
+    }
+    Ok(())
+}
 impl Layer36 {
+    pub(crate) fn remap_rasters(
+        &mut self,
+        mut visit: impl FnMut(&mut RasterRef36) -> Result<()>,
+    ) -> Result<()> {
+        remap_raster(&mut self.pixels, &mut visit)?;
+        if let Some(mask) = &mut self.mask {
+            for step in &mut mask.steps {
+                remap_raster(&mut step.pixels, &mut visit)?;
+            }
+        }
+        for effect in &mut self.effects {
+            effect.checked_clips()?;
+            for clip in &mut effect.clips {
+                remap_raster(&mut clip.coverage.mask, &mut visit)?;
+            }
+        }
+        Ok(())
+    }
     fn capture(layer: &Layer, c: &mut impl RasterCollector) -> Result<Self> {
         Ok(Self {
             id: layer.id.clone(),
@@ -941,10 +1082,24 @@ impl Coverage36 {
 }
 impl Effect36 {
     fn capture(effect: &crate::effects::Effect, c: &mut impl RasterCollector) -> Result<Self> {
+        let (settings, clips) = Self::capture_settings(&effect.kind, &effect.settings, c)?;
+        Ok(Self {
+            id: effect.id.clone(),
+            kind: effect.kind.clone(),
+            enabled: effect.enabled,
+            weight: effect.weight,
+            settings: settings.into(),
+            clips,
+        })
+    }
+    pub(crate) fn capture_settings(
+        kind: &str,
+        settings: &Value,
+        c: &mut impl RasterCollector,
+    ) -> Result<(Value, Vec<EffectClip36>)> {
         let mut clips = vec![];
-        let settings = if effect.kind == "liquify" {
-            let object = effect
-                .settings
+        let settings = if kind == "liquify" {
+            let object = settings
                 .as_object()
                 .ok_or("Liquify settings must be an object")?;
             let mut output = serde_json::Map::new();
@@ -980,18 +1135,11 @@ impl Effect36 {
                 }
                 output.insert(key.clone(), Value::Array(rows));
             }
-            Arc::new(Value::Object(output))
+            Value::Object(output)
         } else {
-            effect.settings.clone()
+            settings.clone()
         };
-        Ok(Self {
-            id: effect.id.clone(),
-            kind: effect.kind.clone(),
-            enabled: effect.enabled,
-            weight: effect.weight,
-            settings: (*settings).clone().into(),
-            clips,
-        })
+        Ok((settings, clips))
     }
     fn checked_clips(&self) -> Result<&[EffectClip36]> {
         if self.kind != "liquify" {
@@ -1024,9 +1172,74 @@ impl Source36 {
     pub fn definition(&self) -> &Content36 {
         &self.content
     }
+    pub(in crate::engine) fn to_resident(&self) -> crate::source::Source {
+        use crate::source::{Content, Source};
+        let content = match self.definition() {
+            Content36::Bezier {
+                nodes,
+                closed,
+                fill,
+                stroke,
+                stroke_width,
+            } => Content::Bezier {
+                nodes: nodes.clone(),
+                closed: *closed,
+                fill: *fill,
+                stroke: *stroke,
+                stroke_width: *stroke_width,
+            },
+            Content36::Text {
+                text,
+                layout,
+                font,
+                size,
+                line_height,
+                letter_spacing,
+                align,
+                color,
+            } => Content::Text {
+                text: text.clone(),
+                layout: *layout,
+                font: font.clone(),
+                size: *size,
+                line_height: *line_height,
+                letter_spacing: *letter_spacing,
+                align: align.clone(),
+                color: *color,
+            },
+            Content36::Shape {
+                shape,
+                bounds,
+                points,
+                closed,
+                fill,
+                stroke,
+                stroke_width,
+            } => Content::Shape {
+                shape: shape.clone(),
+                bounds: *bounds,
+                points: points.clone(),
+                closed: *closed,
+                fill: *fill,
+                stroke: *stroke,
+                stroke_width: *stroke_width,
+            },
+            Content36::Svg { svg } => Content::Svg { svg: svg.clone() },
+        };
+        Source {
+            width: self.width,
+            height: self.height,
+            matrix: self.matrix,
+            content,
+        }
+    }
     fn capture(source: &crate::source::Source) -> Self {
+        Self::from_source(source.clone())
+    }
+    /// Move a parsed command definition without another unadmitted deep copy.
+    pub(crate) fn from_source(source: crate::source::Source) -> Self {
         use crate::source::Content;
-        let content = match &source.content {
+        let content = match source.content {
             Content::Bezier {
                 nodes,
                 closed,
@@ -1034,11 +1247,11 @@ impl Source36 {
                 stroke,
                 stroke_width,
             } => Content36::Bezier {
-                nodes: nodes.clone(),
-                closed: *closed,
-                fill: *fill,
-                stroke: *stroke,
-                stroke_width: *stroke_width,
+                nodes,
+                closed,
+                fill,
+                stroke,
+                stroke_width,
             },
             Content::Text {
                 text,
@@ -1050,14 +1263,14 @@ impl Source36 {
                 align,
                 color,
             } => Content36::Text {
-                text: text.clone(),
-                layout: *layout,
-                font: font.clone(),
-                size: *size,
-                line_height: *line_height,
-                letter_spacing: *letter_spacing,
-                align: align.clone(),
-                color: *color,
+                text,
+                layout,
+                font,
+                size,
+                line_height,
+                letter_spacing,
+                align,
+                color,
             },
             Content::Shape {
                 shape,
@@ -1068,15 +1281,15 @@ impl Source36 {
                 stroke,
                 stroke_width,
             } => Content36::Shape {
-                shape: shape.clone(),
-                bounds: *bounds,
-                points: points.clone(),
-                closed: *closed,
-                fill: *fill,
-                stroke: *stroke,
-                stroke_width: *stroke_width,
+                shape,
+                bounds,
+                points,
+                closed,
+                fill,
+                stroke,
+                stroke_width,
             },
-            Content::Svg { svg } => Content36::Svg { svg: svg.clone() },
+            Content::Svg { svg } => Content36::Svg { svg },
         };
         Self {
             width: source.width,

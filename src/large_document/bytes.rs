@@ -9,6 +9,62 @@ type Digest = [u8; 32];
 type Check<'a> = &'a mut dyn FnMut() -> Result<()>;
 pub const MAX_SOURCE_PAYLOAD: u64 = 64 * 1024 * 1024 * 1024;
 const CHUNK: usize = 64 * 1024;
+pub(crate) const VERIFIED_BATCH_BYTES: usize = 1024 * 1024;
+
+pub(crate) fn verified_transfer_buffer(budget: &ResidentBudget, bytes: u64) -> Result<ScratchBytes> {
+    let length = (bytes.min(VERIFIED_BATCH_BYTES as u64) as usize)
+        .div_ceil(CHUNK)
+        .max(1)
+        * CHUNK;
+    match ScratchBytes::new(budget, length, VERIFIED_BATCH_BYTES) {
+        Err(Error::Budget) if length > CHUNK => ScratchBytes::new(budget, CHUNK, CHUNK),
+        result => result,
+    }
+}
+
+/// Batch small writes in memory already charged to the caller's source budget.
+/// Callers flush explicitly before treating the underlying write as complete.
+pub(crate) struct BufferedWrite<'a> {
+    output: &'a mut dyn Write,
+    scratch: &'a mut [u8],
+    used: usize,
+}
+
+impl<'a> BufferedWrite<'a> {
+    pub(crate) fn new(output: &'a mut dyn Write, scratch: &'a mut ScratchBytes) -> Self {
+        assert!(!scratch.is_empty());
+        Self { output, scratch, used: 0 }
+    }
+
+    fn drain(&mut self) -> io::Result<()> {
+        if self.used != 0 {
+            self.output.write_all(&self.scratch[..self.used])?;
+            self.used = 0;
+        }
+        Ok(())
+    }
+}
+
+impl Write for BufferedWrite<'_> {
+    fn write(&mut self, mut bytes: &[u8]) -> io::Result<usize> {
+        let length = bytes.len();
+        while !bytes.is_empty() {
+            let count = bytes.len().min(self.scratch.len() - self.used);
+            self.scratch[self.used..self.used + count].copy_from_slice(&bytes[..count]);
+            self.used += count;
+            bytes = &bytes[count..];
+            if self.used == self.scratch.len() {
+                self.drain()?;
+            }
+        }
+        Ok(length)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.drain()?;
+        self.output.flush()
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -19,6 +75,15 @@ pub enum ByteRole {
     CompositeData = 4,
     CompatibleJxlMode1 = 5,
     StraightNativeRgba = 6,
+}
+
+impl ByteRole {
+    pub(super) fn photoshop_transfer(self) -> bool {
+        matches!(
+            self,
+            Self::PhotoshopContainer | Self::LayerData | Self::CompositeData
+        )
+    }
 }
 
 pub struct LargeSourceTemporary {
@@ -81,6 +146,16 @@ impl LargeSourceTemporary {
             inner: self.inner.finish(binding, check)?,
         })
     }
+    pub(crate) fn finish_recoverable(
+        self,
+        binding: Digest,
+        check: Check<'_>,
+    ) -> std::result::Result<CompletedBytes, (Error, Self)> {
+        self.inner
+            .finish_recoverable(binding, check)
+            .map(|inner| CompletedBytes { inner })
+            .map_err(|(error, inner)| (error, Self { inner }))
+    }
     pub fn abort(self, check: Check<'_>) -> Result<()> {
         self.inner.abort(check)
     }
@@ -95,7 +170,12 @@ impl Write for AppendWriter<'_> {
         if bytes.is_empty() {
             return Ok(0);
         }
-        let count = bytes.len().min(CHUNK);
+        let limit = if self.temporary.role().photoshop_transfer() {
+            VERIFIED_BATCH_BYTES
+        } else {
+            CHUNK
+        };
+        let count = bytes.len().min(limit);
         self.temporary
             .append(&bytes[..count], self.check)
             .map_err(io_error)?;
@@ -172,6 +252,39 @@ impl CompletedBytes {
     ) -> Result<()> {
         self.inner.read_range_into(start, output, check)
     }
+    /// Fill the authenticated payload prefix of one native chunk buffer.
+    pub(crate) fn read_complete_chunk_into(
+        &self,
+        start: u64,
+        count: usize,
+        output: &mut ScratchBytes,
+        check: Check<'_>,
+    ) -> Result<()> {
+        if output.len() != CHUNK {
+            return Err(Error::Budget);
+        }
+        self.read_complete_chunks_into(start, count, output, check)
+    }
+    /// Authenticate each sealed chunk and check the owner around the batch.
+    pub(crate) fn read_complete_chunks_into(
+        &self,
+        start: u64,
+        count: usize,
+        output: &mut ScratchBytes,
+        check: Check<'_>,
+    ) -> Result<()> {
+        self.inner.read_complete_chunks_into(start, count, output, check)
+    }
+    pub(crate) fn read_strided_into(
+        &self,
+        start: u64,
+        row_bytes: usize,
+        row_stride: u64,
+        output: &mut ScratchBytes,
+        check: Check<'_>,
+    ) -> Result<()> {
+        self.inner.read_strided_into(start, row_bytes, row_stride, output, check)
+    }
     /// Each cursor pins its own charged chunk buffer. The caller must separately
     /// admit the transfer buffer supplied to Read; positions are range-relative.
     pub fn cursor<'a>(&self, start: u64, length: u64, check: Check<'a>) -> Result<BytesCursor<'a>> {
@@ -216,16 +329,34 @@ impl Read for BytesCursor<'_> {
             self.owner.inner.owned.check().map_err(io_error)?;
             return Ok(0);
         }
-        let count = (self.length - self.position).min(output.len().min(CHUNK) as u64) as usize;
-        self.owner
-            .inner
-            .read_bytes(
-                self.start + self.position,
-                &mut output[..count],
-                &mut self.buffer,
-                self.check,
-            )
-            .map_err(io_error)?;
+        let start = self.start + self.position;
+        let limit = (self.length - self.position)
+            .min(output.len().min(VERIFIED_BATCH_BYTES) as u64) as usize;
+        let complete = if start + limit as u64 == self.owner.payload_length() {
+            limit
+        } else {
+            limit / CHUNK * CHUNK
+        };
+        let offset = (start % CHUNK as u64) as usize;
+        let photoshop = self.owner.role().photoshop_transfer();
+        let count = if photoshop && complete != 0 && offset == 0 {
+            self.owner
+                .inner
+                .read_complete_chunks(start, &mut output[..complete], self.check)
+                .map_err(io_error)?;
+            complete
+        } else {
+            let count = limit.min(if photoshop && limit > CHUNK && offset != 0 {
+                CHUNK - offset
+            } else {
+                CHUNK
+            });
+            self.owner
+                .inner
+                .read_bytes(start, &mut output[..count], &mut self.buffer, self.check)
+                .map_err(io_error)?;
+            count
+        };
         self.position += count as u64;
         Ok(count)
     }
@@ -262,7 +393,9 @@ fn io_error(error: Error) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::super::store::{open_directory, stamp, validate_ancestors, write_all_at};
+    use super::super::store::{
+        open_directory, read_exact_at, stamp, validate_ancestors, write_all_at,
+    };
     use super::*;
     use ring::digest::{Context, SHA256};
     use std::{
@@ -407,6 +540,57 @@ mod tests {
     }
 
     #[test]
+    fn strided_reads_pack_rows_and_authenticate_shared_chunks_once() {
+        let fixture = Fixture::new();
+        let budget = ResidentBudget::new(1024 * 1024).unwrap();
+        let disk = DiskBudget::new(256 * 1024, 1).unwrap();
+        let mut done = filled(&fixture, 200123, &budget, &disk);
+        let (start, stride, row_bytes, rows) = (65500, 1024, 300, 130);
+        let mut output = ScratchBytes::new(&budget, rows * row_bytes, rows * row_bytes).unwrap();
+        let admitted = budget.used();
+        let mut checks = 0;
+        done.read_strided_into(start, row_bytes, stride, &mut output, &mut || {
+            checks += 1;
+            Ok(())
+        }).unwrap();
+        // One probe per row and one per distinct authenticated chunk, with
+        // two enclosing probes. The first row straddles a chunk boundary.
+        assert_eq!(checks, rows + 4 + 2);
+        for (y, row) in output.chunks_exact(row_bytes).enumerate() {
+            for (x, &byte) in row.iter().enumerate() {
+                assert_eq!(byte, value(start + y as u64 * stride + x as u64));
+            }
+        }
+        assert_eq!(budget.used(), admitted);
+        for (offset, width, step) in [
+            (start, 0, stride), (start, row_bytes + 1, stride),
+            (start, row_bytes, row_bytes as u64 - 1), (start, row_bytes, u64::MAX),
+            (200000, row_bytes, stride),
+        ] {
+            assert!(matches!(done.read_strided_into(offset, width, step, &mut output, &mut okay), Err(Error::Invalid(_))));
+        }
+        let mut foreign = ScratchBytes::new(&ResidentBudget::new(1024).unwrap(), row_bytes, row_bytes).unwrap();
+        assert!(matches!(done.read_strided_into(start, row_bytes, stride, &mut foreign, &mut okay), Err(Error::Budget)));
+        checks = 0;
+        assert!(matches!(done.read_strided_into(start, row_bytes, stride, &mut output, &mut || {
+            checks += 1;
+            if checks == 80 { Err(Error::Cancelled) } else { Ok(()) }
+        }), Err(Error::Cancelled)));
+        assert_eq!(budget.used(), admitted);
+
+        // Accept the changed file stamp so the test reaches the immutable
+        // digest check for a late chunk rather than the ownership fence.
+        let last = start + (rows - 1) as u64 * stride + row_bytes as u64 - 1;
+        let owned = &mut Arc::get_mut(&mut done.inner).unwrap().owned;
+        write_all_at(&owned.file, 64 + last, &[value(last) ^ 0xff]).unwrap();
+        owned.expected = stamp(&owned.file).unwrap();
+        assert!(matches!(done.read_strided_into(start, row_bytes, stride, &mut output, &mut okay), Err(Error::Corrupt)));
+        assert_eq!(budget.used(), admitted);
+        drop((output, done));
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
     fn byte_spool_maximum_and_empty_policy_do_not_raise_legacy_or_image_limits() {
         assert!(LargeSourceTemporary::encoded_bytes(MAX_SOURCE_PAYLOAD).is_ok());
         assert!(matches!(
@@ -514,6 +698,178 @@ mod tests {
     }
 
     #[test]
+    fn recoverable_sealing_retires_every_verified_cancellation_prefix() {
+        let fixture = Fixture::new();
+        let budget = ResidentBudget::new(2 * 1024 * 1024).unwrap();
+        let disk = DiskBudget::new(4 * 1024 * 1024, 4).unwrap();
+        let path = fixture.root.join("recoverable");
+        let payload = vec![37; CHUNK * 3 + 7];
+        let create = || {
+            let mut spool = LargeSourceTemporary::create(
+                &path,
+                payload.len() as u64,
+                ByteRole::SourceBulk,
+                budget.clone(),
+                disk.clone(),
+            )
+            .unwrap();
+            spool.append(&payload, &mut okay).unwrap();
+            spool
+        };
+        let mut checkpoints = 0;
+        let completed = create()
+            .finish([13; 32], &mut || {
+                checkpoints += 1;
+                Ok(())
+            })
+            .unwrap();
+        completed.retire(&mut okay).unwrap();
+        assert!(checkpoints > 3);
+        for stop in 1..=checkpoints {
+            let mut calls = 0;
+            let (reason, mut spool) = create()
+                .finish_recoverable([13; 32], &mut || {
+                    calls += 1;
+                    if calls == stop {
+                        Err(Error::Cancelled)
+                    } else {
+                        Ok(())
+                    }
+                })
+                .err()
+                .unwrap();
+            assert!(matches!(reason, Error::Cancelled));
+            assert_eq!(calls, stop);
+            assert!(spool
+                .append(b"cannot resume a failed seal", &mut okay)
+                .is_err());
+            spool.abort(&mut okay).unwrap();
+            assert!(!path.exists());
+            assert_eq!(disk.used().unwrap(), 0);
+            assert_eq!(budget.used(), 0);
+        }
+    }
+
+    #[test]
+    fn cancelled_photoshop_stripe_keeps_its_exact_completed_prefix_for_retirement() {
+        let fixture = Fixture::new();
+        let budget = ResidentBudget::new(1024 * 1024).unwrap();
+        let first = [37; 17];
+        let batch = vec![58; 2 * CHUNK + 31];
+        let prefix = (first.len() + batch.len()) as u64;
+        let length = prefix + 1;
+        let disk = DiskBudget::new(LargeSourceTemporary::encoded_bytes(length).unwrap(), 1).unwrap();
+        let path = fixture.root.join("cancel-stripe");
+        let mut spool = LargeSourceTemporary::create(
+            &path,
+            length,
+            ByteRole::LayerData,
+            budget,
+            disk.clone(),
+        )
+        .unwrap();
+        spool.append(&first, &mut okay).unwrap();
+        let file = path.join("bytes.pbb");
+        let mut check = || {
+            if fs::metadata(&file)?.len() == 64 + prefix {
+                Err(Error::Cancelled)
+            } else {
+                Ok(())
+            }
+        };
+        assert!(spool.writer(&mut check).write_all(&batch).is_err());
+        let mut actual = vec![0; prefix as usize];
+        read_exact_at(&spool.inner.owned.file, 64, &mut actual).unwrap();
+        assert_eq!(&actual[..first.len()], &first);
+        assert_eq!(&actual[first.len()..], batch.as_slice());
+        assert!(matches!(spool.append(&[9], &mut okay), Err(Error::Interrupted)));
+        spool.abort(&mut okay).unwrap();
+        assert_eq!(disk.used().unwrap(), 0);
+    }
+
+    #[test]
+    fn batched_photoshop_seal_refuses_corruption_in_its_final_partial_chunk() {
+        let fixture = Fixture::new();
+        let budget = ResidentBudget::new(1024 * 1024).unwrap();
+        let length = CHUNK + 31;
+        let disk = DiskBudget::new(LargeSourceTemporary::encoded_bytes(length as u64).unwrap(), 1)
+            .unwrap();
+        let mut spool = LargeSourceTemporary::create(
+            &fixture.root.join("seal-batch"),
+            length as u64,
+            ByteRole::PhotoshopContainer,
+            budget,
+            disk,
+        )
+        .unwrap();
+        spool.append(&vec![37; length], &mut okay).unwrap();
+        let last = 64 + (length - 1) as u64;
+        let owned = &mut spool.inner.owned;
+        write_all_at(&owned.file, last, &[38]).unwrap();
+        owned.expected = stamp(&owned.file).unwrap();
+        let (error, spool) = spool.finish_recoverable([13; 32], &mut okay).err().unwrap();
+        assert!(matches!(error, Error::Corrupt));
+        write_all_at(&spool.inner.owned.file, last, &[37]).unwrap();
+        spool.abort(&mut okay).unwrap();
+    }
+
+    #[test]
+    fn recovered_seal_ownership_never_authorizes_deleting_changed_bytes() {
+        for changed in [0, 64, 64 + 1031, 64 + 1031 + 32, 64 + 1031 + 32 + 144] {
+            let fixture = Fixture::new();
+            let budget = ResidentBudget::new(2 * 1024 * 1024).unwrap();
+            let disk = DiskBudget::new(65536, 2).unwrap();
+            let path = fixture.root.join("changed-seal");
+            let mut spool = LargeSourceTemporary::create(
+                &path,
+                1031,
+                ByteRole::SourceBulk,
+                budget.clone(),
+                disk.clone(),
+            )
+            .unwrap();
+            spool.append(&[37; 1031], &mut okay).unwrap();
+            let encoded = LargeSourceTemporary::encoded_bytes(1031).unwrap();
+            let (reason, spool) = spool
+                .finish_recoverable([13; 32], &mut || {
+                    if fs::metadata(path.join("bytes.pbb"))?.len() == encoded {
+                        Err(Error::Cancelled)
+                    } else {
+                        Ok(())
+                    }
+                })
+                .err()
+                .unwrap();
+            assert!(matches!(reason, Error::Cancelled));
+            let used = disk.used().unwrap();
+            let original = spool
+                .inner
+                .owned
+                .file
+                .metadata()
+                .unwrap()
+                .modified()
+                .unwrap();
+            let mut byte = [0];
+            if changed < encoded {
+                read_exact_at(&spool.inner.owned.file, changed, &mut byte).unwrap();
+            }
+            byte[0] ^= 0x5a;
+            write_all_at(&spool.inner.owned.file, changed, &byte).unwrap();
+            spool
+                .inner
+                .owned
+                .file
+                .set_times(std::fs::FileTimes::new().set_modified(original))
+                .unwrap();
+            assert!(spool.abort(&mut okay).is_err());
+            assert!(path.join("bytes.pbb").exists());
+            assert_eq!(disk.used().unwrap(), used);
+            assert_eq!(budget.used(), 0);
+        }
+    }
+
+    #[test]
     fn corrupted_or_foreign_spool_reads_never_masquerade_as_eof() {
         for foreign in [false, true] {
             let fixture = Fixture::new();
@@ -539,6 +895,11 @@ mod tests {
                 let mut cursor = cursor.unwrap();
                 assert!(cursor.read(&mut [0; 8]).is_err());
                 drop(cursor);
+                let mut chunk = ScratchBytes::new(&budget, CHUNK, CHUNK).unwrap();
+                assert!(matches!(
+                    done.read_complete_chunk_into(0, 1031, &mut chunk, &mut okay),
+                    Err(Error::Corrupt)
+                ));
                 drop(done);
             }
             assert_eq!(budget.used(), 0);
@@ -586,5 +947,120 @@ mod tests {
         done.retire(&mut okay).unwrap();
         assert_eq!(budget.used(), 0);
         assert_eq!(disk.used().unwrap(), 0);
+    }
+
+    #[test]
+    fn sealed_chunk_read_validates_exact_length_and_preserves_the_unused_buffer_tail() {
+        let fixture = Fixture::new();
+        let budget = ResidentBudget::new(1024 * 1024).unwrap();
+        let length = CHUNK as u64 + 31;
+        let disk = DiskBudget::new(LargeSourceTemporary::encoded_bytes(length).unwrap(), 1).unwrap();
+        let done = filled(&fixture, length, &budget, &disk);
+        let mut chunk = ScratchBytes::new(&budget, CHUNK, CHUNK).unwrap();
+        done.read_complete_chunk_into(0, CHUNK, &mut chunk, &mut okay)
+            .unwrap();
+        assert!(chunk.iter().enumerate().all(|(i, &b)| b == value(i as u64)));
+        let start = CHUNK as u64;
+        assert!(done
+            .read_complete_chunk_into(start, 30, &mut chunk, &mut okay)
+            .is_err());
+        assert!(done
+            .read_complete_chunk_into(start + 1, 30, &mut chunk, &mut okay)
+            .is_err());
+        done.read_complete_chunk_into(start, 31, &mut chunk, &mut okay)
+            .unwrap();
+        assert!(chunk[..31]
+            .iter()
+            .enumerate()
+            .all(|(i, &b)| b == value(start + i as u64)));
+        assert_eq!(chunk[31], value(31));
+        drop(chunk);
+        done.retire(&mut okay).unwrap();
+    }
+
+    #[test]
+    fn sealed_batch_checks_every_chunk_and_preserves_its_tail() {
+        let fixture = Fixture::new();
+        let budget = ResidentBudget::new(1024 * 1024).unwrap();
+        let length = 2 * CHUNK + 31;
+        let constrained = ResidentBudget::new(CHUNK).unwrap();
+        let fallback = verified_transfer_buffer(&constrained, length as u64).unwrap();
+        assert_eq!(fallback.len(), CHUNK);
+        assert!(fallback.uses_budget(&constrained));
+        drop(fallback);
+        let disk =
+            DiskBudget::new(LargeSourceTemporary::encoded_bytes(length as u64).unwrap(), 1)
+                .unwrap();
+        let mut done = filled(&fixture, length as u64, &budget, &disk);
+        let mut batch = ScratchBytes::new(&budget, 3 * CHUNK, VERIFIED_BATCH_BYTES).unwrap();
+        batch.fill(0xa5);
+        done.read_complete_chunks_into(0, length, &mut batch, &mut okay)
+            .unwrap();
+        assert!(batch[..length]
+            .iter()
+            .enumerate()
+            .all(|(i, &b)| b == value(i as u64)));
+        assert!(batch[length..].iter().all(|&b| b == 0xa5));
+        {
+            let mut check = okay;
+            let mut cursor = done.cursor(0, length as u64, &mut check).unwrap();
+            batch.fill(0xa5);
+            assert_eq!(cursor.read(&mut batch).unwrap(), length);
+            assert!(batch[..length]
+                .iter()
+                .enumerate()
+                .all(|(i, &b)| b == value(i as u64)));
+            assert!(batch[length..].iter().all(|&b| b == 0xa5));
+            let offset = 17;
+            cursor.seek(SeekFrom::Start(offset as u64)).unwrap();
+            let prefix = cursor.read(&mut batch).unwrap();
+            assert_eq!(prefix, CHUNK - offset);
+            assert_eq!(cursor.read(&mut batch[prefix..]).unwrap(), CHUNK + 31);
+            assert!(batch[..length - offset]
+                .iter()
+                .enumerate()
+                .all(|(i, &b)| b == value((i + offset) as u64)));
+        }
+
+        let mut checks = 0;
+        let result = done.read_complete_chunks_into(0, length, &mut batch, &mut || {
+            checks += 1;
+            if checks == 2 {
+                return Err(Error::Cancelled);
+            }
+            Ok(())
+        });
+        assert!(matches!(result, Err(Error::Cancelled)));
+
+        let position = 64 + 2 * CHUNK as u64;
+        let original = value(2 * CHUNK as u64);
+        let owned = &mut Arc::get_mut(&mut done.inner).unwrap().owned;
+        write_all_at(&owned.file, position, &[original ^ 1]).unwrap();
+        owned.expected = stamp(&owned.file).unwrap();
+        assert!(matches!(
+            done.read_complete_chunks_into(0, length, &mut batch, &mut okay),
+            Err(Error::Corrupt)
+        ));
+        {
+            let mut check = okay;
+            let mut cursor = done.cursor(0, length as u64, &mut check).unwrap();
+            assert_eq!(
+                cursor.read(&mut batch).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+            assert_eq!(cursor.stream_position().unwrap(), 0);
+            assert_eq!(cursor.read(&mut batch[..CHUNK]).unwrap(), CHUNK);
+            cursor.seek(SeekFrom::Start(2 * CHUNK as u64)).unwrap();
+            assert_eq!(
+                cursor.read(&mut batch[..31]).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+            assert_eq!(cursor.stream_position().unwrap(), 2 * CHUNK as u64);
+        }
+        let owned = &mut Arc::get_mut(&mut done.inner).unwrap().owned;
+        write_all_at(&owned.file, position, &[original]).unwrap();
+        owned.expected = stamp(&owned.file).unwrap();
+        drop(batch);
+        done.retire(&mut okay).unwrap();
     }
 }

@@ -37,9 +37,9 @@ impl Choice {
         }
     }
 
-    pub(super) fn show(&mut self, ctx: &egui::Context) {
+    pub(super) fn show(&mut self, ctx: &egui::Context, logo: &TextureHandle) {
         if let Some(welcome) = &mut self.welcome {
-            welcome.show(ctx);
+            welcome.show(ctx, logo);
         }
         self.show_for(ctx, std::env::consts::OS, open_windows_defaults);
     }
@@ -303,15 +303,15 @@ mod tests {
             app.recovery.open = false;
             {
                 let mut engine = app.shared.lock().unwrap();
-                engine.doc = Document::new_depth(32, 24, depth).unwrap();
-                app.selected = engine.doc.layers[0].id.clone();
+                engine.resident_state_mut().expect("resident fixture").document = Document::new_depth(32, 24, depth).unwrap();
+                app.selected = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
                 for point in [[8, 8], [16, 16]] {
                     engine.edit("human", &[json!({"op":"paint","layer":app.selected,"points":[point],"radius":3,"color":[233,84,32,255]})], None, None, "Existing stroke").unwrap();
                 }
                 engine.undo("human").unwrap();
-                assert_eq!((engine.undo.len(), engine.redo.len()), (1, 1));
+                assert_eq!((engine.resident_state().expect("resident fixture").undo.len(), engine.resident_state().expect("resident fixture").redo.len()), (1, 1));
             }
-            let before = serde_json::to_value(&app.shared.lock().unwrap().doc).unwrap();
+            let before = serde_json::to_value(&app.shared.lock().unwrap().resident_state().expect("resident fixture").document).unwrap();
             let draw = |app: &mut PeerBrush, events| {
                 ctx.run(
                     egui::RawInput {
@@ -336,8 +336,8 @@ mod tests {
             draw(&mut app, escape());
             assert!(!app.associations.open);
             let engine = app.shared.lock().unwrap();
-            assert_eq!(serde_json::to_value(&engine.doc).unwrap(), before);
-            assert_eq!((engine.undo.len(), engine.redo.len()), (1, 1));
+            assert_eq!(serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap(), before);
+            assert_eq!((engine.resident_state().expect("resident fixture").undo.len(), engine.resident_state().expect("resident fixture").redo.len()), (1, 1));
         }
     }
 }

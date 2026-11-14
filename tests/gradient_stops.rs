@@ -34,8 +34,8 @@ fn native_gradient_stops_interpolate_exact_endpoints_midpoints_and_independent_a
 #[test]
 fn malformed_gradient_stops_reject_without_partial_edits_or_history() {
     let mut e = Engine::new();
-    let layer = e.doc.layers[0].id.clone();
-    let before = serde_json::to_value(&e.doc).unwrap();
+    let layer = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
+    let before = serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap();
     for bad in [
         json!(null),
         json!([{"position":0.,"color":[0.,0.,0.]}]),
@@ -56,8 +56,8 @@ fn malformed_gradient_stops_reject_without_partial_edits_or_history() {
                 "Invalid gradient"
             )
             .is_err());
-        assert_eq!(serde_json::to_value(&e.doc).unwrap(), before);
-        assert!(e.undo.is_empty());
+        assert_eq!(serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap(), before);
+        assert!(e.resident_state().expect("resident fixture").undo.is_empty());
     }
     let stops: Vec<_> = (0..17)
         .map(|i| json!({"position":i as f64/16.,"opacity":1.}))
@@ -66,10 +66,10 @@ fn malformed_gradient_stops_reject_without_partial_edits_or_history() {
 }
 fn fixture(depth: u16) -> Engine {
     let mut e = Engine::new();
-    e.doc = Document::new_depth(16, 8, depth).unwrap();
+    e.resident_state_mut().expect("resident fixture").document = Document::new_depth(16, 8, depth).unwrap();
     for y in 0..8 {
         for x in 0..16 {
-            e.doc.layers[0].pixels.set16(
+            e.resident_state_mut().expect("resident fixture").document.layers[0].pixels.set16(
                 x,
                 y,
                 [
@@ -97,22 +97,22 @@ fn strip(bytes: &[u8]) -> Vec<u8> {
 fn gradient_stops_preserve_native_sources_preview_undo_and_actual_standard_composites() {
     for depth in [8, 16] {
         let mut e = fixture(depth);
-        let before = e.doc.export_png().unwrap();
-        let source = e.doc.layers[0].pixels.rgba16();
-        let layer = e.doc.layers[0].id.clone();
+        let before = e.resident_state().expect("resident fixture").document.export_png().unwrap();
+        let source = e.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16();
+        let layer = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
         let command = json!({"op":"effect.add","layer":layer,"kind":"gradient_overlay","settings":settings()});
-        let preview = Engine::preview_edits(e.doc.clone(), std::slice::from_ref(&command)).unwrap();
-        assert_eq!(e.doc.export_png().unwrap(), before);
+        let preview = Engine::preview_edits(e.resident_state().expect("resident fixture").document.clone(), std::slice::from_ref(&command)).unwrap();
+        assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), before);
         e.edit("human", &[command], None, None, "Gradient stops")
             .unwrap();
-        assert_eq!(e.doc.layers[0].pixels.rgba16(), source);
-        let current = e.doc.export_png().unwrap();
+        assert_eq!(e.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(), source);
+        let current = e.resident_state().expect("resident fixture").document.export_png().unwrap();
         assert_eq!(current, preview.export_png().unwrap());
         assert_ne!(current, before);
-        assert_eq!(e.undo.len(), 1);
+        assert_eq!(e.resident_state().expect("resident fixture").undo.len(), 1);
         for bytes in [
-            psd::encode(&e.doc).unwrap(),
-            psd::encode_psb(&e.doc).unwrap(),
+            psd::encode(&e.resident_state().expect("resident fixture").document).unwrap(),
+            psd::encode_psb(&e.resident_state().expect("resident fixture").document).unwrap(),
         ] {
             let d = psd::decode(&bytes).unwrap();
             assert!(!d.read_only);
@@ -123,24 +123,24 @@ fn gradient_stops_preserve_native_sources_preview_undo_and_actual_standard_compo
             );
             assert_eq!(d.export_png().unwrap(), current);
         }
-        let standard = psd::decode(&strip(&psd::encode(&e.doc).unwrap())).unwrap();
+        let standard = psd::decode(&strip(&psd::encode(&e.resident_state().expect("resident fixture").document).unwrap())).unwrap();
         assert!(!standard.read_only);
         assert_eq!(standard.export_png().unwrap(), current);
         e.undo("human").unwrap();
-        assert_eq!(e.doc.export_png().unwrap(), before);
+        assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), before);
         e.redo("human").unwrap();
-        assert_eq!(e.doc.export_png().unwrap(), current);
+        assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), current);
     }
 }
 #[test]
 fn shared_gradient_stops_feedback_has_actual_native_pixels_and_document_coordinates() {
     let e = fixture(16);
-    let layer = e.doc.layers[0].id.clone();
+    let layer = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
     let shared = Arc::new(Mutex::new(e));
     let result=server::dispatch(&shared,"edit",&json!({"actor":"human","commands":[{"op":"effect.add","layer":layer,"kind":"gradient_overlay","settings":settings()}],"feedback":"always","max_edge":32})).unwrap();
     assert_eq!(result["images"][0]["document_rect"], json!([0, 0, 16, 8]));
     assert!(result["images"][0]["data"].as_str().unwrap().len() > 20);
-    assert_eq!(shared.lock().unwrap().undo.len(), 1);
+    assert_eq!(shared.lock().unwrap().resident_state().expect("resident fixture").undo.len(), 1);
 }
 
 #[test]
@@ -154,21 +154,21 @@ fn positioned_gradients_match_analytic_native_coordinates_and_preserve_alpha() {
         ] {
             for reflected in [false, true] {
                 let mut e = Engine::new();
-                e.doc = Document::new_depth(4, 2, depth).unwrap();
+                e.resident_state_mut().expect("resident fixture").document = Document::new_depth(4, 2, depth).unwrap();
                 for y in 0..2 {
                     for x in 0..4 {
-                        e.doc.layers[0]
+                        e.resident_state_mut().expect("resident fixture").document.layers[0]
                             .pixels
                             .set16(x, y, [12347, 23459, 34571, 65535]);
                     }
                 }
-                let source = e.doc.layers[0].pixels.rgba16();
-                let layer = e.doc.layers[0].id.clone();
+                let source = e.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16();
+                let layer = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
                 e.edit("human", &[json!({"op":"effect.add","layer":layer,"kind":"gradient_overlay","settings":{"opacity":1.,"color":[0.,0.,0.],"color2":[1.,1.,1.],"angle":angle,"offset_x":ox,"offset_y":oy,"style":if reflected{"reflected"}else{"linear"}}})],None,None,"Gradient placement").unwrap();
                 let actual = if depth == 16 {
-                    peerbrush::depth16::render(&e.doc).unwrap().words
+                    peerbrush::depth16::render(&e.resident_state().expect("resident fixture").document).unwrap().words
                 } else {
-                    e.doc
+                    e.resident_state().expect("resident fixture").document
                         .preview(None, 8, None, false)
                         .unwrap()
                         .2
@@ -202,7 +202,7 @@ fn positioned_gradients_match_analytic_native_coordinates_and_preserve_alpha() {
                         );
                     }
                 }
-                assert_eq!(e.doc.layers[0].pixels.rgba16(), source);
+                assert_eq!(e.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(), source);
             }
         }
     }
@@ -212,13 +212,13 @@ fn gradient_placement_shared_feedback_undo_save_and_disabled_sources_remain_exac
     for depth in [8, 16] {
         for disabled in [false, true] {
             let mut e = fixture(depth);
-            let source = e.doc.layers[0].pixels.rgba16();
-            let layer = e.doc.layers[0].id.clone();
+            let source = e.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16();
+            let layer = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
             e.edit("human",&[json!({"op":"effect.add","layer":layer,"kind":"gradient_overlay","settings":settings()})],None,None,"Initial gradient").unwrap();
-            e.doc.layers[0].effects[0].enabled = !disabled;
-            e.undo.clear();
-            let effect = e.doc.layers[0].effects[0].id.clone();
-            let before = e.doc.export_png().unwrap();
+            e.resident_state_mut().expect("resident fixture").document.layers[0].effects[0].enabled = !disabled;
+            e.resident_state_mut().expect("resident fixture").undo.clear();
+            let effect = e.resident_state().expect("resident fixture").document.layers[0].effects[0].id.clone();
+            let before = e.resident_state().expect("resident fixture").document.export_png().unwrap();
             let mut s = settings();
             s["offset_x"] = json!(0.25);
             s["offset_y"] = json!(-0.375);
@@ -227,12 +227,12 @@ fn gradient_placement_shared_feedback_undo_save_and_disabled_sources_remain_exac
             assert_eq!(result["images"][0]["document_rect"], json!([0, 0, 16, 8]));
             assert!(result["images"][0]["data"].as_str().unwrap().len() > 20);
             let mut e = shared.lock().unwrap();
-            assert_eq!(e.undo.len(), 1);
-            assert_eq!(e.doc.layers[0].pixels.rgba16(), source);
-            let current = e.doc.export_png().unwrap();
+            assert_eq!(e.resident_state().expect("resident fixture").undo.len(), 1);
+            assert_eq!(e.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(), source);
+            let current = e.resident_state().expect("resident fixture").document.export_png().unwrap();
             for output in [
-                psd::encode(&e.doc).unwrap(),
-                psd::encode_psb(&e.doc).unwrap(),
+                psd::encode(&e.resident_state().expect("resident fixture").document).unwrap(),
+                psd::encode_psb(&e.resident_state().expect("resident fixture").document).unwrap(),
             ] {
                 let reopened = psd::decode(&output).unwrap();
                 assert!(!reopened.read_only);
@@ -253,9 +253,9 @@ fn gradient_placement_shared_feedback_undo_save_and_disabled_sources_remain_exac
                 assert_eq!(raw["format"], 23);
             }
             e.undo("human").unwrap();
-            assert_eq!(e.doc.export_png().unwrap(), before);
+            assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), before);
             e.redo("human").unwrap();
-            assert_eq!(e.doc.export_png().unwrap(), current);
+            assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), current);
         }
     }
 }
@@ -271,8 +271,8 @@ fn gradient_placement_invalid_or_inapplicable_settings_roll_back_atomically() {
             ("bevel_emboss", json!({"offset_y":0.25})),
         ] {
             let mut e = fixture(depth);
-            let before = serde_json::to_value(&e.doc).unwrap();
-            let layer = e.doc.layers[0].id.clone();
+            let before = serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap();
+            let layer = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
             assert!(e
                 .edit(
                     "human",
@@ -285,8 +285,8 @@ fn gradient_placement_invalid_or_inapplicable_settings_roll_back_atomically() {
                     "Invalid placement"
                 )
                 .is_err());
-            assert_eq!(serde_json::to_value(&e.doc).unwrap(), before);
-            assert!(e.undo.is_empty());
+            assert_eq!(serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap(), before);
+            assert!(e.resident_state().expect("resident fixture").undo.is_empty());
         }
     }
 }

@@ -10,7 +10,7 @@ fn text<'a>(v: &'a Value, key: &str, default: &'a str) -> &'a str {
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    collections::{BTreeSet, HashMap, VecDeque},
+    collections::HashMap,
     sync::Arc,
 };
 /// Runtime replay source, scoped to unchanged artwork and its original combination baseline.
@@ -42,22 +42,7 @@ fn update_wand(doc: &mut Document, c: &Value) -> Result<(), String> {
         .filter(|s| s.revision == doc.revision || s.revision == doc.revision.saturating_add(1))
         .ok_or("Click with the Magic Wand again after changing the artwork or selection")?;
     let mut command = source.command.clone();
-    for (key, limit) in [("tolerance", 255.), ("feather", 64.)] {
-        if let Some(value) = c.get(key) {
-            let n = value
-                .as_f64()
-                .filter(|n| n.is_finite() && *n >= 0. && *n <= limit)
-                .ok_or_else(|| format!("Wand {key} must be between 0 and {limit}"))?;
-            command[key] = serde_json::json!(n);
-        }
-    }
-    for key in ["contiguous", "sample_merged", "color_similarity"] {
-        if let Some(value) = c.get(key) {
-            command[key] = serde_json::json!(value
-                .as_bool()
-                .ok_or("Wand sampling options must be boolean")?);
-        }
-    }
+    super::wand::update(&mut command, c)?;
     doc.selection = source.before.as_ref().map(|s| s.bounds);
     doc.selection_polygon = None;
     doc.selection_coverage = source.before.clone();
@@ -237,19 +222,7 @@ pub(super) fn snapshot(doc: &Document, c: &Value) -> Result<(u32, u32, Vec<u8>),
     let (w, h, p, _) = doc.preview(None, doc.width.max(doc.height), target, false)?;
     Ok((w, h, p))
 }
-fn difference(a: &[u8], b: &[u8], color_similarity: bool) -> f32 {
-    if color_similarity {
-        return (0..4)
-            .map(|i| (a[i] as f32 - b[i] as f32).abs())
-            .fold(0., f32::max);
-    }
-    let rgb = (0..3)
-        .map(|i| (a[i] as f32 - b[i] as f32).powi(2))
-        .sum::<f32>()
-        .sqrt()
-        / 3.0_f32.sqrt();
-    rgb.max((a[3] as f32 - b[3] as f32).abs())
-}
+use super::sampling::difference;
 pub fn apply(doc: &mut Document, c: &Value) -> Result<(), String> {
     if c["op"] == "selection.wand_update" {
         return update_wand(doc, c);
@@ -324,7 +297,7 @@ pub fn apply(doc: &mut Document, c: &Value) -> Result<(), String> {
         return Err("Raster selection work is limited to 16 megapixels".into());
     }
     let mut mask = Raster::new(w, h);
-    let mut area = c["rect"]
+    let area = c["rect"]
         .as_array()
         .filter(|a| a.len() == 4)
         .map(|a| std::array::from_fn(|i| a[i].as_i64().unwrap_or(0) as i32))
@@ -458,7 +431,7 @@ pub fn apply(doc: &mut Document, c: &Value) -> Result<(), String> {
                 } else {
                     0
                 };
-                if seeds.len() > 8192 {
+                if seeds.len() > super::MAX_BRUSH_SEEDS {
                     return Err("Use at most 8192 selection brush seeds".into());
                 }
                 flood_mask(
@@ -473,48 +446,14 @@ pub fn apply(doc: &mut Document, c: &Value) -> Result<(), String> {
         }
     } else {
         let points: Option<Vec<[f32; 2]>> = serde_json::from_value(c["polygon"].clone()).ok();
-        if let Some(p) = &points {
-            area = bounds(p)?;
-        }
-        for y in area[1].max(0)..area[3].min(h as i32) {
-            if let Some(points) = &points {
-                let cy = y as f32 + 0.5;
-                let mut crossings = Vec::new();
-                for (a, b) in points
-                    .iter()
-                    .zip(points.iter().cycle().skip(1))
-                    .take(points.len())
-                {
-                    if (a[1] > cy) != (b[1] > cy) {
-                        crossings.push(a[0] + (b[0] - a[0]) * (cy - a[1]) / (b[1] - a[1]));
-                    }
-                }
-                crossings.sort_by(f32::total_cmp);
-                for pair in crossings.chunks_exact(2) {
-                    for x in ((pair[0] - 0.5).ceil() as i32).max(0)
-                        ..=((pair[1] - 0.5).floor() as i32).min(w as i32 - 1)
-                    {
-                        mask.set(x, y, [255; 4]);
-                    }
-                }
-                continue;
-            }
-            for x in area[0].max(0)..area[2].min(w as i32) {
-                let inside = if let Some(p) = &points {
-                    contains(p, x as f32 + 0.5, y as f32 + 0.5)
-                } else if kind == "ellipse" {
-                    let rx = (area[2] - area[0]) as f32 / 2.0;
-                    let ry = (area[3] - area[1]) as f32 / 2.0;
-                    rx > 0.0
-                        && ry > 0.0
-                        && ((x as f32 + 0.5 - area[0] as f32 - rx) / rx).powi(2)
-                            + ((y as f32 + 0.5 - area[1] as f32 - ry) / ry).powi(2)
-                            <= 1.0
-                } else {
-                    true
-                };
-                if inside {
-                    mask.set(x, y, [255; 4]);
+        let geometry = super::geometry::Geometry::new([w, h], c, points.as_deref())?;
+        let mut crossings = Vec::with_capacity(geometry.points());
+        let mut row = vec![0; w as usize];
+        for y in 0..h {
+            geometry.row(y, &mut row, &mut crossings);
+            for (x, value) in row.iter().enumerate() {
+                if *value > 0 {
+                    mask.set(x as i32, y as i32, [*value; 4]);
                 }
             }
         }
@@ -579,28 +518,7 @@ pub fn apply(doc: &mut Document, c: &Value) -> Result<(), String> {
         }
     }
     let source = if kind == "wand" && op == "selection" {
-        let mut command = serde_json::json!({"op":"selection","kind":"wand"});
-        for key in [
-            "point",
-            "points",
-            "rect",
-            "mode",
-            "tolerance",
-            "feather",
-            "contiguous",
-            "sample_merged",
-            "color_similarity",
-            "layer",
-        ] {
-            if let Some(value) = c.get(key) {
-                command[key] = value.clone();
-            }
-        }
-        command["tolerance"] = serde_json::json!(num(c, "tolerance", 24.).clamp(0., 255.));
-        command["feather"] = serde_json::json!(num(c, "feather", 0.).clamp(0., 64.));
-        command["contiguous"] = serde_json::json!(c["contiguous"] != false);
-        command["sample_merged"] = serde_json::json!(c["sample_merged"] == true);
-        command["color_similarity"] = serde_json::json!(c["color_similarity"] == true);
+        let command = serde_json::to_value(super::wand::Command(c)).map_err(|e| e.to_string())?;
         Some(Arc::new(WandSource {
             id: crate::engine::id(),
             revision: doc.revision + 1,
@@ -691,36 +609,7 @@ fn flood_mask(
     Ok(())
 }
 pub fn restrict_raster(after: &mut Raster, before: &Raster, coverage: &Coverage, origin: [i32; 2]) {
-    let keys: BTreeSet<_> = if after.depth == 16 {
-        after
-            .samples16
-            .keys()
-            .chain(before.samples16.keys())
-            .copied()
-            .collect()
-    } else {
-        after
-            .tiles
-            .keys()
-            .chain(before.tiles.keys())
-            .copied()
-            .collect()
-    };
-    for key in keys {
-        let same = if after.depth == 16 {
-            match (after.samples16.get(&key), before.samples16.get(&key)) {
-                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
-                _ => false,
-            }
-        } else {
-            match (after.tiles.get(&key), before.tiles.get(&key)) {
-                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
-                _ => false,
-            }
-        };
-        if same {
-            continue;
-        }
+    for key in after.changed_tile_keys(before) {
         let (tx, ty) = key;
         let left = (tx * TILE) as i32;
         let top = (ty * TILE) as i32;
@@ -781,70 +670,16 @@ pub fn restrict_document(after: &mut Document, before: &Document, coverage: &Cov
     }
 }
 pub fn magnetic_point(doc: &Document, point: [f32; 2], width: f32) -> [f32; 2] {
-    let r = width.clamp(2.0, 32.0) as i32;
-    let x = point[0] as i32;
-    let y = point[1] as i32;
-    let area = [
-        (x - r).max(0),
-        (y - r).max(0),
-        (x + r + 1).min(doc.width as i32),
-        (y + r + 1).min(doc.height as i32),
-    ];
-    let Ok((w, h, p, a)) = doc.preview(Some(area), (2 * r + 1) as u32, None, false) else {
-        return point;
-    };
-    let lum = |x: u32, y: u32| {
-        let i = ((y * w + x) * 4) as usize;
-        0.2126 * p[i] as f32 + 0.7152 * p[i + 1] as f32 + 0.0722 * p[i + 2] as f32
-    };
-    let mut best = point;
-    let mut score = 8.0;
-    for yy in 1..h.saturating_sub(1) {
-        for xx in 1..w.saturating_sub(1) {
-            let dx = a[0] as f32 + xx as f32 - point[0];
-            let dy = a[1] as f32 + yy as f32 - point[1];
-            let edge = ((lum(xx + 1, yy) - lum(xx - 1, yy)).powi(2)
-                + (lum(xx, yy + 1) - lum(xx, yy - 1)).powi(2))
-            .sqrt();
-            let value = edge / (1.0 + 0.2 * (dx * dx + dy * dy).sqrt());
-            if value > score {
-                score = value;
-                best = [a[0] as f32 + xx as f32, a[1] as f32 + yy as f32];
-            }
-        }
-    }
-    best
+    crate::render::magnetic::resident(doc, point, width, &mut || Ok(())).unwrap_or(point)
 }
 
 pub(super) fn morph<T: Copy + Ord + Default>(line: &[T], radius: usize, expand: bool) -> Vec<T> {
-    let mut queue: VecDeque<usize> = VecDeque::new();
     let mut out = vec![T::default(); line.len()];
-    let mut end = 0;
-    for (i, value) in out.iter_mut().enumerate() {
-        while end < (i + radius + 1).min(line.len()) {
-            while queue.back().is_some_and(|&j| {
-                if expand {
-                    line[j] <= line[end]
-                } else {
-                    line[j] >= line[end]
-                }
-            }) {
-                queue.pop_back();
-            }
-            queue.push_back(end);
-            end += 1;
-        }
-        while queue.front().is_some_and(|&j| j < i.saturating_sub(radius)) {
-            queue.pop_front();
-        }
-        *value = if !expand && (i < radius || i + radius >= line.len()) {
-            T::default()
-        } else {
-            line[*queue.front().unwrap()]
-        };
-    }
+    let mut queue = vec![0; line.len()];
+    super::morphology::line(line, radius, expand, &mut out, &mut queue);
     out
 }
+
 impl Coverage {
     pub fn validate(&self) -> Result<(), String> {
         self.mask.validate_layout()?;
@@ -909,7 +744,7 @@ mod flood_tests {
                         let at = ((sy as u32 * width + sx as u32) * 4) as usize;
                         let reference = &pixels[at..at + 4];
                         let mut seen = vec![false; expected.len()];
-                        let mut queue = VecDeque::from([[sx, sy]]);
+                        let mut queue = std::collections::VecDeque::from([[sx, sy]]);
                         while let Some([x, y]) = queue.pop_front() {
                             let index = (y as u32 * width + x as u32) as usize;
                             if seen[index] {

@@ -6,19 +6,28 @@ use super::{
     canonical36::Limits as MetadataLimits,
     manifest36::{self, SourceBinding},
     memory36::{Admitted, MetadataCharge, WorkingSet},
-    read36::{self, OwnedSource},
+    mib_progress,
+    read36::{self, OwnedSource, VerificationPhase},
     row_stream::Source,
     scene_save36::{CapturedRows, ScenePlan},
     standard36::ComparedStandard,
     structural::{Index, Span},
 };
 use crate::{
-    engine::scene::{Document36, PendingScene, RasterRoster, SceneIdentity, SceneSnapshot},
-    large_document::{BlockRef, Error, ScratchBytes, Store, TileSpec},
+    engine::{
+        native::NativeDocument,
+        scene::{Document36, PendingScene, RasterRoster, SceneIdentity, SceneSnapshot},
+    },
+    large_document::{
+        verified_transfer_buffer, BlockRef, Error, FreshFragment, ScratchBytes, Store, TileSpec,
+    },
+    loading::Control,
     raster::{backed::Plane, Surface},
+    workspace::source_runtime::SourceSession,
 };
 use std::{
     collections::BTreeMap,
+    fs::File,
     io::{Read, Seek},
     sync::Arc,
 };
@@ -28,12 +37,172 @@ use std::{
 pub(crate) trait ImportSession {
     fn store(&self) -> &Store;
     fn check(&self) -> Result<(), String>;
+    fn check_pinned_work(&self) -> Result<(), String> {
+        self.check()
+    }
 }
 pub(crate) struct ImportLimits {
     pub metadata: MetadataLimits,
     pub bulk: BulkLimits,
     pub working: WorkingSet,
 }
+
+struct OpenFragment<'a> {
+    session: &'a SourceSession,
+    fragment: &'a FreshFragment,
+    control: &'a Control,
+}
+impl ImportSession for OpenFragment<'_> {
+    fn store(&self) -> &Store {
+        self.fragment.store()
+    }
+    fn check(&self) -> Result<(), String> {
+        self.session.check()
+    }
+    fn check_pinned_work(&self) -> Result<(), String> {
+        self.control.check()?;
+        self.session.check_pinned_work()
+    }
+}
+
+/// Own a qualified document and its unpublished source fragment together until
+/// the workspace installs the document or explicitly retires its staging.
+pub(crate) struct PreparedOpen {
+    pub(crate) document: NativeDocument,
+    pub(crate) fragment: FreshFragment,
+}
+
+pub(crate) fn open(
+    file: &mut File,
+    version: crate::file_safety::Version,
+    session: &SourceSession,
+    project: String,
+    filename: &str,
+    control: &Control,
+    check: &dyn Fn() -> Result<(), String>,
+) -> Result<PreparedOpen, String> {
+    check()?;
+    session.check()?;
+    let pool = session.resident();
+    let source = Source::with_held_buffer(
+        file,
+        version,
+        verified_transfer_buffer(&pool, version.bytes).map_err(|e| e.to_string())?,
+    )?;
+    let metadata = MetadataLimits {
+        bytes: super::canonical36::MAX_BYTES,
+        nodes: 8_388_608,
+        depth: 128,
+    };
+    let bulk = BulkLimits {
+        rasters: 65536,
+        tiles: 1_048_576,
+        references: 1_048_576,
+        chunks: 16384,
+        encoded_bytes: 64 * 1024 * 1024 * 1024,
+    };
+    let structure = super::structural::Limits::source36(bulk.encoded_bytes, bulk.chunks)?;
+    let index_owner =
+        MetadataCharge::reserve(&pool, 4 * 1024 * 1024 + structure.tags * 128, check)?;
+    let whole = Span {
+        offset: 0,
+        bytes: version.bytes,
+    };
+    let index = Arc::new(super::structural::index(
+        &mut source.range(whole, check)?,
+        structure,
+        check,
+    )?);
+    if !index
+        .resources
+        .iter()
+        .any(|resource| resource.peerbrush_source)
+    {
+        return Err("Photoshop file has no PeerBrush native source manifest".into());
+    }
+    super::standard36::check_layer_info(&source, &index, check)?;
+    let fragment = session.fresh_fragment()?;
+    let prepared = (|| {
+        let owner = OpenFragment {
+            session,
+            fragment: &fragment,
+            control,
+        };
+        let progress = |stage: &str, completed, total| control.progress(stage, completed, total);
+        let mut initial_checksum = mib_progress(
+            &progress,
+            "Verifying the Photoshop file checksum",
+            version.bytes,
+        );
+        let mut streams_checksum = mib_progress(
+            &progress,
+            "Rechecking the Photoshop checksum after stream verification",
+            version.bytes,
+        );
+        let candidate = prepare(
+            &source,
+            index,
+            index_owner,
+            version.sha256(),
+            &owner,
+            project,
+            ImportLimits {
+                metadata,
+                bulk,
+                working: WorkingSet {
+                    raw_bytes: metadata.bytes,
+                    canonical_core_bytes: metadata.bytes,
+                    canonical_manifest_bytes: metadata.bytes,
+                    typed_metadata_bytes: metadata.bytes,
+                    tile_scratch_bytes: bulk36::MAX_TILE_BYTES,
+                    index_scratch_bytes: 2 * 1024 * 1024,
+                },
+            },
+            check,
+            |phase, completed| match phase {
+                VerificationPhase::InitialChecksum => initial_checksum(completed),
+                VerificationPhase::EditableSources { total_bytes } => progress(
+                    "Checking Photoshop editable sources",
+                    (if completed == total_bytes {
+                        completed.div_ceil(1024 * 1024)
+                    } else {
+                        completed / (1024 * 1024)
+                    }) as usize,
+                    total_bytes.div_ceil(1024 * 1024) as usize,
+                ),
+                VerificationPhase::Streams { total } => progress(
+                    "Verifying native channels and merged composite",
+                    completed as usize,
+                    total,
+                ),
+                VerificationPhase::AfterStreamsChecksum => streams_checksum(completed),
+            },
+        )?;
+        control.progress("Validating editable Photoshop artwork", 0, 0)?;
+        candidate.scene().validate_provisional_editable(check)?;
+        let compared = super::native_rows36::with_styles(
+            candidate.scene(),
+            session,
+            check,
+            |rows| candidate.compare_rows(rows, check, &progress),
+            |_| Ok(()),
+        )?;
+        let qualified = ProvisionalImport::qualify(candidate, compared, check, &progress)?;
+        let document =
+            QualifiedImport::map_pending(qualified, check, &progress, |pending, _| {
+                NativeDocument::from_pending(pending)
+            })?;
+        document.for_runtime_registration(Some(filename), check)
+    })();
+    match prepared {
+        Ok(document) => Ok(PreparedOpen { document, fragment }),
+        Err(reason) => match session.abort_fragment(fragment, &mut || session.cleanup_check()) {
+            Ok(()) => Err(reason),
+            Err(cleanup) => Err(format!("{reason}; native open staging retained: {cleanup}")),
+        },
+    }
+}
+
 struct StoredTile {
     depth: u16,
     digest: Digest,
@@ -75,6 +244,7 @@ pub(crate) fn prepare<'a, R: Read + Seek, S: ImportSession>(
     project_id: String,
     limits: ImportLimits,
     check: &dyn Fn() -> Result<(), String>,
+    progress: impl FnMut(VerificationPhase, u64) -> Result<(), String>,
 ) -> Result<Admitted<ProvisionalImport<'a, R, S>>, String> {
     check()?;
     session.check()?;
@@ -89,6 +259,15 @@ pub(crate) fn prepare<'a, R: Read + Seek, S: ImportSession>(
     if !index_owner.uses_budget(&resident) || index_owner.bytes() < index_bytes(&index)? {
         return Err("Source36 import index is outside retained pre-admission".into());
     }
+    if let Some(reason) = super::indexed_document_resource_warnings(source, &index, check)?
+        .into_iter().next()
+    {
+        return Err(reason);
+    }
+    if !super::indexed_saved_composite(source, &index, check)? {
+        return Err("Source36 requires a current saved Photoshop composite".into());
+    }
+    let working_srgb = super::indexed_working_srgb(source, &index, check)?;
     let mut resources = index.resources.iter().filter(|r| r.peerbrush_source);
     let resource = resources
         .next()
@@ -111,6 +290,9 @@ pub(crate) fn prepare<'a, R: Read + Seek, S: ImportSession>(
     )?;
     let parsed = parsed.map_unique(|manifest, _| {
         manifest.into_typed::<Document36>(limits.metadata, check, |doc, rasters, id, revision| {
+            if doc.srgb_tagged != working_srgb {
+                return Err(super::SOURCE_WORKING_PROFILE_MISMATCH.into());
+            }
             if doc.id != id
                 || doc.revision != revision
                 || doc.width != index.header.width
@@ -194,7 +376,8 @@ pub(crate) fn prepare<'a, R: Read + Seek, S: ImportSession>(
         &mut entries,
         &mut counts,
         &mut scratch,
-        check,
+        (check, &|| session.check_pinned_work()),
+        progress,
         |record| {
             session.check()?;
             check()?;
@@ -210,9 +393,12 @@ pub(crate) fn prepare<'a, R: Read + Seek, S: ImportSession>(
                             .map_err(|e| Error::Io(std::io::Error::other(e)))
                     };
                     let reference = store
-                        .put(
+                        .put_guarded(
                             TileSpec::new(256, 256, spec.depth()).map_err(|e| e.to_string())?,
                             payload,
+                            &mut || session.check_pinned_work().map_err(|error| {
+                                Error::Io(std::io::Error::other(error))
+                            }),
                             &mut guarded,
                         )
                         .map_err(|e| e.to_string())?;
@@ -318,6 +504,7 @@ impl<'a, R: Read + Seek, S: ImportSession> ProvisionalImport<'a, R, S> {
     pub(crate) fn scene(&self) -> &SceneSnapshot {
         &self.scene
     }
+    #[cfg(test)]
     pub(crate) fn compare(
         &self,
         provider: &mut impl CapturedRows,
@@ -327,34 +514,71 @@ impl<'a, R: Read + Seek, S: ImportSession> ProvisionalImport<'a, R, S> {
         check()?;
         self.session.check()?;
         validate_semantics(&self.scene)?;
+        self.compare_rows(provider, check, &|_, _, _| Ok(()))
+    }
+    fn compare_rows(
+        &self,
+        provider: &mut impl CapturedRows,
+        check: &dyn Fn() -> Result<(), String>,
+        progress: &dyn Fn(&str, usize, usize) -> Result<(), String>,
+    ) -> Result<ComparedImport, String> {
+        check()?;
+        self.session.check()?;
         if !std::ptr::eq(provider.scene(), &self.scene) {
             return Err("Imported native row provider belongs to another provisional scene".into());
         }
-        let mut expected = ScratchBytes::new(
+        let mut scratch = ScratchBytes::new(
             self.scene.budget(),
             bulk36::MAX_TILE_BYTES,
             bulk36::MAX_TILE_BYTES,
         )
         .map_err(|e| e.to_string())?;
-        let mut actual =
-            ScratchBytes::new(self.scene.budget(), 32000, 32000).map_err(|e| e.to_string())?;
-        self.source.recheck(&self.binding, &mut expected, check)?;
-        let plan = ScenePlan::new(
-            &self.scene,
-            self.source.index().header.format,
-            &self.sizes,
+        let file_bytes = self.source.index().file_bytes;
+        self.source.recheck(
+            &self.binding,
+            &mut scratch,
             check,
+            mib_progress(
+                progress,
+                "Verifying the Photoshop file before pixel comparison",
+                file_bytes,
+            ),
         )?;
+        if super::indexed_resources(self.source.source(), self.source.index(), check)?
+            != self.scene.metadata().psd_resources()
+        {
+            return Err("Source36 document resources differ from standard Photoshop data".into());
+        }
+        if !super::file_info::matches_indexed(
+            self.source.source(),
+            self.source.index(),
+            self.scene.metadata().psd_file_info(),
+            check,
+        )? {
+            return Err(super::file_info::SOURCE_MISMATCH.into());
+        }
+        let plan = ScenePlan::for_import(&self.scene, self.source.source(), self.source.index(), &self.sizes, check)?;
+        let (expected, actual) = scratch.split_at_mut(bulk36::MAX_TILE_BYTES / 2);
         let fidelity = plan.standard().compare(
             self.source.source(),
             self.source.index(),
             provider,
-            &mut expected,
-            &mut actual,
+            expected,
+            actual,
             check,
+            |completed, total| progress("Comparing saved Photoshop pixels", completed, total),
         )?;
         fidelity.check(plan.standard(), check)?;
-        self.source.recheck(&self.binding, &mut expected, check)?;
+        self.source.recheck(
+            &self.binding,
+            &mut scratch,
+            check,
+            mib_progress(
+                progress,
+                "Verifying the Photoshop file after pixel comparison",
+                file_bytes,
+            ),
+        )?;
         self.session.check()?;
         check()?;
         Ok(ComparedImport {
@@ -366,25 +590,38 @@ impl<'a, R: Read + Seek, S: ImportSession> ProvisionalImport<'a, R, S> {
         this: Admitted<Self>,
         compared: ComparedImport,
         check: &dyn Fn() -> Result<(), String>,
+        progress: &dyn Fn(&str, usize, usize) -> Result<(), String>,
     ) -> Result<Admitted<QualifiedImport<'a, R, S>>, String> {
         this.map_unique(|candidate, _| {
             if candidate.nonce != compared.nonce {
                 return Err("Imported native comparison belongs to another candidate".into());
             }
             candidate.session.check()?;
-            let plan = ScenePlan::new(
+            let plan = ScenePlan::for_import(
                 &candidate.scene,
-                candidate.source.index().header.format,
+                candidate.source.source(),
+                candidate.source.index(),
                 &candidate.sizes,
                 check,
             )?;
             compared.fidelity.check(plan.standard(), check)?;
             drop(plan);
-            let mut scratch = ScratchBytes::new(candidate.scene.budget(), 65536, 65536)
-                .map_err(|e| e.to_string())?;
-            candidate
-                .source
-                .recheck(&candidate.binding, &mut scratch, check)?;
+            let file_bytes = candidate.source.index().file_bytes;
+            let mut scratch = verified_transfer_buffer(
+                candidate.scene.budget(),
+                file_bytes.min(bulk36::MAX_TILE_BYTES as u64),
+            )
+            .map_err(|e| e.to_string())?;
+            candidate.source.recheck(
+                &candidate.binding,
+                &mut scratch,
+                check,
+                mib_progress(
+                    progress,
+                    "Checking the Photoshop file before preparing layers",
+                    file_bytes,
+                ),
+            )?;
             candidate.session.check()?;
             check()?;
             let pending = candidate.scene.into_provisional_pending()?;
@@ -404,15 +641,27 @@ impl<R: Read + Seek, S: ImportSession> QualifiedImport<'_, R, S> {
     pub(crate) fn map_pending<U>(
         this: Admitted<Self>,
         check: &dyn Fn() -> Result<(), String>,
+        progress: &dyn Fn(&str, usize, usize) -> Result<(), String>,
         adopt: impl FnOnce(PendingScene, &Arc<MetadataCharge>) -> Result<U, String>,
     ) -> Result<Admitted<U>, String> {
         this.map_unique(|candidate, owner| {
             candidate.session.check()?;
-            let mut scratch = ScratchBytes::new(candidate.pending.budget(), 65536, 65536)
-                .map_err(|e| e.to_string())?;
-            candidate
-                .source
-                .recheck(&candidate.binding, &mut scratch, check)?;
+            let file_bytes = candidate.source.index().file_bytes;
+            let mut scratch = verified_transfer_buffer(
+                candidate.pending.budget(),
+                file_bytes.min(bulk36::MAX_TILE_BYTES as u64),
+            )
+            .map_err(|e| e.to_string())?;
+            candidate.source.recheck(
+                &candidate.binding,
+                &mut scratch,
+                check,
+                mib_progress(
+                    progress,
+                    "Checking the Photoshop file before opening layers",
+                    file_bytes,
+                ),
+            )?;
             check()?;
             candidate.session.check()?;
             let value = adopt(candidate.pending, owner)?;

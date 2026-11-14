@@ -26,7 +26,7 @@ impl PeerBrush {
             || self.task_undo_review.is_some()
             || self.proposal_review.is_some()
             || self.project_settings.is_some()
-            || !self.selection_path.is_empty()
+            || self.selection_path_pending()
             || self.open_file_warning.is_some()
             || self.saved_versions.is_some()
             || self.recovery.open
@@ -88,7 +88,7 @@ mod tests {
         let (mut app, ctx) = super::super::tests::fixture();
         let root = app.workspace_root.clone();
         let path = std::env::temp_dir().join(format!("after-recovery-{}.psd", crate::engine::id()));
-        let before = root.lock().unwrap().state();
+        let before = crate::server::state(&root).unwrap();
         app.recovery.open = true;
         activation::enqueue(&root, vec![path.clone()]).unwrap();
         app.open_activated_file(&ctx);
@@ -98,7 +98,7 @@ mod tests {
         app.recovery.open = false;
         settle(&mut app, &ctx);
         assert!(activation::next(&app.workspace).is_none());
-        assert_eq!(root.lock().unwrap().state(), before);
+        assert_eq!(crate::server::state(&root).unwrap(), before);
     }
 
     #[test]
@@ -107,8 +107,8 @@ mod tests {
         app.recovery.open = false;
         let root = app.workspace_root.clone();
         let path = std::env::temp_dir().join(format!("after-edit-{}.psd", crate::engine::id()));
-        let before = root.lock().unwrap().state();
-        let doc = root.lock().unwrap().doc.clone();
+        let before = crate::server::state(&root).unwrap();
+        let doc = root.lock().unwrap().resident_state().expect("resident fixture").document.clone();
         app.rename_edit = Some(RenameEdit {
             document: doc.id,
             layer: doc.layers[0].id.clone(),
@@ -131,17 +131,16 @@ mod tests {
         app.selection_path.clear();
         settle(&mut app, &ctx);
         assert!(activation::next(&app.workspace).is_none());
-        assert_eq!(root.lock().unwrap().state(), before);
+        assert_eq!(crate::server::state(&root).unwrap(), before);
     }
 
     #[test]
-    fn queued_files_wait_for_document_bound_color_editor() {
+    fn queued_files_wait_for_open_color_editor() {
         let (mut app, ctx) = super::super::tests::fixture();
         app.recovery.open = false;
         let root = app.workspace_root.clone();
         let path = std::env::temp_dir().join(format!("after-color-{}.psd", crate::engine::id()));
-        let layer = root.lock().unwrap().doc.layers[0].id.clone();
-        app.open_color(color::Target::Layer(layer), [20, 30, 40, 255]);
+        app.open_color(color::Target::Foreground);
         activation::enqueue(&root, vec![path.clone()]).unwrap();
         app.open_activated_file(&ctx);
         assert!(app.color_editor.is_some());
@@ -159,8 +158,8 @@ mod tests {
         let root = app.workspace_root.clone();
         {
             let mut e = root.lock().unwrap();
-            e.doc = Document::new(12, 9).unwrap();
-            let layer = e.doc.layers[0].id.clone();
+            e.resident_state_mut().expect("resident fixture").document = Document::new(12, 9).unwrap();
+            let layer = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
             e.edit(
                 "human",
                 &[json!({"op":"layer.update","layer":layer,"name":"Unsaved work"})],
@@ -170,8 +169,8 @@ mod tests {
             )
             .unwrap();
         }
-        let before = root.lock().unwrap().state();
-        let history = root.lock().unwrap().undo.len();
+        let before = crate::server::state(&root).unwrap();
+        let history = root.lock().unwrap().resident_state().expect("resident fixture").undo.len();
         let path =
             std::env::temp_dir().join(format!("作品 with spaces-{}.psd", crate::engine::id()));
         let mut doc = Document::new_depth(8, 6, 16).unwrap();
@@ -188,18 +187,18 @@ mod tests {
             .unwrap();
         {
             let e = opened.lock().unwrap();
-            assert_eq!(e.doc.bit_depth, 16);
+            assert_eq!(e.resident_state().expect("resident fixture").document.bit_depth, 16);
             assert_eq!(
-                e.doc.layers[0].pixels.get16(2, 3),
+                e.resident_state().expect("resident fixture").document.layers[0].pixels.get16(2, 3),
                 [60001, 12347, 34569, 65535]
             );
         }
-        assert_eq!(root.lock().unwrap().state(), before);
-        assert_eq!(root.lock().unwrap().undo.len(), history);
+        assert_eq!(crate::server::state(&root).unwrap(), before);
+        assert_eq!(root.lock().unwrap().resident_state().expect("resident fixture").undo.len(), history);
         activation::enqueue(&root, vec![path.clone()]).unwrap();
         settle(&mut app, &ctx);
         assert_eq!(workspace::handles(&root).len(), 2);
-        assert_eq!(root.lock().unwrap().state(), before);
+        assert_eq!(crate::server::state(&root).unwrap(), before);
         assert_eq!(
             workspace::active_id(&root),
             opened.lock().unwrap().project_id
@@ -215,7 +214,7 @@ mod tests {
         let (mut app, ctx) = super::super::tests::fixture();
         app.recovery.open = false;
         let root = app.workspace_root.clone();
-        let before = root.lock().unwrap().state();
+        let before = crate::server::state(&root).unwrap();
         let path = std::env::temp_dir().join(format!("missing-{}.psd", crate::engine::id()));
         activation::enqueue(&root, vec![path.clone()]).unwrap();
         app.jobs.insert("another project".into());
@@ -225,11 +224,11 @@ mod tests {
         app.jobs.clear();
         settle(&mut app, &ctx);
         assert_eq!(workspace::handles(&root).len(), 1);
-        assert_eq!(root.lock().unwrap().state(), before);
+        assert_eq!(crate::server::state(&root).unwrap(), before);
         assert_ne!(app.message, "Ready");
         // No accidental replacement even when another project exists.
         workspace::register(&root, Engine::new(), None).unwrap();
-        assert_eq!(root.lock().unwrap().state(), before);
+        assert_eq!(crate::server::state(&root).unwrap(), before);
     }
 
     #[test]
@@ -237,7 +236,7 @@ mod tests {
         let (mut app, ctx) = super::super::tests::fixture();
         app.recovery.open = false;
         let root = app.workspace_root.clone();
-        let before = root.lock().unwrap().state();
+        let before = crate::server::state(&root).unwrap();
         let directory =
             std::env::temp_dir().join(format!("pb-image-activation-{}", crate::engine::id()));
         std::fs::create_dir_all(&directory).unwrap();
@@ -278,7 +277,7 @@ mod tests {
         settle(&mut app, &ctx);
         assert!(app.pending_image_open.is_none());
         assert_eq!(workspace::handles(&root).len(), 2);
-        assert_eq!(root.lock().unwrap().state(), before);
+        assert_eq!(crate::server::state(&root).unwrap(), before);
         drop(app);
         drop(root);
         std::fs::remove_dir_all(directory).unwrap();

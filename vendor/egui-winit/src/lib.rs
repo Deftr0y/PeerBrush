@@ -73,23 +73,36 @@ pub struct EventResponse {
 
 #[derive(Default)]
 struct KeyboardFocus {
-    pressed: std::collections::HashSet<winit::keyboard::PhysicalKey>,
+    pressed: std::collections::HashMap<winit::keyboard::PhysicalKey, Option<egui::Key>>,
 }
 
 impl KeyboardFocus {
-    fn focus_lost(&mut self) {
-        self.pressed.clear();
+    fn focus_lost(
+        &mut self,
+    ) -> impl Iterator<Item = (winit::keyboard::PhysicalKey, egui::Key)> + '_ {
+        self.pressed
+            .drain()
+            .filter_map(|(physical, key)| key.map(|key| (physical, key)))
     }
 
-    fn accepts(&mut self, key: winit::keyboard::PhysicalKey, pressed: bool, repeat: bool) -> bool {
+    fn resolve(
+        &mut self,
+        physical: winit::keyboard::PhysicalKey,
+        resolved: Option<egui::Key>,
+        pressed: bool,
+        repeat: bool,
+    ) -> Result<Option<egui::Key>, ()> {
+        // Layout and modifier changes can give the same physical key a new
+        // identity. Release the key egui saw at the start of the hold.
         if !pressed {
-            self.pressed.remove(&key);
-            true
+            Ok(self.pressed.remove(&physical).flatten().filter(|released| {
+                !self.pressed.values().any(|held| *held == Some(*released))
+            }))
         } else if repeat {
-            self.pressed.contains(&key)
+            self.pressed.get(&physical).copied().ok_or(())
         } else {
-            self.pressed.insert(key);
-            true
+            self.pressed.insert(physical, resolved);
+            Ok(resolved)
         }
     }
 }
@@ -120,7 +133,7 @@ pub struct State {
     /// Is Some(…) when a touch is being translated to a pointer.
     ///
     /// Only one touch will be interpreted as pointer at any time.
-    pointer_touch_id: Option<u64>,
+    pointer_touch_id: Option<(winit::event::DeviceId, u64)>,
 
     /// track ime state
     has_sent_ime_enabled: bool,
@@ -432,7 +445,15 @@ impl State {
             }
             WindowEvent::Focused(focused) => {
                 if !focused {
-                    self.keyboard_focus.focus_lost();
+                    self.egui_input.events.extend(self.keyboard_focus.focus_lost().map(
+                        |(physical, key)| egui::Event::Key {
+                            key,
+                            physical_key: resolved_physical_key(physical),
+                            pressed: false,
+                            repeat: false,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ));
                 }
                 self.egui_input.focused = *focused;
                 self.egui_input
@@ -652,6 +673,10 @@ impl State {
 
     fn on_touch(&mut self, window: &Window, touch: &winit::event::Touch) {
         let pixels_per_point = pixels_per_point(&self.egui_ctx, window);
+        let pos = egui::pos2(
+            touch.location.x as f32 / pixels_per_point,
+            touch.location.y as f32 / pixels_per_point,
+        );
 
         // Emit touch event
         self.egui_input.events.push(egui::Event::Touch {
@@ -663,10 +688,7 @@ impl State {
                 winit::event::TouchPhase::Ended => egui::TouchPhase::End,
                 winit::event::TouchPhase::Cancelled => egui::TouchPhase::Cancel,
             },
-            pos: egui::pos2(
-                touch.location.x as f32 / pixels_per_point,
-                touch.location.y as f32 / pixels_per_point,
-            ),
+            pos,
             force: match touch.force {
                 Some(winit::event::Force::Normalized(force)) => Some(force as f32),
                 Some(winit::event::Force::Calibrated {
@@ -677,14 +699,16 @@ impl State {
                 None => None,
             },
         });
-        // If we're not yet translating a touch or we're translating this very
-        // touch …
-        if self.pointer_touch_id.is_none() || self.pointer_touch_id.unwrap_or_default() == touch.id
-        {
+        let contact = (touch.device_id, touch.id);
+        let controls_pointer = match touch.phase {
+            winit::event::TouchPhase::Started => self.pointer_touch_id.is_none(),
+            _ => self.pointer_touch_id == Some(contact),
+        };
+        if controls_pointer {
             // … emit PointerButton resp. PointerMoved events to emulate mouse
             match touch.phase {
                 winit::event::TouchPhase::Started => {
-                    self.pointer_touch_id = Some(touch.id);
+                    self.pointer_touch_id = Some(contact);
                     // First move the pointer to the right location
                     self.on_cursor_moved(window, touch.location);
                     self.on_mouse_button_input(
@@ -697,6 +721,7 @@ impl State {
                 }
                 winit::event::TouchPhase::Ended => {
                     self.pointer_touch_id = None;
+                    self.pointer_pos_in_points = Some(pos);
                     self.on_mouse_button_input(
                         winit::event::ElementState::Released,
                         winit::event::MouseButton::Left,
@@ -768,20 +793,36 @@ impl State {
 
         let pressed = *state == winit::event::ElementState::Pressed;
 
-        // egui derives repeats from its own key state, which is cleared on focus loss.
-        // Do not turn an OS repeat from a previous focus session into a fresh command
-        // or text event, and do not read the clipboard for such a repeat.
-        if !self.keyboard_focus.accepts(*physical_key, pressed, *repeat) {
-            return;
-        }
-
-        let physical_key = if let winit::keyboard::PhysicalKey::Code(keycode) = *physical_key {
-            key_from_key_code(keycode)
-        } else {
-            None
-        };
+        let physical_identity = *physical_key;
+        let physical_key = resolved_physical_key(physical_identity);
 
         let logical_key = key_from_winit_key(logical_key);
+        #[cfg(any(
+            target_os = "windows",
+            target_os = "macos",
+            all(target_os = "linux", any(feature = "x11", feature = "wayland")),
+        ))]
+        let logical_key = if self.egui_input.modifiers.shift
+            && logical_key.map_or(true, |key| {
+                let symbol = key.symbol_or_name();
+                symbol.len() == 1
+                    && symbol.as_bytes()[0].is_ascii_punctuation()
+                    && !matches!(key, egui::Key::OpenBracket | egui::Key::CloseBracket)
+            })
+        {
+            use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
+            // A shifted glyph can have its own egui key, such as ! or {.
+            // Keep the layout's digit/bracket identity for shortcuts; Text
+            // events below still carry the characters produced by the OS.
+            key_from_winit_key(&event.key_without_modifiers())
+                .filter(|key| {
+                    matches!(key, egui::Key::OpenBracket | egui::Key::CloseBracket)
+                        || key.symbol_or_name().as_bytes().first().is_some_and(u8::is_ascii_digit)
+                })
+                .or(logical_key)
+        } else {
+            logical_key
+        };
 
         // Helpful logging to enable when adding new key support
         log::trace!(
@@ -796,7 +837,24 @@ impl State {
         // emit events as if the corresponding keys from the Latin layout were pressed. In this case, clipboard shortcuts
         // are mapped to the physical keys that normally contain C, X, V, etc.
         // See also: https://github.com/emilk/egui/issues/3653
-        if let Some(active_key) = logical_key.or(physical_key) {
+        // A repeat from an earlier focus session must not become a new command,
+        // text event or clipboard read after focus returns.
+        let Ok(active_key) = self.keyboard_focus.resolve(
+            physical_identity,
+            logical_key.or(physical_key),
+            pressed,
+            *repeat,
+        ) else {
+            return;
+        };
+        if let Some(active_key) = active_key {
+            let key_event = egui::Event::Key {
+                key: active_key,
+                physical_key,
+                pressed,
+                repeat: false, // egui will fill this in for us!
+                modifiers: self.egui_input.modifiers,
+            };
             match clipboard_input(
                 self.egui_input.modifiers,
                 active_key,
@@ -806,19 +864,19 @@ impl State {
             ) {
                 ClipboardInput::Other => {}
                 ClipboardInput::Suppressed => return,
+                ClipboardInput::CopyMerged => {
+                    // The editor needs the press modifiers. TextEdit still
+                    // receives the standard copy event.
+                    self.egui_input.events.extend([key_event, egui::Event::Copy]);
+                    return;
+                }
                 ClipboardInput::Event(event) => {
                     self.egui_input.events.push(event);
                     return;
                 }
             }
 
-            self.egui_input.events.push(egui::Event::Key {
-                key: active_key,
-                physical_key,
-                pressed,
-                repeat: false, // egui will fill this in for us!
-                modifiers: self.egui_input.modifiers,
-            });
+            self.egui_input.events.push(key_event);
         }
 
         if let Some(text) = &text {
@@ -829,10 +887,7 @@ impl State {
                 // We need to ignore these characters that are side-effects of commands.
                 // Also make sure the key is pressed (not released). On Linux, text might
                 // contain some data even when the key is released.
-                let is_cmd = self.egui_input.modifiers.ctrl
-                    || self.egui_input.modifiers.command
-                    || self.egui_input.modifiers.mac_cmd;
-                if pressed && !is_cmd {
+                if pressed && keyboard_text_allowed(self.egui_input.modifiers) {
                     self.egui_input
                         .events
                         .push(egui::Event::Text(text.to_string()));
@@ -1076,7 +1131,14 @@ fn is_printable_char(chr: char) -> bool {
 enum ClipboardInput {
     Other,
     Suppressed,
+    CopyMerged,
     Event(egui::Event),
+}
+
+fn keyboard_text_allowed(modifiers: egui::Modifiers) -> bool {
+    // International layouts can report AltGr as Ctrl+Alt and supply text.
+    let alt_graph = !cfg!(target_os = "macos") && modifiers.ctrl && modifiers.alt;
+    !modifiers.mac_cmd && (alt_graph || !(modifiers.ctrl || modifiers.command))
 }
 
 // Clipboard events carry no key/repeat identity in egui. Suppress native
@@ -1089,7 +1151,9 @@ fn clipboard_input(
     repeat: bool,
     mut text: impl FnMut() -> Option<String>,
 ) -> ClipboardInput {
-    if !pressed {
+    if !pressed
+        || modifiers.alt && !matches!(keycode, egui::Key::Copy | egui::Key::Cut | egui::Key::Paste)
+    {
         return ClipboardInput::Other;
     }
     let cut = is_cut_command(modifiers, keycode);
@@ -1100,6 +1164,9 @@ fn clipboard_input(
     }
     if repeat {
         return ClipboardInput::Suppressed;
+    }
+    if copy && keycode == egui::Key::C && modifiers.shift {
+        return ClipboardInput::CopyMerged;
     }
     ClipboardInput::Event(if cut {
         egui::Event::Cut
@@ -1120,6 +1187,24 @@ fn is_cut_command(modifiers: egui::Modifiers, keycode: egui::Key) -> bool {
 #[cfg(test)]
 mod peerbrush_clipboard_tests {
     use super::*;
+
+    #[test]
+    fn ctrl_alt_character_keys_do_not_translate_to_clipboard_events() {
+        let modifiers = egui::Modifiers {
+            ctrl: true,
+            command: true,
+            alt: true,
+            ..Default::default()
+        };
+        for key in [egui::Key::C, egui::Key::X, egui::Key::V] {
+            assert!(matches!(
+                clipboard_input(modifiers, key, true, false, || panic!("clipboard read")),
+                ClipboardInput::Other
+            ));
+        }
+        assert_eq!(keyboard_text_allowed(modifiers), !cfg!(target_os = "macos"));
+        assert!(!keyboard_text_allowed(egui::Modifiers::COMMAND));
+    }
 
     #[test]
     fn layout_resolution_keeps_logical_keys_and_non_latin_clipboard_fallbacks() {
@@ -1172,34 +1257,42 @@ mod peerbrush_clipboard_tests {
         use winit::keyboard::{KeyCode, NativeKeyCode, PhysicalKey};
 
         let mut focus = KeyboardFocus::default();
+        let before = Some(egui::Key::W);
+        let after = Some(egui::Key::Z);
         for key in [
             PhysicalKey::Code(KeyCode::KeyV),
             PhysicalKey::Code(KeyCode::Delete),
             PhysicalKey::Unidentified(NativeKeyCode::Windows(37)),
         ] {
-            assert!(!focus.accepts(key, true, true));
-            assert!(focus.accepts(key, true, false));
-            assert!(focus.accepts(key, true, true));
-            focus.focus_lost();
-            assert!(!focus.accepts(key, true, true));
-            assert!(focus.accepts(key, false, false));
-            assert!(!focus.accepts(key, true, true));
-            assert!(focus.accepts(key, true, false));
-            assert!(focus.accepts(key, true, true));
-            assert!(focus.accepts(key, false, false));
-            assert!(!focus.accepts(key, true, true));
+            assert_eq!(focus.resolve(key, before, true, true), Err(()));
+            assert_eq!(focus.resolve(key, before, true, false), Ok(before));
+            assert_eq!(focus.resolve(key, after, true, true), Ok(before));
+            assert!(focus.focus_lost().eq([(key, egui::Key::W)]));
+            assert_eq!(focus.resolve(key, after, true, true), Err(()));
+            assert_eq!(focus.resolve(key, after, false, false), Ok(None));
+            assert_eq!(focus.resolve(key, after, true, true), Err(()));
+            assert_eq!(focus.resolve(key, after, true, false), Ok(after));
+            assert_eq!(focus.resolve(key, after, true, true), Ok(after));
+            assert_eq!(focus.resolve(key, before, false, false), Ok(after));
+            assert_eq!(focus.resolve(key, before, true, true), Err(()));
         }
 
         let first = PhysicalKey::Code(KeyCode::KeyW);
         let second = PhysicalKey::Code(KeyCode::KeyE);
-        assert!(focus.accepts(first, true, false));
-        assert!(!focus.accepts(second, true, true));
-        assert!(focus.accepts(second, true, false));
-        assert!(focus.accepts(first, false, false));
-        assert!(focus.accepts(second, true, true));
-        focus.focus_lost();
-        assert!(!focus.accepts(first, true, true));
-        assert!(!focus.accepts(second, true, true));
+        assert_eq!(focus.resolve(first, None, true, false), Ok(None));
+        assert_eq!(focus.resolve(second, before, true, true), Err(()));
+        assert_eq!(focus.resolve(second, before, true, false), Ok(before));
+        assert_eq!(focus.resolve(first, before, false, false), Ok(None));
+        assert_eq!(focus.resolve(second, after, true, true), Ok(before));
+        assert!(focus.focus_lost().eq([(second, egui::Key::W)]));
+        assert_eq!(focus.resolve(first, before, true, true), Err(()));
+        assert_eq!(focus.resolve(second, after, true, true), Err(()));
+
+        // Two held physical keys can resolve to the same key after a layout change.
+        assert_eq!(focus.resolve(first, before, true, false), Ok(before));
+        assert_eq!(focus.resolve(second, before, true, false), Ok(before));
+        assert_eq!(focus.resolve(first, after, false, false), Ok(None));
+        assert_eq!(focus.resolve(second, after, false, false), Ok(before));
     }
 
     #[test]
@@ -1271,6 +1364,19 @@ mod peerbrush_clipboard_tests {
             clipboard_input(command, egui::Key::C, true, false, || panic!("copy read")),
             ClipboardInput::Event(egui::Event::Copy)
         ));
+        let shifted = egui::Modifiers { shift: true, ..command };
+        assert!(matches!(
+            clipboard_input(shifted, egui::Key::C, true, false, || panic!("copy read")),
+            ClipboardInput::CopyMerged
+        ));
+        assert!(matches!(
+            clipboard_input(shifted, egui::Key::C, true, true, || panic!("repeat read")),
+            ClipboardInput::Suppressed
+        ));
+        assert!(matches!(
+            clipboard_input(shifted, egui::Key::Copy, true, false, || panic!("copy read")),
+            ClipboardInput::Event(egui::Event::Copy)
+        ));
         assert!(matches!(
             clipboard_input(command, egui::Key::X, true, false, || panic!("cut read")),
             ClipboardInput::Event(egui::Event::Cut)
@@ -1324,6 +1430,13 @@ fn key_from_winit_key(key: &winit::keyboard::Key) -> Option<egui::Key> {
         winit::keyboard::Key::Named(named_key) => key_from_named_key(*named_key),
         winit::keyboard::Key::Character(str) => egui::Key::from_name(str.as_str()),
         winit::keyboard::Key::Unidentified(_) | winit::keyboard::Key::Dead(_) => None,
+    }
+}
+
+fn resolved_physical_key(key: winit::keyboard::PhysicalKey) -> Option<egui::Key> {
+    match key {
+        winit::keyboard::PhysicalKey::Code(code) => key_from_key_code(code),
+        winit::keyboard::PhysicalKey::Unidentified(_) => None,
     }
 }
 

@@ -20,7 +20,7 @@ import zipfile
 
 from package import git, relative_path, source_files
 from production_readiness import MAX_DMG_QUALIFICATION_BYTES, bind_dmg, immutable, unique_fields
-from package_deb import deb_version, inspect_final
+from package_deb import deb_filename, inspect_final
 from verify_release import inspect_archive
 
 
@@ -160,7 +160,7 @@ def recognize(name, version):
         return 'zip', 'macOS'
     if re.fullmatch(f'PeerBrush-{escaped}-macOS-arm64-apple-signed-r[1-9][0-9]*-dmg-signed-r[1-9][0-9]*\\.dmg', name):
         return 'dmg', 'macOS'
-    if name == f'peerbrush_{deb_version(version)}_amd64.deb':
+    if name == deb_filename(version):
         return 'deb', 'Linux'
     raise ValueError('Unsupported final release asset filename; native adapter required.')
 
@@ -230,7 +230,14 @@ def installed_report(kind, record, data, commit, version):
     return 'native-final-installer-validation-not-configured'
 
 
-def published(root, inventory, tag, commit, notes, get=public_get, *, maintainer=None):
+def published(root, inventory, tag, commit, notes, get=public_get, *, maintainer=None, on_portable=None, on_dmg=None):
+    """Read back public bytes; optional package consumers never change site policy.
+
+    on_portable sees inspected temporary archives; on_dmg sees only DMGs bound
+    to their inspected signed ZIP and typed qualification. Consumers must discard
+    their derived output if this complete verification raises afterwards.
+    Signing metadata/content checks do not establish native publisher trust.
+    """
     selected_final = None
     if isinstance(inventory, dict) and 'format' in inventory:
         from final_release import validate_manifest
@@ -384,6 +391,8 @@ def published(root, inventory, tag, commit, notes, get=public_get, *, maintainer
                         if bound['record'] != record:
                             raise ValueError('Public DMG qualification differs from its inventory record.')
                         exclusion.update(asset_binding_verified=True, qualification_binding=bound['qualification_binding'])
+                        if on_dmg is not None:
+                            on_dmg(bound, assets[name]['browser_download_url'])
                 else:
                     reason = installed_report(kind, record, report, commit, version)
                     exclusion = dict(file=name, reason=reason)
@@ -414,6 +423,8 @@ def published(root, inventory, tag, commit, notes, get=public_get, *, maintainer
             inspected = inspect_archive(path, commit, version, root, selected)
             if inspected['record'] != record or sha(inspected['source']) != records[source_name]['sha256']:
                 raise ValueError('Public archive/source differs from the exact verified inventory.')
+            if on_portable is not None:
+                on_portable(path, inspected, assets[name]['browser_download_url'])
             if formats[platform] != kind:
                 excluded.append(dict(file=name, reason='not-selected-by-committed-distribution-policy'))
                 continue

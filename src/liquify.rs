@@ -5,6 +5,10 @@ use crate::{
 };
 use serde_json::{json, Value};
 
+#[path = "liquify/command.rs"]
+pub(crate) mod command;
+#[path = "liquify/native.rs"]
+pub(crate) mod native;
 #[path = "liquify/regional.rs"]
 pub(crate) mod regional;
 
@@ -198,31 +202,6 @@ struct Plan {
     clips: Vec<usize>,
     unrestricted: bool,
 }
-fn clipped_segment(a: [f32; 2], b: [f32; 2], bounds: [f32; 4]) -> Option<([f32; 2], [f32; 2])> {
-    let delta = [b[0] - a[0], b[1] - a[1]];
-    let (mut lo, mut hi) = (0.0_f32, 1.0_f32);
-    for (origin, d, min, max) in [
-        (a[0], delta[0], bounds[0], bounds[2]),
-        (a[1], delta[1], bounds[1], bounds[3]),
-    ] {
-        if d.abs() < 0.000001 {
-            if origin < min || origin > max {
-                return None;
-            }
-        } else {
-            let (x, y) = ((min - origin) / d, (max - origin) / d);
-            lo = lo.max(x.min(y));
-            hi = hi.min(x.max(y));
-        }
-    }
-    if hi < lo {
-        return None;
-    }
-    Some((
-        [a[0] + delta[0] * lo, a[1] + delta[1] * lo],
-        [a[0] + delta[0] * hi, a[1] + delta[1] * hi],
-    ))
-}
 fn plan(width: u32, height: u32, settings: &Value) -> Result<Plan, String> {
     check_size(width, height)?;
     let strokes = parse(settings)?;
@@ -324,7 +303,7 @@ fn plan_strokes(width: u32, height: u32, strokes: Vec<Stroke>) -> Result<Plan, S
             }
         }
         for pair in stroke.points.windows(2) {
-            let Some((a, b)) = clipped_segment(pair[0], pair[1], expanded) else {
+            let Some((a, b)) = crate::geometry::clipped_segment(pair[0], pair[1], expanded) else {
                 continue;
             };
             let length = (b[0] - a[0]).hypot(b[1] - a[1]);

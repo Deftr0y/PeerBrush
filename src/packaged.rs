@@ -1,6 +1,12 @@
-//! Stable external launch paths for the optional Windows MSIX distribution.
-//! Portable builds continue to use their own executable, without package state.
+//! Stable external launch paths for observed package-managed installations.
+//! Ordinary portable builds continue to use their own executable.
 use std::path::{Path, PathBuf};
+#[cfg(any(target_os = "macos", test))]
+pub(crate) mod homebrew;
+#[cfg(any(target_os = "linux", test))]
+mod nix;
+#[cfg(any(windows, test))]
+pub(crate) mod scoop;
 
 pub const MCP_ALIAS: &str = "peerbrush-mcp.exe";
 
@@ -19,6 +25,7 @@ pub fn installation_info() -> Result<serde_json::Value, String> {
         "platform": std::env::consts::OS,
         "build": build,
         "package": package,
+        "update_owner": crate::updates::Owner::current(),
         "installed_acceptance": "not-established",
         "update_eligible": false
     });
@@ -160,6 +167,31 @@ pub fn mcp_command() -> Result<PathBuf, String> {
                 .ok_or("Cannot locate Local AppData for the installed MCP alias")?;
             return command_path(&executable, Some((&local, &family)));
         }
+        if let Some(launcher) = scoop::command(&executable)? {
+            return Ok(launcher);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    if crate::updates::ownership::nix_store(&executable) {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let state = std::env::var_os("XDG_STATE_HOME").map(PathBuf::from);
+        let user = std::env::var_os("USER");
+        let launch = std::env::args_os().next().map(PathBuf::from);
+        let search = std::env::var_os("PATH");
+        let data_dirs = std::env::var_os("XDG_DATA_DIRS");
+        return nix::command(
+            &executable,
+            home.as_deref(),
+            state.as_deref(),
+            user.as_deref(),
+            launch.as_deref(),
+            search.as_deref(),
+            data_dirs.as_deref(),
+        );
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(launcher) = homebrew::command(&executable)? {
+        return Ok(launcher);
     }
     command_path(&executable, None)
 }
@@ -322,51 +354,39 @@ fn family_alias_path(local: &Path, family: &str) -> Result<PathBuf, String> {
 pub fn is_app_execution_alias(path: &Path) -> bool {
     #[cfg(windows)]
     {
+        use ::windows::Win32::{
+            Foundation::HANDLE,
+            Storage::FileSystem::{
+                FileAttributeTagInfo, GetFileInformationByHandleEx, FILE_ATTRIBUTE_DIRECTORY,
+                FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+                FILE_FLAG_OPEN_REPARSE_POINT,
+            },
+        };
         use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
-        #[repr(C)]
-        struct AttributeTag {
-            attributes: u32,
-            tag: u32,
-        }
-        #[link(name = "kernel32")]
-        extern "system" {
-            fn GetFileInformationByHandleEx(
-                file: *mut std::ffi::c_void,
-                class: i32,
-                info: *mut std::ffi::c_void,
-                size: u32,
-            ) -> i32;
-        }
-        const OPEN_REPARSE_POINT: u32 = 0x00200000;
-        const BACKUP_SEMANTICS: u32 = 0x02000000;
-        const FILE_ATTRIBUTE_TAG_INFO: i32 = 9;
         const APPEXECLINK: u32 = 0x8000001b;
         let Ok(file) = std::fs::OpenOptions::new()
             .access_mode(0)
             .share_mode(7)
-            .custom_flags(OPEN_REPARSE_POINT | BACKUP_SEMANTICS)
+            .custom_flags((FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS).0)
             .open(path)
         else {
             return false;
         };
-        let mut info = AttributeTag {
-            attributes: 0,
-            tag: 0,
-        };
+        let mut info = FILE_ATTRIBUTE_TAG_INFO::default();
         // Only metadata is queried from a handle opened without following the
         // reparse point. The OS owns the link and handles activation separately.
         let success = unsafe {
             GetFileInformationByHandleEx(
-                file.as_raw_handle(),
-                FILE_ATTRIBUTE_TAG_INFO,
-                (&mut info as *mut AttributeTag).cast(),
-                std::mem::size_of::<AttributeTag>() as u32,
+                HANDLE(file.as_raw_handle()),
+                FileAttributeTagInfo,
+                (&mut info as *mut FILE_ATTRIBUTE_TAG_INFO).cast(),
+                std::mem::size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
             )
         };
-        return success != 0
-            && info.attributes & 0x400 != 0
-            && info.attributes & 0x10 == 0
-            && info.tag == APPEXECLINK;
+        return success.is_ok()
+            && info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
+            && info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 == 0
+            && info.ReparseTag == APPEXECLINK;
     }
     #[cfg(not(windows))]
     {
@@ -440,6 +460,10 @@ mod tests {
         assert_eq!(observation["format"], "PeerBrushInstallationObservationV1");
         assert_eq!(observation["installed_acceptance"], "not-established");
         assert_eq!(observation["update_eligible"], false);
+        assert_eq!(
+            observation["update_owner"],
+            serde_json::json!(crate::updates::Owner::current())
+        );
         assert!(observation["package"].is_null()); // Test runner is unpackaged.
     }
 

@@ -9,18 +9,26 @@ use std::{collections::HashMap, sync::Arc};
 pub const DRAFT_BUDGET: usize = 256 * 1024 * 1024;
 const MAX_PENDING: usize = 4;
 const MAX_RECORDS: usize = 16;
+pub(crate) mod native;
 
-#[derive(Clone)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct Proposal {
     pub id: String,
     pub actor: String,
     pub label: String,
     pub task: Option<String>,
+    #[serde(rename = "document_id")]
     pub document: String,
+    #[serde(rename = "source_revision")]
     pub revision: u64,
     pub commands: Vec<Value>,
     pub scopes: Vec<Scope>,
-    pub draft: Option<Document>,
+    #[serde(skip)]
+    pub draft: Option<Arc<Document>>,
+    #[serde(skip)]
+    pub native: Option<native::Binding>,
+    #[serde(skip)]
+    pub native_charge: Option<Arc<crate::psd::memory36::MetadataCharge>>,
     pub expires: u64,
     pub status: String,
     pub reason: String,
@@ -28,11 +36,46 @@ pub(crate) struct Proposal {
     pub operations: Vec<Value>,
 }
 impl Proposal {
+    fn pending(&self) -> bool {
+        self.draft.is_some() || self.native.is_some()
+    }
     pub fn state(&self) -> Value {
-        json!({"id":self.id,"actor":self.actor,"label":self.label,"task":self.task,"document_id":self.document,"source_revision":self.revision,"scopes":self.scopes,"status":self.status,"reason":self.reason,"expires":self.expires,"created":self.created,"operations":self.operations})
+        serde_json::to_value(self.wire()).expect("Proposal metadata is serializable")
+    }
+    pub(crate) fn wire(&self) -> impl serde::Serialize + '_ {
+        #[derive(serde::Serialize)]
+        struct Wire<'a> {
+            id: &'a str,
+            actor: &'a str,
+            label: &'a str,
+            task: Option<&'a str>,
+            document_id: &'a str,
+            source_revision: u64,
+            scopes: &'a [Scope],
+            status: &'a str,
+            reason: &'a str,
+            expires: u64,
+            created: &'a Value,
+            operations: &'a [Value],
+        }
+        Wire {
+            id: &self.id,
+            actor: &self.actor,
+            label: &self.label,
+            task: self.task.as_deref(),
+            document_id: &self.document,
+            source_revision: self.revision,
+            scopes: &self.scopes,
+            status: &self.status,
+            reason: &self.reason,
+            expires: self.expires,
+            created: &self.created,
+            operations: &self.operations,
+        }
     }
     fn stop(&mut self, status: &str, reason: &str) {
         self.draft = None;
+        self.native = None;
         self.commands.clear();
         self.status = status.into();
         self.reason = reason.into();
@@ -122,11 +165,17 @@ impl Engine {
         json!({"active":self.leases,"recent":self.recent_tasks.iter().map(TaskRecord::state).collect::<Vec<_>>()})
     }
     pub(crate) fn expire_proposals(&mut self) {
+        let document = self.authority.view();
         for p in &mut self.proposals {
-            if p.draft.is_none() {
+            if !p.pending() {
                 continue;
             }
-            if p.document != self.doc.id || p.revision != self.doc.revision {
+            if p.document != document.id()
+                || p.revision != document.revision()
+                || p.native
+                    .as_ref()
+                    .is_some_and(|binding| !binding.matches(document, &self.project_id))
+            {
                 p.stop(
                     "stale",
                     "The project changed. Request a fresh proposal; your edits are preserved.",
@@ -158,6 +207,10 @@ impl Engine {
             .collect::<Vec<_>>())
     }
     pub fn proposal_document(&mut self, id: &str) -> Result<Document, String> {
+        self.proposal_snapshot(id)
+            .map(|document| (*document).clone())
+    }
+    pub(crate) fn proposal_snapshot(&mut self, id: &str) -> Result<Arc<Document>, String> {
         self.expire();
         let p = self
             .proposals
@@ -197,21 +250,27 @@ impl Engine {
         if view.id() != document || view.revision() != revision {
             return Err("The project changed; review a fresh proposal before accepting".into());
         }
-        let p = self
+        let pos = self
             .proposals
             .iter()
-            .find(|p| p.id == id)
-            .ok_or("Proposal not found in this project")?
-            .clone();
-        if p.draft.is_none() {
-            return Err(p.reason);
+            .position(|p| p.id == id)
+            .ok_or("Proposal not found in this project")?;
+        if self.proposals[pos].draft.is_none() {
+            return Err(self.proposals[pos].reason.clone());
         }
-        let mut result = self.commit_proposal(&p)?;
-        self.proposals
-            .iter_mut()
-            .find(|q| q.id == id)
-            .unwrap()
-            .stop("accepted", "Accepted by the human as one undoable edit.");
+        // The transaction can expire other records. Keep this sole proposal
+        // owner outside the list and restore it on both success and refusal.
+        let proposal = self.proposals.remove(pos);
+        let result = self.commit_proposal(&proposal);
+        self.proposals.insert(pos, proposal);
+        let mut result = match result {
+            Ok(result) => result,
+            Err(reason) => {
+                self.expire_proposals();
+                return Err(reason);
+            }
+        };
+        self.proposals[pos].stop("accepted", "Accepted by the human as one undoable edit.");
         result["proposal"] = json!(id);
         result["accepted_by"] = json!("human");
         self.expire_proposals();
@@ -273,15 +332,7 @@ pub fn propose(shared: &Shared, actor: &str, p: &Value) -> Result<Value, String>
     let commands = p["commands"]
         .as_array()
         .ok_or("commands must be an array")?;
-    if commands.is_empty()
-        || commands.len() > 100
-        || serde_json::to_vec(commands)
-            .map_err(|e| e.to_string())?
-            .len()
-            > 8 * 1024 * 1024
-    {
-        return Err("A proposal needs 1–100 commands within 8 MiB".into());
-    }
+    validate_commands(commands, &|| Ok(()))?;
     let document = p["document_id"]
         .as_str()
         .ok_or("Proposals require the observed document_id")?;
@@ -322,6 +373,7 @@ pub fn propose(shared: &Shared, actor: &str, p: &Value) -> Result<Value, String>
         .ok_or("Missing proposal scope")?
         .scopes()
         .to_vec();
+    let operations = commands.iter().map(|c| c["op"].clone()).collect();
     let proposal = Proposal {
         id: engine::id(),
         actor: actor.into(),
@@ -329,16 +381,37 @@ pub fn propose(shared: &Shared, actor: &str, p: &Value) -> Result<Value, String>
         task: task.map(String::from),
         document: document.into(),
         revision,
-        commands: commands.clone(),
+        commands,
         scopes,
-        draft: Some(draft.into_resident_document()?),
+        draft: Some(Arc::new(draft.into_resident_document()?)),
+        native: None,
+        native_charge: None,
         expires: engine::now() + 900,
         status: "pending".into(),
         reason: String::new(),
         created: result["created"].clone(),
-        operations: commands.iter().map(|c| c["op"].clone()).collect(),
+        operations,
     };
     shared.lock().unwrap().queue_proposal(proposal)
+}
+
+fn validate_commands(
+    commands: &[Value],
+    check: &dyn Fn() -> Result<(), String>,
+) -> Result<(), String> {
+    if commands.is_empty() || commands.len() > 100 {
+        return Err("A proposal needs 1–100 commands within 8 MiB".into());
+    }
+    crate::psd::canonical36::Canonical::raw_length(
+        &commands,
+        crate::psd::canonical36::Limits {
+            bytes: 8 * 1024 * 1024,
+            nodes: 8_388_608,
+            depth: 128,
+        },
+        check,
+    )
+    .map(|_| ())
 }
 
 #[cfg(test)]
@@ -346,6 +419,133 @@ mod tests {
     use super::*;
     use crate::engine::{Mask, MaskStep};
     use std::sync::Mutex;
+    #[test]
+    fn proposal_wire_bound_counts_escaped_bytes_without_materializing_another_payload() {
+        assert!(validate_commands(&[], &|| Ok(())).is_err());
+        assert!(validate_commands(&vec![json!({}); 101], &|| Ok(())).is_err());
+        let mut command = Value::String("a".repeat(8 * 1024 * 1024 - 4));
+        assert!(validate_commands(std::slice::from_ref(&command), &|| Ok(())).is_ok());
+        if let Value::String(text) = &mut command {
+            text.push('a');
+        }
+        assert!(validate_commands(std::slice::from_ref(&command), &|| Ok(())).is_err());
+        assert!(
+            validate_commands(&[Value::String("\n".repeat(4 * 1024 * 1024))], &|| Ok(())).is_err()
+        );
+        assert_eq!(
+            validate_commands(&[json!({})], &|| Err("Stop validation".into())).unwrap_err(),
+            "Stop validation"
+        );
+    }
+    #[test]
+    fn frozen_review_shares_one_document_and_refused_acceptance_keeps_the_proposal_owner() {
+        for depth in [8, 16] {
+            let mut document = Document::new_depth(16, 12, depth).unwrap();
+            document.layers[0]
+                .pixels
+                .set16(1, 1, [12347, 23459, 34571, 61379]);
+            let layer = document.layers[0].id.clone();
+            let shared = Arc::new(Mutex::new(Engine::from_document(document.clone())));
+            let mut ids = Vec::new();
+            for label in ["First", "Second"] {
+                let state = propose(
+                    &shared,
+                    "agent",
+                    &json!({
+                        "document_id": document.id, "expected_revision": document.revision,
+                        "commands":[{"op":"layer.update","layer":layer,"name":label}],
+                    }),
+                )
+                .unwrap();
+                ids.push(state["id"].as_str().unwrap().to_owned());
+            }
+            let mut engine = shared.lock().unwrap();
+            let snapshot = engine.proposal_snapshot(&ids[0]).unwrap();
+            assert!(Arc::ptr_eq(
+                &snapshot,
+                &engine.proposal_snapshot(&ids[0]).unwrap()
+            ));
+            let frozen = serde_json::to_value(&*snapshot).unwrap();
+            let commands = engine.proposals[0].commands.as_ptr();
+            let task = engine
+                .reserve(
+                    "other-agent",
+                    "Protect during review",
+                    vec![Scope::layer(&layer)],
+                )
+                .unwrap();
+            assert!(engine
+                .accept_proposal("human", &ids[0], &document.id, document.revision)
+                .unwrap_err()
+                .contains("Reserved"));
+            assert_eq!(
+                engine.proposals.iter().map(|p| &p.id).collect::<Vec<_>>(),
+                ids.iter().collect::<Vec<_>>()
+            );
+            assert_eq!(engine.proposals[0].commands.as_ptr(), commands);
+            assert!(Arc::ptr_eq(
+                &snapshot,
+                &engine.proposal_snapshot(&ids[0]).unwrap()
+            ));
+            assert_eq!(
+                serde_json::to_value(&engine.resident_state().expect("resident fixture").document)
+                    .unwrap(),
+                serde_json::to_value(&document).unwrap()
+            );
+            assert!(engine
+                .resident_state()
+                .expect("resident fixture")
+                .undo
+                .is_empty());
+            engine.finish_task(&task.id, "ended");
+            engine
+                .resident_state_mut()
+                .expect("resident fixture")
+                .document
+                .name = "Human Save As.psd".into();
+            engine
+                .accept_proposal("human", &ids[0], &document.id, document.revision)
+                .unwrap();
+            assert_eq!(engine.proposals[0].status, "accepted");
+            assert_eq!(engine.proposals[1].status, "stale");
+            assert_eq!(
+                engine
+                    .resident_state()
+                    .expect("resident fixture")
+                    .document
+                    .name,
+                "Human Save As.psd"
+            );
+            assert_eq!(
+                engine
+                    .resident_state()
+                    .expect("resident fixture")
+                    .undo
+                    .len(),
+                1
+            );
+            assert_eq!(
+                engine.resident_state().expect("resident fixture").undo[0].actor,
+                "agent"
+            );
+            assert_eq!(serde_json::to_value(&*snapshot).unwrap(), frozen);
+            assert_eq!(
+                snapshot.layers[0].pixels.get16(1, 1),
+                document.layers[0].pixels.get16(1, 1)
+            );
+            engine.undo("human").unwrap();
+            assert_eq!(
+                engine
+                    .resident_state()
+                    .expect("resident fixture")
+                    .document
+                    .layers[0]
+                    .pixels
+                    .get16(1, 1),
+                document.layers[0].pixels.get16(1, 1)
+            );
+        }
+    }
     #[test]
     fn accounting_deduplicates_shared_tiles_but_includes_native_masks_and_originals() {
         let mut doc = Document::new_depth(16, 16, 16).unwrap();
@@ -429,16 +629,39 @@ mod tests {
     #[test]
     fn proposal_expiry_drops_sources_without_history_or_document_changes() {
         let shared = Arc::new(Mutex::new(Engine::new()));
-        let doc = shared.lock().unwrap().doc.clone();
+        let doc = shared
+            .lock()
+            .unwrap()
+            .resident_state()
+            .expect("resident fixture")
+            .document
+            .clone();
         let p = propose(&shared,"draft-agent",&json!({"document_id":doc.id,"expected_revision":0,"commands":[{"op":"layer.update","layer":doc.layers[0].id,"name":"Draft"}]})).unwrap();
         let mut e = shared.lock().unwrap();
         e.proposals[0].expires = 0;
         e.expire();
         assert_eq!(e.proposals_state()[0]["status"], "expired");
         assert!(e.proposal_document(p["id"].as_str().unwrap()).is_err());
-        assert!(e.undo.is_empty());
-        assert_eq!(e.doc.revision, 0);
-        assert_eq!(e.doc.layers[0].name, doc.layers[0].name);
+        assert!(e
+            .resident_state()
+            .expect("resident fixture")
+            .undo
+            .is_empty());
+        assert_eq!(
+            e.resident_state()
+                .expect("resident fixture")
+                .document
+                .revision,
+            0
+        );
+        assert_eq!(
+            e.resident_state()
+                .expect("resident fixture")
+                .document
+                .layers[0]
+                .name,
+            doc.layers[0].name
+        );
         assert!(e.proposals[0].commands.is_empty());
     }
 }

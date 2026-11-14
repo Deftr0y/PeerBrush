@@ -1,13 +1,13 @@
 //! Exact export sample coordinates, partitioned into bounded preparation windows.
 //! This owns no pixels and grants no source or destination authority.
-use super::{Output, Resampling};
+use super::{Output, PreviewGrid, Resampling};
 
 type Result<T> = std::result::Result<T, String>;
 const EDGE: i32 = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Window {
-    /// Half-open coordinates in the final output, independent of stripe origin.
+    /// Half-open coordinates in the output or preview grid, independent of stripe origin.
     pub output: [u32; 4],
     /// Includes the precise nearest/bilinear support, including padded exterior.
     pub source: [i32; 4],
@@ -16,27 +16,46 @@ pub(crate) struct Window {
 pub(crate) struct Grid {
     rect: [i32; 4],
     size: [u32; 2],
+    preview: Option<PreviewGrid>,
     method: Resampling,
     // Depth-first subdivision needs at most log2(width)+log2(height)+1 entries.
     pending: [[u32; 4]; 64],
     count: usize,
 }
 impl Grid {
+    pub(crate) fn document_support(output: &Output, method: Resampling) -> Result<[i32; 4]> {
+        let grid = Self::new(output, method, 0, 1)?;
+        Ok(grid.support([0, 0, output.width, output.height]))
+    }
+
     pub(crate) fn new(
         output: &Output,
         method: Resampling,
         first_row: u32,
         rows: u32,
     ) -> Result<Self> {
+        Self::sampled(output, method, first_row, rows, None)
+    }
+
+    pub(super) fn sampled(
+        output: &Output,
+        method: Resampling,
+        first_row: u32,
+        rows: u32,
+        preview: Option<PreviewGrid>,
+    ) -> Result<Self> {
         let rect = output.document_rect;
+        let [width, height] = preview.map_or([output.width, output.height], |grid| [grid.width, grid.height]);
         let last = first_row.checked_add(rows).ok_or("Export row overflow")?;
         if output.width == 0
             || output.height == 0
             || output.width > 16000
             || output.height > 16000
+            || width == 0 || height == 0 || width > output.width || height > output.height
+            || preview.is_some_and(|grid| !(grid.scale > 0. && grid.scale <= 1.))
             || rows == 0
-            || last > output.height
-            || u64::from(output.width) * u64::from(rows) > 128 * 1024
+            || last > height
+            || u64::from(width) * u64::from(rows) > 128 * 1024
             || rect[0] >= rect[2]
             || rect[1] >= rect[3]
             || rect.iter().any(|v| v.unsigned_abs() > 116000)
@@ -46,20 +65,23 @@ impl Grid {
         let mut grid = Self {
             rect,
             size: [output.width, output.height],
+            preview,
             method,
             pending: [[0; 4]; 64],
             count: 1,
         };
-        grid.pending[0] = [0, first_row, output.width, last];
+        grid.pending[0] = [0, first_row, width, last];
         Ok(grid)
     }
     pub(crate) fn position(&self, x: u32, y: u32) -> Result<[f64; 2]> {
-        if x >= self.size[0] || y >= self.size[1] {
+        let [width, height] = self.preview.map_or(self.size, |grid| [grid.width, grid.height]);
+        if x >= width || y >= height {
             return Err("Export sample is outside the planned output".into());
         }
         Ok([self.axis(x, 0), self.axis(y, 1)])
     }
     fn axis(&self, value: u32, axis: usize) -> f64 {
+        let value = self.preview.map_or(value, |grid| grid.source(value, self.size[axis]) as u32);
         // Keep the legacy order of f64 operations and clamp before sampling.
         (f64::from(self.rect[axis])
             + (f64::from(value) + 0.5) * f64::from(self.rect[axis + 2] - self.rect[axis])
@@ -70,7 +92,7 @@ impl Grid {
                 f64::from(self.rect[axis + 2] - 1),
             )
     }
-    fn support(&self, bounds: [u32; 4]) -> [i32; 4] {
+    pub(super) fn support(&self, bounds: [u32; 4]) -> [i32; 4] {
         let mut support = [0; 4];
         for axis in 0..2 {
             let first = self.axis(bounds[axis], axis);
@@ -189,12 +211,14 @@ mod tests {
             (1901, 83, [-7, -9, 11, 19], 0, 67),
         ] {
             for method in [Resampling::Nearest, Resampling::Bilinear] {
-                let mut grid =
-                    Grid::new(&output(width, height, rect), method, first, rows).unwrap();
+                let output = output(width, height, rect);
+                let mut grid = Grid::new(&output, method, first, rows).unwrap();
+                let [dl, dt, dr, db] = Grid::document_support(&output, method).unwrap();
                 let mut covered = vec![false; width as usize * rows as usize];
                 while let Some(window) = grid.next().unwrap() {
                     let [l, t, r, b] = window.source;
                     assert!(r - l <= EDGE && b - t <= EDGE);
+                    assert!(l >= dl && t >= dt && r <= dr && b <= db);
                     for y in window.output[1]..window.output[3] {
                         for x in window.output[0]..window.output[2] {
                             let at = ((y - first) * width + x) as usize;

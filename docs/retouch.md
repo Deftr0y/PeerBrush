@@ -2,7 +2,7 @@
 
 Press **C** for Clone or **J** for Heal. Alt-click the canvas, or choose **Set source** and click, to choose a source, then paint with the usual brush size, hardness, opacity, flow, tip, pressure and taper controls. The source crosshair shows where the current stroke samples. No stroke is committed until release; Undo restores the entire gesture.
 
-**Aligned** keeps the source-to-destination offset across strokes. Turn it off to restart each stroke from the chosen source. **Merged** samples visible artwork, including effects, masks and the layer stack. Otherwise the source is the chosen paint layer's original pixels. A source may belong to another layer in the same project. Changing projects or channels requires choosing a new source. If the shared image changes during a gesture, the gesture is canceled before it can overwrite newer work.
+**Aligned** keeps the source-to-destination offset across strokes. Turn it off to restart each stroke from the chosen source. Under **Sample**, the single-layer icon uses the chosen paint layer's original pixels. The stacked-layer icon uses the visible composite, including effects and masks. In mask editing, Clone and Heal sample the evaluated layer mask. A source may belong to another layer in the same project. Changing projects or channels requires choosing a new source. If the shared image changes during a gesture, the gesture is canceled before it can overwrite newer work.
 
 Clone copies sampled color and alpha through brush coverage. Heal transfers source texture while adapting its local average color to the destination, preserving the destination's alpha. Healing works on existing pixels; use Clone to fill transparent areas. This is local color adaptation, not Photoshop's complete healing algorithm.
 

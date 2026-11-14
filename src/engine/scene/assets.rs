@@ -6,7 +6,9 @@ use super::*;
 pub(crate) enum AssetKind {
     Settings,
     Profile,
+    FileInfo,
     GlobalMask,
+    GlobalMetadata,
     Contours,
     Polygon,
     Content,
@@ -16,7 +18,9 @@ pub(crate) enum AssetKind {
 pub(crate) enum MetadataAsset {
     Settings(MetadataPayload<Value>),
     Profile(MetadataPayload<Vec<u8>>),
+    FileInfo(MetadataPayload<Vec<u8>>),
     GlobalMask(MetadataPayload<crate::psd::GlobalMaskSettings>),
+    GlobalMetadata(MetadataPayload<Vec<crate::psd::GlobalMetadata>>),
     Contours(MetadataPayload<Vec<Vec<[f32; 2]>>>),
     Polygon(MetadataPayload<Vec<[f32; 2]>>),
     Content(MetadataPayload<Content36>),
@@ -28,7 +32,9 @@ macro_rules! asset_match {
         match $self {
             MetadataAsset::Settings($value) => $body,
             MetadataAsset::Profile($value) => $body,
+            MetadataAsset::FileInfo($value) => $body,
             MetadataAsset::GlobalMask($value) => $body,
+            MetadataAsset::GlobalMetadata($value) => $body,
             MetadataAsset::Contours($value) => $body,
             MetadataAsset::Polygon($value) => $body,
             MetadataAsset::Content($value) => $body,
@@ -42,7 +48,9 @@ impl MetadataAsset {
         match self {
             Self::Settings(_) => AssetKind::Settings,
             Self::Profile(_) => AssetKind::Profile,
+            Self::FileInfo(_) => AssetKind::FileInfo,
             Self::GlobalMask(_) => AssetKind::GlobalMask,
+            Self::GlobalMetadata(_) => AssetKind::GlobalMetadata,
             Self::Contours(_) => AssetKind::Contours,
             Self::Polygon(_) => AssetKind::Polygon,
             Self::Content(_) => AssetKind::Content,
@@ -54,7 +62,9 @@ impl MetadataAsset {
         Ok(match self {
             Self::Settings(v) => Self::Settings(v.shared()?),
             Self::Profile(v) => Self::Profile(v.shared()?),
+            Self::FileInfo(v) => Self::FileInfo(v.shared()?),
             Self::GlobalMask(v) => Self::GlobalMask(v.shared()?),
+            Self::GlobalMetadata(v) => Self::GlobalMetadata(v.shared()?),
             Self::Contours(v) => Self::Contours(v.shared()?),
             Self::Polygon(v) => Self::Polygon(v.shared()?),
             Self::Content(v) => Self::Content(v.shared()?),
@@ -66,7 +76,9 @@ impl MetadataAsset {
         match (self, other) {
             (Self::Settings(a), Self::Settings(b)) => a == b,
             (Self::Profile(a), Self::Profile(b)) => a == b,
+            (Self::FileInfo(a), Self::FileInfo(b)) => a == b,
             (Self::GlobalMask(a), Self::GlobalMask(b)) => a == b,
+            (Self::GlobalMetadata(a), Self::GlobalMetadata(b)) => a == b,
             (Self::Contours(a), Self::Contours(b)) => a == b,
             (Self::Polygon(a), Self::Polygon(b)) => a == b,
             (Self::Content(a), Self::Content(b)) => a == b,
@@ -110,7 +122,9 @@ impl MetadataAsset {
         Ok(match kind {
             AssetKind::Settings => make!(Value, Settings),
             AssetKind::Profile => make!(Vec<u8>, Profile),
+            AssetKind::FileInfo => make!(Vec<u8>, FileInfo),
             AssetKind::GlobalMask => make!(crate::psd::GlobalMaskSettings, GlobalMask),
+            AssetKind::GlobalMetadata => make!(Vec<crate::psd::GlobalMetadata>, GlobalMetadata),
             AssetKind::Contours => make!(Vec<Vec<[f32; 2]>>, Contours),
             AssetKind::Polygon => make!(Vec<[f32; 2]>, Polygon),
             AssetKind::Content => make!(Content36, Content),
@@ -123,11 +137,12 @@ impl MetadataAsset {
         let point = [(id >> 16) as f32, (id & 65535) as f32];
         Ok(match self.kind() {
             AssetKind::Settings => serde_json::json!(["PBA1", id]),
-            AssetKind::Profile => Value::String({
+            AssetKind::Profile | AssetKind::FileInfo => Value::String({
                 use base64::Engine as _;
                 base64::engine::general_purpose::STANDARD.encode(bytes)
             }),
             AssetKind::GlobalMask => serde_json::json!({"data":bytes}),
+            AssetKind::GlobalMetadata => serde_json::json!([{"key":"PBA1","data":bytes}]),
             AssetKind::Contours => serde_json::json!([[point]]),
             AssetKind::Polygon => serde_json::json!([point, point, point]),
             AssetKind::Content => serde_json::json!({"kind":"svg","svg":format!("PBA1:{id}")}),
@@ -136,10 +151,11 @@ impl MetadataAsset {
         })
     }
     fn stub(&self, id: u32) -> Result<Self> {
-        if self.kind() == AssetKind::Profile {
-            return Ok(Self::Profile(marker_bytes(id).to_vec().into()));
+        match self.kind() {
+            AssetKind::Profile => Ok(Self::Profile(marker_bytes(id).to_vec().into())),
+            AssetKind::FileInfo => Ok(Self::FileInfo(marker_bytes(id).to_vec().into())),
+            kind => Self::wire(kind, self.marker(id)?),
         }
-        Self::wire(self.kind(), self.marker(id)?)
     }
     fn wire(kind: AssetKind, value: Value) -> Result<Self> {
         macro_rules! make {
@@ -152,7 +168,9 @@ impl MetadataAsset {
         Ok(match kind {
             AssetKind::Settings => make!(Value, Settings),
             AssetKind::Profile => make!(Vec<u8>, Profile),
+            AssetKind::FileInfo => make!(Vec<u8>, FileInfo),
             AssetKind::GlobalMask => make!(crate::psd::GlobalMaskSettings, GlobalMask),
+            AssetKind::GlobalMetadata => make!(Vec<crate::psd::GlobalMetadata>, GlobalMetadata),
             AssetKind::Contours => make!(Vec<Vec<[f32; 2]>>, Contours),
             AssetKind::Polygon => make!(Vec<[f32; 2]>, Polygon),
             AssetKind::Content => make!(Content36, Content),
@@ -171,7 +189,14 @@ impl MetadataAsset {
                     .map_err(|_| "Asset ordinal overflow")?
             }
             Self::Profile(value) => read_marker(value)?,
+            Self::FileInfo(value) => read_marker(value)?,
             Self::GlobalMask(value) => read_marker(&value.data)?,
+            Self::GlobalMetadata(value) => {
+                if value.len() != 1 || value[0].key != "PBA1" {
+                    return Err("Invalid Photoshop document metadata token".into());
+                }
+                read_marker(&value[0].data)?
+            }
             Self::Contours(value) => {
                 if value.len() != 1 || value[0].len() != 1 {
                     return Err("Invalid contour asset token".into());
@@ -278,7 +303,9 @@ impl Document36 {
         add(
             &mut count,
             usize::from(self.icc_profile.is_some())
+                + usize::from(self.psd_file_info.is_some())
                 + usize::from(self.psd_global_mask.is_some())
+                + usize::from(self.psd_global_metadata.is_some())
                 + usize::from(self.selection_polygon.is_some())
                 + usize::from(self.selection_coverage.is_some())
                 + usize::from(self.selection_previous.is_some()),
@@ -318,12 +345,23 @@ impl Document36 {
         if let Some(value) = &mut self.icc_profile {
             field!(*value, Profile, Vec::<u8>::new(), &[Key("icc_profile")]);
         }
+        if let Some(value) = &mut self.psd_file_info {
+            field!(*value, FileInfo, Vec::<u8>::new(), &[Key("psd_file_info")]);
+        }
         if let Some(value) = &mut self.psd_global_mask {
             field!(
                 *value,
                 GlobalMask,
                 crate::psd::GlobalMaskSettings { data: vec![] },
                 &[Key("psd_global_mask")]
+            );
+        }
+        if let Some(value) = &mut self.psd_global_metadata {
+            field!(
+                *value,
+                GlobalMetadata,
+                Vec::<crate::psd::GlobalMetadata>::new(),
+                &[Key("psd_global_metadata")]
             );
         }
         for (li, layer) in self.layers.iter_mut().enumerate() {

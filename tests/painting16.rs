@@ -158,7 +158,7 @@ fn native_fill_blends_original_words_and_creates_native_folder_children() {
         .pixels
         .set16(10, 10, [10001, 30003, 50005, 50007]);
     let mut engine = Engine::new();
-    engine.doc = doc;
+    engine.resident_state_mut().expect("resident fixture").document = doc;
     engine
         .edit(
             "human",
@@ -169,7 +169,7 @@ fn native_fill_blends_original_words_and_creates_native_folder_children() {
         )
         .unwrap();
     assert_eq!(
-        engine.doc.layers[0].pixels.get16(10, 10),
+        engine.resident_state().expect("resident fixture").document.layers[0].pixels.get16(10, 10),
         raster::blend16(
             [10001, 30003, 50005, 50007],
             [80 * 257, 160 * 257, 240 * 257, 257],
@@ -179,13 +179,13 @@ fn native_fill_blends_original_words_and_creates_native_folder_children() {
     );
     engine.undo("human").unwrap();
     assert_eq!(
-        engine.doc.layers[0].pixels.get16(10, 10),
+        engine.resident_state().expect("resident fixture").document.layers[0].pixels.get16(10, 10),
         [10001, 30003, 50005, 50007]
     );
     let mut group = Layer::new("Folder", "group", 24, 20);
     group.pixels.promote16();
     let gid = group.id.clone();
-    engine.doc.layers.insert(0, group);
+    engine.resident_state_mut().expect("resident fixture").document.layers.insert(0, group);
     engine
         .edit(
             "human",
@@ -196,7 +196,7 @@ fn native_fill_blends_original_words_and_creates_native_folder_children() {
         )
         .unwrap();
     let child = engine
-        .doc
+        .resident_state().expect("resident fixture").document
         .layers
         .iter()
         .find(|l| l.parent.as_deref() == Some(gid.as_str()))
@@ -211,8 +211,8 @@ fn native_fill_blends_original_words_and_creates_native_folder_children() {
 #[test]
 fn native_png_placement_resize_and_selection_clipboard_round_trip_without_narrowing() {
     let mut engine = Engine::new();
-    engine.doc = document(16, 12);
-    let target = engine.doc.layers[0].id.clone();
+    engine.resident_state_mut().expect("resident fixture").document = document(16, 12);
+    let target = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
     let words = vec![10001, 30003, 40007, 65535, 20009, 31011, 41013, 65535];
     let encoded = STANDARD.encode(raster::png16(2, 1, &words).unwrap());
     engine
@@ -224,10 +224,10 @@ fn native_png_placement_resize_and_selection_clipboard_round_trip_without_narrow
             "Place",
         )
         .unwrap();
-    let placed = engine.doc.layers[0].id.clone();
-    assert_eq!(engine.doc.layers[0].pixels.rgba16(), words);
-    engine.doc.selection = Some([4, 5, 6, 6]);
-    let copy = clipboard::copy_document_pixels(&engine.doc, &placed, false, false).unwrap();
+    let placed = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
+    assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(), words);
+    engine.resident_state_mut().expect("resident fixture").document.selection = Some([4, 5, 6, 6]);
+    let copy = clipboard::copy_document_pixels(&engine.resident_state().expect("resident fixture").document, &placed, false, false).unwrap();
     assert_eq!(copy.samples16.as_ref().unwrap(), &words);
     engine
         .edit(
@@ -239,7 +239,7 @@ fn native_png_placement_resize_and_selection_clipboard_round_trip_without_narrow
         )
         .unwrap();
     let pasted = engine
-        .doc
+        .resident_state().expect("resident fixture").document
         .layers
         .iter()
         .find(|l| l.name == "Pasted image")
@@ -257,7 +257,7 @@ fn native_png_placement_resize_and_selection_clipboard_round_trip_without_narrow
         )
         .unwrap();
     let resized = engine
-        .doc
+        .resident_state().expect("resident fixture").document
         .layers
         .iter()
         .find(|layer| layer.name == "Placed image" && layer.pixels.width == 3)

@@ -1,24 +1,72 @@
 //! Complete immutable recovery versions. No source file is used as a destination.
 pub(crate) mod backed;
+mod native;
 mod worker;
 use crate::{engine, psd, server, workspace};
+pub(crate) use native::{Catalog as NativeCatalog, DISCARD_AVAILABLE as NATIVE_DISCARD_AVAILABLE};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    io::Read,
+    io::{Read, Seek},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock, Weak},
+    sync::{atomic::Ordering, Arc, Mutex, MutexGuard, OnceLock, Weak},
     time::{SystemTime, UNIX_EPOCH},
 };
 pub(crate) use worker::Worker;
+
+pub(crate) struct Available {
+    pub versions: Vec<Snapshot>,
+    pub unpaired: Vec<Unpaired>,
+    pub resident_error: Option<&'static str>,
+    pub legacy: Vec<(String, PathBuf)>,
+    pub native: NativeCatalog,
+}
+/// Off-lock discovery. The returned native rows retain their own memory admission;
+/// rows are display metadata, never restoration or source-retirement permission.
+pub(crate) fn catalog_in(
+    workspace: &workspace::Registry,
+    dir: &Path,
+    check: &dyn Fn() -> Result<(), String>,
+) -> Result<Available, String> {
+    let _operation = server::FileOperation::begin_workspace(workspace)?;
+    check()?;
+    let resident = scan_resident(dir, check)?;
+    let legacy = legacy(dir);
+    let native = match native::catalog(workspace, check) {
+        Ok(catalog) => catalog,
+        Err(_) => {
+            check()?;
+            NativeCatalog::unavailable()
+        }
+    };
+    check()?;
+    Ok(Available {
+        versions: resident.entries,
+        unpaired: resident.unpaired,
+        resident_error: resident.incomplete.then_some(RESIDENT_CATALOG_ERROR),
+        legacy,
+        native,
+    })
+}
 
 pub const VERSIONS_PER_PROJECT: usize = 3;
 pub const MAX_PROJECTS: usize = 64;
 pub const MAX_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_FILE: u64 = 256 * 1024 * 1024;
-pub type Versions = HashMap<String, (String, u64, Value)>;
+const RESIDENT_CATALOG_ERROR: &str =
+    "Some recovery records are unreadable or incomplete. Existing resident recovery files are retained. Save current work until the inventory is repaired.";
+#[derive(Default)]
+pub struct Versions {
+    resident: HashMap<String, (String, u64, Value)>,
+    native: HashMap<String, native::Saved>,
+}
+impl Versions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
 
 #[cfg(test)]
 thread_local! {
@@ -41,6 +89,13 @@ pub struct Snapshot {
     pub bytes: u64,
     pub checksum: String,
     pub file: String,
+}
+
+#[derive(Serialize)]
+pub(crate) struct Unpaired {
+    pub snapshot: String,
+    pub timestamp_ms: u64,
+    pub bytes: u64,
 }
 impl Snapshot {
     fn valid(&self) -> bool {
@@ -69,21 +124,21 @@ fn gate(dir: &Path) -> Arc<Mutex<()>> {
     gate
 }
 // Corruption detection, not an authentication or security signature.
-fn checksum(bytes: &[u8]) -> String {
-    let hash = bytes.iter().fold(0xcbf29ce484222325u64, |hash, byte| {
+const CHECKSUM_START: u64 = 0xcbf29ce484222325;
+fn checksum_chunk(hash: u64, bytes: &[u8]) -> u64 {
+    bytes.iter().fold(hash, |hash, byte| {
         (hash ^ *byte as u64).wrapping_mul(0x100000001b3)
-    });
-    format!("{hash:016x}")
+    })
+}
+fn checksum(bytes: &[u8]) -> String {
+    format!("{:016x}", checksum_chunk(CHECKSUM_START, bytes))
 }
 fn regular(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file())
 }
 fn bounded_read(path: &Path, max: u64) -> Result<Vec<u8>, String> {
-    if !regular(path) {
-        return Err("Recovery is missing or is not a regular local file".into());
-    }
     let mut bytes = vec![];
-    fs::File::open(path)
+    crate::file_safety::open_native_read(path)
         .map_err(|e| e.to_string())?
         .take(max + 1)
         .read_to_end(&mut bytes)
@@ -93,35 +148,102 @@ fn bounded_read(path: &Path, max: u64) -> Result<Vec<u8>, String> {
     }
     Ok(bytes)
 }
+
+pub(crate) fn preserve_previous_index(dir: &Path) -> Result<(), String> {
+    let Ok(bytes) = bounded_read(&dir.join("recoveries.json"), 65535) else {
+        return Ok(());
+    };
+    if serde_json::from_slice::<Value>(&bytes).is_ok_and(|index|
+        index["projects"].as_array().is_some_and(|projects| !projects.is_empty()))
+    {
+        server::atomic_write(&dir.join("previous-recoveries.json"), &bytes)?;
+    }
+    Ok(())
+}
+
 /// The immutable sidecar is the commit marker. A mutable index is not needed.
 pub fn catalog(dir: &Path) -> Vec<Snapshot> {
-    let mut entries = vec![];
-    if let Ok(files) = fs::read_dir(dir) {
-        for file in files.flatten() {
+    scan_resident(dir, &|| Ok(())).map_or_else(|_| Vec::new(), |catalog| catalog.entries)
+}
+
+#[derive(Default)]
+struct ResidentCatalog {
+    entries: Vec<Snapshot>,
+    unpaired: Vec<Unpaired>,
+    incomplete: bool,
+}
+
+fn scan_resident(dir: &Path, check: &dyn Fn() -> Result<(), String>) -> Result<ResidentCatalog, String> {
+    let mut catalog = ResidentCatalog::default();
+    let files = match fs::read_dir(dir) {
+        Ok(files) => files,
+        Err(error) => {
+            catalog.incomplete = error.kind() != std::io::ErrorKind::NotFound;
+            return Ok(catalog);
+        }
+    };
+    for file in files {
+        check()?;
+        let Ok(file) = file else {
+            catalog.incomplete = true;
+            continue;
+        };
+        let name = file.file_name();
+        let name = name.to_string_lossy();
+        if recovery_extension(&name) == Some("psd") {
+            // An unpaired final PSD may be usable after interrupted publication.
             let path = file.path();
-            let name = file.file_name();
-            let name = name.to_string_lossy();
-            if !name.starts_with("recovery-") || !name.ends_with(".json") {
-                continue;
+            if let Err(error) = fs::symlink_metadata(path.with_extension("json")) {
+                catalog.incomplete = true;
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    if let Ok(held) = crate::file_safety::open_native_read(&path) {
+                        if let Ok(entry) = unpaired_entry(&name, &held) {
+                            catalog.unpaired.push(entry);
+                        }
+                    }
+                }
             }
-            let Ok(bytes) = bounded_read(&path, 16 * 1024) else {
-                continue;
-            };
-            let Ok(entry) = serde_json::from_slice::<Snapshot>(&bytes) else {
-                continue;
-            };
-            if entry.valid() && entry.manifest(dir) == path && regular(&dir.join(&entry.file)) {
-                entries.push(entry);
-            }
+            continue;
+        }
+        if !name.starts_with("recovery-") || !name.ends_with(".json") {
+            continue;
+        }
+        let path = file.path();
+        let entry = bounded_read(&path, 16 * 1024)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Snapshot>(&bytes).ok())
+            .filter(|entry| entry.valid() && entry.manifest(dir) == path);
+        let Some(entry) = entry else {
+            catalog.incomplete |= recovery_extension(&name) == Some("json");
+            continue;
+        };
+        let data = crate::file_safety::open_native_read(&dir.join(&entry.file))
+            .and_then(|file| file.metadata());
+        if let Ok(data) = data {
+            catalog.incomplete |= data.len() != entry.bytes;
+            catalog.entries.push(entry);
+        } else {
+            catalog.incomplete = true;
         }
     }
-    entries.sort_by(|a, b| {
+    catalog.entries.sort_by(|a, b| {
         b.timestamp_ms
             .cmp(&a.timestamp_ms)
             .then(b.revision.cmp(&a.revision))
             .then(a.snapshot.cmp(&b.snapshot))
     });
-    entries
+    catalog.unpaired.sort_unstable_by(|a, b| {
+        b.timestamp_ms.cmp(&a.timestamp_ms).then(a.snapshot.cmp(&b.snapshot))
+    });
+    Ok(catalog)
+}
+
+fn complete_resident_catalog(dir: &Path) -> Result<Vec<Snapshot>, String> {
+    let catalog = scan_resident(dir, &|| Ok(()))?;
+    if catalog.incomplete {
+        return Err(RESIDENT_CATALOG_ERROR.into());
+    }
+    Ok(catalog.entries)
 }
 fn remove(dir: &Path, entry: &Snapshot) -> Result<(), String> {
     // Remove the marker first. A crash can leave an unlisted data file, never a
@@ -153,6 +275,9 @@ pub fn discard_in(
     snapshot: &str,
 ) -> Result<(), String> {
     let _operation = server::FileOperation::begin_workspace(workspace)?;
+    if snapshot.starts_with("native:") {
+        return native::discard(workspace, snapshot);
+    }
     discard(dir, snapshot)
 }
 fn discard_project(dir: &Path, project: &str) -> Result<(), String> {
@@ -163,70 +288,111 @@ fn discard_project(dir: &Path, project: &str) -> Result<(), String> {
             observe();
         }
     });
-    for entry in catalog(dir).into_iter().filter(|e| e.project_id == project) {
+    for entry in complete_resident_catalog(dir)?.into_iter().filter(|e| e.project_id == project) {
         remove(dir, &entry)?;
     }
     Ok(())
 }
+fn recovery_extension(name: &str) -> Option<&str> {
+    recovery_name(name).map(|(_, _, extension)| extension)
+}
+
+fn recovery_name(name: &str) -> Option<(&str, &str, &str)> {
+    let (stem, extension) = name.strip_prefix("recovery-")?.split_once('.')?;
+    (stem.is_ascii()
+        && stem.len() == 73
+        && stem.as_bytes()[36] == b'-'
+        && uuid::Uuid::parse_str(&stem[..36]).is_ok()
+        && uuid::Uuid::parse_str(&stem[37..]).is_ok())
+    .then(|| (&stem[..36], &stem[37..], extension))
+}
+
 fn cleanup_orphans(dir: &Path) -> Result<(), String> {
     let files = fs::read_dir(dir).map_err(|e| e.to_string())?;
     for file in files.flatten() {
         let name = file.file_name();
         let name = name.to_string_lossy();
-        let Some(stem) = name
-            .strip_prefix("recovery-")
-            .and_then(|s| s.split_once('.').map(|(stem, _)| stem))
-        else {
+        let Some(extension) = recovery_extension(&name) else {
             continue;
         };
-        if !stem.is_ascii()
-            || stem.len() != 73
-            || stem.as_bytes()[36] != b'-'
-            || uuid::Uuid::parse_str(&stem[..36]).is_err()
-            || uuid::Uuid::parse_str(&stem[37..]).is_err()
-        {
-            continue;
-        }
         let path = file.path();
         if !regular(&path) {
             continue;
         }
-        let temporary = name
+        let temporary = extension
             .strip_suffix(".tmp")
-            .and_then(|s| s.rsplit_once('.'))
-            .is_some_and(|(_, id)| uuid::Uuid::parse_str(id).is_ok());
-        let orphan = name.ends_with(".psd") && !regular(&path.with_extension("json"));
-        if temporary || orphan {
+            .is_some_and(|id| id.len() == 36 && uuid::Uuid::parse_str(id).is_ok());
+        if temporary {
             fs::remove_file(path).map_err(|e| format!("Cannot clean incomplete recovery: {e}"))?;
         }
     }
     Ok(())
 }
-fn persist(
+fn verify_checkpoint_data(dir: &Path, entry: &Snapshot) -> std::io::Result<bool> {
+    let file = crate::file_safety::open_native_read(&dir.join(&entry.file))?;
+    if file.metadata()?.len() != entry.bytes {
+        return Ok(false);
+    }
+    let mut file = file.take(entry.bytes + 1);
+    let mut buffer = [0; 64 * 1024];
+    let mut bytes = 0;
+    let mut hash = CHECKSUM_START;
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        bytes += read as u64;
+        hash = checksum_chunk(hash, &buffer[..read]);
+    }
+    Ok(bytes == entry.bytes && format!("{hash:016x}") == entry.checksum)
+}
+
+fn prune_versions<'a>(
+    dir: &Path,
+    versions: impl Iterator<Item = &'a Snapshot> + Clone,
+) -> Result<bool, String> {
+    let mut older = versions.clone().skip(VERSIONS_PER_PROJECT).peekable();
+    if older.peek().is_none() {
+        return Ok(false);
+    }
+    for retained in versions.take(VERSIONS_PER_PROJECT) {
+        if !verify_checkpoint_data(dir, retained).unwrap_or(false) {
+            return Err(format!(
+                "Recovery version {} is damaged or unreadable; earlier versions retained",
+                retained.snapshot
+            ));
+        }
+    }
+    for old in older {
+        remove(dir, old)?;
+    }
+    Ok(true)
+}
+
+fn persist<T>(
     dir: &Path,
     project: &str,
     doc: &engine::Document,
     path: Option<PathBuf>,
     bytes: &[u8],
+    validate: impl FnOnce(&Path) -> Result<T, String>,
 ) -> Result<Snapshot, String> {
     if bytes.len() as u64 > MAX_FILE {
         return Err("Autosave exceeds the 256 MiB encoded-file limit".into());
     }
-    let entries = catalog(dir);
+    let mut entries = complete_resident_catalog(dir)?;
     // Retry failed pruning before allocating another version, bounding failed writes.
-    for old in entries
-        .iter()
-        .filter(|e| e.project_id == project)
-        .skip(VERSIONS_PER_PROJECT)
-    {
-        remove(dir, old)?;
+    if prune_versions(dir, entries.iter().filter(|e| e.project_id == project))? {
+        entries = complete_resident_catalog(dir)?;
     }
-    let entries = catalog(dir);
+    let checksum = checksum(bytes);
     if let Some(entry) = entries.iter().find(|e| {
         e.project_id == project
             && e.document_id == doc.id
             && e.revision == doc.revision
-            && e.checksum == checksum(bytes)
+            && e.checksum == checksum
+            && verify_checkpoint_data(dir, e).unwrap_or(false)
     }) {
         return Ok(entry.clone());
     }
@@ -271,27 +437,46 @@ fn persist(
             .as_millis()
             .min(u64::MAX as u128) as u64,
         bytes: bytes.len() as u64,
-        checksum: checksum(bytes),
+        checksum,
     };
-    let marker = serde_json::to_vec(&entry).map_err(|e| e.to_string())?;
+    let marker = marker_bytes(&entry)?;
+    server::atomic_create(&dir.join(&entry.file), bytes, validate)?;
+    // A failed or uncertain marker publication must leave the complete PSD available.
+    server::atomic_create(&entry.manifest(dir), &marker, |_| Ok(()))?;
+    // Give the new checkpoint a retention slot even if the clock moved back.
+    prune_versions(
+        dir,
+        std::iter::once(&entry).chain(entries.iter().filter(|e| e.project_id == project)),
+    )?;
+    Ok(entry)
+}
+
+fn marker_bytes(entry: &Snapshot) -> Result<Vec<u8>, String> {
+    if !entry.valid() {
+        return Err("Invalid recovery metadata".into());
+    }
+    let marker = serde_json::to_vec(entry).map_err(|e| e.to_string())?;
     if marker.len() > 16 * 1024 {
         return Err("Recovery metadata exceeds its limit".into());
     }
-    server::atomic_write(&dir.join(&entry.file), bytes)?;
-    if let Err(error) = server::atomic_write(&entry.manifest(dir), &marker) {
-        let _ = fs::remove_file(dir.join(&entry.file));
-        return Err(error);
-    }
-    // Old complete versions are pruned only after the new commit marker is durable.
-    for old in entries
-        .iter()
-        .filter(|e| e.project_id == project)
-        .skip(VERSIONS_PER_PROJECT - 1)
-    {
-        remove(dir, old)?;
-    }
-    Ok(entry)
+    Ok(marker)
 }
+
+fn resident_checkpoint_guard<'a>(
+    shared: &'a server::Shared,
+    doc: &engine::Document,
+) -> Result<Option<MutexGuard<'a, engine::Engine>>, String> {
+    let current = shared
+        .try_lock()
+        .map_err(|_| "Recovery source is busy; checkpoint deferred")?;
+    let view = engine::view::current(&current);
+    let unchanged = !current.closed
+        && !view.read_only()
+        && engine::view::DocumentView::Resident(doc).same_observation(view)
+        && current.saved_revision != view.revision();
+    Ok(unchanged.then_some(current))
+}
+
 /// Encoding runs outside the engine lock. Newer work stays dirty and is picked up
 /// by the next tick; a checkpoint never changes saved_revision or original files.
 pub fn checkpoint(workspace: &workspace::Registry, dir: &Path, previous: &mut Versions) {
@@ -315,8 +500,16 @@ pub fn checkpoint(workspace: &workspace::Registry, dir: &Path, previous: &mut Ve
     failures.remove("@storage");
     let retired = workspace.lock().unwrap().recovery_retired.clone();
     for project in retired {
-        match discard_project(dir, &project) {
+        let cleanup = previous
+            .native
+            .get(&project)
+            .map_or(Ok(()), |saved| {
+                native::discard_project(workspace, &project, saved)
+            })
+            .and_then(|_| discard_project(dir, &project));
+        match cleanup {
             Ok(()) => {
+                previous.native.remove(&project);
                 workspace
                     .lock()
                     .unwrap()
@@ -324,6 +517,7 @@ pub fn checkpoint(workspace: &workspace::Registry, dir: &Path, previous: &mut Ve
                     .retain(|id| id != &project);
                 failures.remove(&project);
             }
+            Err(error) if error == native::FOREGROUND_ACTIVE => {}
             Err(error) => {
                 failures.insert(project, error);
             }
@@ -331,50 +525,154 @@ pub fn checkpoint(workspace: &workspace::Registry, dir: &Path, previous: &mut Ve
     }
     let entries = workspace::entries_in(workspace);
     let live: HashSet<_> = entries.iter().map(|(id, _, _)| id.clone()).collect();
-    previous.retain(|id, _| live.contains(id));
+    previous.resident.retain(|id, _| live.contains(id));
+    let retired = workspace.lock().unwrap().recovery_retired.clone();
+    previous
+        .native
+        .retain(|id, _| live.contains(id) || retired.contains(id));
+    enum Source {
+        Resident(Arc<engine::Document>, Option<PathBuf>),
+        Native(engine::scene::SceneSnapshot),
+        NativeCurrent,
+    }
     for (project, _, shared) in entries {
-        let (doc, path) = match shared.try_lock() {
-            Ok(e) if e.closed || e.doc.read_only || e.doc.revision == e.saved_revision => {
-                drop(e);
-                previous.remove(&project);
-                if let Err(error) = discard_project(dir, &project) {
-                    failures.insert(project, error);
-                } else {
-                    failures.remove(&project);
-                }
-                continue;
-            }
+        let source = match shared.try_lock() {
             Ok(e) => {
-                if previous
-                    .get(&project)
-                    .is_some_and(|(id, rev, _)| id == &e.doc.id && *rev == e.doc.revision)
-                {
+                let view = engine::view::current(&e);
+                if view.native().is_some() && e.file_operations.load(Ordering::Acquire) != 0 {
                     continue;
                 }
-                (e.doc.clone(), e.path.clone())
+                if e.closed || view.read_only() || view.revision() == e.saved_revision {
+                    drop(e);
+                    previous.resident.remove(&project);
+                    let cleanup = previous
+                        .native
+                        .get(&project)
+                        .map_or(Ok(()), |saved| {
+                            native::discard_project(workspace, &project, saved)
+                        })
+                        .and_then(|_| discard_project(dir, &project));
+                    match cleanup {
+                        Ok(()) => {
+                            previous.native.remove(&project);
+                            failures.remove(&project);
+                        }
+                        Err(error) if error == native::FOREGROUND_ACTIVE => {}
+                        Err(error) => {
+                            failures.insert(project, error);
+                        }
+                    }
+                    continue;
+                }
+                match e.doc_snapshot() {
+                    engine::view::DocumentSnapshot::Resident(doc) => {
+                        if previous
+                            .resident
+                            .get(&project)
+                            .is_some_and(|(id, revision, _)| {
+                                id == view.id() && *revision == view.revision()
+                            })
+                        {
+                            continue;
+                        }
+                        Ok(Source::Resident(doc, e.path.clone()))
+                    }
+                    engine::view::DocumentSnapshot::Native(document) => {
+                        if previous.native.get(&project).is_some_and(|saved| {
+                            saved.key == document.key() && !saved.prune_pending
+                        }) {
+                            Ok(Source::NativeCurrent)
+                        } else {
+                            e.capture_scene(None)
+                                .and_then(|scene| scene.into_native())
+                                .map(Source::Native)
+                        }
+                    }
+                }
             }
             Err(_) => continue,
         };
+        let (doc, path) = match source {
+            Ok(Source::NativeCurrent) => {
+                if let Some(saved) = previous.native.get(&project) {
+                    match saved.check_runtime(workspace) {
+                        Ok(()) => {
+                            failures.remove(&project);
+                        }
+                        Err(error) => {
+                            failures.insert(project, error);
+                        }
+                    }
+                }
+                continue;
+            }
+            Ok(Source::Resident(doc, path)) => (doc, path),
+            Ok(Source::Native(scene)) => {
+                if (!previous.native.contains_key(&project)
+                    && previous.native.len() >= MAX_PROJECTS)
+                    || previous.native.try_reserve(1).is_err()
+                {
+                    failures.insert(
+                        project,
+                        "Native recovery worker admission is full; existing recoveries retained"
+                            .into(),
+                    );
+                    continue;
+                }
+                let result = native::checkpoint(
+                    workspace,
+                    dir,
+                    &shared,
+                    &scene,
+                    previous.native.get(&project),
+                    &|| Ok(()),
+                );
+                match result {
+                    Ok(outcome) => {
+                        if let Some(error) = outcome.error {
+                            failures.insert(project.clone(), error);
+                        } else {
+                            failures.remove(&project);
+                        }
+                        previous.resident.remove(&project);
+                        previous.native.insert(project, outcome.saved);
+                    }
+                    Err(error) if error == native::FOREGROUND_ACTIVE => {}
+                    Err(error) => {
+                        failures.insert(project, error);
+                    }
+                }
+                continue;
+            }
+            Err(error) => {
+                failures.insert(project, error);
+                continue;
+            }
+        };
         let result = psd::encode(&doc).and_then(|bytes| {
-            // Replacement/closing during encoding must not create a new recovery.
-            if shared.try_lock().is_ok_and(|e| {
-                e.closed
-                    || e.doc.id != doc.id
-                    || e.doc.revision != doc.revision
-                    || e.saved_revision == e.doc.revision
-            }) {
+            if resident_checkpoint_guard(&shared, &doc)?.is_none() {
                 return Ok(None);
             }
-            persist(dir, &project, &doc, path, &bytes).map(Some)
+            native::admit_resident(workspace, dir, &project, bytes.len() as u64)?;
+            // Hold the observed document through the PSD move. Once the data is
+            // visible, finish its record even if a later edit advances the source.
+            persist(dir, &project, &doc, path, &bytes, |_| {
+                resident_checkpoint_guard(&shared, &doc)?
+                    .ok_or_else(|| "Recovery source changed or was saved; checkpoint deferred".into())
+            })
+            .map(Some)
         });
         match result {
             Ok(Some(entry)) => {
                 failures.remove(&project);
-                previous.insert(project, (doc.id, doc.revision, json!(entry)));
+                previous
+                    .resident
+                    .insert(project, (doc.id.clone(), doc.revision, json!(entry)));
             }
             Ok(None) => {
                 failures.remove(&project);
             }
+            Err(error) if error == native::FOREGROUND_ACTIVE => {}
             Err(error) => {
                 failures.insert(project, format!("{}: {error}", doc.name));
             }
@@ -397,10 +695,15 @@ pub fn restore(
     control: &crate::loading::Control,
     initiating: Option<&str>,
 ) -> Result<server::Shared, String> {
-    let entry = catalog(dir)
-        .into_iter()
-        .find(|e| e.snapshot == snapshot)
-        .ok_or("Recovery version no longer exists; refresh the list")?;
+    if snapshot.starts_with("unpaired:") {
+        let _operation = server::FileOperation::begin_workspace(workspace)?;
+        let checked = check_unpaired(dir, snapshot, control)?;
+        return register_recovered(workspace, checked.doc, initiating);
+    }
+    let entry = catalog(dir).into_iter().find(|e| e.snapshot == snapshot);
+    let Some(entry) = entry else {
+        return native::restore(workspace, snapshot, control, initiating);
+    };
     control.begin()?;
     let bytes = bounded_read(&dir.join(&entry.file), MAX_FILE)?;
     if bytes.len() as u64 != entry.bytes || checksum(&bytes) != entry.checksum {
@@ -415,6 +718,153 @@ pub fn restore(
         );
     }
     doc.name = entry.name;
+    register_recovered(workspace, doc, initiating)
+}
+
+fn unpaired_entry(name: &str, file: &fs::File) -> Result<Unpaired, String> {
+    let (bytes, modified) = crate::file_safety::stamp(file)?;
+    if !(26..=MAX_FILE).contains(&bytes) {
+        return Err("Unpaired recovery is outside the resident PSD file limit".into());
+    }
+    let (volume, file_id) = crate::file_safety::identity(file)?;
+    let mut fingerprint = ring::digest::Context::new(&ring::digest::SHA256);
+    fingerprint.update(&volume.to_be_bytes());
+    fingerprint.update(&file_id.to_be_bytes());
+    fingerprint.update(&bytes.to_be_bytes());
+    fingerprint.update(&modified.to_be_bytes());
+    let digest = fingerprint.finish();
+    let token = uuid::Uuid::from_bytes(digest.as_ref()[..16].try_into().unwrap());
+    Ok(Unpaired {
+        snapshot: format!("unpaired:{name}:{token}"),
+        timestamp_ms: (modified / 1_000_000).min(u64::MAX as u128) as u64,
+        bytes,
+    })
+}
+
+struct CheckedUnpaired<'a> {
+    name: &'a str,
+    path: PathBuf,
+    file: fs::File,
+    version: crate::file_safety::Version,
+    timestamp_ms: u64,
+    doc: engine::Document,
+}
+
+fn check_unpaired<'a>(
+    dir: &Path,
+    snapshot: &'a str,
+    control: &crate::loading::Control,
+) -> Result<CheckedUnpaired<'a>, String> {
+    let (name, token) = snapshot
+        .strip_prefix("unpaired:")
+        .and_then(|id| id.split_once(':'))
+        .ok_or("Choose a listed unpaired recovery")?;
+    if recovery_extension(name) != Some("psd") || token.len() != 36 {
+        return Err("Choose a listed unpaired recovery".into());
+    }
+    let path = dir.join(name);
+    let marker = path.with_extension("json");
+    let check_marker = || -> Result<(), String> {
+        if !matches!(fs::symlink_metadata(&marker), Err(error) if error.kind() == std::io::ErrorKind::NotFound) {
+            return Err("Unpaired recovery marker changed; refresh the list".into());
+        }
+        Ok(())
+    };
+    control.begin()?;
+    check_marker()?;
+    let mut file = crate::file_safety::open_native_read(&path).map_err(|e| e.to_string())?;
+    let candidate = unpaired_entry(name, &file)?;
+    if candidate.snapshot != snapshot {
+        return Err("Unpaired recovery file changed; refresh the list".into());
+    }
+    let version = crate::file_safety::resident_source_version(
+        &path, &mut file, &mut [0; 64 * 1024], &|| control.check(),
+    )?;
+    if unpaired_entry(name, &file)?.snapshot != snapshot {
+        return Err("Unpaired recovery file changed; refresh the list".into());
+    }
+    let doc = psd::decode_unpaired_autosave(&mut file, control, version)?;
+    crate::file_safety::check_native_source_binding(&path, &file, version)?;
+    check_marker()?;
+    control.check()?;
+    Ok(CheckedUnpaired {
+        name,
+        path,
+        file,
+        version,
+        timestamp_ms: candidate.timestamp_ms,
+        doc,
+    })
+}
+
+pub(crate) fn repair_unpaired(
+    workspace: &workspace::Registry,
+    dir: &Path,
+    snapshot: &str,
+    control: &crate::loading::Control,
+) -> Result<Snapshot, String> {
+    let _operation = server::FileOperation::begin_workspace(workspace)?;
+    let mut checked = check_unpaired(dir, snapshot, control)?;
+    let (project, id, _) = recovery_name(checked.name).ok_or("Invalid recovery filename")?;
+    let snapshot_id = uuid::Uuid::parse_str(id).map_err(|e| e.to_string())?;
+
+    // The format-2 checksum must describe the same bytes the decoder accepted.
+    checked.file.rewind().map_err(|e| e.to_string())?;
+    let mut reader = (&mut checked.file).take(checked.version.bytes + 1);
+    let mut buffer = [0; 64 * 1024];
+    let mut bytes = 0;
+    let mut hash = CHECKSUM_START;
+    let mut sha = ring::digest::Context::new(&ring::digest::SHA256);
+    loop {
+        control.check()?;
+        let read = reader.read(&mut buffer).map_err(|e| e.to_string())?;
+        if read == 0 {
+            break;
+        }
+        bytes += read as u64;
+        hash = checksum_chunk(hash, &buffer[..read]);
+        sha.update(&buffer[..read]);
+    }
+    if bytes != checked.version.bytes
+        || crate::file_safety::finish_fingerprint(sha) != checked.version.sha256()
+    {
+        return Err("Unpaired recovery file changed; refresh the list".into());
+    }
+    let entry = Snapshot {
+        version: 2,
+        snapshot: id.into(),
+        project_id: project.into(),
+        document_id: checked.doc.id,
+        revision: checked.doc.revision,
+        name: checked.doc.name,
+        original_path: None,
+        bit_depth: checked.doc.bit_depth,
+        timestamp_ms: checked.timestamp_ms,
+        bytes,
+        checksum: format!("{hash:016x}"),
+        file: checked.name.into(),
+    };
+    let marker = marker_bytes(&entry)?;
+    let gate = gate(dir);
+    let _guard = gate.lock().unwrap();
+    let catalog = scan_resident(dir, &|| control.check())?;
+    if catalog.entries.iter().any(|entry| {
+        uuid::Uuid::parse_str(&entry.snapshot).ok() == Some(snapshot_id)
+    }) {
+        return Err("A recovery record already uses this snapshot identity; refresh the list".into());
+    }
+    server::atomic_create(&entry.manifest(dir), &marker, |_| {
+        crate::file_safety::check_native_source_binding(&checked.path, &checked.file, checked.version)?;
+        control.check()
+    })?;
+    Ok(entry)
+}
+
+fn register_recovered(
+    workspace: &workspace::Registry,
+    doc: engine::Document,
+    initiating: Option<&str>,
+) -> Result<server::Shared, String> {
     let mut e = engine::Engine::from_document(doc);
     e.saved_revision = u64::MAX;
     e.status = "Recovered into an unsaved tab · choose Save As · recovery retained".into();
@@ -469,6 +919,168 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    #[test]
+    fn saving_during_resident_checkpoint_staging_leaves_the_earlier_recovery() {
+        let fixture = crate::engine::native::worker::tests::Fixture::new();
+        let dir = fixture.path();
+        let mut engine = engine::Engine::new();
+        let project = engine.project_id.clone();
+        let mut doc = engine::Document::new_depth(2, 1, 16).unwrap();
+        let old = persist(dir, &project, &doc, None, &psd::encode(&doc).unwrap(), |_| Ok(()))
+            .unwrap();
+        doc.layers[0].pixels.set16(1, 0, [12347, 23459, 34571, 65535]);
+        doc.revision += 1;
+        engine.resident_state_mut().unwrap().document = doc.clone();
+        let shared = Arc::new(Mutex::new(engine));
+        assert!(resident_checkpoint_guard(&shared, &doc).unwrap().is_some());
+
+        let bytes = psd::encode(&doc).unwrap();
+        let original = dir.join("Original.psd");
+        let result = persist(dir, &project, &doc, None, &bytes, |staged| {
+            assert_eq!(fs::metadata(staged).unwrap().len(), bytes.len() as u64);
+            server::save(&shared, &original).unwrap();
+            resident_checkpoint_guard(&shared, &doc)?.ok_or_else(|| "Source saved".into())
+        });
+        assert_eq!(result.unwrap_err(), "Source saved");
+        let inventory = scan_resident(dir, &|| Ok(())).unwrap();
+        assert!(!inventory.incomplete);
+        assert!(inventory.unpaired.is_empty());
+        assert_eq!(inventory.entries.len(), 1);
+        assert_eq!(inventory.entries[0].snapshot, old.snapshot);
+        assert!(verify_checkpoint_data(dir, &old).unwrap());
+        assert!(original.is_file());
+    }
+
+    #[test]
+    fn cleanup_preserves_unpaired_psds_occupied_markers_and_unrelated_files() {
+        let fixture = crate::engine::native::worker::tests::Fixture::new();
+        let dir = fixture.path();
+        let project = engine::id();
+        let mut document = engine::Document::new_depth(2, 1, 16).unwrap();
+        let sample = [12347, 23459, 34571, 65535];
+        document.layers[0].pixels.set16(1, 0, sample);
+        let encoded = psd::encode(&document).unwrap();
+        let entry = persist(dir, &project, &document, None, &encoded, |_| Ok(())).unwrap();
+        let good = persist(dir, &engine::id(), &document, None, &encoded, |_| Ok(())).unwrap();
+        let marker = entry.manifest(dir);
+        let marker_bytes = fs::read(&marker).unwrap();
+        fs::remove_file(&marker).unwrap();
+        fs::create_dir(&marker).unwrap();
+
+        let uncommitted = dir.join(format!("recovery-{project}-{}.psd", engine::id()));
+        let temporary = uncommitted.with_extension(format!("{}.tmp", engine::id()));
+        let retained_psd = uncommitted.with_extension("backup.psd");
+        let retained_tmp = uncommitted.with_extension(format!("backup.{}.tmp", engine::id()));
+        for path in [&uncommitted, &temporary, &retained_psd, &retained_tmp] {
+            fs::write(path, &encoded).unwrap();
+        }
+        cleanup_orphans(dir).unwrap();
+        assert!(!temporary.exists());
+        assert!(marker.is_dir());
+        for path in [&dir.join(&entry.file), &uncommitted, &retained_psd, &retained_tmp] {
+            assert_eq!(fs::read(path).unwrap(), encoded);
+        }
+        let shared = Arc::new(Mutex::new(engine::Engine::new()));
+        let registry = workspace::attach(&shared);
+        let available = catalog_in(&registry, dir, &|| Ok(())).unwrap();
+        assert_eq!(available.resident_error, Some(RESIDENT_CATALOG_ERROR));
+        assert_eq!(available.versions.len(), 1);
+        assert_eq!(available.versions[0].snapshot, good.snapshot);
+        assert_eq!(available.unpaired.len(), 1);
+        let candidate = &available.unpaired[0];
+        let restored = restore(&registry, dir, &candidate.snapshot, &Default::default(), None).unwrap();
+        {
+            let restored = restored.lock().unwrap();
+            let recovered = restored.resident().unwrap();
+            assert_eq!(recovered.bit_depth, 16);
+            assert_eq!(recovered.layers[0].pixels.get16(1, 0), sample);
+            assert_ne!(recovered.id, document.id);
+            assert!(restored.path.is_none() && restored.file_ownership.is_none());
+            assert_ne!(restored.saved_revision, recovered.revision);
+        }
+        assert_eq!(fs::read(&uncommitted).unwrap(), encoded);
+        let resource_bytes = u32::from_be_bytes(encoded[30..34].try_into().unwrap()) as usize;
+        let conventional = [&encoded[..30], &[0; 4], &encoded[34 + resource_bytes..]].concat();
+        fs::write(&uncommitted, conventional).unwrap();
+        assert!(restore(&registry, dir, &candidate.snapshot, &Default::default(), None)
+            .err().unwrap().contains("file changed"));
+        assert!(repair_unpaired(&registry, dir, &candidate.snapshot, &Default::default())
+            .unwrap_err().contains("file changed"));
+        let current = catalog_in(&registry, dir, &|| Ok(())).unwrap();
+        assert!(restore(&registry, dir, &current.unpaired[0].snapshot, &Default::default(), None)
+            .err().unwrap().contains("no unique PeerBrush source"));
+        assert!(repair_unpaired(&registry, dir, &current.unpaired[0].snapshot, &Default::default())
+            .unwrap_err().contains("no unique PeerBrush source"));
+        let mut damaged_source = encoded.clone();
+        let source = damaged_source.windows(4).position(|bytes| bytes == b"PBR1").unwrap() + 4;
+        damaged_source[source] = 0;
+        fs::write(&uncommitted, damaged_source).unwrap();
+        let current = catalog_in(&registry, dir, &|| Ok(())).unwrap();
+        assert!(repair_unpaired(&registry, dir, &current.unpaired[0].snapshot, &Default::default())
+            .unwrap_err().contains("no valid editable PeerBrush source"));
+        assert!(!uncommitted.with_extension("json").exists());
+        assert_eq!(persist(dir, &project, &document, None, &encoded, |_| Ok(())).unwrap_err(), RESIDENT_CATALOG_ERROR);
+        assert!(native::admit_resident(&registry, dir, &project, encoded.len() as u64).is_err());
+        assert!(discard_project(dir, &good.project_id).is_err());
+        assert_eq!(fs::read(dir.join(&good.file)).unwrap(), encoded);
+
+        fs::remove_dir(&marker).unwrap();
+        fs::write(&marker, marker_bytes).unwrap();
+        let unpaired = catalog_in(&registry, dir, &|| Ok(())).unwrap();
+        assert_eq!(unpaired.resident_error, Some(RESIDENT_CATALOG_ERROR));
+        assert_eq!(unpaired.versions.len(), 2);
+        fs::write(&uncommitted, &encoded).unwrap();
+        let current = catalog_in(&registry, dir, &|| Ok(())).unwrap();
+        let candidate = &current.unpaired[0];
+        let competing_marker = uncommitted.with_extension("json");
+        fs::write(&competing_marker, b"other record").unwrap();
+        assert!(repair_unpaired(&registry, dir, &candidate.snapshot, &Default::default())
+            .unwrap_err().contains("marker changed"));
+        assert_eq!(fs::read(&competing_marker).unwrap(), b"other record");
+        fs::remove_file(&competing_marker).unwrap();
+        let record = repair_unpaired(&registry, dir, &candidate.snapshot, &Default::default()).unwrap();
+        assert_eq!(record.project_id, project);
+        assert_eq!(record.document_id, document.id);
+        assert_eq!(record.revision, document.revision);
+        assert_eq!(record.bit_depth, 16);
+        assert_eq!(record.timestamp_ms, candidate.timestamp_ms);
+        assert!(record.original_path.is_none());
+        assert!(verify_checkpoint_data(dir, &record).unwrap());
+        assert_eq!(fs::read(&uncommitted).unwrap(), encoded);
+        let repaired = catalog_in(&registry, dir, &|| Ok(())).unwrap();
+        assert!(repaired.resident_error.is_none());
+        assert!(repaired.unpaired.is_empty());
+        assert_eq!(repaired.versions.len(), 3);
+        let retained = persist(dir, &project, &document, None, &encoded, |_| Ok(())).unwrap();
+        assert!(retained.snapshot == record.snapshot || retained.snapshot == entry.snapshot);
+        let restored = restore(&registry, dir, &record.snapshot, &Default::default(), None).unwrap();
+        let restored = restored.lock().unwrap();
+        let recovered = restored.resident().unwrap();
+        assert_eq!(recovered.bit_depth, 16);
+        assert_eq!(recovered.layers[0].pixels.get16(1, 0), sample);
+    }
+
+    #[test]
+    fn startup_copies_the_bounded_recovery_index_without_replacing_it_with_an_oversized_index() {
+        let dir = std::env::temp_dir().join(format!("pb-recovery-index-{}", engine::id()));
+        fs::create_dir(&dir).unwrap();
+        let current = dir.join("recoveries.json");
+        let previous = dir.join("previous-recoveries.json");
+        let bytes = br#"{"projects":[{"file":"fixture.psd"}]}"#;
+        fs::write(&current, bytes).unwrap();
+        preserve_previous_index(&dir).unwrap();
+        assert_eq!(fs::read(&previous).unwrap(), bytes);
+        let mut oversized = br#"{"projects":[{"file":"too-large.psd"}]}"#.to_vec();
+        oversized.resize(65536, b' ');
+        fs::write(&current, &oversized).unwrap();
+        preserve_previous_index(&dir).unwrap();
+        assert_eq!(fs::read(&previous).unwrap(), bytes);
+        assert_eq!(fs::read(&current).unwrap(), oversized);
+        fs::remove_file(current).unwrap();
+        fs::remove_file(previous).unwrap();
+        fs::remove_dir(dir).unwrap();
+    }
+
     fn source(engine: &engine::Engine) -> Value {
         let history = |entries: &[engine::History]| {
             entries.iter().map(|entry| json!({
@@ -476,8 +1088,8 @@ mod tests {
                 "task":entry.task,"scopes":entry.scopes,"gesture":entry.gesture,"reverted":entry.reverted,
             })).collect::<Vec<_>>()
         };
-        json!({"document":engine.doc,"png":engine.doc.export_png().unwrap(),
-            "undo":history(&engine.undo),"redo":history(&engine.redo),
+        json!({"document":engine.resident_state().expect("resident fixture").document,"png":engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
+            "undo":history(&engine.resident_state().expect("resident fixture").undo),"redo":history(&engine.resident_state().expect("resident fixture").redo),
             "saved_revision":engine.saved_revision,"path":engine.path,"closed":engine.closed})
     }
 
@@ -487,11 +1099,24 @@ mod tests {
             let dir = std::env::temp_dir().join(format!("pb-recovery-lock-{}", engine::id()));
             fs::create_dir(&dir).unwrap();
             let mut engine = engine::Engine::new();
-            engine.doc = engine::Document::new_depth(12, 8, depth).unwrap();
-            engine.doc.layers[0]
+            engine
+                .resident_state_mut()
+                .expect("resident fixture")
+                .document = engine::Document::new_depth(12, 8, depth).unwrap();
+            engine
+                .resident_state_mut()
+                .expect("resident fixture")
+                .document
+                .layers[0]
                 .pixels
                 .set16(0, 0, [12347, 33559, 51237, 65535]);
-            let layer = engine.doc.layers[0].id.clone();
+            let layer = engine
+                .resident_state()
+                .expect("resident fixture")
+                .document
+                .layers[0]
+                .id
+                .clone();
             engine
                 .edit(
                     "human",
@@ -527,7 +1152,14 @@ mod tests {
                     let engine = observed_shared.try_lock().unwrap_or_else(|_| {
                         panic!("Recovery storage cleanup must not hold the document engine")
                     });
-                    assert_eq!(engine.doc.revision, engine.saved_revision);
+                    assert_eq!(
+                        engine
+                            .resident_state()
+                            .expect("resident fixture")
+                            .document
+                            .revision,
+                        engine.saved_revision
+                    );
                     assert!(!engine.closed);
                     drop(engine);
                     assert!(catalog(&observed_dir)
@@ -586,18 +1218,46 @@ mod tests {
             {
                 let engine = shared.lock().unwrap();
                 assert_eq!(source(&engine), expected);
-                assert_eq!(engine.doc.revision, old.revision + 1);
-                assert_eq!(engine.doc.bit_depth, depth);
                 assert_eq!(
-                    engine.doc.layers[0].pixels.get16(2, 1),
+                    engine
+                        .resident_state()
+                        .expect("resident fixture")
+                        .document
+                        .revision,
+                    old.revision + 1
+                );
+                assert_eq!(
+                    engine
+                        .resident_state()
+                        .expect("resident fixture")
+                        .document
+                        .bit_depth,
+                    depth
+                );
+                assert_eq!(
+                    engine
+                        .resident_state()
+                        .expect("resident fixture")
+                        .document
+                        .layers[0]
+                        .pixels
+                        .get16(2, 1),
                     [53 * 257, 97 * 257, 173 * 257, 65535]
                 );
                 assert_eq!(
-                    engine.undo.len(),
+                    engine
+                        .resident_state()
+                        .expect("resident fixture")
+                        .undo
+                        .len(),
                     before["undo"].as_array().unwrap().len() + 1
                 );
                 assert_eq!(expected["undo"][0], before["undo"][0]);
-                assert!(engine.redo.is_empty());
+                assert!(engine
+                    .resident_state()
+                    .expect("resident fixture")
+                    .redo
+                    .is_empty());
                 assert!(!engine.closed);
             }
             checkpoint(&registry, &dir, &mut previous);
@@ -612,15 +1272,32 @@ mod tests {
             assert!(!recovered.read_only);
             assert_eq!(
                 recovered.layers[0].pixels.rgba16(),
-                engine.doc.layers[0].pixels.rgba16()
+                engine
+                    .resident_state()
+                    .expect("resident fixture")
+                    .document
+                    .layers[0]
+                    .pixels
+                    .rgba16()
             );
             assert_eq!(
                 recovered.export_png().unwrap(),
-                engine.doc.export_png().unwrap()
+                engine
+                    .resident_state()
+                    .expect("resident fixture")
+                    .document
+                    .export_png()
+                    .unwrap()
             );
             assert_eq!(
                 recovered.layers[0].pixels.get16(0, 0),
-                engine.doc.layers[0].pixels.get16(0, 0)
+                engine
+                    .resident_state()
+                    .expect("resident fixture")
+                    .document
+                    .layers[0]
+                    .pixels
+                    .get16(0, 0)
             );
             if depth == 16 {
                 assert_eq!(

@@ -106,6 +106,7 @@ class DebianPackage(unittest.TestCase):
                          source_sha256=digest(self.root / 'final-deb-stage/usr/share/doc/peerbrush/PeerBrush-0.2.0-source.zip')))
         self.assertEqual(inspected['executable_sha256'], digest(self.root / 'final-deb-stage/usr/bin/peerbrush'))
         self.assertEqual(inspected['portable_sha256'], digest(self.archive))
+        self.assertEqual(inspected['control'], self.final_control)
         for changes in [dict(package_sha256='0' * 64), dict(portable_sha256='0' * 64),
                         dict(commit='0' * 40), dict(version='0.30.0'), dict(maintainer='Other <other@example.invalid>')]:
             with self.subTest(changes=changes), self.assertRaises(ValueError):
@@ -313,6 +314,13 @@ class DebianPackage(unittest.TestCase):
     def test_version_order_and_control_fields_are_bounded(self):
         self.assertEqual(deb.deb_version('0.30.0-dev.1'), '0.30.0~dev.1-1')
         self.assertEqual(deb.deb_version('0.30.0'), '0.30.0-1')
+        self.assertEqual(deb.deb_version('0.4.0'), '1:0.4.0-1')
+        self.assertEqual(deb.deb_version('0.4.0-rc.1'), '1:0.4.0~rc.1-1')
+        self.assertEqual(deb.deb_filename('0.4.0'), 'peerbrush_0.4.0-1_amd64.deb')
+        self.assertIn(
+            'Version: 1:0.4.0-1\n',
+            deb.control('0.4.0', 'libc6 (>= 2.34)', 123, 'Synthetic Maintainer <builds@example.invalid>'),
+        )
         text = deb.control('0.30.0', 'libc6 (>= 2.34)', 123, 'Synthetic Maintainer <builds@example.invalid>')
         self.assertIn('Architecture: amd64\n', text)
         self.assertIn('Depends: libc6 (>= 2.34)\n', text)

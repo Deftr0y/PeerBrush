@@ -598,7 +598,7 @@ impl<'a> Flood<'a> {
             return Err(Error::Poisoned);
         }
         self.finished = true;
-        if seeds.len() > 8192 || radius.is_some_and(|r| r == 0 || r > 256) {
+        if seeds.len() > super::MAX_BRUSH_SEEDS || radius.is_some_and(|r| r == 0 || r > 256) {
             return Err(Error::Invalid);
         }
         check().map_err(Error::Callback)?;

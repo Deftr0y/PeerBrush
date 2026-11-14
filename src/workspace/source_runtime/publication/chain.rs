@@ -64,6 +64,13 @@ pub(super) fn continues(
                     .ok_or("Previous backup name absent")?,
                 binding.fact,
             )?,
+            Place::RetainedOriginal => preserved(
+                next,
+                &before
+                    .retained_original_name()
+                    .ok_or("Previous original name absent")?,
+                binding.fact,
+            )?,
         }
     }
     if next.expected != expected {
@@ -305,6 +312,32 @@ mod tests {
         assert_eq!(after.facts[0].fact.identity, (1, 2));
         drop(selected);
         assert_eq!(pool.used(), 0);
+    }
+    #[test]
+    fn next_intent_must_preserve_the_relocated_original_identity_and_name() {
+        let before = first();
+        let mut receipt = closed();
+        receipt.retired.clear();
+        receipt.bindings.push(super::super::closed_frame::Binding {
+            place: Place::RetainedOriginal,
+            fact: fact(1, 4),
+        });
+        receipt.bindings.sort_unstable_by_key(|b| b.fact.identity);
+        receipt.validate(&before, [10; 32]).unwrap();
+        let mut after = second();
+        assert!(continues(&before, &receipt, [11; 32], &after).is_err());
+        after.facts.insert(
+            0,
+            NamedFact {
+                role: Role::Backup,
+                name: before.retained_original_name().unwrap(),
+                fact: fact(1, 4),
+            },
+        );
+        after.validate().unwrap();
+        continues(&before, &receipt, [11; 32], &after).unwrap();
+        after.facts[0].name = "different-original.psb".into();
+        assert!(continues(&before, &receipt, [11; 32], &after).is_err());
     }
     #[test]
     fn missing_previous_competing_children_cross_target_and_live_version_changes_refuse() {

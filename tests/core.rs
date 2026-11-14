@@ -35,7 +35,7 @@ fn blending_preserves_transparency_without_dark_fringes() {
 #[test]
 fn failed_batch_is_atomic() {
     let mut e = Engine::new();
-    let layer = e.doc.layers[0].id.clone();
+    let layer = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
     let r = e.edit(
         "agent",
         &[
@@ -47,15 +47,15 @@ fn failed_batch_is_atomic() {
         "bad batch",
     );
     assert!(r.is_err());
-    assert_eq!(e.doc.revision, 0);
-    assert_eq!(e.doc.layers[0].pixels.bytes(), 0);
-    assert!(e.undo.is_empty());
+    assert_eq!(e.resident_state().expect("resident fixture").document.revision, 0);
+    assert_eq!(e.resident_state().expect("resident fixture").document.layers[0].pixels.bytes(), 0);
+    assert!(e.resident_state().expect("resident fixture").undo.is_empty());
 }
 
 #[test]
 fn region_reservation_blocks_overlap_but_not_elsewhere() {
     let mut e = Engine::new();
-    let layer = e.doc.layers[0].id.clone();
+    let layer = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
     e.reserve(
         "agent",
         "mask work",
@@ -72,7 +72,7 @@ fn region_reservation_blocks_overlap_but_not_elsewhere() {
 #[test]
 fn optimistic_edits_reject_conflicts_and_allow_disjoint_regions() {
     let mut e = Engine::new();
-    let layer = e.doc.layers[0].id.clone();
+    let layer = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
     e.edit(
         "human",
         &[json!({"op":"paint","layer":layer,"points":[[50,50]],"radius":5,"color":[255,0,0,255]})],
@@ -88,7 +88,7 @@ fn optimistic_edits_reject_conflicts_and_allow_disjoint_regions() {
 #[test]
 fn takeover_rejects_late_task_writes() {
     let mut e = Engine::new();
-    let layer = e.doc.layers[0].id.clone();
+    let layer = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
     let task = e
         .reserve("agent", "work", vec![Scope::layer(&layer)])
         .unwrap();
@@ -107,20 +107,20 @@ fn takeover_rejects_late_task_writes() {
 #[test]
 fn undo_redo_and_mask_paint_roundtrip() {
     let mut e = Engine::new();
-    let layer = e.doc.layers[0].id.clone();
+    let layer = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
     e.edit("human",&[json!({"op":"fill","layer":layer,"rect":[0,0,20,20],"color":[233,84,32,255]}),json!({"op":"mask.add","layer":layer,"value":255}),json!({"op":"paint","layer":layer,"mask":true,"points":[[10,10]],"radius":3,"color":[0,0,0,255]})],None,None,"mask").unwrap();
-    assert!(e.doc.layers[0].mask_value(10, 10) < 0.05);
+    assert!(e.resident_state().expect("resident fixture").document.layers[0].mask_value(10, 10) < 0.05);
     e.undo("human").unwrap();
-    assert!(e.doc.layers[0].mask.is_none());
+    assert!(e.resident_state().expect("resident fixture").document.layers[0].mask.is_none());
     e.redo("human").unwrap();
-    assert!(e.doc.layers[0].mask.is_some());
+    assert!(e.resident_state().expect("resident fixture").document.layers[0].mask.is_some());
 }
 
 #[test]
 fn psd_preserves_sources_and_actual_composite() {
     let mut e = Engine::new();
-    e.doc = Document::new(64, 48).unwrap();
-    let layer = e.doc.layers[0].id.clone();
+    e.resident_state_mut().expect("resident fixture").document = Document::new(64, 48).unwrap();
+    let layer = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
     e.edit(
         "human",
         &[
@@ -133,12 +133,12 @@ fn psd_preserves_sources_and_actual_composite() {
         "art",
     )
     .unwrap();
-    let bytes = psd::encode(&e.doc).unwrap();
+    let bytes = psd::encode(&e.resident_state().expect("resident fixture").document).unwrap();
     assert_eq!(&bytes[..4], b"8BPS");
     let reopened = psd::decode(&bytes).unwrap();
     assert_eq!(reopened.layers[0].id, layer);
     assert_eq!(reopened.layers[0].mask.as_ref().unwrap().steps.len(), 3);
-    assert_eq!(reopened.export_png().unwrap(), e.doc.export_png().unwrap());
+    assert_eq!(reopened.export_png().unwrap(), e.resident_state().expect("resident fixture").document.export_png().unwrap());
 }
 
 #[test]
@@ -167,12 +167,12 @@ fn transparent_psd_fallback_unmattes_the_merged_preview() {
 #[test]
 fn external_changes_do_not_restore_stale_sources() {
     let mut e = Engine::new();
-    e.doc = Document::new(32, 32).unwrap();
-    let mut bytes = psd::encode(&e.doc).unwrap();
+    e.resident_state_mut().expect("resident fixture").document = Document::new(32, 32).unwrap();
+    let mut bytes = psd::encode(&e.resident_state().expect("resident fixture").document).unwrap();
     let last = bytes.len() - 1;
     bytes[last] ^= 1;
     let reopened = psd::decode(&bytes).unwrap();
-    assert_ne!(reopened.layers[0].id, e.doc.layers[0].id);
+    assert_ne!(reopened.layers[0].id, e.resident_state().expect("resident fixture").document.layers[0].id);
     assert!(reopened.warnings.iter().any(|w| w.contains("externally")));
 }
 
@@ -224,7 +224,7 @@ fn mcp_returns_image_blocks_and_typed_errors() {
 #[test]
 fn ai_can_iterate_but_cannot_undo_interleaved_human_work() {
     let shared = Arc::new(Mutex::new(Engine::new()));
-    let layer = shared.lock().unwrap().doc.layers[0].id.clone();
+    let layer = shared.lock().unwrap().resident_state().expect("resident fixture").document.layers[0].id.clone();
     server::dispatch(&shared,"edit",&json!({"actor":"artist","commands":[{"op":"layer.update","layer":layer,"name":"Try one"}],"feedback":"request"})).unwrap();
     let undone = server::dispatch(
         &shared,
@@ -263,14 +263,14 @@ fn ai_can_iterate_but_cannot_undo_interleaved_human_work() {
         &json!({"actor":"artist","action":"undo","expected_revision":4})
     )
     .is_err());
-    assert_eq!(shared.lock().unwrap().doc.layers[0].name, "Human idea");
+    assert_eq!(shared.lock().unwrap().resident_state().expect("resident fixture").document.layers[0].name, "Human idea");
 }
 
 #[test]
 fn transform_resamples_pixels_and_masks_and_undo_restores_original() {
     let mut e = Engine::new();
-    e.doc = Document::new(32, 32).unwrap();
-    let id = e.doc.layers[0].id.clone();
+    e.resident_state_mut().expect("resident fixture").document = Document::new(32, 32).unwrap();
+    let id = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
     e.edit(
         "human",
         &[
@@ -282,7 +282,7 @@ fn transform_resamples_pixels_and_masks_and_undo_restores_original() {
         "source",
     )
     .unwrap();
-    let original = e.doc.export_png().unwrap();
+    let original = e.resident_state().expect("resident fixture").document.export_png().unwrap();
     e.edit(
         "human",
         &[json!({"op":"transform","layer":id,"angle":90,"pivot":[4,3]})],
@@ -291,15 +291,15 @@ fn transform_resamples_pixels_and_masks_and_undo_restores_original() {
         "rotate",
     )
     .unwrap();
-    let l = &e.doc.layers[0];
+    let l = &e.resident_state().expect("resident fixture").document.layers[0];
     assert_eq!((l.pixels.width, l.pixels.height), (2, 4));
     assert_eq!((l.x, l.y), (3, 1));
     assert_eq!(l.pixels.get(0, 0), [255, 100, 20, 255]);
     assert!((l.mask_value(0, 0) - 128.0 / 255.0).abs() < 0.001);
-    let reopened = psd::decode(&psd::encode(&e.doc).unwrap()).unwrap();
-    assert_eq!(reopened.export_png().unwrap(), e.doc.export_png().unwrap());
+    let reopened = psd::decode(&psd::encode(&e.resident_state().expect("resident fixture").document).unwrap()).unwrap();
+    assert_eq!(reopened.export_png().unwrap(), e.resident_state().expect("resident fixture").document.export_png().unwrap());
     e.undo("human").unwrap();
-    assert_eq!(e.doc.export_png().unwrap(), original);
+    assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), original);
 }
 
 #[test]
@@ -319,8 +319,8 @@ fn image_imports_are_atomic_and_share_undo_history() {
             "drop"
         )
         .is_err());
-    assert_eq!(e.doc.layers.len(), 1);
-    assert_eq!(e.doc.revision, 0);
+    assert_eq!(e.resident_state().expect("resident fixture").document.layers.len(), 1);
+    assert_eq!(e.resident_state().expect("resident fixture").document.revision, 0);
     e.edit(
         "human",
         &[json!({"op":"image.import","path":path})],
@@ -329,9 +329,9 @@ fn image_imports_are_atomic_and_share_undo_history() {
         "drop",
     )
     .unwrap();
-    assert_eq!(e.doc.layers.len(), 2);
+    assert_eq!(e.resident_state().expect("resident fixture").document.layers.len(), 2);
     e.undo("human").unwrap();
-    assert_eq!(e.doc.layers.len(), 1);
+    assert_eq!(e.resident_state().expect("resident fixture").document.layers.len(), 1);
     std::fs::remove_file(path).unwrap();
 }
 
@@ -372,7 +372,7 @@ fn mcp_presence_and_activity_follow_live_clients_and_tasks() {
 #[test]
 fn group_reservations_protect_descendants() {
     let mut e = Engine::new();
-    let child = e.doc.layers[0].id.clone();
+    let child = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
     e.edit(
         "human",
         &[json!({"op":"layer.add","kind":"group"})],
@@ -381,7 +381,7 @@ fn group_reservations_protect_descendants() {
         "group",
     )
     .unwrap();
-    let group = e.doc.layers[0].id.clone();
+    let group = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
     e.edit(
         "human",
         &[json!({"op":"layer.parent","layer":child,"parent":group})],
@@ -406,14 +406,14 @@ fn group_reservations_protect_descendants() {
 #[test]
 fn extreme_agent_coordinates_fail_without_corrupting_state() {
     let mut e = Engine::new();
-    let layer = e.doc.layers[0].id.clone();
+    let layer = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
     for command in [
         json!({"op":"move","layer":layer,"dx":1e100}),
         json!({"op":"shape","layer":layer,"rect":[-2147483648,0,2147483647,20]}),
         json!({"op":"paint","layer":layer,"points":[[1e100,20]]}),
     ] {
         assert!(e.edit("artist", &[command], None, None, "invalid").is_err());
-        assert_eq!(e.doc.revision, 0);
+        assert_eq!(e.resident_state().expect("resident fixture").document.revision, 0);
     }
 }
 

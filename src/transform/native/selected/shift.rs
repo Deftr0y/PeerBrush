@@ -2,12 +2,12 @@
 //! original, whose off-frame data has a separate metadata lifetime.
 use super::render::Written;
 use crate::{
-    large_document::{Result as SourceResult, ScratchBytes, Store, TileSpec},
+    large_document::{ScratchBytes, Store, TileSpec},
     raster::{
         backed::{Plane, Region},
         Pixel, Surface, TILE,
     },
-    transform::native::Work,
+    transform::native::{write_plane_guarded, Checks, Mapping, Work},
 };
 use std::collections::BTreeMap;
 
@@ -18,9 +18,9 @@ pub(crate) fn shift(
     fill: Option<Pixel>,
     store: &Store,
     work: &mut Work,
-    check: &dyn Fn() -> SourceResult<()>,
+    checks: Checks<'_>,
 ) -> Result<Written, String> {
-    check().map_err(|e| e.to_string())?;
+    (checks.owner)().map_err(|e| e.to_string())?;
     let pool = store.resident_budget();
     let disk = store
         .disk_budget()
@@ -32,14 +32,32 @@ pub(crate) fn shift(
     {
         return Err("Current reframe source or admission differs".into());
     }
-    if fill.is_some()
-        && (offset[0] < 0
-            || offset[1] < 0
-            || i64::from(offset[0]) + i64::from(source.width()) > i64::from(frame[0])
-            || i64::from(offset[1]) + i64::from(source.height()) > i64::from(frame[1]))
+    let Some(fill) = fill else {
+        let matrix = [1., 0., 0., 1., f64::from(offset[0]), f64::from(offset[1])];
+        let mapping = Mapping::retained(
+            source.width(),
+            source.height(),
+            source.depth(),
+            matrix,
+            None,
+            &[],
+            &pool,
+        )?;
+        return Ok(Written {
+            surface: write_plane_guarded(
+                source, &mapping, frame, store, work, checks.active, checks.owner,
+            )?,
+            cleared_retained: false,
+        });
+    };
+    if offset[0] < 0
+        || offset[1] < 0
+        || i64::from(offset[0]) + i64::from(source.width()) > i64::from(frame[0])
+        || i64::from(offset[1]) + i64::from(source.height()) > i64::from(frame[1])
     {
         return Err("Fill materialization must preserve its complete logical frame".into());
     }
+    work.checked_total(u64::from(frame[0]) * u64::from(frame[1]))?;
     let count = frame[0].div_ceil(TILE) as usize * frame[1].div_ceil(TILE) as usize;
     let bytes = count * 512 + 4096;
     let index = pool
@@ -50,15 +68,15 @@ pub(crate) fn shift(
         TileSpec::new(TILE as u16, TILE as u16, source.depth()).map_err(|e| e.to_string())?;
     let stride = usize::from(source.depth() / 8) * 4;
     let same = frame == [source.width(), source.height()] && offset == [0, 0];
-    let fill = fill.map(|p| p.map(|v| u16::from(v) * 257));
+    let fill = fill.map(|v| u16::from(v) * 257);
     let mut changed = false;
     for ty in 0..frame[1].div_ceil(TILE) {
         for tx in 0..frame[0].div_ceil(TILE) {
-            check().map_err(|e| e.to_string())?;
+            (checks.active)().map_err(|e| e.to_string())?;
             let initial = if same {
                 Some(
                     source
-                        .prepare_tile((tx, ty), &mut || check())
+                        .prepare_tile((tx, ty), &mut || (checks.owner)())
                         .map_err(|e| e.to_string())?,
                 )
             } else {
@@ -85,14 +103,14 @@ pub(crate) fn shift(
             let view = if r[0] < r[2] && r[1] < r[3] {
                 Some(
                     source
-                        .prepare_region(Region::new(r).map_err(|e| e.to_string())?, &mut || check())
+                        .prepare_region(Region::new(r).map_err(|e| e.to_string())?, &mut || (checks.owner)())
                         .map_err(|e| e.to_string())?,
                 )
             } else {
                 None
             };
             for y in tile[1]..tile[3] {
-                check().map_err(|e| e.to_string())?;
+                (checks.active)().map_err(|e| e.to_string())?;
                 for x in tile[0]..tile[2] {
                     work.claim(1)?;
                     let (sx, sy) = (x - offset[0], y - offset[1]);
@@ -106,9 +124,8 @@ pub(crate) fn shift(
                             .ok_or("Missing current reframe footprint")?
                             .pixel16(sx, sy)
                             .map_err(|e| e.to_string())?;
-                        let after = fill.unwrap_or(before);
-                        changed |= after != before;
-                        after
+                        changed |= fill != before;
+                        fill
                     } else {
                         [0; 4]
                     };
@@ -129,7 +146,12 @@ pub(crate) fn shift(
                 blocks.insert(
                     (tx, ty),
                     store
-                        .put(spec, &output, &mut || check())
+                        .put_guarded(
+                            spec,
+                            &output,
+                            &mut || (checks.active)(),
+                            &mut || (checks.owner)(),
+                        )
                         .map_err(|e| e.to_string())?,
                 );
             }
@@ -146,7 +168,7 @@ pub(crate) fn shift(
         .map_err(|e| e.to_string())?
     };
     drop(index);
-    check().map_err(|e| e.to_string())?;
+    (checks.owner)().map_err(|e| e.to_string())?;
     Ok(Written {
         surface,
         cleared_retained: changed,

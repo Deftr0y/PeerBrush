@@ -239,6 +239,7 @@ pub(crate) fn write_to<'scene, 'output>(
     {
         return Err("Native WebP source, dimensions, precision or output admission differs".into());
     }
+    let max_bytes = max_bytes.min(crate::image_import::webp::NATIVE_FILE_BYTES);
     let profile = super::native_png::profile(scene);
     if profile.is_some_and(|p| p.is_empty() || p.len() > crate::color_profile::MAX_PROFILE_BYTES) {
         return Err("Native WebP profile exceeds its exact source envelope".into());

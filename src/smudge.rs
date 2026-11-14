@@ -5,7 +5,7 @@ pub(crate) mod input;
 pub(crate) mod native;
 use crate::{
     brush::{self, Settings, Tip},
-    raster::{Pixel, Raster, TILE},
+    raster::{project16, Pixel, Pixel16, Raster, TILE},
 };
 use std::sync::Arc;
 
@@ -15,6 +15,21 @@ pub fn paint(
     pressures: Option<&[f32]>,
     settings: Settings,
     color: Pixel,
+    clip: Option<[i32; 4]>,
+    polygon: Option<&[[f32; 2]]>,
+) -> Result<(), String> {
+    paint_native_color(
+        raster, points, pressures, settings, color.map(|value| u16::from(value) * 257),
+        clip, polygon,
+    )
+}
+
+pub(crate) fn paint_native_color(
+    raster: &mut Raster,
+    points: &[[f32; 2]],
+    pressures: Option<&[f32]>,
+    settings: Settings,
+    color: Pixel16,
     clip: Option<[i32; 4]>,
     polygon: Option<&[[f32; 2]]>,
 ) -> Result<(), String> {
@@ -33,6 +48,7 @@ pub fn paint(
     if raster.depth == 16 {
         return paint16(raster, &dabs, settings, color, clip, polygon);
     }
+    let color = color.map(project16);
     let selected = |x: i32, y: i32| {
         polygon.is_none_or(|p| crate::selection::contains(p, x as f32 + 0.5, y as f32 + 0.5))
     };
@@ -170,7 +186,7 @@ fn paint16(
     raster: &mut Raster,
     dabs: &[brush::Dab],
     settings: Settings,
-    color: Pixel,
+    color: Pixel16,
     clip: [i32; 4],
     polygon: Option<&[[f32; 2]]>,
 ) -> Result<(), String> {
@@ -221,7 +237,7 @@ fn paint16(
             *channel /= weight;
         }
         let Some(mut pigment) = carry else {
-            let loaded = premultiplied16(color.map(|value| value as u16 * 257));
+            let loaded = premultiplied16(color);
             for channel in 0..4 {
                 average[channel] += (loaded[channel] - average[channel]) * settings.load as f64;
             }

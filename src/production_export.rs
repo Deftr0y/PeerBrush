@@ -1,13 +1,14 @@
 //! Flattened production exports. Plans and renders never mutate editable sources.
 pub mod jobs;
 pub mod library;
+pub(crate) mod native;
 pub(crate) mod native_grid;
 pub(crate) mod native_png;
 pub(crate) mod native_rows;
 pub(crate) mod native_webp;
 mod png;
 pub(crate) mod staged_rows;
-use crate::engine::Document;
+use crate::engine::{authority::NativeSeed, scene::SceneSnapshot, view::DocumentView, Document, Engine};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
@@ -190,6 +191,358 @@ pub struct Plan {
     pub isolated: bool,
     pub profile_retained: bool,
 }
+
+pub(crate) struct PreviewPixels {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) rgba: Vec<u8>,
+    pub(crate) encoded_bytes: Option<usize>,
+    managed: bool,
+    _display: Option<crate::large_document::Reservation>,
+}
+
+enum Capture {
+    Resident(Document),
+    Native(NativeSeed, SceneSnapshot),
+}
+impl Capture {
+    fn new(engine: &Engine) -> Result<Self, String> {
+        Ok(match engine.native_seed()? {
+            Some(seed) => Self::Native(seed, engine.capture_scene(None)?.into_native()?),
+            None => Self::Resident(engine.resident()?.clone()),
+        })
+    }
+    fn for_document(
+        shared: &crate::server::Shared,
+        document: &str,
+        revision: u64,
+    ) -> Result<Self, String> {
+        let engine = shared.lock().unwrap();
+        crate::workspace::guard(&engine, document, revision)?;
+        Self::new(&engine)
+    }
+    fn view(&self) -> DocumentView<'_> {
+        match self {
+            Self::Resident(doc) => doc.into(),
+            Self::Native(seed, _) => DocumentView::Native(seed.document()),
+        }
+    }
+    fn seed(&self) -> Option<&NativeSeed> {
+        match self {
+            Self::Resident(_) => None,
+            Self::Native(seed, _) => Some(seed),
+        }
+    }
+    fn validate(&self, engine: &Engine) -> Result<(), String> {
+        let doc = self.view();
+        crate::workspace::guard(engine, doc.id(), doc.revision())?;
+        if let Some(seed) = self.seed() {
+            seed.validate(engine)?;
+        } else if engine.native_document().is_some() {
+            return Err("Export source authority changed".into());
+        }
+        Ok(())
+    }
+    fn plan(
+        &self,
+        shared: &crate::server::Shared,
+        targets: &[String],
+        settings: &Settings,
+        control: &Control,
+    ) -> Result<Plan, String> {
+        match self {
+            Self::Resident(doc) => plan(doc, targets, settings, control),
+            Self::Native(_, scene) => {
+                let read = (settings.crop == Crop::Alpha)
+                    .then(|| crate::workspace::native_dispatch::begin_read_scene(shared, scene))
+                    .transpose()?;
+                let check = || {
+                    control.check()?;
+                    if let Some(read) = &read {
+                        read.check()?;
+                    }
+                    Ok(())
+                };
+                plan_view(self.view(), targets, settings, control, |target| {
+                    if let Some(read) = &read {
+                        native::bounds(scene, read, target, &check)
+                    } else {
+                        crate::compositor::native::Topology::for_target(scene, target)?;
+                        Ok(native::canvas(scene, settings.format).document_rect)
+                    }
+                })
+            }
+        }
+    }
+    fn preview(
+        &self,
+        shared: &crate::server::Shared,
+        output: &Output,
+        settings: &Settings,
+        grid: PreviewGrid,
+        control: &Control,
+    ) -> Result<(Vec<u8>, bool, Option<usize>), String> {
+        match self {
+            Self::Resident(doc) => {
+                let bytes = render(doc, output, settings, control)?;
+                preview_encoded(&bytes, self.view().profile(), output, grid, &|| {
+                    control.check()
+                })
+                .map(|(rgba, managed)| (rgba, managed, Some(bytes.len())))
+            }
+            Self::Native(_, scene) => {
+                let read = crate::workspace::native_dispatch::begin_read_scene(shared, scene)?;
+                let check = || {
+                    control.check()?;
+                    read.check()
+                };
+                if output.format != Format::Jxl {
+                    return native::preview_lossless(scene, &read, output, settings, grid, &check)
+                        .map(|(rgba, managed)| (rgba, managed, None));
+                }
+                // The JPEG XL worker's display decoder still consumes the
+                // complete encoded output at its bounded decoded dimensions.
+                size(output.width, output.height).map_err(|_| {
+                    "JPEG XL preview exceeds the display decoder limit. The full output can still be exported."
+                })?;
+                let pixels = output.width as usize * output.height as usize;
+                let limit = (pixels * usize::from(output.bit_depth) + 4 * 1024 * 1024)
+                    .min(256 * 1024 * 1024);
+                let footprint = pixels * 24 + limit * 2;
+                let _work = scene
+                    .budget()
+                    .reserve_bytes(footprint, footprint)
+                    .map_err(|_| "JPEG XL preview exceeds the available memory budget")?;
+                let mut bytes = Vec::new();
+                native::render(
+                    scene,
+                    &read,
+                    output,
+                    settings,
+                    &mut bytes,
+                    limit as u64,
+                    &check,
+                )?;
+                preview_encoded(&bytes, None, output, grid, &check)
+                    .map(|(rgba, managed)| (rgba, managed, Some(bytes.len())))
+            }
+        }
+    }
+
+    fn display_preview(
+        &self,
+        shared: &crate::server::Shared,
+        output: &Output,
+        settings: &Settings,
+        edge: u64,
+        control: &Control,
+    ) -> Result<PreviewPixels, String> {
+        let grid = PreviewGrid::new(output, edge);
+        let (width, height) = (grid.width, grid.height);
+        let display = match self {
+            Self::Resident(_) => None,
+            Self::Native(_, scene) => {
+                let bytes = width as usize * height as usize * 24 + 2 * 1024 * 1024;
+                Some(scene.budget().reserve_bytes(bytes, bytes).map_err(|e| e.to_string())?)
+            }
+        };
+        let (rgba, managed, encoded_bytes) = self.preview(shared, output, settings, grid, control)?;
+        Ok(PreviewPixels { width, height, rgba, encoded_bytes, managed, _display: display })
+    }
+}
+
+pub(crate) struct ObservedDocument {
+    id: String,
+    revision: u64,
+    native: Option<crate::engine::native::DocumentKey>,
+}
+impl ObservedDocument {
+    pub(crate) fn new(doc: DocumentView<'_>) -> Self {
+        Self {
+            id: doc.id().into(),
+            revision: doc.revision(),
+            native: doc.native().map(|document| document.key()),
+        }
+    }
+
+    pub(crate) fn observes(&self, doc: DocumentView<'_>) -> bool {
+        self.id == doc.id()
+            && self.revision == doc.revision()
+            && self.native == doc.native().map(|document| document.key())
+    }
+
+    fn validate(&self, engine: &Engine) -> Result<(), String> {
+        crate::workspace::guard(engine, &self.id, self.revision)?;
+        if !self.observes(crate::engine::view::current(engine)) {
+            return Err("Export source changed before capture".into());
+        }
+        Ok(())
+    }
+}
+
+pub(crate) struct DesktopPlan {
+    document: ObservedDocument,
+    name: String,
+    settings: Settings,
+    outputs: Vec<Output>,
+}
+impl DesktopPlan {
+    pub(crate) fn outputs(&self) -> &[Output] {
+        &self.outputs
+    }
+}
+
+pub(crate) enum PreviewOutput {
+    Plan(Vec<String>, Settings, Option<(Option<String>, String)>),
+    Planned(Arc<DesktopPlan>, usize),
+}
+pub(crate) struct DesktopPreview {
+    pub(crate) plan: Arc<DesktopPlan>,
+    pub(crate) index: usize,
+    pub(crate) pixels: Result<PreviewPixels, String>,
+}
+
+pub(crate) fn desktop_preview(
+    root: &crate::server::Shared,
+    project: &str,
+    document: &ObservedDocument,
+    output: PreviewOutput,
+    control: &Control,
+) -> Result<DesktopPreview, String> {
+    let shared = crate::workspace::get(root, project)?;
+    let capture = {
+        let engine = shared.lock().unwrap();
+        document.validate(&engine)?;
+        Capture::new(&engine)?
+    };
+    let doc = capture.view();
+    let (plan, index) = match output {
+        PreviewOutput::Plan(targets, settings, preferred) => {
+            let outputs = capture.plan(&shared, &targets, &settings, control)?.outputs;
+            let index = preferred
+                .and_then(|(target, variant)| {
+                    outputs.iter().position(|output| output.target == target && output.variant == variant)
+                })
+                .unwrap_or(0);
+            (Arc::new(DesktopPlan {
+                document: ObservedDocument::new(doc),
+                name: doc.name().into(),
+                settings,
+                outputs,
+            }), index)
+        }
+        PreviewOutput::Planned(plan, index) => {
+            if !plan.document.observes(doc) || plan.name != doc.name() {
+                return Err("Export preview plan belongs to an earlier source".into());
+            }
+            (plan, index)
+        }
+    };
+    let output = plan.outputs.get(index).ok_or("Export preview output is missing")?;
+    let pixels = capture.display_preview(&shared, output, &plan.settings, 512, control);
+    capture.validate(&shared.lock().unwrap())?;
+    Ok(DesktopPreview { plan, index, pixels })
+}
+
+pub(crate) fn desktop_start(
+    root: &crate::server::Shared,
+    project: &str,
+    document: &ObservedDocument,
+    settings: Settings,
+    targets: Vec<String>,
+    directory: std::path::PathBuf,
+    existing: jobs::Existing,
+) -> Result<jobs::State, String> {
+    let shared = crate::workspace::get(root, project)?;
+    jobs::start_guarded(
+        &shared,
+        |engine| document.validate(engine),
+        settings,
+        targets,
+        directory,
+        existing,
+        "human",
+    )
+}
+
+#[derive(Clone, Copy)]
+struct PreviewGrid {
+    width: u32,
+    height: u32,
+    scale: f64,
+}
+impl PreviewGrid {
+    fn new(output: &Output, edge: u64) -> Self {
+        let scale =
+            (edge.clamp(32, 1024) as f64 / f64::from(output.width.max(output.height))).min(1.);
+        Self {
+            width: (f64::from(output.width) * scale).round().max(1.) as u32,
+            height: (f64::from(output.height) * scale).round().max(1.) as u32,
+            scale,
+        }
+    }
+    fn source(self, sample: u32, extent: u32) -> usize {
+        (f64::from(sample) / self.scale)
+            .floor()
+            .min(f64::from(extent - 1)) as usize
+    }
+}
+
+fn manage_preview(profile: Option<&[u8]>, words: &mut [u16]) -> Result<bool, String> {
+    if let Some(profile) =
+        profile.filter(|profile| crate::color_profile::supported(profile).is_ok())
+    {
+        crate::color_profile::convert16(profile, words)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn preview_encoded(
+    bytes: &[u8],
+    profile: Option<&[u8]>,
+    output: &Output,
+    grid: PreviewGrid,
+    check: &dyn Fn() -> Result<(), String>,
+) -> Result<(Vec<u8>, bool), String> {
+    let (words, managed) = if output.format == Format::Jxl {
+        let decoded = crate::jpeg_xl::decode(bytes, check)?;
+        if (
+            decoded.info.width,
+            decoded.info.height,
+            decoded.info.bit_depth,
+        ) != (output.width, output.height, output.bit_depth)
+        {
+            return Err("JPEG XL preview differs from the planned output".into());
+        }
+        let words = match crate::image_import::working_jxl_pixels(decoded, check)? {
+            crate::jpeg_xl::Pixels::Eight(bytes) => {
+                bytes.into_iter().map(|v| u16::from(v) * 257).collect()
+            }
+            crate::jpeg_xl::Pixels::Sixteen(words) => words,
+        };
+        (words, true)
+    } else {
+        let image = image::load_from_memory(bytes)
+            .map_err(|e| e.to_string())?
+            .into_rgba16();
+        if image.dimensions() != (output.width, output.height) {
+            return Err("Encoded preview differs from the planned output".into());
+        }
+        let mut words = image.into_raw();
+        let managed = manage_preview(profile, &mut words)?;
+        (words, managed)
+    };
+    check()?;
+    let rgba = crate::render::rgba8(grid.width, grid.height, |x, y| {
+        let at = (grid.source(y, output.height) * output.width as usize
+            + grid.source(x, output.width))
+            * 4;
+        crate::depth16::display_pixel(words[at..at + 4].try_into().unwrap())
+    });
+    Ok((rgba, managed))
+}
+
 pub fn safe_name(name: &str) -> String {
     let mut name: String = name
         .chars()
@@ -446,9 +799,34 @@ pub fn plan(
     settings: &Settings,
     control: &Control,
 ) -> Result<Plan, String> {
+    plan_view(doc.into(), targets, settings, control, |target| {
+        if settings.crop == Crop::Alpha {
+            if settings.format == Format::Png {
+                png::bounds(doc, target, control)
+            } else {
+                Image::render(doc, target, control)?.bounds(control)
+            }
+        } else {
+            target_document(doc, target)?;
+            Ok([0, 0, doc.width as i32, doc.height as i32])
+        }
+    })
+}
+
+fn plan_view(
+    doc: DocumentView<'_>,
+    targets: &[String],
+    settings: &Settings,
+    control: &Control,
+    mut bounds: impl FnMut(Option<&str>) -> Result<[i32; 4], String>,
+) -> Result<Plan, String> {
     settings.validate()?;
-    size(doc.width, doc.height)?;
-    if !matches!(doc.bit_depth, 8 | 16) {
+    let validate_size = match doc {
+        DocumentView::Resident(_) => size,
+        DocumentView::Native(_) => native::size,
+    };
+    validate_size(doc.width(), doc.height())?;
+    if !matches!(doc.depth(), 8 | 16) {
         return Err("Exports require native 8/16-bit RGB channels".into());
     }
     control.check()?;
@@ -456,14 +834,10 @@ pub fn plan(
         return Err("Export selection exceeds 1024 layer references".into());
     }
     let selected: HashSet<_> = targets.iter().cloned().collect();
-    if selected.len() != targets.len()
-        || selected
-            .iter()
-            .any(|id| !doc.layers.iter().any(|l| &l.id == id))
-    {
+    if selected.len() != targets.len() || selected.iter().any(|id| doc.find_layer(id).is_none()) {
         return Err("Choose unique existing export layers/folders".into());
     }
-    let roots = crate::tree::roots(doc, &selected);
+    let roots = crate::tree::roots_view(doc, &selected);
     if roots.len().max(1) * settings.variants.len() > MAX_OUTPUTS {
         return Err("Export at most 64 outputs per batch".into());
     }
@@ -475,36 +849,26 @@ pub fn plan(
     let mut outputs = vec![];
     let mut names = HashSet::new();
     let document_name = safe_name(
-        std::path::Path::new(&doc.name)
+        std::path::Path::new(doc.name())
             .file_stem()
             .and_then(|s| s.to_str())
-            .unwrap_or(&doc.name),
+            .unwrap_or(doc.name()),
     );
     for target in &targets {
         control.check()?;
         let target_name = target
-            .as_ref()
-            .and_then(|id| doc.layers.iter().find(|l| &l.id == id))
-            .map(|l| l.name.as_str())
+            .as_deref()
+            .and_then(|id| doc.find_layer(id))
+            .map(|layer| layer.name())
             .unwrap_or("composite");
-        // Validate target semantics even when no alpha scan is needed.
-        target_document(doc, target.as_deref())?;
-        let mut rect = if settings.crop == Crop::Alpha {
-            if settings.format == Format::Png {
-                png::bounds(doc, target.as_deref(), control)?
-            } else {
-                Image::render(doc, target.as_deref(), control)?.bounds(control)?
-            }
-        } else {
-            [0, 0, doc.width as i32, doc.height as i32]
-        };
+        let mut rect = bounds(target.as_deref())?;
         let pad = settings.padding as i32;
         rect = [rect[0] - pad, rect[1] - pad, rect[2] + pad, rect[3] + pad];
         let (rw, rh) = ((rect[2] - rect[0]) as u32, (rect[3] - rect[1]) as u32);
         for variant in &settings.variants {
             let width = (f64::from(rw) * variant.scale).round().max(1.) as u32;
             let height = (f64::from(rh) * variant.scale).round().max(1.) as u32;
-            size(width, height)?;
+            validate_size(width, height)?;
             let base = safe_name(
                 &settings
                     .template
@@ -534,8 +898,8 @@ pub fn plan(
                 width,
                 height,
                 format: settings.format,
-                native_source_depth: doc.bit_depth,
-                bit_depth: settings.format.bit_depth(doc.bit_depth),
+                native_source_depth: doc.depth(),
+                bit_depth: settings.format.bit_depth(doc.depth()),
                 scale_xy: [
                     f64::from(width) / f64::from(rw),
                     f64::from(height) / f64::from(rh),
@@ -544,13 +908,14 @@ pub fn plan(
         }
     }
     Ok(Plan {
-        document_id: doc.id.clone(),
-        revision: doc.revision,
+        document_id: doc.id().to_owned(),
+        revision: doc.revision(),
         outputs,
         isolated: !targets.iter().any(Option::is_none),
-        profile_retained: doc.icc_profile.is_some() || doc.srgb_tagged,
+        profile_retained: doc.profile().is_some() || doc.srgb_tagged(),
     })
 }
+
 pub fn render(
     doc: &Document,
     output: &Output,
@@ -689,6 +1054,64 @@ pub(crate) fn render_document_to(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn lossy_rgb16_jxl_preview_projects_the_decoded_working_srgb_samples() {
+        use crate::jpeg_xl::{self, Options, Pixels, PixelsRef};
+        let _codec = jpeg_xl::test_process_guard();
+        let (width, height) = (17, 9);
+        let input: Vec<u16> = (0..width * height)
+            .flat_map(|i| {
+                [
+                    (i * 2107 + 12347) as u16,
+                    (i * 3797 + 23459) as u16,
+                    (i * 4751 + 34571) as u16,
+                    (i * 97 + 45683) as u16,
+                ]
+            })
+            .collect();
+        let check = || Ok(());
+        let encoded = jpeg_xl::encode(
+            width,
+            height,
+            PixelsRef::Sixteen(&input),
+            None,
+            Options {
+                lossless: false,
+                distance: 1.,
+                effort: 3,
+            },
+            &check,
+        )
+        .unwrap();
+        let decoded = jpeg_xl::decode(&encoded, &check).unwrap();
+        assert!(crate::color_profile::is_srgb_profile(&decoded.icc_profile));
+        let Pixels::Sixteen(words) = decoded.pixels else {
+            panic!("JPEG XL changed native depth")
+        };
+        let expected: Vec<u8> = words
+            .chunks_exact(4)
+            .flat_map(|pixel| crate::depth16::display_pixel(pixel.try_into().unwrap()))
+            .collect();
+        let output = super::Output {
+            target: None,
+            target_name: "Canvas".into(),
+            variant: "native".into(),
+            filename: "preview.jxl".into(),
+            document_rect: [0, 0, width as i32, height as i32],
+            width,
+            height,
+            format: super::Format::Jxl,
+            native_source_depth: 16,
+            bit_depth: 16,
+            scale_xy: [1., 1.],
+        };
+        let grid = super::PreviewGrid::new(&output, 32);
+        let (preview, managed) =
+            super::preview_encoded(&encoded, None, &output, grid, &check).unwrap();
+        assert!(managed);
+        assert_eq!(preview, expected);
+    }
+
+    #[test]
     fn export_dimensions_retain_the_full_shared_document_limit_without_allocating_pixels() {
         assert_eq!(8192_u64 * 4096, crate::raster::MAX_PIXELS);
         assert!(super::size(8192, 4096).is_ok());
@@ -698,18 +1121,12 @@ mod tests {
     }
 }
 
-/// Native UI, MCP and CLI use this same preference/plan/publication surface.
+/// MCP and CLI export requests, also used by the desktop for preset and run actions.
 pub fn request(
     root: &crate::server::Shared,
     p: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    request_with_control(root, p, &Control::default())
-}
-pub(crate) fn request_with_control(
-    root: &crate::server::Shared,
-    p: &serde_json::Value,
-    control: &Control,
-) -> Result<serde_json::Value, String> {
+    let control = &Control::default();
     let _operation = matches!(p["action"].as_str(), Some("save_preset" | "delete_preset"))
         .then(|| crate::server::FileOperation::begin_workspace(&crate::workspace::attach(root)))
         .transpose()?;
@@ -805,18 +1222,15 @@ pub(crate) fn request_with_control(
                     actor
                 )?));
             }
-            let doc = {
-                let engine = shared.lock().unwrap();
-                crate::workspace::guard(
-                    &engine,
-                    text("document_id")?,
-                    p["expected_revision"]
-                        .as_u64()
-                        .ok_or("Observe expected_revision before export planning")?,
-                )?;
-                engine.doc.clone()
-            };
-            let plan = plan(&doc, &targets, &settings, control)?;
+            let capture = Capture::for_document(
+                &shared,
+                text("document_id")?,
+                p["expected_revision"]
+                    .as_u64()
+                    .ok_or("Observe expected_revision before export planning")?,
+            )?;
+            let doc = capture.view();
+            let plan = capture.plan(&shared, &targets, &settings, control)?;
             let mut result = json!({"plan":plan});
             if action == "preview" {
                 use base64::Engine as _;
@@ -825,65 +1239,16 @@ pub(crate) fn request_with_control(
                     .outputs
                     .get(index)
                     .ok_or("Export preview output is missing")?;
-                let bytes = render(&doc, output, &settings, control)?;
-                let mut managed = false;
-                let mut words = if output.format == Format::Jxl {
-                    let decoded = crate::jpeg_xl::decode(&bytes, &|| control.check())?;
-                    if (
-                        decoded.info.width,
-                        decoded.info.height,
-                        decoded.info.bit_depth,
-                    ) != (output.width, output.height, output.bit_depth)
-                    {
-                        return Err("JPEG XL preview differs from the planned output".into());
-                    }
-                    let mut words = match decoded.pixels {
-                        crate::jpeg_xl::Pixels::Eight(bytes) => {
-                            bytes.into_iter().map(|v| u16::from(v) * 257).collect()
-                        }
-                        crate::jpeg_xl::Pixels::Sixteen(words) => words,
-                    };
-                    // Use the actual decoded profile; XYB output can differ from Original.
-                    // display the decoded samples in their actual returned ICC.
-                    crate::color_profile::convert16(&decoded.icc_profile, &mut words)?;
-                    managed = true;
-                    words
-                } else {
-                    image::load_from_memory(&bytes)
-                        .map_err(|e| e.to_string())?
-                        .into_rgba16()
-                        .into_raw()
-                };
-                if output.format != Format::Jxl {
-                    if let Some(profile) = doc.icc_profile.as_deref() {
-                        if crate::color_profile::supported(profile).is_ok() {
-                            crate::color_profile::convert16(profile, &mut words)?;
-                            managed = true;
-                        }
-                    }
-                }
-                let edge = p["max_edge"].as_u64().unwrap_or(512).clamp(32, 1024) as f64;
-                let scale = (edge / f64::from(output.width.max(output.height))).min(1.);
-                let (w, h) = (
-                    (f64::from(output.width) * scale).round().max(1.) as u32,
-                    (f64::from(output.height) * scale).round().max(1.) as u32,
-                );
-                let rgba = crate::render::rgba8(w, h, |x, y| {
-                    let sx = (f64::from(x) / scale)
-                        .floor()
-                        .min(f64::from(output.width - 1)) as usize;
-                    let sy = (f64::from(y) / scale)
-                        .floor()
-                        .min(f64::from(output.height - 1)) as usize;
-                    let at = (sy * output.width as usize + sx) * 4;
-                    crate::depth16::display_pixel(words[at..at + 4].try_into().unwrap())
-                });
+                let pixels = capture.display_preview(
+                    &shared, output, &settings, p["max_edge"].as_u64().unwrap_or(512), control,
+                )?;
+                let (w, h) = (pixels.width, pixels.height);
                 result["preview_only"] = json!(true);
-                result["images"] = json!([{"mime_type":"image/png","data":base64::engine::general_purpose::STANDARD.encode(crate::raster::png(w,h,&rgba)?),"width":w,"height":h,"document_rect":output.document_rect,"output_size":[output.width,output.height],"output_format":output.format,"output_bit_depth":output.bit_depth,"native_source_depth":doc.bit_depth,"display_managed":managed,"revision":doc.revision}]);
+                result["images"] = json!([{"mime_type":"image/png","data":base64::engine::general_purpose::STANDARD.encode(crate::raster::png(w,h,&pixels.rgba)?),"width":w,"height":h,"document_rect":output.document_rect,"output_size":[output.width,output.height],"output_format":output.format,"output_bit_depth":output.bit_depth,"native_source_depth":doc.depth(),"display_managed":pixels.managed,"revision":doc.revision()}]);
             }
             {
                 let engine = shared.lock().unwrap();
-                crate::workspace::guard(&engine, &doc.id, doc.revision)?;
+                capture.validate(&engine)?;
             }
             Ok(result)
         }

@@ -101,11 +101,44 @@ pub(super) fn scopes(metadata: &Document36, c: &Value) -> Vec<Scope> {
 }
 fn command_scopes(metadata: &Document36, c: &Value) -> Vec<Scope> {
     let op = text(c, "op", "");
-    if op.starts_with("filter.") {
+    if op.starts_with("filter.")
+        || crate::engine::document_settings::may_promote(metadata.bit_depth, c)
+        || crate::engine::document_settings::may_initialize_global_light(metadata.psd_global_angle, c)
+    {
         return vec![Scope {
             target: None,
             rect: None,
         }];
+    }
+    if matches!(op, "image.paste" | "layer.paste") {
+        let layer = |i: usize| {
+            let l = &metadata.layers[i];
+            crate::clipboard::paste::Layer {
+                id: &l.id,
+                parent: l.parent.as_deref(),
+                kind: &l.kind,
+                clip_to: l.clip_to.as_deref(),
+                locked: l.locked,
+            }
+        };
+        let plan = if op == "layer.paste" {
+            crate::clipboard::paste::Plan::layers(
+                text(c, "layer", ""),
+                metadata.layers.len(),
+                1,
+                layer,
+            )
+        } else {
+            crate::clipboard::paste::Plan::new(c, metadata.layers.len(), layer)
+        };
+        return plan
+            .map(|plan| plan.scopes(metadata.layers.len(), layer))
+            .unwrap_or_else(|_| {
+                vec![Scope {
+                    target: None,
+                    rect: None,
+                }]
+            });
     }
     let target = c.get("layer").and_then(Value::as_str).map(String::from);
     if matches!(op, "path.to_selection" | "path.to_mask") {
@@ -219,6 +252,18 @@ fn command_scopes(metadata: &Document36, c: &Value) -> Vec<Scope> {
             })
             .collect();
     }
+    if op == "fill"
+        && c["mask"] != true
+        && target.as_deref().is_some_and(|id| {
+            metadata.layers.iter().any(|layer| {
+                layer.id == id
+                    && (layer.kind == "group"
+                        || (layer.kind == "fill" && metadata.selection.is_none()))
+            })
+        })
+    {
+        return vec![Scope { target, rect: None }];
+    }
     if matches!(op, "paint.fill" | "paint.clear_selection") {
         let layer = target
             .as_deref()
@@ -246,10 +291,7 @@ fn command_scopes(metadata: &Document36, c: &Value) -> Vec<Scope> {
         }];
     }
     if op == "image.place" && c["new_layer"] == false {
-        return vec![Scope {
-            target,
-            rect: c.get("rect").and_then(rect),
-        }];
+        return vec![Scope { target, rect: None }];
     }
     if [
         "new",
@@ -258,6 +300,7 @@ fn command_scopes(metadata: &Document36, c: &Value) -> Vec<Scope> {
         "canvas.resize",
         "image.resize",
         "document.settings",
+        "document.global_light",
         "layer.add",
         "layer.reorder",
         "layer.delete",
@@ -282,7 +325,12 @@ fn command_scopes(metadata: &Document36, c: &Value) -> Vec<Scope> {
     }
     let mut area = if ["paint", "smudge", "clone", "heal", "liquify.stroke"].contains(&op) {
         c.get("points").and_then(Value::as_array).map(|p| {
-            let r = num(c, "radius", 10.0) as f32 + 2.0;
+            let r = if op == "liquify.stroke" {
+                crate::liquify::command::radius(c)
+            } else {
+                num(c, "radius", 10.0)
+            } as f32
+                + 2.0;
             let mut a = [f32::MAX, f32::MAX, f32::MIN, f32::MIN];
             for point in p {
                 if let Some(pair) = point.as_array() {
@@ -460,85 +508,15 @@ fn command_scopes(metadata: &Document36, c: &Value) -> Vec<Scope> {
     vec![Scope { target, rect: area }]
 }
 fn requested(command: &Value) -> Result<Vec<String>> {
-    if let Some(ids) = command.get("layers") {
-        let ids = ids
-            .as_array()
-            .ok_or("Merge layers must be an array of layer IDs")?;
-        ids.iter()
-            .map(|v| {
-                v.as_str()
-                    .filter(|s| !s.is_empty())
-                    .map(String::from)
-                    .ok_or_else(|| "Merge needs valid layer IDs".into())
-            })
-            .collect()
-    } else {
-        Ok(vec![command["layer"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .ok_or("Choose layers to merge")?
-            .into()])
-    }
+    crate::merge::requested(command)
 }
-
 fn resolve(doc: &Document36, ids: &[String]) -> Result<Vec<String>> {
-    if ids.is_empty() || ids.len() > 100 {
-        return Err("Choose 1–100 layers to merge".into());
-    }
-    for id in ids {
-        if !doc.layers.iter().any(|l| l.id == *id) {
-            return Err("A selected layer no longer exists".into());
-        }
-    }
-    let mut roots = roots(doc, ids);
-    if roots.len() == 1 {
-        let at = doc.layers.iter().position(|l| l.id == roots[0]).unwrap();
-        let selected = &doc.layers[at];
-        if selected.kind != "group" {
-            let below = doc
-                .layers
-                .iter()
-                .skip(at + 1)
-                .find(|l| l.parent == selected.parent)
-                .ok_or("There is no layer below this one to merge")?;
-            roots.push(below.id.clone());
-        }
-    }
-    let parent = &doc.layers.iter().find(|l| l.id == roots[0]).unwrap().parent;
-    if roots
-        .iter()
-        .any(|id| doc.layers.iter().find(|l| l.id == *id).unwrap().parent != *parent)
-    {
-        return Err("Choose layers in the same folder to merge".into());
-    }
-    if roots
-        .iter()
-        .any(|id| !doc.layers.iter().find(|l| l.id == *id).unwrap().visible)
-    {
-        return Err("Show the selected layers before merging".into());
-    }
-    if roots.len() > 1 {
-        let siblings: Vec<_> = doc.layers.iter().filter(|l| l.parent == *parent).collect();
-        let positions: Vec<_> = siblings
-            .iter()
-            .enumerate()
-            .filter_map(|(i, l)| roots.contains(&l.id).then_some(i))
-            .collect();
-        if positions.last().unwrap() - positions[0] + 1 != roots.len() {
-            return Err("Choose adjacent layers to preserve the canvas when merging".into());
-        }
-        if siblings
-            .iter()
-            .filter(|l| roots.contains(&l.id))
-            .any(|l| l.blend != "normal")
-        {
-            return Err(
-                "Put these layers in a folder and merge the folder to preserve their blend modes"
-                    .into(),
-            );
-        }
-    }
-    Ok(roots)
+    crate::merge::input::resolve(doc.layers.len(), |i| (&doc.layers[i]).into(), ids).map(|roots| {
+        roots
+            .into_iter()
+            .map(|i| doc.layers[i].id.clone())
+            .collect()
+    })
 }
 
 #[cfg(test)]
@@ -575,15 +553,15 @@ mod tests {
     fn selected_linked_mask_reframe_reserves_current_and_revealed_pixels() {
         for depth in [8, 16] {
             let mut legacy = crate::engine::Engine::new();
-            legacy.doc = crate::engine::Document::new_depth(64, 64, depth).unwrap();
-            legacy.doc.selection = Some([4, 6, 9, 12]);
-            let layer = &mut legacy.doc.layers[0];
+            legacy.resident_state_mut().expect("resident fixture").document = crate::engine::Document::new_depth(64, 64, depth).unwrap();
+            legacy.resident_state_mut().expect("resident fixture").document.selection = Some([4, 6, 9, 12]);
+            let layer = &mut legacy.resident_state_mut().expect("resident fixture").document.layers[0];
             layer.x = 2;
             layer.y = 3;
             layer.pixels = crate::raster::Raster::new_depth(17, 19, depth);
             let command = json!({"op":"transform","layer":layer.id,"angle":0});
             let mut source = ZeroSources { sources: vec![] };
-            let mut metadata = Document36::capture(&legacy.doc, &mut source).unwrap();
+            let mut metadata = Document36::capture(&legacy.resident_state().expect("resident fixture").document, &mut source).unwrap();
             metadata.layers[0].mask = Some(crate::engine::scene::Mask36 {
                 linked: true,
                 enabled: false,
@@ -635,28 +613,30 @@ mod tests {
     fn scope_policy_matches_actual_legacy_engine_for_native8_and16_geometry_and_selections() {
         for depth in [8, 16] {
             let mut legacy = crate::engine::Engine::new();
-            legacy.doc = crate::engine::Document::new_depth(512, 256, depth).unwrap();
-            legacy.doc.layers[0].id = "paint".into();
+            legacy.resident_state_mut().expect("resident fixture").document = crate::engine::Document::new_depth(512, 256, depth).unwrap();
+            legacy.resident_state_mut().expect("resident fixture").document.layers[0].id = "paint".into();
             let mut group = crate::engine::Layer::new("Folder", "group", 512, 256);
             group.id = "group".into();
             group.pixels = crate::raster::Raster::new_depth(512, 256, depth);
-            legacy.doc.layers.push(group);
+            legacy.resident_state_mut().expect("resident fixture").document.layers.push(group);
             let mut child = crate::engine::Layer::new("Child", "paint", 512, 256);
             child.id = "child".into();
             child.parent = Some("group".into());
             child.pixels = crate::raster::Raster::new_depth(512, 256, depth);
-            legacy.doc.layers.push(child);
+            legacy.resident_state_mut().expect("resident fixture").document.layers.push(child);
             for selected in [false, true] {
-                legacy.doc.selection = selected.then_some([1, 2, 20, 22]);
-                legacy.doc.selection_polygon =
+                legacy.resident_state_mut().expect("resident fixture").document.selection = selected.then_some([1, 2, 20, 22]);
+                legacy.resident_state_mut().expect("resident fixture").document.selection_polygon =
                     selected.then_some(vec![[1., 2.], [20., 2.], [1., 22.]]);
                 let mut source = ZeroSources { sources: vec![] };
-                let metadata = Document36::capture(&legacy.doc, &mut source).unwrap();
+                let metadata = Document36::capture(&legacy.resident_state().expect("resident fixture").document, &mut source).unwrap();
                 let grid = json!({"rect":[0.,0.,24.,24.],"points":[[0.,0.],[12.,0.],[24.,0.],[0.,12.],[12.,13.],[24.,12.],[0.,24.],[12.,24.],[24.,24.]]});
                 let commands = vec![
                     json!({"op":"layer.update","layer":"paint","visible":false}),
                     json!({"op":"layer.update","layer":"paint","name":"Renamed"}),
                     json!({"op":"paint","layer":"paint","points":[[255.25,3.],[258.5,8.]],"radius":2.25}),
+                    json!({"op":"liquify.stroke","layer":"paint","points":[[100.,100.],[110.,105.]]}),
+                    json!({"op":"liquify.stroke","layer":"group","points":[[100.,100.],[110.,105.]],"radius":3.25}),
                     json!({"op":"paint.fill","layer":"paint","rect":[0,0,12,16]}),
                     json!({"op":"paint.clear_selection","layer":"paint"}),
                     json!({"op":"paint.fill","layer":"group"}),
@@ -679,9 +659,22 @@ mod tests {
                     json!({"op":"layer.merge","layers":["group"]}),
                     json!({"op":"image.place","layer":"paint","new_layer":false,"rect":[0,0,7,9]}),
                     json!({"op":"image.import"}),
+                    json!({"op":"image.import","parent":"group"}),
+                    json!({"op":"image.paste","layer":"child"}),
+                    json!({"op":"layer.paste","parent":"group"}),
+                    json!({"op":"effect.add","layer":"paint","kind":"pattern_overlay","settings":{"pattern":"bitmap","bitmap_png":"pending"}}),
                     json!({"op":"canvas.resize"}),
                 ];
                 for command in commands {
+                    if command["op"] == "liquify.stroke"
+                        && command.get("radius").is_none()
+                        && !selected
+                    {
+                        assert_eq!(
+                            scopes(&metadata, &command)[0].rect,
+                            Some([58, 58, 152, 147])
+                        );
+                    }
                     assert_eq!(
                         scopes(&metadata, &command),
                         legacy.scopes(&command),

@@ -47,14 +47,14 @@ fn source(markup: &str) -> Source {
 }
 fn fixture(depth: u16) -> Engine {
     let mut e = Engine::new();
-    e.doc = Document::new_depth(96, 80, depth).unwrap();
-    e.doc.layers[0]
+    e.resident_state_mut().expect("resident fixture").document = Document::new_depth(96, 80, depth).unwrap();
+    e.resident_state_mut().expect("resident fixture").document.layers[0]
         .pixels
         .set16(85, 70, [12345, 23457, 34569, 60001]);
     e
 }
 fn edit(e: &mut Engine, commands: &[Value]) {
-    e.edit("human", commands, Some(e.doc.revision), None, "SVG artwork")
+    e.edit("human", commands, Some(e.resident_state().expect("resident fixture").document.revision), None, "SVG artwork")
         .unwrap();
 }
 fn source_format(bytes: &[u8]) -> u64 {
@@ -172,23 +172,23 @@ fn import_retains_source_native_human_samples_single_undo_and_standard_psd12_pix
     let file = File::new("svg", ART.as_bytes());
     for depth in [8, 16] {
         let mut e = fixture(depth);
-        let before = e.doc.export_png().unwrap();
-        let human = e.doc.layers[0].pixels.rgba16();
+        let before = e.resident_state().expect("resident fixture").document.export_png().unwrap();
+        let human = e.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16();
         let command =
             json!({"op":"image.import","path":file.0,"x":7,"y":9,"name":"Vector artwork"});
-        let preview = Engine::preview_edits(e.doc.clone(), &[command.clone()]).unwrap();
+        let preview = Engine::preview_edits(e.resident_state().expect("resident fixture").document.clone(), &[command.clone()]).unwrap();
         edit(&mut e, &[command]);
-        assert_eq!(e.undo.len(), 1);
-        assert_eq!(e.doc.layers[0].source, Some(source(ART).into()));
-        assert_eq!((e.doc.layers[0].x, e.doc.layers[0].y), (7, 9));
-        assert_eq!(e.doc.layers[1].pixels.rgba16(), human);
-        assert_eq!(preview.export_png().unwrap(), e.doc.export_png().unwrap());
-        let encoded = psd::encode(&e.doc).unwrap();
+        assert_eq!(e.resident_state().expect("resident fixture").undo.len(), 1);
+        assert_eq!(e.resident_state().expect("resident fixture").document.layers[0].source, Some(source(ART).into()));
+        assert_eq!((e.resident_state().expect("resident fixture").document.layers[0].x, e.resident_state().expect("resident fixture").document.layers[0].y), (7, 9));
+        assert_eq!(e.resident_state().expect("resident fixture").document.layers[1].pixels.rgba16(), human);
+        assert_eq!(preview.export_png().unwrap(), e.resident_state().expect("resident fixture").document.export_png().unwrap());
+        let encoded = psd::encode(&e.resident_state().expect("resident fixture").document).unwrap();
         assert_eq!(source_format(&encoded), 12);
         let loaded = psd::decode(&encoded).unwrap();
         assert!(!loaded.read_only);
-        assert_eq!(loaded.layers[0].source, e.doc.layers[0].source);
-        assert_eq!(loaded.export_png().unwrap(), e.doc.export_png().unwrap());
+        assert_eq!(loaded.layers[0].source, e.resident_state().expect("resident fixture").document.layers[0].source);
+        assert_eq!(loaded.export_png().unwrap(), e.resident_state().expect("resident fixture").document.export_png().unwrap());
         let standard = psd::decode(&without_resources(&encoded)).unwrap();
         assert!(!standard.read_only);
         assert!(standard.layers.iter().all(|l| l.source.is_none()));
@@ -196,14 +196,14 @@ fn import_retains_source_native_human_samples_single_undo_and_standard_psd12_pix
             image::load_from_memory(&standard.export_png().unwrap())
                 .unwrap()
                 .into_rgba16(),
-            image::load_from_memory(&e.doc.export_png().unwrap())
+            image::load_from_memory(&e.resident_state().expect("resident fixture").document.export_png().unwrap())
                 .unwrap()
                 .into_rgba16()
         );
         e.undo("human").unwrap();
-        assert_eq!(e.doc.export_png().unwrap(), before);
+        assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), before);
         e.redo("human").unwrap();
-        assert_eq!(e.doc.layers[0].source, Some(source(ART).into()));
+        assert_eq!(e.resident_state().expect("resident fixture").document.layers[0].source, Some(source(ART).into()));
     }
 }
 
@@ -236,8 +236,8 @@ fn svgz_choices_mixed_batches_locks_reservations_and_stale_sources_are_atomic() 
         &peerbrush::raster::png16(1, 1, &[12345, 23457, 34569, 65535]).unwrap(),
     );
     let mut e = fixture(8);
-    let before = e.doc.export_png().unwrap();
-    let revision = e.doc.revision;
+    let before = e.resident_state().expect("resident fixture").document.export_png().unwrap();
+    let revision = e.resident_state().expect("resident fixture").document.revision;
     let batch = [
         json!({"op":"image.import","path":png.0}),
         json!({"op":"image.import","path":bad.0}),
@@ -245,23 +245,23 @@ fn svgz_choices_mixed_batches_locks_reservations_and_stale_sources_are_atomic() 
     assert!(e
         .edit("human", &batch, None, None, "Invalid batch")
         .is_err());
-    assert_eq!(e.doc.bit_depth, 8);
-    assert_eq!(e.doc.export_png().unwrap(), before);
-    assert_eq!(e.doc.revision, revision);
-    assert!(e.undo.is_empty());
+    assert_eq!(e.resident_state().expect("resident fixture").document.bit_depth, 8);
+    assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), before);
+    assert_eq!(e.resident_state().expect("resident fixture").document.revision, revision);
+    assert!(e.resident_state().expect("resident fixture").undo.is_empty());
     edit(
         &mut e,
         &[json!({"op":"layer.add","kind":"group","name":"Vector folder"})],
     );
-    let folder = e.doc.layers[0].id.clone();
+    let folder = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
     let command = json!({"op":"image.import","path":good.0,"parent":folder});
-    e.doc.layers[0].locked = true;
-    let state = e.doc.clone();
+    e.resident_state_mut().expect("resident fixture").document.layers[0].locked = true;
+    let state = e.resident_state().expect("resident fixture").document.clone();
     assert!(e
         .edit("human", &[command.clone()], None, None, "Locked import")
         .is_err());
-    assert_eq!(e.doc.export_png().unwrap(), state.export_png().unwrap());
-    e.doc.layers[0].locked = false;
+    assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), state.export_png().unwrap());
+    e.resident_state_mut().expect("resident fixture").document.layers[0].locked = false;
     e.reserve(
         "agent",
         "svg-test",
@@ -275,18 +275,18 @@ fn svgz_choices_mixed_batches_locks_reservations_and_stale_sources_are_atomic() 
         .edit("human", &[command.clone()], None, None, "Reserved import")
         .is_err());
     e.leases.clear();
-    let stale = json!({"op":"image.import","path":good.0,"document_id":"old-project","source_revision":e.doc.revision});
+    let stale = json!({"op":"image.import","path":good.0,"document_id":"old-project","source_revision":e.resident_state().expect("resident fixture").document.revision});
     assert!(e
         .edit("human", &[stale.clone()], None, None, "Stale import")
         .is_err());
-    assert!(Engine::preview_edits(e.doc.clone(), &[stale]).is_err());
+    assert!(Engine::preview_edits(e.resident_state().expect("resident fixture").document.clone(), &[stale]).is_err());
     edit(
         &mut e,
         &[json!({"op":"image.import","path":png.0}), command],
     );
-    assert_eq!(e.doc.bit_depth, 16);
+    assert_eq!(e.resident_state().expect("resident fixture").document.bit_depth, 16);
     assert_eq!(
-        e.doc
+        e.resident_state().expect("resident fixture").document
             .layers
             .iter()
             .find(|l| l.source.is_some())
@@ -304,17 +304,17 @@ fn vector_updates_transforms_and_internal_clipboard_preserve_editable_source() {
         &mut e,
         &[json!({"op":"source.add","source":source(ART),"x":7,"y":9})],
     );
-    let target = e.doc.layers[0].id.clone();
-    let original = e.doc.export_png().unwrap();
+    let target = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
+    let original = e.resident_state().expect("resident fixture").document.export_png().unwrap();
     let revised = source(&ART.replace("#00ff00", "#ffff00"));
-    let command = json!({"op":"source.update","layer":target,"source":revised,"document_id":e.doc.id,"source_revision":e.doc.revision});
-    let preview = Engine::preview_edits(e.doc.clone(), &[command.clone()]).unwrap();
+    let command = json!({"op":"source.update","layer":target,"source":revised,"document_id":e.resident_state().expect("resident fixture").document.id,"source_revision":e.resident_state().expect("resident fixture").document.revision});
+    let preview = Engine::preview_edits(e.resident_state().expect("resident fixture").document.clone(), &[command.clone()]).unwrap();
     edit(&mut e, &[command]);
-    assert_eq!(preview.export_png().unwrap(), e.doc.export_png().unwrap());
-    assert_ne!(original, e.doc.export_png().unwrap());
+    assert_eq!(preview.export_png().unwrap(), e.resident_state().expect("resident fixture").document.export_png().unwrap());
+    assert_ne!(original, e.resident_state().expect("resident fixture").document.export_png().unwrap());
     e.undo("human").unwrap();
-    assert_eq!(original, e.doc.export_png().unwrap());
-    let snapshot = layer_clipboard::copy(&e.doc, &[target.clone()]).unwrap();
+    assert_eq!(original, e.resident_state().expect("resident fixture").document.export_png().unwrap());
+    let snapshot = layer_clipboard::copy(&e.resident_state().expect("resident fixture").document, &[target.clone()]).unwrap();
     let mut destination = Document::new_depth(96, 80, 16).unwrap();
     layer_clipboard::paste(&mut destination, &snapshot, "").unwrap();
     assert!(destination
@@ -326,11 +326,11 @@ fn vector_updates_transforms_and_internal_clipboard_preserve_editable_source() {
         &[json!({"op":"transform","layer":target,"angle":90.,"selection_only":false})],
     );
     assert_eq!(
-        e.doc.layers[0].source.as_ref().unwrap().content,
+        e.resident_state().expect("resident fixture").document.layers[0].source.as_ref().unwrap().content,
         source(ART).content
     );
     e.undo("human").unwrap();
-    assert_eq!(original, e.doc.export_png().unwrap());
+    assert_eq!(original, e.resident_state().expect("resident fixture").document.export_png().unwrap());
     let huge = source(ART);
     assert!(svg::render(ART, [huge.width, huge.height], huge.matrix, 8192, 4096, 16).is_err());
 }
@@ -351,7 +351,7 @@ fn protocol_inspection_discovery_and_source_feedback_include_svg_and_coordinates
         (details["width"].as_u64(), details["height"].as_u64()),
         (Some(64), Some(48))
     );
-    assert!(shared.lock().unwrap().undo.is_empty());
+    assert!(shared.lock().unwrap().resident_state().expect("resident fixture").undo.is_empty());
     let catalog = server::capabilities();
     assert!(catalog["image_import"]["extensions"]
         .as_array()
@@ -362,7 +362,7 @@ fn protocol_inspection_discovery_and_source_feedback_include_svg_and_coordinates
         &mut e,
         &[json!({"op":"image.import","path":file.0,"x":11,"y":13})],
     );
-    let state = e.state();
+    let state = e.capture_state().unwrap().project().unwrap();
     assert_eq!(state["layers"][0]["source"]["content"]["kind"], "svg");
     assert_eq!(state["layers"][0]["bounds"], json!([11, 13, 75, 61]));
 }

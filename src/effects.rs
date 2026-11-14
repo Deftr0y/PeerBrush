@@ -14,12 +14,36 @@ pub(crate) mod alpha;
 pub mod catalog;
 pub mod channel_clamp;
 pub mod contours;
+pub(crate) mod curves;
 pub(crate) mod field;
 pub mod gradient;
+pub(crate) mod legacy_brightness;
+pub(crate) mod modern_brightness;
+pub(crate) mod exposure;
+pub(crate) mod channel_mixer;
+pub(crate) mod black_white;
+pub(crate) mod selective_color;
+pub(crate) mod vibrance;
+pub(crate) mod photo_filter;
+pub(crate) mod gradient_map;
+pub(crate) mod photoshop_color_balance;
+mod hue_saturation_tables;
+pub(crate) mod photoshop_hue_saturation;
+pub(crate) mod color_lookup;
+pub(crate) mod levels;
 pub mod patterns;
 pub mod posterize;
 pub(crate) mod regional;
+pub(crate) mod stored;
 pub mod styles;
+pub(crate) mod threshold;
+
+const PHOTOSHOP_WORD_SCALE: u32 = 32768;
+
+fn photoshop_word(value: u16) -> u32 {
+    (u32::from(value) * PHOTOSHOP_WORD_SCALE + 32767) / 65535
+}
+
 pub const KINDS: &[&str] = &[
     "bevel_emboss",
     "contour",
@@ -37,6 +61,18 @@ pub const KINDS: &[&str] = &[
     "curves",
     "blur",
     "adjust",
+    legacy_brightness::KIND,
+    modern_brightness::KIND,
+    exposure::KIND,
+    channel_mixer::KIND,
+    black_white::KIND,
+    selective_color::KIND,
+    vibrance::KIND,
+    photo_filter::KIND,
+    gradient_map::KIND,
+    photoshop_color_balance::KIND,
+    photoshop_hue_saturation::KIND,
+    color_lookup::KIND,
     "color_balance",
     "hsl",
     "bloom",
@@ -44,6 +80,7 @@ pub const KINDS: &[&str] = &[
     "invert",
     "grayscale",
     "posterize",
+    "threshold",
     "channel_clamp",
 ];
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -158,7 +195,20 @@ pub fn defaults(kind: &str) -> Value {
     match kind {
         "channel_clamp" => json!({"channel":"r","minimum":0.0,"maximum":1.0}),
         "posterize" => json!({"levels":posterize::DEFAULT_LEVELS}),
-        "levels" => json!({"black":0.0,"white":1.0,"gamma":1.0}),
+        "threshold" => json!({"level":threshold::DEFAULT_LEVEL}),
+        legacy_brightness::KIND | modern_brightness::KIND =>
+            json!({"brightness":0,"contrast":0,"mean":legacy_brightness::DEFAULT_MEAN}),
+        exposure::KIND => json!({"exposure":0.0,"offset":0.0,"gamma":1.0}),
+        channel_mixer::KIND => channel_mixer::defaults(),
+        black_white::KIND => black_white::defaults(),
+        selective_color::KIND => selective_color::defaults(),
+        vibrance::KIND => json!({"vibrance":0,"saturation":0}),
+        photo_filter::KIND => photo_filter::defaults(),
+        gradient_map::KIND => gradient_map::defaults(),
+        photoshop_color_balance::KIND => photoshop_color_balance::defaults(),
+        photoshop_hue_saturation::KIND => photoshop_hue_saturation::Settings::default().value(),
+        color_lookup::KIND => color_lookup::defaults(),
+        "levels" => json!({"black":0.0,"white":1.0,"gamma":1.0,"output_black":0.0,"output_white":1.0,"input_mapping":"exact"}),
         "curves" => json!({"points":[[0.0,0.0],[0.5,0.5],[1.0,1.0]],"interpolation":"smooth"}),
         "blur" => json!({"radius":8.0}),
         "adjust" => json!({"brightness":0.0,"contrast":1.0,"saturation":1.0}),
@@ -178,6 +228,26 @@ pub fn number(v: &Value, key: &str, default: f32) -> f32 {
         .map(|n| n as f32)
         .unwrap_or(default)
 }
+
+pub(crate) const MAX_ADJUSTMENT_PRESET_NAME: usize = 4096;
+
+pub(crate) fn supports_tone_preset(kind: &str) -> bool {
+    matches!(kind, "levels" | "curves" | exposure::KIND)
+}
+
+pub(crate) fn adjustment_preset(settings: &Value) -> Result<Option<(i32, &str)>, String> {
+    let Some(value) = settings.get("preset") else { return Ok(None) };
+    let fields = value.as_object().filter(|fields| fields.len() == 2)
+        .ok_or("Adjustment preset requires a kind and name")?;
+    let kind = fields.get("kind").and_then(Value::as_i64).and_then(|kind| i32::try_from(kind).ok())
+        .ok_or("Invalid adjustment preset kind")?;
+    let name = fields.get("name").and_then(Value::as_str)
+        .filter(|name| name.len() <= MAX_ADJUSTMENT_PRESET_NAME * 3
+            && name.encode_utf16().count() <= MAX_ADJUSTMENT_PRESET_NAME)
+        .ok_or("Invalid adjustment preset name")?;
+    Ok(Some((kind, name)))
+}
+
 pub fn validate(kind: &str, v: &Value) -> Result<(), String> {
     if !KINDS.contains(&kind) {
         return Err("Unsupported effect".into());
@@ -203,6 +273,9 @@ pub fn validate(kind: &str, v: &Value) -> Result<(), String> {
     if styles::contains(kind) {
         return styles::validate(kind, v);
     }
+    if supports_tone_preset(kind) {
+        adjustment_preset(v)?;
+    }
     let check = |key: &str, min: f32, max: f32| {
         if let Some(value) = v.get(key) {
             let n = value.as_f64().ok_or("Invalid effect setting")?;
@@ -217,16 +290,48 @@ pub fn validate(kind: &str, v: &Value) -> Result<(), String> {
             channel_clamp::parameters(v)?;
         }
         "posterize" => {
-            posterize::levels(v)?;
+            posterize::Quantizer::new(v)?;
         }
-        "levels" => {
-            check("black", 0.0, 0.99)?;
-            check("white", 0.01, 1.0)?;
-            check("gamma", 0.1, 5.0)?;
-            if number(v, "black", 0.0) >= number(v, "white", 1.0) {
-                return Err("White point must be greater than black point".into());
-            }
+        "threshold" => {
+            threshold::level(v)?;
         }
+        legacy_brightness::KIND => {
+            legacy_brightness::Mapping::new(v)?;
+        }
+        modern_brightness::KIND => {
+            modern_brightness::parameters(v)?;
+        }
+        exposure::KIND => {
+            exposure::parameters(v)?;
+        }
+        channel_mixer::KIND => {
+            channel_mixer::Mixer::new(v)?;
+        }
+        black_white::KIND => {
+            black_white::Settings::new(v)?;
+        }
+        selective_color::KIND => {
+            selective_color::Settings::new(v)?;
+        }
+        vibrance::KIND => {
+            vibrance::parameters(v)?;
+        }
+        photo_filter::KIND => {
+            photo_filter::Settings::new(v)?;
+        }
+        gradient_map::KIND => {
+            gradient_map::Settings::new(v)?;
+        }
+        photoshop_color_balance::KIND => {
+            photoshop_color_balance::Settings::new(v)?;
+        }
+        photoshop_hue_saturation::KIND => {
+            photoshop_hue_saturation::Settings::new(v)?;
+        }
+        color_lookup::KIND => {
+            color_lookup::prepare(v)?;
+        }
+        "levels" => levels::validate(v)?,
         "blur" => check("radius", 0.0, 64.0)?,
         "adjust" => {
             check("brightness", -1.0, 1.0)?;
@@ -268,42 +373,95 @@ pub fn validate(kind: &str, v: &Value) -> Result<(), String> {
         }
         "liquify" => crate::liquify::validate(v)?,
         "curves" => {
-            if let Some(interpolation) = v.get("interpolation") {
-                if !matches!(interpolation.as_str(), Some("linear" | "smooth")) {
-                    return Err("Curve interpolation must be linear or smooth".into());
-                }
+            let byte_composition = curves::byte_composition(kind, v);
+            if v.get("composition").is_some() && (!byte_composition || v.get("channels").is_none()) {
+                return Err("Photoshop byte composition requires independent RGB channel curves".into());
             }
-            let points = v["points"].as_array().ok_or("Missing curve points")?;
-            if points.len() < 2 || points.len() > 16 {
-                return Err("Use 2–16 curve points".into());
-            }
-            let mut previous = -1.0;
-            for p in points {
-                let p = p.as_array().ok_or("Invalid curve point")?;
-                if p.len() != 2 {
-                    return Err("Curve points must be [x,y]".into());
+            validate_curve(v, byte_composition)?;
+            if let Some(channels) = v.get("channels") {
+                let channels = channels.as_array().filter(|values| values.len() == 3)
+                    .ok_or("Curves channels must contain Red, Green and Blue settings")?;
+                for channel in channels {
+                    let fields = channel.as_object().ok_or("Curves channel settings must be an object")?;
+                    if fields.keys().any(|key| !matches!(key.as_str(), "points" | "interpolation"))
+                        || !fields.contains_key("interpolation")
+                    {
+                        return Err("Curves channels require points and explicit interpolation".into());
+                    }
+                    validate_curve(channel, byte_composition)?;
                 }
-                let x = p[0].as_f64().ok_or("Invalid curve x")?;
-                let y = p[1].as_f64().ok_or("Invalid curve y")?;
-                if !x.is_finite()
-                    || !y.is_finite()
-                    || !(0.0..=1.0).contains(&x)
-                    || !(0.0..=1.0).contains(&y)
-                    || x <= previous
-                {
-                    return Err("Curve x positions must increase within 0–1".into());
-                }
-                previous = x;
             }
         }
         _ => {}
     }
     Ok(())
 }
+
+fn validate_curve(settings: &Value, byte_composition: bool) -> Result<(), String> {
+    if settings.get("interpolation").is_some_and(|value| {
+        !matches!(value.as_str(), Some("linear" | "smooth" | curves::PHOTOSHOP))
+    }) {
+        return Err("Curve interpolation must be linear, smooth, or photoshop".into());
+    }
+    let points = settings["points"].as_array().ok_or("Missing curve points")?;
+    if !(2..=curves::MAX_POINTS).contains(&points.len()) {
+        return Err("Use 2–16 curve points".into());
+    }
+    let photoshop = settings["interpolation"] == curves::PHOTOSHOP;
+    if photoshop && points.len() < 3 {
+        return Err("Use at least three points for Photoshop spline interpolation".into());
+    }
+    if byte_composition && !photoshop && (settings["interpolation"] != "linear" || points.len() != 2) {
+        return Err("Photoshop byte composition requires two-point linear curves or Photoshop splines".into());
+    }
+    let mut previous = -1.0;
+    for point in points {
+        let [x, y] = point.as_array().ok_or("Invalid curve point")?.as_slice() else {
+            return Err("Curve points must be [x,y]".into());
+        };
+        if (photoshop || byte_composition) && (curves::grid_sample(x).is_none() || curves::grid_sample(y).is_none()) {
+            return Err("Photoshop curve points must lie on the 0–255 coordinate grid".into());
+        }
+        let x = x.as_f64().ok_or("Invalid curve x")?;
+        let y = y.as_f64().ok_or("Invalid curve y")?;
+        if !(0.0..=1.0).contains(&x) || !(0.0..=1.0).contains(&y) || x <= previous {
+            return Err("Curve x positions must increase within 0–1".into());
+        }
+        previous = x;
+    }
+    Ok(())
+}
+
+pub(crate) fn has_channel_curves(kind: &str, settings: &Value) -> bool {
+    kind == "curves" && settings.get("channels").is_some()
+}
+
+pub(crate) fn has_channel_mapping(kind: &str, settings: &Value) -> bool {
+    levels::channels(kind, settings) || has_channel_curves(kind, settings)
+}
+
+pub(crate) fn map_channel64(kind: &str, settings: &Value, channel: usize, value: f64) -> f64 {
+    match kind {
+        "levels" => levels::channel64(settings, channel, value),
+        "curves" => curve_value64(settings, curve_value64(&settings["channels"][channel], value)),
+        _ => unreachable!("Unsupported channel mapping"),
+    }
+}
+
+pub(crate) fn map_channel_sample(kind: &str, settings: &Value, channel: usize, value: u8) -> u8 {
+    if kind == "levels" {
+        return levels::channel8(settings, channel, value);
+    }
+    (map_channel64(kind, settings, channel, f64::from(value) / 255.) * 255.).round() as u8
+}
+
 /// Resolve omitted parameters once; UI, saved sources, and agents use the same defaults.
 pub fn normalized(kind: &str, settings: &Value) -> Result<Value, String> {
     validate(kind, settings)?;
     let mut result = defaults(kind);
+    if kind == "levels" && settings.get("input_mapping").is_none() {
+        result.as_object_mut().unwrap().remove("input_mapping");
+    }
     if patterns::active(kind, settings) {
         for (key, value) in styles::bitmap_defaults().as_object().unwrap() {
             result[key] = value.clone();
@@ -312,9 +470,18 @@ pub fn normalized(kind: &str, settings: &Value) -> Result<Value, String> {
     if kind == "curves" && settings.get("interpolation").is_none() {
         result["interpolation"] = json!("linear");
     }
+    if kind == color_lookup::KIND && settings.get("embed_profile").is_none()
+        && color_lookup::uses_table(settings) && color_lookup::source_size(settings, "profile") == 0
+        && color_lookup::source_size(settings, "lut_format") != 0
+    {
+        result["embed_profile"] = json!(true);
+    }
     let target = result.as_object_mut().ok_or("Invalid effect defaults")?;
     for (key, value) in settings.as_object().unwrap() {
         target.insert(key.clone(), value.clone());
+    }
+    if styles::contains(kind) {
+        styles::localize_shadow_light(&mut result);
     }
     Ok(result)
 }
@@ -325,6 +492,19 @@ pub fn color_only(kind: &str) -> bool {
             "hsl",
             "bloom",
             "posterize",
+            "threshold",
+            legacy_brightness::KIND,
+            modern_brightness::KIND,
+            exposure::KIND,
+            channel_mixer::KIND,
+            black_white::KIND,
+            selective_color::KIND,
+            vibrance::KIND,
+            photo_filter::KIND,
+            gradient_map::KIND,
+            photoshop_color_balance::KIND,
+            photoshop_hue_saturation::KIND,
+            color_lookup::KIND,
             "channel_clamp",
         ]
         .contains(&kind)
@@ -338,19 +518,29 @@ pub fn working_bytes(kind: &str, width: u32, height: u32, settings: &Value) -> R
     }
     match kind {
         "blur" | "bloom" => Ok(pixels * 8 + width.max(height) as u64 * 8),
+        color_lookup::KIND => Ok(color_lookup::source_size(settings, "profile") as u64 * 9
+            + color_lookup::source_size(settings, "cube") as u64 * 6),
         // Liquify enforces its own field/stroke work limits as well.
         "liquify" => crate::liquify::working_bytes(width, height, settings).map(|n| n as u64),
         _ => Ok(0),
     }
 }
+pub(crate) fn has_levels_output(kind: &str, settings: &Value) -> bool {
+    kind == "levels"
+        && (settings["output_black"].as_f64().unwrap_or(0.0) != 0.0
+            || settings["output_white"].as_f64().unwrap_or(1.0) != 1.0)
+}
 pub fn map_value(kind: &str, settings: &Value, v: f32) -> f32 {
     match kind {
+        "levels" if levels::exact(settings) => levels::map64(settings, f64::from(v)) as f32,
         "levels" => {
             let b = number(settings, "black", 0.0);
             let w = number(settings, "white", 1.0);
-            ((v - b) / (w - b).max(0.01))
+            let input = ((v - b) / (w - b).max(0.01))
                 .clamp(0.0, 1.0)
-                .powf(1.0 / number(settings, "gamma", 1.0))
+                .powf(1.0 / number(settings, "gamma", 1.0));
+            let low = number(settings, "output_black", 0.0);
+            low + input * (number(settings, "output_white", 1.0) - low)
         }
         "curves" => curve_value(settings, v),
         "invert" => 1.0 - v,
@@ -361,11 +551,21 @@ pub fn map_value(kind: &str, settings: &Value, v: f32) -> f32 {
         _ => v,
     }
 }
-/// Shape-preserving cubic Hermite interpolation shared by the graph and both pixel depths.
+pub(crate) fn map_sample(kind: &str, settings: &Value, sample: u8) -> u8 {
+    if kind == "levels" && levels::exact(settings) {
+        (levels::map64(settings, f64::from(sample) / 255.) * 255.).round() as u8
+    } else {
+        (map_value(kind, settings, f32::from(sample) / 255.) * 255.).round() as u8
+    }
+}
+/// Curve interpolation shared by the graph and both pixel depths.
 pub fn curve_value(settings: &Value, v: f32) -> f32 {
     curve_value64(settings, v as f64) as f32
 }
 pub fn curve_value64(settings: &Value, v: f64) -> f64 {
+    if let Some(spline) = curves::Spline::from_settings(settings) {
+        return spline.value(v);
+    }
     let points = settings["points"].as_array().unwrap();
     if settings["interpolation"] == "linear" {
         for pair in points.windows(2) {
@@ -605,9 +805,18 @@ pub fn prepare(
     doc: &Document,
     masks: &[Option<Arc<crate::mask::GrayMask>>],
 ) -> Result<Vec<Option<Arc<Image>>>, String> {
+    prepare_checked(doc, masks, &|| Ok(()))
+}
+pub(crate) fn prepare_checked(
+    doc: &Document,
+    masks: &[Option<Arc<crate::mask::GrayMask>>],
+    check: &crate::render::Check<'_>,
+) -> Result<Vec<Option<Arc<Image>>>, String> {
+    check()?;
     validate_budget(doc)?;
     let mut out = vec![None; doc.layers.len()];
     for i in crate::compositor::effect_order(doc) {
+        check()?;
         let l = &doc.layers[i];
         if !active(l) {
             continue;
@@ -624,6 +833,7 @@ pub fn prepare(
             continue;
         }
         if let Some(bytes) = crate::disk_cache::read(&key, w, h, 8) {
+            check()?;
             let image = Arc::new(Image {
                 width: w,
                 height: h,
@@ -634,34 +844,16 @@ pub fn prepare(
             continue;
         }
         let bytes = match l.kind.as_str() {
-            "fill" => {
-                let mut bytes = vec![0; l.pixels.width as usize * l.pixels.height as usize * 4];
-                for pixel in bytes.chunks_exact_mut(4) {
-                    pixel.copy_from_slice(&l.color);
-                }
-                bytes
-            }
+            "fill" => crate::render::rgba(l.pixels.width, l.pixels.height, check, |_, _| l.color)?,
             "group" => {
                 let plan = crate::compositor::Plan::new(doc, masks, &out);
                 let group = plan.group(Some(&l.id));
-                let mut bytes = vec![0; w as usize * h as usize * 4];
-                for (index, pixel) in bytes.chunks_exact_mut(4).enumerate() {
-                    let x = (index % w as usize) as i32;
-                    let y = (index / w as usize) as i32;
-                    pixel.copy_from_slice(&plan.sample(group, x, y));
-                }
-                bytes
+                crate::render::rgba(w, h, check, |x, y| plan.sample(group, x as i32, y as i32))?
             }
             "adjustment" => {
-                let mut bytes = vec![0; w as usize * h as usize * 4];
-                for (index, pixel) in bytes.chunks_exact_mut(4).enumerate() {
-                    let x = (index % w as usize) as i32;
-                    let y = (index / w as usize) as i32;
-                    pixel.copy_from_slice(&crate::compositor::adjustment_input(
-                        doc, i, x, y, masks, &out,
-                    ));
-                }
-                bytes
+                crate::render::rgba(w, h, check, |x, y| {
+                    crate::compositor::adjustment_input(doc, i, x as i32, y as i32, masks, &out)
+                })?
             }
             _ => l.pixels.rgba(),
         };
@@ -673,15 +865,11 @@ pub fn prepare(
         };
         let mut expanded = base_frame;
         for effect in l.effects.iter().filter(|e| e.enabled && e.weight > 0.0) {
+            check()?;
             if styles::contains(&effect.kind) && !expanded {
-                let mut bytes = vec![0; w as usize * h as usize * 4];
-                for y in 0..h {
-                    for x in 0..w {
-                        let at = ((y * w + x) * 4) as usize;
-                        bytes[at..at + 4]
-                            .copy_from_slice(&image.get(x as i32 - l.x, y as i32 - l.y));
-                    }
-                }
+                let bytes = crate::render::rgba(w, h, check, |x, y| {
+                    image.get(x as i32 - l.x, y as i32 - l.y)
+                })?;
                 image = Image {
                     width: w,
                     height: h,
@@ -691,6 +879,7 @@ pub fn prepare(
             }
             apply_effect(&mut image, effect, None)?;
         }
+        check()?;
         let image = Arc::new(image);
         let mut cache = cache.lock().unwrap();
         if let Some(existing) = cache.get(&key) {
@@ -700,6 +889,7 @@ pub fn prepare(
             out[i] = Some(image);
         }
     }
+    check()?;
     Ok(out)
 }
 fn validated_settings(image: &Image, kind: &str, settings: &Value) -> Result<Value, String> {
@@ -737,6 +927,15 @@ pub(crate) fn apply_region(
     }
     apply_cpu_prepared(image, kind, settings)
 }
+fn apply_rgb8_table(bytes: &mut [u8], sample: impl Fn(u16) -> u16) {
+    let table: [u8; 256] = std::array::from_fn(|i| sample(i as u16) as u8);
+    for pixel in bytes.chunks_exact_mut(4) {
+        for channel in &mut pixel[..3] {
+            *channel = table[*channel as usize];
+        }
+    }
+}
+
 fn apply_cpu_prepared(image: &mut Image, kind: &str, settings: Value) -> Result<(), String> {
     let (w, h) = (image.width as usize, image.height as usize);
     if styles::contains(kind) {
@@ -757,14 +956,74 @@ fn apply_cpu_prepared(image: &mut Image, kind: &str, settings: Value) -> Result<
             return Ok(());
         }
         "posterize" => {
-            let levels = posterize::levels(&settings)?;
-            let table: [u8; 256] =
-                std::array::from_fn(|i| posterize::sample(i as u16, 255, levels) as u8);
+            let mapping = posterize::Quantizer::new(&settings)?;
+            apply_rgb8_table(&mut image.bytes, |i| mapping.sample(i, 255));
+            return Ok(());
+        }
+        "threshold" => {
+            threshold::apply8(&mut image.bytes, threshold::level(&settings)?);
+            return Ok(());
+        }
+        legacy_brightness::KIND => {
+            legacy_brightness::apply8(&mut image.bytes, legacy_brightness::Mapping::new(&settings)?);
+            return Ok(());
+        }
+        modern_brightness::KIND => {
+            let mapping = modern_brightness::Prepared::new(&settings)?;
+            apply_rgb8_table(&mut image.bytes, |i| mapping.sample(i, 255));
+            return Ok(());
+        }
+        exposure::KIND => {
+            let mapping = exposure::Prepared::new(&settings)?;
+            apply_rgb8_table(&mut image.bytes, |i| mapping.sample(i, 255));
+            return Ok(());
+        }
+        channel_mixer::KIND => {
+            let mixer = channel_mixer::Mixer::new(&settings)?.prepare();
             for pixel in image.bytes.chunks_exact_mut(4) {
-                for channel in &mut pixel[..3] {
-                    *channel = table[*channel as usize];
-                }
+                let sample = [pixel[0], pixel[1], pixel[2]].map(u16::from);
+                pixel[..3].copy_from_slice(&mixer.sample(sample, 255).map(|value| value as u8));
             }
+            return Ok(());
+        }
+        black_white::KIND => {
+            let adjustment = black_white::Settings::new(&settings)?.prepare(255);
+            for pixel in image.bytes.chunks_exact_mut(4) {
+                let sample = [pixel[0], pixel[1], pixel[2]].map(u16::from);
+                pixel[..3].copy_from_slice(&adjustment.sample(sample).map(|value| value as u8));
+            }
+            return Ok(());
+        }
+        selective_color::KIND => {
+            let adjustment = selective_color::Settings::new(&settings)?.prepare();
+            for pixel in image.bytes.chunks_exact_mut(4) {
+                let sample = [pixel[0], pixel[1], pixel[2]].map(u16::from);
+                pixel[..3].copy_from_slice(&adjustment.sample(sample, 255).map(|value| value as u8));
+            }
+            return Ok(());
+        }
+        vibrance::KIND => {
+            vibrance::Prepared::new(&settings)?.apply8(&mut image.bytes);
+            return Ok(());
+        }
+        photo_filter::KIND => {
+            photo_filter::Settings::new(&settings)?.prepare(255).apply8(&mut image.bytes);
+            return Ok(());
+        }
+        gradient_map::KIND => {
+            gradient_map::Settings::new(&settings)?.prepare().apply8(&mut image.bytes);
+            return Ok(());
+        }
+        photoshop_color_balance::KIND => {
+            photoshop_color_balance::Settings::new(&settings)?.prepare().apply8(&mut image.bytes);
+            return Ok(());
+        }
+        photoshop_hue_saturation::KIND => {
+            photoshop_hue_saturation::Settings::new(&settings)?.prepare(8).apply8(&mut image.bytes);
+            return Ok(());
+        }
+        color_lookup::KIND => {
+            if let Some(lookup) = color_lookup::prepare(&settings)? { lookup.apply8(&mut image.bytes); }
             return Ok(());
         }
         "blur" => {
@@ -778,9 +1037,16 @@ fn apply_cpu_prepared(image: &mut Image, kind: &str, settings: Value) -> Result<
         "liquify" => return crate::liquify::apply(image, &settings),
         _ => {}
     }
-    let table: [u8; 256] = std::array::from_fn(|i| {
-        (map_value(kind, &settings, i as f32 / 255.0) * 255.0).round() as u8
-    });
+    let per_channel = has_channel_mapping(kind, &settings);
+    let natural = curves::Prepared::new(kind, &settings);
+    let mut tables = [[0u8; 256]; 3];
+    for (channel, table) in tables.iter_mut().enumerate().take(if per_channel { 3 } else { 1 }) {
+        *table = std::array::from_fn(|i| if let Some(natural) = &natural {
+            natural.sample8(channel, i as u8)
+        } else if per_channel {
+            map_channel_sample(kind, &settings, channel, i as u8)
+        } else { map_sample(kind, &settings, i as u8) });
+    }
     let balance = ["shadows", "midtones", "highlights"].map(|band| {
         std::array::from_fn::<_, 3, _>(|i| settings[band][i].as_f64().unwrap_or(0.0) as f32)
     });
@@ -858,7 +1124,7 @@ fn apply_cpu_prepared(image: &mut Image, kind: &str, settings: Value) -> Result<
             }
             _ => {
                 for c in 0..3 {
-                    p[c] = table[p[c] as usize];
+                    p[c] = tables[if per_channel { c } else { 0 }][p[c] as usize];
                 }
                 if kind == "adjust" {
                     let gray = p[0] as f32 * 0.2126 + p[1] as f32 * 0.7152 + p[2] as f32 * 0.0722;
@@ -1010,6 +1276,19 @@ pub fn box_channel(
     r: usize,
     vertical: bool,
 ) {
+    box_channel_checked(src, dst, w, h, channels, r, vertical, &|| Ok(()))
+        .expect("Uncancelled box filter");
+}
+pub(crate) fn box_channel_checked(
+    src: &[u8],
+    dst: &mut [u8],
+    w: usize,
+    h: usize,
+    channels: usize,
+    r: usize,
+    vertical: bool,
+    check: &crate::render::Check<'_>,
+) -> Result<(), String> {
     let (lines, len, stride) = if vertical {
         (w, h, w * channels)
     } else {
@@ -1017,6 +1296,7 @@ pub fn box_channel(
     };
     let n = (r * 2 + 1) as i64;
     for line in 0..lines {
+        check()?;
         let base = if vertical {
             line * channels
         } else {
@@ -1032,6 +1312,7 @@ pub fn box_channel(
             }
         }
     }
+    Ok(())
 }
 pub fn blur_rgba(bytes: &mut Vec<u8>, w: usize, h: usize, sigma: f32) -> Result<(), String> {
     if !sigma.is_finite() || sigma < 0.5 || w == 0 || h == 0 {

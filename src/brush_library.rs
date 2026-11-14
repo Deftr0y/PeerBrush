@@ -2,16 +2,14 @@
 use crate::brush::{self, Settings, TipKind};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 pub const CATEGORIES: &[&str] = &[
     "Basic", "Sketch", "Ink", "Paint", "Airbrush", "Texture", "Blend",
 ];
 const LIMIT: usize = 256;
 const FILE_LIMIT: u64 = 4 * 1024 * 1024;
+const OVERSIZED: &str = "Brush library exceeds 4 MiB";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -32,7 +30,7 @@ struct Stored {
 pub struct Library {
     custom: Vec<Preset>,
     path: Option<PathBuf>,
-    version: Option<(u64, u128)>,
+    original: Option<Vec<u8>>,
     pub error: Option<String>,
 }
 impl Default for Library {
@@ -40,24 +38,13 @@ impl Default for Library {
         Self {
             custom: vec![],
             path: None,
-            version: None,
+            original: None,
             error: None,
         }
     }
 }
-fn file_version(path: &Path) -> Result<Option<(u64, u128)>, String> {
-    match fs::metadata(path) {
-        Ok(m) => Ok(Some((
-            m.len(),
-            m.modified()
-                .map_err(|e| e.to_string())?
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos(),
-        ))),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e.to_string()),
-    }
+fn read_library(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    crate::tool_settings::read_owned_bounded(path, FILE_LIMIT, OVERSIZED)
 }
 fn validate_text(text: &str, max: usize, label: &str) -> Result<(), String> {
     if text.trim().is_empty() || text.chars().count() > max || text.chars().any(char::is_control) {
@@ -74,16 +61,11 @@ impl Library {
             ..Default::default()
         };
         let result = (|| {
-            library.version = file_version(&path)?;
-            let Some((size, _)) = library.version else {
+            let Some(bytes) = read_library(&path)? else {
                 return Ok(());
             };
-            if size > FILE_LIMIT {
-                return Err("Brush library exceeds 4 MiB".into());
-            }
-            let stored: Stored =
-                serde_json::from_slice(&fs::read(&path).map_err(|e| e.to_string())?)
-                    .map_err(|e| format!("Unreadable brush library: {e}"))?;
+            let stored: Stored = serde_json::from_slice(&bytes)
+                .map_err(|e| format!("Unreadable brush library: {e}"))?;
             if stored.version != 1 || stored.presets.len() > LIMIT {
                 return Err("Unsupported or oversized brush library".into());
             }
@@ -104,10 +86,11 @@ impl Library {
                     return Err("Invalid or duplicate custom brush ID".into());
                 }
             }
-            if file_version(&path)? != library.version {
+            if read_library(&path)?.as_deref() != Some(bytes.as_slice()) {
                 return Err("Brush library changed during loading".into());
             }
             library.custom = stored.presets;
+            library.original = Some(bytes);
             Ok(())
         })();
         library.error = result.err();
@@ -119,8 +102,12 @@ impl Library {
         list
     }
     pub fn get(&self, id: &str) -> Result<Preset, String> {
-        self.presets()
-            .into_iter()
+        self.get_ref(id).cloned()
+    }
+    pub(crate) fn get_ref(&self, id: &str) -> Result<&Preset, String> {
+        curated_values()
+            .iter()
+            .chain(self.custom.iter())
             .find(|p| p.id == id)
             .ok_or_else(|| format!("Unknown brush preset: {id}"))
     }
@@ -129,18 +116,22 @@ impl Library {
             return Err(format!("Custom brushes preserved; repair or restore the library file before saving: {error}"));
         }
         if let Some(path) = &self.path {
-            if file_version(path)? != self.version {
-                return Err(
-                    "Brush library changed on disk; restart to load it before saving".into(),
-                );
-            }
             let bytes = serde_json::to_vec_pretty(&Stored {
                 version: 1,
                 presets: presets.clone(),
             })
             .map_err(|e| e.to_string())?;
-            crate::server::atomic_write(path, &bytes)?;
-            self.version = file_version(path)?;
+            if bytes.len() as u64 > FILE_LIMIT {
+                return Err(OVERSIZED.into());
+            }
+            crate::tool_settings::write_owned_with_reader(
+                path,
+                &bytes,
+                self.original.as_deref(),
+                "Brush library changed on disk; restart to load it before saving",
+                read_library,
+            )?;
+            self.original = Some(bytes);
         }
         self.custom = presets;
         Ok(())
@@ -222,6 +213,13 @@ impl Library {
 
 /// Curated for PeerBrush's own five procedural tips; names/settings are original.
 pub fn curated() -> Vec<Preset> {
+    curated_values().to_vec()
+}
+fn curated_values() -> &'static [Preset] {
+    static PRESETS: std::sync::OnceLock<Vec<Preset>> = std::sync::OnceLock::new();
+    PRESETS.get_or_init(build_curated)
+}
+fn build_curated() -> Vec<Preset> {
     use TipKind::*;
     let base = Settings {
         pressure_opacity: false,

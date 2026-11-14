@@ -81,6 +81,10 @@
     "native16_color_effect_budget_mib": 128,
     "native16_mask_effect_budget_mib": 128,
     "selection_pixels": 16000000,
+    "native_selection_pixels": 256000000,
+    "native_selection_max_edge": 16000,
+    "selection_png_encoded_bytes": 67108864,
+    "native_selection_png_file_bytes": 3221225472,
     "selection_boundary_edges": 500000
   },
   "color_profiles": {
@@ -115,6 +119,7 @@
     {
       "op": "layer.duplicate_selection",
       "layer": "ID",
+      "mask": false,
       "document_id": "DOCUMENT_ID",
       "source_revision": 7
     },
@@ -132,9 +137,15 @@
       "op": "layer.update",
       "layer": "ID",
       "opacity": 0.7,
+      "fill_opacity": 192,
       "blend": "multiply",
       "visible": true,
       "locked": false
+    },
+    {
+      "op": "layer.update",
+      "layer": "ID",
+      "color_label": "indigo"
     },
     {
       "op": "layer.delete",
@@ -323,7 +334,11 @@
       "settings": {
         "black": 0.0,
         "white": 1.0,
-        "gamma": 1.2
+        "gamma": 1.2,
+        "input_mapping": "exact",
+        "output_black": 0.0,
+        "output_white": 1.0,
+        "channels": [{"gamma": 1.1}, {}, {}]
       }
     },
     {
@@ -446,6 +461,12 @@
         0,
         0
       ]
+    },
+    {
+      "op": "image.paste",
+      "layer": "destination-layer-or-group-id",
+      "path": "absolute-path.png",
+      "origin": null
     },
     {
       "op": "image.place",
@@ -802,7 +823,7 @@
     "broader Photoshop clipping/group compatibility"
   ],
   "image_placement": "Use peerbrush_place_image for one-call placement from an absolute local supported image path or base64 PNG. SVG/SVGZ placement rasterizes; image.import retains the editable source. Consult image_import extensions and peerbrush_image_info; select an explicit zero-based frame/page/variant when required. Rect is exact document-pixel destination; new_layer defaults true, layer supplies folder/sibling context, parent overrides it. new_layer:false edits existing pixels; mode over blends, replace replaces even transparent pixels. Native16 input promotes the project before resampling or compositing; imported working RGB carries a standard sRGB tag on save. Pixels outside the rect, masks and effect stacks are preserved. Natural size at x/y is available through image.place commands. All placement is undoable.",
-  "duplicate_selection": "layer.duplicate_selection duplicates the active layer's selected rendered pixels at their original document coordinates in one edit. Irregular/feathered coverage, effects, masks and opacity are baked once into a new native-depth paint sibling; source layers stay editable and selection is retained. Without a pixel selection, duplicate the active editable layer tree; complete clipping units are required for whole-layer copies. Empty selected pixels and adjustment-only targets are refused. Optional document_id/source_revision plus shared revision, lock and reservation guards apply. Ctrl+D invokes this command; Deselect remains in Select.",
+  "duplicate_selection": "layer.duplicate_selection duplicates the active layer's selected rendered pixels at their original document coordinates in one edit. Irregular and feathered coverage, effects, masks and opacity are baked once into a new native-depth paint sibling. Source layers stay editable and the selection is retained. With mask:true, the command requires a pixel selection and copies the rendered layer mask as an independent grayscale paint layer above any original clipping unit. With mask:false (the default) and no pixel selection, the active editable layer tree is duplicated. Complete clipping units are required for whole-layer copies. Empty selections and adjustment-only color targets are refused. Optional document_id/source_revision plus shared revision, lock and reservation guards apply. The desktop shortcut is Shift+D for Duplicate with Transform.",
   "merge_layers": {
     "command": "layer.merge",
     "single_paint": "Merge down to the next sibling",
@@ -811,9 +832,14 @@
     "undo": "One reversible batch; masks/effects are baked into raster pixels",
     "blend": "Multiple selected roots must be contiguous normal-blend siblings. Flattening a single folder preserves its external blend. Unsupported backdrop-dependent merges are rejected."
   },
+  "paint_color16": "paint, paint.fill, shape, gradient and smudge accept color16 on 16-bit targets. Supply four integers from 0 to 65535 in RGBA order. This takes precedence over the byte color field. With mask:true the red channel supplies grayscale and the fourth channel supplies alpha. For smudge, the color applies to Load.",
   "foreground_fill": "paint.fill blends foreground RGBA into the current selection, or the visible canvas when unselected. Expands a raster layer to cover that area while preserving surrounding pixels, masks and effects. mask:true fills the requested/latest paint mask step in grayscale. Layer and folder locks, reservations and undo apply. A folder color target creates one ordinary child paint layer. Legacy fill source layers remain readable for PSD compatibility.",
   "selected_clear": "paint.clear_selection requires an active selection and erases only its coverage at native depth, without changing selection geometry or deleting layers. Unselected RGB/alpha, hierarchy, effects and other mask steps remain intact. Folder Color targets clear raster descendants including hidden children; locked or editable text/vector/adjustment children reject the entire transaction. mask:true erases the requested/latest paint-mask step to reveal earlier mask steps. Delete uses this operation while selected; Ctrl+X writes the selected image to the clipboard before one guarded erase. Failed clipboard writes or changed sources never erase work.",
   "selection_geometry": "selection.rect stays the axis-aligned bounding rectangle. After W/E/R selection transforms, document.selection_polygon retains the exact transformed shape. Brush, fill, shapes, gradients and copied image pixels clip to pixel centers inside this polygon. selection commands with rect reset the polygon; polygon points can also be supplied explicitly. Repeated layer transforms in one gesture use the same original selection.",
+  "layer_fill_opacity": "layer.update accepts fill_opacity as a native Photoshop byte from 0 to 255 on paint with no enabled effects and Solid Color layers without effects. Restore full Fill before enabling a paint effect. Special blend modes apply their Fill-specific overlap math. Clipped layers apply their own Fill within the clipping shape, then the base applies its Fill to the combined result.",
+  "layer_blend_channels": "layer.update accepts blend_channels as three booleans in Red, Green, Blue order. True enables blending for that channel. A disabled channel preserves the backdrop's premultiplied contribution. All false removes the layer's composite contribution. Supported on adjustments, and on paint, Solid Color and folders without effects. Unclipped paint also supports Color, Gradient and Pattern Overlay stacks. Pass Through folders restrict each child write and nested exclusions combine. Isolated folders restrict their merge. Clipped paint, Solid Color and adjustment members require a grouped paint or Solid Color base without effects. Member restrictions preserve the current stack's channels. A restricted base preserves channels from below the stack, and all false on a base removes the stack's composite contribution.",
+  "layer_clipping_blend": "layer.update accepts blend_clipped_as_group as a boolean. An active clipping base can disable grouping when it is a Normal paint or Solid Color layer at full Fill with no effects.",
+  "layer_blend_if": "layer.update accepts blend_if as one to four byte arrays in Gray, Red, Green, Blue order, or null to reset. Each array is [source black low, source black high, source white low, source white high, underlying black low, underlying black high, underlying white low, underlying white high]. Missing channels use [0,0,255,255,0,0,255,255]. Paint and Solid Color layers without effects can combine Blend If with supported blend modes and Fill values. Unclipped paint can retain disabled effects with Blend If. Clear its ranges before enabling an effect. A folder without effects evaluates its composited children and the backdrop outside it. Active ranges isolate Pass Through folders without changing their selected mode. An adjustment evaluates the adjusted output and its input backdrop. Clipped paint, Solid Color and adjustment members require a grouped paint or Solid Color base without effects. A grouped paint or Solid Color base without effects or special partial Fill can use Blend If while keeping its original clipping shape.",
   "blend_modes": [
     "normal",
     "darken",
@@ -830,7 +856,17 @@
     "difference",
     "exclusion",
     "subtract",
-    "divide"
+    "divide",
+    "linear_light",
+    "vivid_light",
+    "pin_light",
+    "hard_mix",
+    "darker_color",
+    "lighter_color",
+    "hue",
+    "saturation",
+    "color",
+    "luminosity"
   ],
   "effect_weight": "effect.add/update and mask.step.add/update accept weight from 0 to 1, default 1. Zero bypasses the step; partial weights interpolate its input and result at native precision (premultiplied for color/alpha). Weight is independent of effect settings, observable, undoable and preserved in clipboard/PSD sources. The UI shows a compact strength percentage beside every effect name, with settings opened only for the selected row; top effects run last.",
   "effects": [
@@ -845,6 +881,7 @@
     "bloom",
     "liquify",
     "posterize",
+    "threshold",
     "channel_clamp"
   ],
   "painting": {
@@ -865,7 +902,7 @@
   "psd_sources": "Supplementary PeerBrush formats retain native samples and editable sources alongside current standard raster/mask channels and a merged composite. Default grouped raster clipping stays layered in standard 8/16-bit RGB PSD data, including inside isolated folders. Adjustment layers and clipping involving folders still use a standard composite bake. Unsupported Photoshop structure opens protected at its original precision; compatible_copy explicitly creates a flattened editable copy at the same bit depth without touching the source.",
   "psd_clipping": {
     "supported": "Contiguous paint/fill raster followers above a raster base, at root or within an isolated or pass-through folder; standard opacity, supported blends, visibility and raster masks. The base blend applies to the complete clipping unit. Missing clbl uses Photoshop's default grouped behavior; saves explicitly write clbl:true on clipping bases.",
-    "protected": "Imported folder clipping, ungrouped clipping (clbl:false), orphan/cross-folder bases, invalid flags, Blend If ranges, non-default fill opacity, knockout, partial/unknown Photoshop protection flags, unknown/scene groups and unmanaged ICC profiles remain read-only from their saved native-depth composite. Standard lock-all lspf=7 maps to the shared layer lock, including folders, and saves in standard PSD data; unlock explicitly before editing.",
+    "protected": "Imported folder clipping, unsupported ungrouped clipping (clbl:false), orphan/cross-folder bases, invalid flags, Blend If or partial Fill outside their supported subsets, knockout, partial/unknown Photoshop protection flags, unknown/scene groups and unmanaged ICC profiles remain read-only from their saved native-depth composite. Standard lock-all lspf=7 maps to the shared layer lock, including folders, and saves in standard PSD data; unlock explicitly before editing.",
     "commands": "Observe clip_to; use layer.clip, layer.update and the ordinary shared editing/history/reservation tools. Private sources cannot override protection caused by an unsupported standard resource."
   },
   "pass_through_folders": {
@@ -881,7 +918,7 @@
     ],
     "new_document": "document action new accepts bit_depth:8 or 16 (default8)",
     "preservation": "Native samples, edits, masks, internal clipboard, effects and PSD/PNG saves retain document precision. Screen/MCP PNG previews project to 8 bits for fast observation. Importing retained native 16-bit sources promotes the document.",
-    "limits": "RGB PSD v1; unsupported profiles/Photoshop source features remain protected; full ICC management and HDR/32-bit are not implemented."
+    "limits": "Editable Photoshop support uses RGB PSD and PSB at 8 or 16 bits. Grayscale at those depths opens as a protected saved-composite preview. Untagged grayscale and bounded ICC v2/v4 monochrome tone curves with XYZ connection space are supported. Other grayscale ICC layouts, full ICC management and HDR/32-bit remain unsupported."
   },
   "selection": {
     "tools": [
@@ -906,7 +943,7 @@
     "object_region": "Deterministic perimeter-color extraction. Use peerbrush_segment for learned subject/object confidence.",
     "refinement": "selection.refine and mask.refine accept smooth 0\u201332 px, feather 0\u201364 px, shift -32\u201332 px, contrast 0\u2013100%, edge 0\u2013100% and edge_radius 1\u201332 px. Image-guided feathering uses merged colors by default; sample_merged:false and layer select one source. Native16 mask words and original mask steps remain intact. source_revision/document_id protect snapshot-dependent results.",
     "mask_from_selection": "mask.from_selection on a layer maps document coverage into its native local mask frame. mode replace/add/subtract/intersect; one undoable editable paint step.",
-    "confidence_import": "selection.import accepts one PNG path or base64 png, an explicit in-canvas document rect, channel luma/alpha and selection mode. Bilinear confidence resampling preserves soft edges. Maximum document/mask size 16 megapixels; original image channels stay unchanged.",
+    "confidence_import": "selection.import accepts one PNG path or base64 png, an explicit in-canvas document rect, channel luma/alpha and selection mode. Bilinear confidence resampling preserves soft edges. Native document/mask input supports 16000 pixels per edge and 256 megapixels, with streamed PNG files up to 3 GiB and inline PNGs up to 64 MiB. Resident selection retains its 16-megapixel bound. Coverage is scalar8; original artwork channels stay unchanged.",
     "preview": "peerbrush_observe selection_view cutout/mask/overlay returns presentation-only PNG feedback with actual document coordinates."
   },
   "segmentation": {
@@ -938,7 +975,7 @@
     "guards": "Optional document_id and exact source_revision reject stale or different source documents. Shared expected_revision, task reservations and locks apply.",
     "mask": "mask:true writes the active paint mask step. Source is evaluated layer mask or explicit source_step paint ID. No merged artwork into masks.",
     "precision": "Native16 source samples, premultiplied fractional interpolation and grayscale values remain native16. Heal preserves destination alpha and transparent hidden pixels.",
-    "limits": "Merged sampling 16 MP; heal_radius integer 1\u201364 (default brush radius clamped 1\u201332). Brush work budgets apply.",
+    "limits": "Native merged sampling uses bounded windows on canvases up to 16000 pixels per edge; resident merged sampling is limited to 16 MP. heal_radius is an integer from 1 to 64 (default brush radius clamped to 1 through 32). Brush work and source budgets apply.",
     "algorithm": "Clone copies sampled color/alpha through brush coverage. Heal transfers texture with local average color adaptation; not full Photoshop healing."
   },
   "document_geometry": {
@@ -961,7 +998,7 @@
     "crop": "Explicit exclusive rect in document pixels; shifts layer origins and retains all off-canvas pixels. Negative coordinates may expand canvas.",
     "canvas": "Changes canvas dimensions and anchored origins without resampling. Default center.",
     "image": "Resamples all layer and paint-mask sources at original depth, scales editable spatial controls, clears current/previous selections. Integer frame rounding; premultiplied bilinear with clamped edges.",
-    "limits": "8192 per edge, 32 MP, 128 million output samples across nonempty sources/masks. Spatial effects need proportional dimensions (integer rounding allowed); radius and source budgets apply.",
+    "limits": "Disk-backed documents support 16000 pixels per edge and aggregate resize work up to the greater of 128 million samples or the destination canvas area. Resident documents support 8192 pixels per edge, 32 MP and 128 million resize samples. Spatial effects need proportional dimensions with integer rounding. Radius, source, memory and disk budgets apply.",
     "guards": "Whole-document reservation scope; locked moved/resampled layers reject. Optional document_id/source_revision; all failures atomic.",
     "preview": "Native Image menu shows actual shared-engine pixels and dimensions. Apply one undo; Cancel/Escape or a newer source edit discards preview."
   },
@@ -974,7 +1011,7 @@
     "observation": "Layer and mask step transform_source contain original width/height/bit_depth/bytes and matrix=[a,b,c,d,tx,ty], or null. Optional projective is a row-major nine-coefficient original-local homography applied before matrix. Optional warp_stages is the bounded exact before-homography/grid chain applied before that final placement. Absent nonlinear maps retain the exact affine schema. No tile samples in observations.",
     "pixel_edits": "Painting, clone/heal, fill, direct adjustments, image replacement and selected-pixel edits establish a new baseline for only the changed raster. Other mask/color originals and effects remain editable. Image resize and explicit channel-depth conversion establish raster baselines; crop/canvas retain sources.",
     "psd": "Supplementary format 9 retains affine originals; format 32 is required for any projective Color or mask original, format 33 for any retained Warp stage. Current standard raster/mask channels and merged composite remain present. Older readers protect newer sources. Photoshop receives raster layers, not Smart Objects.",
-    "limits": "Current plus original tiles count against 512 MiB document memory. 8192 per edge, 32 MP, 128 million output samples per layer command; singular/nonfinite/out-of-range/nested sources refused atomically.",
+    "limits": "Native raster affine transforms support 16000 pixels per edge and plan work from occupied source tiles and their bilinear support. A whole-layer affine command can admit one dense output frame plus planning work, within shared memory/disk admission. Selection, projective and Warp keep their existing work limits. Resident transforms retain 8192 per edge, 32 MP and 512 MiB for current plus original tiles. Singular, nonfinite, out-of-range and invalid nested sources are refused atomically.",
     "guards": "Shared engine/UI/MCP/CLI reservations, locks, document_id/source_revision and one undo per gesture. Use selection_only:false for whole-layer transforms when a selection exists.",
     "translation": {
       "fields": [
@@ -1045,7 +1082,7 @@
     "reference_point": "Enter or drag before or after an adjustment. Moving only the reference preserves exact commands and rendered pixels; later affine values use the chosen document-space reference in one original-sampling command, with explicit fractional posttranslation when needed. User values snap before reference compensation; Reset clears the pending transform.",
     "skew_handles": "The compact Skew mode exposes X handles at the top/bottom edge centers and Y handles at the left/right centers. Drag changes the corresponding shared horizontal-then-vertical shear about the current reference, including existing rotation, scale and mirrors. Shift uses fifteen-degree snapping. Release and switching back to Move/Rotate/Scale keep the same pending command and actual rendered preview; no new engine operation or source format.",
     "projective_handles": "Distort drags one corner; Shift constrains its axis. Perspective drags a symmetric edge pair; Shift selects the vertical pair. Exact document X/Y corner entry is independent. Existing affine fields apply after the quad; mode changes and release retain one pending command. Invalid quads remain editable with Apply disabled. The controls scroll vertically on short windows.",
-    "limits": "Selected raster transforms follow the current selection by default; Whole target (keep selection) is explicit. Editable text/vector projective or Warp changes require native-precision rasterization. Grid Warp is a bounded coarse grid, without Bezier or Photoshop preset/metadata equivalence. Native visible interaction acceptance remains pending.",
+    "limits": "Selected raster transforms follow the current selection by default; The Whole target choice keeps selection geometry in place. Editable text/vector projective or Warp changes require native-precision rasterization. Grid Warp is a bounded coarse grid, without Bezier or Photoshop preset/metadata equivalence. Native visible interaction acceptance remains pending.",
     "context_menu": "Right-click the canvas for Move/Scale/Rotate/Skew/Distort/Perspective/Grid Warp and horizontal/vertical flips in the same pending session. Mode changes preserve exact commands. Escape closes this menu first; outside dismissal cannot start a transform. Alt/Space/middle navigation, numeric typing and floating-window occlusion retain their input guards.",
     "warp_controls": "Coarse 3 by 3 grid with straight segments between nodes, Arc/Bulge/Flag presets and exact document X/Y fields. Nodes use inverse A*P, not inverse Warp. Ordinary guides use full seam-split A*P*W; Distort/Perspective controls retain their A(quad) projection plane. Folded grids remain repairable with Apply disabled. Whole target retains the exact Grid/A/P and shared admission may reject insufficient coverage; Reset Warp fits a fresh current-target grid while preserving other transform settings."
   },
@@ -1056,13 +1093,13 @@
       "source.rasterize"
     ],
     "observation": "Each layer exposes its complete source definition or null. Preserve current width/height/matrix when editing content.",
-    "text": "Text/T retains editable fields, bundled Ubuntu Sans or exact installed static-outline fonts, explicit newlines, size/line_height/letter_spacing, alignment and native RGBA16. Omitted layout is legacy and never silently reflows; explicit layout:shaped enables exact-font ligatures/combining/script+bidi layout through native outlines. No automatic wrapping or font substitution. Loading/missing/changed/unsupported states are explicit.",
+    "text": "Text/T retains editable fields, bundled Ubuntu Sans or exact installed static-outline fonts, explicit newlines, size/line_height/letter_spacing, alignment and native RGBA16. Omitted layout uses the legacy layout. layout:shaped enables exact-font ligatures, combining marks, script shaping and bidirectional layout. layout:paragraph also wraps to field width, with up to 96 visual rows. Loading, missing, changed and unsupported font states are explicit.",
     "shapes": "Rectangle, ellipse, or straight-segment path with editable points, even-odd fill, open/closed flag, stroke and stroke_width. Native RGBA16 fill/stroke colors.",
     "svg": "Self-contained static UTF-8 SVG/SVGZ retains original markup and editable affine placement. Paths/curves, basic shapes, groups, solid colors, linear/radial gradients, local use and clip paths are supported. Text must be outlined; raster images, filters, masks, patterns, stylesheets, scripts/animation, external resources and unknown visual properties reject. SVG coverage/colors project through RGBA8, promoted for native16 projects; existing native16 raster channels remain exact. image.import retains the definition; image.place and external image-file paste rasterize it.",
     "coordinates": "Source width/height define local frame. x/y on add are document origins. Optional matrix=[a,b,c,d,tx,ty] maps local coordinates to current raster frame, identity by default. source.update may resize a Text field, preserving document placement, native masks and effects; the projection retains its previous extent. Read the updated source/frame from observation. Other source kinds keep their fixed-frame update restriction.",
     "precision": "Native text/shapes use colors 0\u201365535 regardless of document depth; native16 projections preserve words and sub-byte antialias coverage. 8-bit documents project at their own boundary. SVG uses the explicitly described RGBA8 projection while retaining its original markup.",
     "guards": "Complete-layer transforms preserve definitions; selected-pixel/mask transforms require explicit rasterization. Color painting/placement refuses source layers. Mask painting and effects remain editable. Shared stale/revision/lock/reservation guards are atomic.",
-    "psd": "Private source format 8 supports native text/shapes; SVG requires format 12; nonzero text letter_spacing requires format 30; installed-font references require format 31; explicit shaped text requires format 34. All supplement current standard raster/mask channels and merged composite. Photoshop receives raster layers, not native type/vector objects. Unsupported imported Photoshop features remain protected.",
+    "psd": "Private source format 8 supports native text/shapes. SVG requires format 12, nonzero text letter_spacing requires format 30, installed-font references require format 31, shaped text requires format 34, and paragraph text requires resident format 128. All supplement current standard raster/mask channels and the merged composite. Photoshop receives the standard raster layers. Unsupported imported Photoshop features remain protected.",
     "limits": "4 MP original source frame. Native text/shapes: 4096 characters / 96 lines / 16384 shaped glyphs, shaped coordinates \u00b1100000, size 1\u20131024, line_height 0.5\u20134, letter_spacing -1024\u20131024, 128 path points, stroke_width 0\u2013256, 32 million outline/path work budget. Text field resizing additionally enforces raster, coordinate, mask and native work budgets. SVG: 512 KiB UTF-8 markup, 1 MiB compressed SVGZ, 4096 XML nodes, bounded reference expansion, geometry, nesting, render work and memory. External resource resolvers are disabled.",
     "text_layout": {
       "default": "legacy",
@@ -1108,12 +1145,22 @@
   },
   "posterize": {
     "settings": {
-      "levels": "Integer 2\u2013256, default 4"
+      "levels": "Integer 2\u2013256, default 4. Photoshop mapping uses 2\u2013255.",
+      "mapping": "Omit for nearest levels. Use photoshop_native for Photoshop's depth-specific bins. Existing photoshop settings retain the earlier bucket rule."
     },
     "channels": "RGB only; alpha and editable source pixels are preserved",
-    "processing": "Nearest evenly spaced channel levels at native 8/16-bit depth; strength interpolates before/after at native precision",
+    "processing": "Nearest evenly spaced levels or Photoshop bins at native 8/16-bit depth. RGB16 Photoshop bins select on the Photoshop tonal grid and store the palette step at native16 precision. Strength interpolates before/after at native precision.",
     "sources": "Layer, isolated folder and explicitly requested adjustment effects; settings, bypass, removal, preview and undo share the document engine",
-    "psd": "Private source format 13 protects older readers; standard raster/mask channels and current merged composite are still written"
+    "psd": "Standard post records for supported RGB8/16 Photoshop-mapped adjustments. Resident source formats 55 and 56 and native Source36 mapping markers distinguish the earlier and current mappings. Standard raster/mask channels and the current merged composite remain present."
+  },
+  "threshold": {
+    "settings": { "level": "Integer 1–255, default 128" },
+    "processing": "Photoshop's depth-specific RGB luminosity cutoff at native 8/16-bit precision. Alpha and original source pixels are preserved.",
+    "psd": "Standard thrs records for supported full-strength RGB8/16 adjustments. Exact saved-composite matching is required for editable import. Resident source format 57 retains Threshold settings in private sources."
+  },
+  "curves": {
+    "settings": { "points": "2–16 ordered [x,y] pairs in 0–1", "interpolation": "linear, smooth, or photoshop. Photoshop splines require 3–16 points on the 0–255 grid and a color target." },
+    "psd": "Supported two-point records at RGB8/16 and Photoshop spline point records at RGB8. Standard spline import requires exact saved-composite matching. Resident source format 58 retains spline settings, including in native16 raster fallback."
   },
   "live_code": {
     "language": "Rhai",

@@ -134,15 +134,15 @@ mod tests {
             let (mut app, ctx) = super::super::tests::fixture();
             let (before, saved, history, document, revision) = {
                 let mut e = app.shared.lock().unwrap();
-                e.doc = Document::new_depth(8, 4, depth).unwrap();
-                e.doc.layers[0].pixels.set16(2, 1, [12347, 23459, 34571, 0]);
-                e.doc.revision = 1;
+                e.resident_state_mut().expect("resident fixture").document = Document::new_depth(8, 4, depth).unwrap();
+                e.resident_state_mut().expect("resident fixture").document.layers[0].pixels.set16(2, 1, [12347, 23459, 34571, 0]);
+                e.resident_state_mut().expect("resident fixture").document.revision = 1;
                 (
-                    serde_json::to_value(&e.doc).unwrap(),
+                    serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap(),
                     e.saved_revision,
-                    e.undo.len(),
-                    e.doc.id.clone(),
-                    e.doc.revision,
+                    e.resident_state().expect("resident fixture").undo.len(),
+                    e.resident_state().expect("resident fixture").document.id.clone(),
+                    e.resident_state().expect("resident fixture").document.revision,
                 )
             };
             let control = crate::saving::Control::default();
@@ -206,10 +206,10 @@ mod tests {
             assert!(app.message.contains("canceled"));
             let e = app.shared.lock().unwrap();
             assert!(!e.closed);
-            assert_eq!(serde_json::to_value(&e.doc).unwrap(), before);
+            assert_eq!(serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap(), before);
             assert_eq!(e.saved_revision, saved);
-            assert_eq!(e.undo.len(), history);
-            assert_ne!(e.doc.revision, e.saved_revision);
+            assert_eq!(e.resident_state().expect("resident fixture").undo.len(), history);
+            assert_ne!(e.resident_state().expect("resident fixture").document.revision, e.saved_revision);
             assert!(e.path.is_none());
         }
     }

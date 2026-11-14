@@ -436,28 +436,27 @@ fn other_png_layouts_and_orientations_use_the_existing_path_without_entering_row
             });
             encoder.set_animated(2, 0).unwrap();
             let mut writer = encoder.write_header().unwrap();
-            for color in [[255, 0, 0, 255], [0, 0, 255, 255]] {
-                let data = color
-                    .into_iter()
-                    .flat_map(|value| {
-                        if depth == 16 {
-                            vec![value, value]
-                        } else {
-                            vec![value]
-                        }
-                    })
-                    .collect::<Vec<u8>>()
-                    .repeat(2);
-                writer.write_image_data(&data).unwrap();
+            if depth == 16 {
+                let first = [12347u16, 23459, 34571, 65535].map(u16::to_be_bytes).concat();
+                let next = [50331u16, 41011, 11473, 32768].map(u16::to_be_bytes).concat();
+                writer.write_image_data(&first.repeat(2)).unwrap();
+                writer.set_blend_op(::png::BlendOp::Over).unwrap();
+                writer.write_image_data(&next.repeat(2)).unwrap();
+            } else {
+                writer.write_image_data(&[255, 0, 0, 255].repeat(2)).unwrap();
+                writer.write_image_data(&[0, 0, 255, 255].repeat(2)).unwrap();
             }
+            writer.finish().unwrap();
         }
-        let encoded = Encoded::png(animated);
+        let encoded = Encoded::png(animated).unwrap();
+        assert!(encoded.decode(&json!({}), BUDGET).is_err());
+        let image = encoded.decode(&json!({"frame":1}), BUDGET).unwrap();
+        assert_eq!(image.depth, depth);
         if depth == 16 {
-            assert!(encoded.err().unwrap().contains("16-bit APNG"));
+            let first = encoded.decode(&json!({"frame":0}), BUDGET).unwrap();
+            assert_eq!(first.get16(1, 0), [12347, 23459, 34571, 65535]);
+            assert_eq!(image.get16(1, 0), [31339, 32235, 23022, 65535]);
         } else {
-            let encoded = encoded.unwrap();
-            assert!(encoded.decode(&json!({}), BUDGET).is_err());
-            let image = encoded.decode(&json!({"frame":1}), BUDGET).unwrap();
             assert_eq!(image.get(1, 0), [0, 0, 255, 255]);
         }
     }
@@ -470,7 +469,7 @@ fn other_png_layouts_and_orientations_use_the_existing_path_without_entering_row
 
 fn state(shared: &crate::server::Shared) -> Value {
     let engine = shared.lock().unwrap();
-    json!({"doc":engine.doc,"undo":engine.undo.len(),"redo":engine.redo.len(),"saved":engine.saved_revision})
+    json!({"doc":engine.resident_state().expect("resident fixture").document,"undo":engine.resident_state().expect("resident fixture").undo.len(),"redo":engine.resident_state().expect("resident fixture").redo.len(),"saved":engine.saved_revision})
 }
 struct File(std::path::PathBuf);
 impl File {
@@ -517,11 +516,11 @@ fn row_and_final_cancellation_stale_human_work_and_file_changes_never_replace_th
             let shared = Arc::new(std::sync::Mutex::new(crate::engine::Engine::new()));
             {
                 let mut engine = shared.lock().unwrap();
-                engine.doc = crate::engine::Document::new_depth(7, 5, depth).unwrap();
-                engine.doc.layers[0]
+                engine.resident_state_mut().expect("resident fixture").document = crate::engine::Document::new_depth(7, 5, depth).unwrap();
+                engine.resident_state_mut().expect("resident fixture").document.layers[0]
                     .pixels
                     .set16(1, 1, [12347, 23459, 34571, 45679]);
-                let target = engine.doc.layers[0].id.clone();
+                let target = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
                 engine
                     .edit(
                         "human",
@@ -553,7 +552,7 @@ fn row_and_final_cancellation_stale_human_work_and_file_changes_never_replace_th
                         let mut engine = source
                             .try_lock()
                             .expect("Opening must not hold the engine lock while decoding rows");
-                        let target = engine.doc.layers[0].id.clone();
+                        let target = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
                         engine
                             .edit(
                                 "human",
@@ -593,7 +592,7 @@ fn row_and_final_cancellation_stale_human_work_and_file_changes_never_replace_th
             let other = Arc::new(std::sync::Mutex::new(crate::engine::Engine::new()));
             crate::server::open(&other, &file.0).unwrap();
             assert!(
-                other.lock().unwrap().doc.layers[0].pixels.rgba16() == original,
+                other.lock().unwrap().resident_state().expect("resident fixture").document.layers[0].pixels.rgba16() == original,
                 "Failed opening releases ownership and a fresh complete request can succeed"
             );
         }

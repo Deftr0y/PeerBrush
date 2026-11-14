@@ -15,6 +15,9 @@ mod task_prepare;
 mod task_sources;
 pub(crate) use task_capture::{TaskCapture, TaskEntry, TaskRequest};
 pub(crate) use task_prepare::{RefusedTask, TaskCandidate, TaskPreparationError};
+#[path = "history/save_name.rs"]
+mod save_name;
+pub(crate) use save_name::{PreparedSaveName, RefusedSaveName};
 
 pub(crate) struct NativeHistory {
     identity: DocumentKey,
@@ -24,6 +27,7 @@ pub(crate) struct NativeHistory {
     redo: Vec<Arc<Record>>,
     pool: ResidentBudget,
     current: Option<DocumentKey>,
+    name_from_save: bool,
     truncated: Arc<task_capture::TruncatedTasks>,
     _capacity: Reservation,
 }
@@ -129,6 +133,7 @@ pub(crate) struct PreparedCommit {
     retired: Vec<Arc<Record>>,
     sources: Option<super::publication::SourcePublication>,
     truncated: Arc<task_capture::TruncatedTasks>,
+    raster_damage: Option<super::worker::RasterDamage>,
     _retirement_charge: Reservation,
 }
 pub(crate) struct CommitRuntime<'a> {
@@ -141,6 +146,50 @@ pub(crate) struct CommitRuntime<'a> {
     pub descriptor: Option<&'a CommandDescriptor>,
 }
 impl PreparedCommit {
+    pub(super) fn with_raster_damage(mut self, damage: Option<super::worker::RasterDamage>) -> Self {
+        self.raster_damage = damage;
+        self
+    }
+    pub(crate) fn raster_damage(&self) -> Option<super::worker::RasterDamage> {
+        self.raster_damage
+    }
+    pub(crate) fn prepare_retirement(
+        self,
+    ) -> std::result::Result<super::AbortBatch, (Self, String)> {
+        let Self {
+            identity,
+            epoch,
+            delta,
+            record,
+            coalesce,
+            retired,
+            sources,
+            truncated,
+            raster_damage,
+            _retirement_charge,
+        } = self;
+        match delta.prepare_retirement() {
+            Ok(batch) => {
+                drop((record, retired, sources, truncated, _retirement_charge));
+                Ok(batch)
+            }
+            Err((delta, reason)) => Err((
+                Self {
+                    identity,
+                    epoch,
+                    delta,
+                    record,
+                    coalesce,
+                    retired,
+                    sources,
+                    truncated,
+                    raster_damage,
+                    _retirement_charge,
+                },
+                reason,
+            )),
+        }
+    }
     pub(crate) fn runtime_view(&self) -> CommitRuntime<'_> {
         CommitRuntime {
             record: self.record.identity,
@@ -252,7 +301,7 @@ impl std::fmt::Debug for RetiredHistory {
             .finish_non_exhaustive()
     }
 }
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Direction {
     Undo,
     Redo,
@@ -266,6 +315,22 @@ pub(crate) struct PreparedMove {
     delta: PreparedDelta,
 }
 impl PreparedMove {
+    pub(crate) fn runtime_view(&self) -> CommitRuntime<'_> {
+        CommitRuntime {
+            record: self.record,
+            base: self.delta.base,
+            candidate: self.delta.preview(),
+            actor: &self.actor,
+            label: match (self.direction, self.actor.as_str() == "human") {
+                (Direction::Undo, true) => "Undo",
+                (Direction::Redo, true) => "Redo",
+                (Direction::Undo, false) => "Undo AI edit",
+                (Direction::Redo, false) => "Redo AI edit",
+            },
+            scopes: self.delta.intent.scopes(),
+            descriptor: None,
+        }
+    }
     pub(crate) fn refused(self, reason: &str) -> RefusedMove {
         RefusedMove {
             reason: reason.into(),
@@ -329,6 +394,7 @@ impl NativeHistory {
             redo,
             pool: pool.clone(),
             current: None,
+            name_from_save: false,
             truncated: task_capture::TruncatedTasks::empty(pool)?,
             _capacity: charge,
         })
@@ -361,26 +427,28 @@ impl NativeHistory {
         gate: Publication<'_>,
         prepared: PreparedCommit,
     ) -> std::result::Result<RetiredHistory, RefusedCommit> {
+        if let Err(reason) = self.check_commit(current, gate, &prepared) {
+            return Err(RefusedCommit { reason, prepared });
+        }
+        Ok(self.commit_checked(current, prepared))
+    }
+
+    pub(in crate::engine) fn check_commit(
+        &self,
+        current: &NativeDocument,
+        gate: Publication<'_>,
+        prepared: &PreparedCommit,
+    ) -> Result<()> {
         if !self.pool.same_pool(current.budget())
             || self.current.is_some_and(|key| key != current.key())
         {
-            return Err(RefusedCommit {
-                reason: "Native history belongs to another current document or admission".into(),
-                prepared,
-            });
+            return Err("Native history belongs to another current document or admission".into());
         }
         if prepared.sources.is_none() && !prepared.delta.outputs.is_empty() {
-            return Err(RefusedCommit {
-                reason: "Native source publication plan is missing".into(),
-                prepared,
-            });
+            return Err("Native source publication plan is missing".into());
         }
         if let Some(sources) = &prepared.sources {
-            if let Err(reason) =
-                sources.validate(&prepared.delta.candidate, &prepared.delta.outputs)
-            {
-                return Err(RefusedCommit { reason, prepared });
-            }
+            sources.validate(&prepared.delta.candidate, &prepared.delta.outputs)?;
         }
         let reason = if self.identity != prepared.identity || self.epoch != prepared.epoch {
             Some("Prepared native history cursor is stale")
@@ -394,42 +462,29 @@ impl NativeHistory {
             None
         };
         if let Some(reason) = reason {
-            return Err(RefusedCommit {
-                reason: reason.into(),
-                prepared,
-            });
+            return Err(reason.into());
         }
+        current.check_publication(gate.actor, gate.leases, gate.now, gate.closed, &prepared.delta)
+    }
+
+    /// Apply after checking this exact edit under the same exclusive fence.
+    pub(in crate::engine) fn commit_checked(
+        &mut self,
+        current: &mut NativeDocument,
+        prepared: PreparedCommit,
+    ) -> RetiredHistory {
         let PreparedCommit {
-            identity,
-            epoch,
-            delta,
+            delta: PreparedDelta {
+                candidate, outputs, ..
+            },
             record,
             coalesce,
             mut retired,
             sources,
             truncated,
             _retirement_charge,
+            ..
         } = prepared;
-        let (candidate, outputs) =
-            match current.publish_deferred(gate.actor, gate.leases, gate.now, gate.closed, delta) {
-                Ok(result) => result,
-                Err(refused) => {
-                    return Err(RefusedCommit {
-                        reason: refused.reason,
-                        prepared: PreparedCommit {
-                            identity,
-                            epoch,
-                            delta: refused.prepared,
-                            record,
-                            coalesce,
-                            retired,
-                            sources,
-                            truncated,
-                            _retirement_charge,
-                        },
-                    })
-                }
-            };
         if let Some(sources) = &sources {
             sources.mark(&outputs);
         }
@@ -447,14 +502,15 @@ impl NativeHistory {
         self.epoch += 1;
         self.current = Some(candidate.key());
         let old_truncated = std::mem::replace(&mut self.truncated, truncated);
+        self.name_from_save &= candidate.metadata().name() == current.metadata().name();
         let previous = std::mem::replace(current, candidate);
-        Ok(RetiredHistory {
+        RetiredHistory {
             _previous: previous,
             _records: retired,
             sources: sources.map(|plan| (plan, outputs)),
             _truncated: old_truncated,
             _charge: _retirement_charge,
-        })
+        }
     }
     pub fn move_cursor(
         &mut self,
@@ -536,6 +592,7 @@ impl NativeHistory {
         }
         self.epoch += 1;
         self.current = Some(candidate.key());
+        self.name_from_save &= candidate.metadata().name() == current.metadata().name();
         Ok(std::mem::replace(current, candidate))
     }
 }
@@ -655,6 +712,7 @@ impl HistorySnapshot {
                 retired,
                 sources,
                 truncated,
+                raster_damage: None,
                 _retirement_charge: charge,
             }),
             Err(reason) => Err(RefusedDelta {
@@ -693,21 +751,22 @@ impl HistorySnapshot {
         }
         let intent =
             Intent::from_scopes(IntentKind::History, &record.info.scopes, current.budget())?;
-        let copied = copy_metadata(&source.core.metadata, current.budget(), check)?;
-        let roster = source.core.roster.clone();
-        let resident = current.budget().clone();
-        let disk = current.disk_budget().clone();
-        if !resident.same_pool(source.budget()) || !disk.same_pool(source.disk_budget()) {
+        if !current.budget().same_pool(source.budget())
+            || !current.disk_budget().same_pool(source.disk_budget())
+        {
             return Err("History source admission differs".into());
         }
-        let core = copied.rehome_unique(|mut metadata, _| {
-            metadata.revision = current
+        let candidate = super::wand::restamp_named(
+            source,
+            current
                 .metadata()
                 .revision()
                 .checked_add(1)
-                .ok_or("Native revision overflow")?;
-            Core::prepare(metadata, roster, resident, disk, check)
-        })?;
+                .ok_or("Native revision overflow")?,
+            current.metadata().name(),
+            source.core.wand.clone(),
+            check,
+        )?;
         let actor: Admitted<String> = copy_admitted(&actor, current.budget(), true, check)?;
         check()?;
         Ok(PreparedMove {
@@ -718,7 +777,7 @@ impl HistorySnapshot {
             actor,
             delta: PreparedDelta {
                 base: current.key(),
-                candidate: NativeDocument { core },
+                candidate,
                 cancellation: Cancellation::default(),
                 intent,
                 outputs: vec![],

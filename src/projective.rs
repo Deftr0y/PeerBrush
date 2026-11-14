@@ -146,6 +146,24 @@ impl Map {
             .unwrap_or([-2.; 2])
     }
 
+    /// Conservative inverse footprint for a tile. An uncertain map must be sampled.
+    pub(crate) fn sampling_bounds(self, rect: [f64; 4]) -> Option<[f64; 4]> {
+        let [l, t, r, b] = self.bounds(rect).ok()?;
+        let x = rect[0].abs().max(rect[2].abs());
+        let y = rect[1].abs().max(rect[3].abs());
+        let largest_sum = self.0
+            .chunks_exact(3)
+            .map(|row| row[0].abs() * x + row[1].abs() * y + row[2].abs())
+            .fold(0., f64::max);
+        let smallest_denominator = corners(rect).ok()?
+            .into_iter()
+            .map(|p| self.denominator(p).abs())
+            .fold(f64::INFINITY, f64::min);
+        // Keep enough distance from cancellation to bound rounding in point().
+        (smallest_denominator > largest_sum * 1e-7)
+            .then_some([l - 0.01, t - 0.01, r + 0.01, b + 0.01])
+    }
+
     pub(crate) fn as_affine(self) -> Option<[f64; 6]> {
         let m = self.0;
         (m[6] == 0. && m[7] == 0. && m[8] != 0.).then(|| {

@@ -253,6 +253,49 @@ fn link_windows_version(root: &Path, version: &str) {
     }
 }
 
+fn prepare_branding(root: &Path, output: &Path) {
+    use image::imageops::{self, FilterType};
+
+    let logo = root.join("assets/peerbrush-logo.png");
+    watch(&logo);
+    let logo = image::open(logo).expect("Read PeerBrush logo");
+    assert_eq!(logo.width(), logo.height(), "PeerBrush logo must be square");
+    let logo = logo.resize_exact(256, 256, FilterType::Lanczos3).into_rgba8();
+    fs::write(output.join("window-icon.rgba"), logo.as_raw()).expect("Write startup icon");
+
+    let wordmark = root.join("assets/peerbrush-wordmark.png");
+    watch(&wordmark);
+    let wordmark = image::open(wordmark).expect("Read PeerBrush wordmark").into_rgba8();
+    let mut bounds = [wordmark.width(), wordmark.height(), 0, 0];
+    for (x, y, pixel) in wordmark.enumerate_pixels() {
+        if pixel[3] > 180 {
+            bounds = [bounds[0].min(x), bounds[1].min(y), bounds[2].max(x + 1), bounds[3].max(y + 1)];
+        }
+    }
+    let [left, top, right, bottom] = bounds;
+    assert!(right > left && bottom > top, "PeerBrush wordmark must contain visible pixels");
+    let cropped = imageops::crop_imm(&wordmark, left, top, right - left, bottom - top).to_image();
+    let width = 576;
+    let height = (cropped.height() as f32 * width as f32 / cropped.width() as f32).round() as u32;
+    let wordmark = imageops::resize(&cropped, width, height, FilterType::Lanczos3);
+    fs::write(output.join("workspace-wordmark.rgba"), wordmark.as_raw()).expect("Write startup wordmark");
+
+    for (name, columns, rows) in [("tool-icons", 6, 3), ("selection-icons", 4, 2)] {
+        let path = root.join("assets").join(format!("{name}.png"));
+        watch(&path);
+        let atlas = image::open(path).expect("Read PeerBrush icon atlas").into_rgb8();
+        assert_eq!(atlas.width() * rows, atlas.height() * columns, "Atlas cells must be square");
+        // The white-on-black artwork encodes glyph coverage for runtime tinting.
+        let coverage = image::GrayImage::from_fn(atlas.width(), atlas.height(), |x, y| {
+            let [r, g, b] = atlas.get_pixel(x, y).0;
+            let alpha = (u16::from(r.min(g).min(b).saturating_sub(8)) * 255 + 123) / 247;
+            image::Luma([alpha as u8])
+        });
+        let atlas = imageops::resize(&coverage, columns * 128, rows * 128, FilterType::Lanczos3);
+        fs::write(output.join(format!("{name}.alpha")), atlas.as_raw()).expect("Write icon coverage");
+    }
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     // Trusted release tooling computes this invalidator. Never use it as a label.
@@ -262,12 +305,10 @@ fn main() {
     let (commit, tree) = provenance(root).unwrap_or_else(|| ("unknown".into(), "unknown"));
     let version = env::var("CARGO_PKG_VERSION").unwrap();
     link_windows_version(root, &version);
+    let output = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+    prepare_branding(root, &output);
     let json = format!("{{\"format\":\"PeerBrushBuildInfoV1\",\"schema\":1,\"product\":\"PeerBrush\",\"version\":\"{version}\",\"commit\":\"{commit}\",\"tree\":\"{tree}\",\"end\":\"PeerBrushBuildInfoEnd\"}}");
-    fs::write(
-        Path::new(&env::var_os("OUT_DIR").unwrap()).join("build-info.json"),
-        json,
-    )
-    .unwrap();
+    fs::write(output.join("build-info.json"), json).unwrap();
 }
 
 #[cfg(test)]

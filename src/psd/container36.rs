@@ -6,6 +6,7 @@ use super::{
     manifest36::{CompletedStandard, Manifest},
     structural::{Format, Header},
 };
+use crate::large_document::VERIFIED_BATCH_BYTES;
 use ring::digest::{Context, SHA256};
 use serde::Serialize;
 use std::io::{Read, Write};
@@ -14,8 +15,11 @@ const PSD_MAX_BYTES: u64 = 2_000_000_000;
 const MAX_CONTAINER_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const TRANSFER: usize = 64 * 1024;
 
-pub(crate) struct Profile<'a> {
-    pub bytes: &'a [u8],
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ImageResources<'a> {
+    pub profile: Option<&'a [u8]>,
+    pub document: super::DocumentResources,
+    pub file_info: &'a [u8],
 }
 
 /// The caller's owned append sink must remain private until its own seal and
@@ -105,7 +109,7 @@ impl LayoutPlan {
         layer_bytes: u64,
         composite_bytes: u64,
         compressed_manifest_bytes: u64,
-        profile: Option<&Profile<'_>>,
+        image: ImageResources<'_>,
     ) -> Result<Self, String> {
         if header.channels != 4
             || ![8, 16].contains(&header.depth)
@@ -125,14 +129,33 @@ impl LayoutPlan {
             .ok_or("Source36 image-resource payload overflows its 32-bit field")?;
         // Signature, ID, padded Pascal name, length, PBR1+zlib and even padding.
         let mut resources = 24u64 + u64::from(payload) + u64::from(payload % 2);
-        if let Some(profile) = profile {
-            if profile.bytes.is_empty() || profile.bytes.len() > 4 * 1024 * 1024 {
+        if let Some(profile) = image.profile {
+            if profile.is_empty() || profile.len() > 4 * 1024 * 1024 {
                 return Err("Source36 profile exceeds the existing ICC byte envelope".into());
             }
             resources = resources
-                .checked_add(12 + profile.bytes.len() as u64 + profile.bytes.len() as u64 % 2)
+                .checked_add(12 + profile.len() as u64 + profile.len() as u64 % 2)
                 .ok_or("Source36 profile resource length overflow")?;
         }
+        image.document.validate()?;
+        if !image.file_info.is_empty() {
+            super::file_info::validate(image.file_info)?;
+        }
+        if image.document.intentionally_untagged && image.profile.is_some() {
+            return Err(super::CONFLICTING_PROFILE_DECLARATIONS.into());
+        }
+        resources += 28 * u64::from(image.document.resolution.is_some())
+            + 26 * u64::from(image.document.scale.is_some())
+            + 24 * u64::from(image.document.pixel_aspect.is_some())
+            + 28 * u64::from(image.document.grid.is_some())
+            + 16 * u64::from(image.document.layer_id_seed.is_some())
+            + 22 * u64::from(image.document.print_flags.is_some())
+            + 22 * u64::from(image.document.print_flags_info.is_some())
+            + 14 * u64::from(image.document.copyright.is_some())
+            + 16 * u64::from(image.document.global_angle.is_some())
+            + 16 * u64::from(image.document.global_altitude.is_some())
+            + super::UNTAGGED_PROFILE_RECORD.len() as u64 * u64::from(image.document.intentionally_untagged)
+            + image.file_info.len() as u64;
         let resources = u32::try_from(resources)
             .map_err(|_| "Source36 image resources overflow their 32-bit field")?;
         let large = header.format == Format::Psb;
@@ -177,8 +200,9 @@ pub(crate) fn write<T: Serialize, W: Write + ?Sized, M: Read, L: Read, C: Read>(
     bulk: &CompletedBulk,
     layers: &mut L,
     composite: &mut C,
-    profile: Option<&Profile<'_>>,
+    image: ImageResources<'_>,
     scratch: &mut [u8],
+    mut report: impl FnMut(u64) -> Result<(), String>,
     check: &dyn Fn() -> Result<(), String>,
 ) -> Result<CompletedContainer, String> {
     check()?;
@@ -188,9 +212,9 @@ pub(crate) fn write<T: Serialize, W: Write + ?Sized, M: Read, L: Read, C: Read>(
         layer_bytes,
         composite_bytes,
         compressed.bytes,
-        profile,
+        image,
     )?;
-    if scratch.is_empty() || scratch.len() > TRANSFER {
+    if scratch.is_empty() || scratch.len() > VERIFIED_BATCH_BYTES {
         return Err("Source36 replay requires admitted bounded transfer scratch".into());
     }
     compressed.check(manifest, metadata, check)?;
@@ -231,31 +255,69 @@ pub(crate) fn write<T: Serialize, W: Write + ?Sized, M: Read, L: Read, C: Read>(
     out.write_all(&payload.to_be_bytes())
         .map_err(|e| e.to_string())?;
     out.write_all(b"PBR1").map_err(|e| e.to_string())?;
-    if copy_exact(
+    let mut compressed_hash = Context::new(&SHA256);
+    copy_exact(
         compressed_input,
         &mut out,
         compressed.bytes,
         scratch,
-        None,
+        &mut compressed_hash,
+        &mut report,
         check,
-    )? != compressed.sha256
-    {
+    )?;
+    if finish(compressed_hash) != compressed.sha256 {
         return Err("Source36 compressed manifest changed during replay".into());
     }
     if payload % 2 != 0 {
         out.write_all(&[0]).map_err(|e| e.to_string())?;
     }
-    if let Some(profile) = profile {
+    if let Some(resolution) = &image.document.resolution {
+        out.write_all(&super::resolution_resource(resolution)).map_err(|e| e.to_string())?;
+    }
+    if let Some(scale) = &image.document.scale {
+        out.write_all(&super::print_scale_resource(scale)).map_err(|e| e.to_string())?;
+    }
+    if let Some(aspect) = &image.document.pixel_aspect {
+        out.write_all(&super::pixel_aspect_resource(aspect)).map_err(|e| e.to_string())?;
+    }
+    if let Some(grid) = &image.document.grid {
+        out.write_all(&super::grid_resource(grid)).map_err(|e| e.to_string())?;
+    }
+    if let Some(seed) = &image.document.layer_id_seed {
+        out.write_all(&super::layer_id_seed_resource(seed)).map_err(|e| e.to_string())?;
+    }
+    if let Some(flags) = &image.document.print_flags {
+        out.write_all(&super::print_flags_resource(flags)).map_err(|e| e.to_string())?;
+    }
+    if let Some(info) = &image.document.print_flags_info {
+        out.write_all(&super::print_flags_info_resource(info)).map_err(|e| e.to_string())?;
+    }
+    if let Some(flag) = &image.document.copyright {
+        out.write_all(&super::copyright_resource(flag)).map_err(|e| e.to_string())?;
+    }
+    for bytes in image.file_info.chunks(TRANSFER) {
+        out.write_all(bytes).map_err(|e| e.to_string())?;
+    }
+    if let Some(angle) = &image.document.global_angle {
+        out.write_all(&super::global_angle_resource(angle)).map_err(|e| e.to_string())?;
+    }
+    if let Some(altitude) = &image.document.global_altitude {
+        out.write_all(&super::global_altitude_resource(altitude)).map_err(|e| e.to_string())?;
+    }
+    if image.document.intentionally_untagged {
+        out.write_all(super::UNTAGGED_PROFILE_RECORD).map_err(|e| e.to_string())?;
+    }
+    if let Some(profile) = image.profile {
         out.write_all(b"8BIM").map_err(|e| e.to_string())?;
         out.write_all(&1039u16.to_be_bytes())
             .map_err(|e| e.to_string())?;
         out.write_all(&[0; 2]).map_err(|e| e.to_string())?;
-        out.write_all(&(profile.bytes.len() as u32).to_be_bytes())
+        out.write_all(&(profile.len() as u32).to_be_bytes())
             .map_err(|e| e.to_string())?;
-        for bytes in profile.bytes.chunks(TRANSFER) {
+        for bytes in profile.chunks(TRANSFER) {
             out.write_all(bytes).map_err(|e| e.to_string())?;
         }
-        if profile.bytes.len() % 2 != 0 {
+        if profile.len() % 2 != 0 {
             out.write_all(&[0]).map_err(|e| e.to_string())?;
         }
     }
@@ -266,16 +328,14 @@ pub(crate) fn write<T: Serialize, W: Write + ?Sized, M: Read, L: Read, C: Read>(
         out.write_all(&(plan.layer_bytes as u32).to_be_bytes())
             .map_err(|e| e.to_string())?;
     }
-    let mut binding = Context::new(&SHA256);
-    binding.update(b"PeerBrushSource36Standard\0");
-    binding.update(&plan.layer_bytes.to_be_bytes());
-    binding.update(&plan.composite_bytes.to_be_bytes());
+    let mut binding = super::bulk36::standard_hasher(plan.layer_bytes, plan.composite_bytes);
     copy_exact(
         layers,
         &mut out,
         plan.layer_bytes,
         scratch,
-        Some(&mut binding),
+        &mut binding,
+        &mut report,
         check,
     )?;
     copy_exact(
@@ -283,7 +343,8 @@ pub(crate) fn write<T: Serialize, W: Write + ?Sized, M: Read, L: Read, C: Read>(
         &mut out,
         plan.composite_bytes,
         scratch,
-        Some(&mut binding),
+        &mut binding,
+        &mut report,
         check,
     )?;
     if finish(binding) != standard_sha {
@@ -295,6 +356,7 @@ pub(crate) fn write<T: Serialize, W: Write + ?Sized, M: Read, L: Read, C: Read>(
     if bytes != plan.output_bytes {
         return Err("Source36 assembled container length differs".into());
     }
+    report(bytes)?;
     Ok(CompletedContainer {
         bytes,
         sha256,
@@ -344,14 +406,14 @@ fn finish(context: Context) -> Digest {
 }
 fn copy_exact<R: Read, W: Write>(
     input: &mut R,
-    output: &mut W,
+    output: &mut HashWriter<'_, W>,
     bytes: u64,
     scratch: &mut [u8],
-    mut binding: Option<&mut Context>,
+    hash: &mut Context,
+    report: &mut impl FnMut(u64) -> Result<(), String>,
     check: &dyn Fn() -> Result<(), String>,
-) -> Result<Digest, String> {
+) -> Result<(), String> {
     let mut remaining = bytes;
-    let mut hash = Context::new(&SHA256);
     while remaining != 0 {
         check()?;
         let count = remaining.min(scratch.len() as u64) as usize;
@@ -362,17 +424,17 @@ fn copy_exact<R: Read, W: Write>(
             .write_all(&scratch[..count])
             .map_err(|e| e.to_string())?;
         hash.update(&scratch[..count]);
-        if let Some(binding) = &mut binding {
-            binding.update(&scratch[..count]);
-        }
         remaining -= count as u64;
+        if output.written < output.limit {
+            report(output.written)?;
+        }
     }
     check()?;
     let mut extra = [0; 1];
     if input.read(&mut extra).map_err(|e| e.to_string())? != 0 {
         return Err("Source36 replay range contains excess bytes".into());
     }
-    Ok(finish(hash))
+    Ok(())
 }
 
 pub(super) struct HashWriter<'a, W> {
@@ -778,8 +840,9 @@ mod tests {
             &bulk,
             &mut layer.as_slice(),
             &mut composite.as_slice(),
-            None,
+            ImageResources::default(),
             &mut [0; 65536],
+            |_| Ok(()),
             &check,
         )
         .unwrap();
@@ -828,7 +891,8 @@ mod tests {
             &mut [],
             &mut [0],
             &mut scratch,
-            &check,
+            (&check, &check),
+            |_, _| Ok(()),
             |_| Ok(()),
         )
         .unwrap();
@@ -860,34 +924,50 @@ mod tests {
             .unwrap();
         assert_eq!(observed, cached);
         assert!(proof
-            .recheck(&source, &index, &manifest, sha, &mut scratch, &check)
+            .recheck(&source, &index, &manifest, sha, &mut scratch, &check, |_| Ok(()))
             .is_err());
         bytes.borrow_mut().get_mut()[at] ^= 1;
         assert!(proof
-            .recheck(&source, &index, &manifest, sha, &mut scratch, &check)
+            .recheck(&source, &index, &manifest, sha, &mut scratch, &check, |_| Ok(()))
             .is_err());
     }
     #[test]
     fn native_multistrip_psd_psb_container_replay_preserves_standard_rows_and_complete_bulk() {
         let check = || Ok(());
+        let mut scratch = vec![0; VERIFIED_BATCH_BYTES];
         for format in [Format::Psd, Format::Psb] {
             for depth in [8, 16] {
                 let f = fixture(format, depth);
                 let (bulk, standard) = proofs(&f);
                 let (encoded, compressed) = encoded(&f);
                 assert_eq!(compressed.bytes(), encoded.len() as u64);
-                let profile = Profile {
-                    bytes: b"profile framing observation",
+                let resolution = [1, 44, 128, 0, 0, 1, 0, 1, 1, 145, 64, 0, 0, 2, 0, 2];
+                let image = ImageResources {
+                    file_info: &[],
+                    profile: Some(b"profile framing observation"),
+                    document: super::super::DocumentResources {
+                        resolution: Some(resolution), scale: Some(super::super::TEST_PRINT_SCALE),
+                        pixel_aspect: None,
+                        grid: None,
+                        layer_id_seed: None,
+                        print_flags: None,
+                        print_flags_info: None,
+                        copyright: None,
+                        global_angle: None,
+                        global_altitude: None,
+                        intentionally_untagged: false,
+                    },
                 };
                 let plan = LayoutPlan::new(
                     f.header,
                     f.layer.len() as u64,
                     f.composite.len() as u64,
                     compressed.bytes(),
-                    Some(&profile),
+                    image,
                 )
                 .unwrap();
                 let mut output = vec![];
+                let mut reports = Vec::new();
                 let completion = write(
                     &mut output,
                     f.header,
@@ -899,13 +979,19 @@ mod tests {
                     &bulk,
                     &mut f.layer.as_slice(),
                     &mut f.composite.as_slice(),
-                    Some(&profile),
-                    &mut [0; 65536],
+                    image,
+                    &mut scratch,
+                    |written| {
+                        reports.push(written);
+                        Ok(())
+                    },
                     &check,
                 )
                 .unwrap();
                 assert_eq!(output.len() as u64, plan.output_bytes());
                 assert_eq!(completion.bytes(), output.len() as u64);
+                assert_eq!(reports.last().copied(), Some(completion.bytes()));
+                assert!(reports.windows(2).all(|pair| pair[0] < pair[1]));
                 assert_eq!(completion.sha256(), digest(&output));
                 completion
                     .check(&f.manifest, metadata(), f.header, &check)
@@ -944,6 +1030,12 @@ mod tests {
                 )
                 .unwrap();
                 assert_eq!(parsed.header, f.header);
+                let resolution_record = parsed.resources.iter()
+                    .find(|resource| resource.id == super::super::RESOLUTION_RESOURCE_ID).unwrap();
+                assert_eq!(range(&output, resolution_record.data), resolution);
+                let scale_record = parsed.resources.iter()
+                    .find(|resource| resource.id == super::super::PRINT_SCALE_RESOURCE_ID).unwrap();
+                assert_eq!(range(&output, scale_record.data), super::super::TEST_PRINT_SCALE);
                 assert_eq!(range(&output, parsed.layer_and_mask), f.layer);
                 assert_eq!(range(&output, parsed.composite.span), f.composite);
                 let chunks = parsed
@@ -988,7 +1080,8 @@ mod tests {
                     &mut entries,
                     &mut counters,
                     &mut scratch,
-                    &check,
+                    (&check, &check),
+                    |_, _| Ok(()),
                     |record| {
                         if matches!(record, Record::Tile { .. }) {
                             staged_tiles += 1;
@@ -1008,6 +1101,7 @@ mod tests {
                         digest(&output),
                         &mut scratch,
                         &check,
+                        |_| Ok(()),
                     )
                     .unwrap();
                 let owned_index = std::sync::Arc::new(parsed.clone());
@@ -1023,7 +1117,8 @@ mod tests {
                     &mut entries,
                     &mut counters,
                     &mut scratch,
-                    &check,
+                    (&check, &check),
+                    |_, _| Ok(()),
                     |_| Ok(()),
                 )
                 .unwrap()
@@ -1038,7 +1133,16 @@ mod tests {
                 )
                 .unwrap();
                 let (_, binding) = reopened.into_source_parts();
-                movable.recheck(&binding, &mut scratch, &check).unwrap();
+                let mut scanned = Vec::new();
+                movable
+                    .recheck(&binding, &mut scratch, &check, |bytes| {
+                        scanned.push(bytes);
+                        Ok(())
+                    })
+                    .unwrap();
+                assert_eq!(scanned.first(), Some(&0));
+                assert_eq!(scanned.last(), Some(&(output.len() as u64)));
+                assert!(scanned.windows(2).all(|pair| pair[0] < pair[1]));
                 assert!(std::ptr::eq(movable.index(), owned_index.as_ref()));
                 assert!(source_proof
                     .check(&source, &parsed.clone(), &restored, digest(&output), &check)
@@ -1088,8 +1192,9 @@ mod tests {
         let f = fixture(Format::Psb, 16);
         let (bulk, standard) = proofs(&f);
         let (encoded, compressed) = encoded(&f);
-        for changed in 0..4 {
+        for changed in 0..5 {
             let mut layer = f.layer.clone();
+            let mut composite = f.composite.clone();
             let mut z = encoded.clone();
             match changed {
                 0 => layer[20] ^= 1,
@@ -1097,7 +1202,8 @@ mod tests {
                     layer.pop();
                 }
                 2 => layer.push(0),
-                _ => z[0] ^= 1,
+                3 => z[0] ^= 1,
+                _ => composite[2] ^= 1,
             }
             let mut output = vec![];
             assert!(write(
@@ -1110,9 +1216,10 @@ mod tests {
                 &standard,
                 &bulk,
                 &mut layer.as_slice(),
-                &mut f.composite.as_slice(),
-                None,
+                &mut composite.as_slice(),
+                ImageResources::default(),
                 &mut [0; 65536],
+                |_| Ok(()),
                 &|| Ok(())
             )
             .is_err());
@@ -1129,8 +1236,9 @@ mod tests {
             &bulk,
             &mut f.layer.as_slice(),
             &mut f.composite.as_slice(),
-            None,
+            ImageResources::default(),
             &mut [0; 65536],
+            |_| Ok(()),
             &|| Err("Cancelled".into())
         )
         .is_err());
@@ -1167,8 +1275,9 @@ mod tests {
             &bulk,
             &mut f.layer.as_slice(),
             &mut f.composite.as_slice(),
-            None,
+            ImageResources::default(),
             &mut [0; 65536],
+            |_| Ok(()),
             &|| Ok(())
         )
         .is_err());
@@ -1184,19 +1293,19 @@ mod tests {
             channels: 4,
         };
         assert!(
-            LayoutPlan::new(header, 1_000_000_000, 1_000_000_000, 32, None)
+            LayoutPlan::new(header, 1_000_000_000, 1_000_000_000, 32, ImageResources::default())
                 .unwrap_err()
                 .contains("PSB")
         );
-        assert!(LayoutPlan::new(header, u64::from(u32::MAX) + 1, 2, 32, None).is_err());
+        assert!(LayoutPlan::new(header, u64::from(u32::MAX) + 1, 2, 32, ImageResources::default()).is_err());
         let header = Header {
             format: Format::Psb,
             ..header
         };
-        assert!(LayoutPlan::new(header, 4_000_000_000, 2_048_000_002, 32, None).is_ok());
-        assert!(LayoutPlan::new(header, 1, 2, u64::from(u32::MAX), None).is_err());
-        assert!(LayoutPlan::new(header, u64::MAX, 2, 32, None).is_err());
-        assert!(LayoutPlan::new(Header { width: 0, ..header }, 1, 2, 32, None).is_err());
+        assert!(LayoutPlan::new(header, 4_000_000_000, 2_048_000_002, 32, ImageResources::default()).is_ok());
+        assert!(LayoutPlan::new(header, 1, 2, u64::from(u32::MAX), ImageResources::default()).is_err());
+        assert!(LayoutPlan::new(header, u64::MAX, 2, 32, ImageResources::default()).is_err());
+        assert!(LayoutPlan::new(Header { width: 0, ..header }, 1, 2, 32, ImageResources::default()).is_err());
         assert!(LayoutPlan::new(
             Header {
                 depth: 32,
@@ -1205,7 +1314,7 @@ mod tests {
             1,
             2,
             32,
-            None
+            ImageResources::default()
         )
         .is_err());
     }
@@ -1229,8 +1338,9 @@ mod tests {
             &bulk,
             &mut f.layer.as_slice(),
             &mut f.composite.as_slice(),
-            None,
+            ImageResources::default(),
             &mut [0; 65536],
+            |_| Ok(()),
             &check,
         )
         .unwrap();
@@ -1276,7 +1386,8 @@ mod tests {
                 &mut entries,
                 &mut counts,
                 &mut scratch,
-                &check,
+                (&check, &check),
+                |_, _| Ok(()),
                 |_| {
                     staged += 1;
                     Ok(())
@@ -1337,18 +1448,19 @@ mod tests {
             &mut entries,
             &mut counts,
             &mut scratch,
-            &check,
+            (&check, &check),
+            |_, _| Ok(()),
             |_| Ok(()),
         )
         .unwrap();
         bytes.borrow_mut()[index.composite.span.offset as usize + 4] ^= 1;
         assert!(proof
-            .recheck(&source, &index, &manifest, sha, &mut scratch, &check)
+            .recheck(&source, &index, &manifest, sha, &mut scratch, &check, |_| Ok(()))
             .is_err());
         bytes.borrow_mut()[index.composite.span.offset as usize + 4] ^= 1;
         assert!(
             proof
-                .recheck(&source, &index, &manifest, sha, &mut scratch, &check)
+                .recheck(&source, &index, &manifest, sha, &mut scratch, &check, |_| Ok(()))
                 .is_err(),
             "A failed completion cannot regain authority after bytes reappear"
         );
@@ -1382,8 +1494,9 @@ mod tests {
             &bulk,
             &mut f.layer.as_slice(),
             &mut f.composite.as_slice(),
-            None,
+            ImageResources::default(),
             &mut [0; 65536],
+            |_| Ok(()),
             &check,
         )
         .unwrap();
@@ -1451,7 +1564,8 @@ mod tests {
             &mut entries,
             &mut counts,
             &mut scratch,
-            &check,
+            (&check, &check),
+            |_, _| Ok(()),
             |_| Ok(()),
         )
         .unwrap();

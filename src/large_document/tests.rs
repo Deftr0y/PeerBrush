@@ -278,6 +278,49 @@ fn fragment_publication_or_a_retained_candidate_prevents_early_retirement() {
 }
 
 #[test]
+fn retryable_fragment_retirement_preserves_the_exact_owner_and_quota_until_verified_unlink() {
+    for depth in [8, 16] {
+        let fixture = Fixture::new();
+        let resident = ResidentBudget::new(1024 * 1024).unwrap();
+        let disk = DiskBudget::new(1024 * 1024, 4).unwrap();
+        let fragment =
+            FreshFragment::create(&fixture.root(), resident.clone(), disk.clone(), limits())
+                .unwrap();
+        let spec = TileSpec::new(7, 5, depth).unwrap();
+        let block = fragment
+            .store()
+            .put(spec, &bytes(spec, 17), &mut okay)
+            .unwrap();
+        let held = fragment.store().clone();
+        let before = owned_bytes(&held);
+        let charged = disk.used().unwrap();
+        let refused = fragment.try_abort(&mut okay).err().unwrap();
+        assert!(matches!(refused.error, Error::Busy));
+        let fragment = refused.fragment.unwrap();
+        assert!(fragment.store().same_owner(&held));
+        drop(held);
+        let refused = fragment
+            .try_abort(&mut || Err(Error::Cancelled))
+            .err()
+            .unwrap();
+        assert!(matches!(refused.error, Error::Cancelled));
+        let fragment = refused.fragment.unwrap();
+        assert_eq!(owned_bytes(fragment.store()), before);
+        assert_eq!(disk.used().unwrap(), charged);
+        assert_eq!(
+            fragment.store().pin(block, &mut okay).unwrap().bytes(),
+            &bytes(spec, 17)
+        );
+        fragment
+            .try_abort(&mut okay)
+            .unwrap_or_else(|refused| panic!("{}", refused.error));
+        assert!(!fixture.root().join("blocks.pbt").exists());
+        assert_eq!(disk.used().unwrap(), 0);
+        assert_eq!(resident.used(), 0);
+    }
+}
+
+#[test]
 fn dropped_or_recovered_fragments_never_gain_unpublished_retirement_authority() {
     let fixture = Fixture::new();
     let resident = ResidentBudget::new(1024 * 1024).unwrap();
@@ -577,7 +620,7 @@ fn failed_and_cancelled_loads_restore_the_shared_capacity() {
     });
     assert!(matches!(result, Err(Error::Cancelled)));
     assert_eq!(budget.payload_used(), 0);
-    let result = store.load((3, [7; 32]), 256, &mut okay, |_, _| {
+    let result = store.load((3, [7; 32]), 256, &mut okay, None, |_, _| {
         Err(Error::Io(std::io::ErrorKind::Other.into()))
     });
     assert!(matches!(result, Err(Error::Io(_))));
@@ -1034,7 +1077,7 @@ fn actual_partial_io_failure_preserves_confirmed_prefix_and_forbids_retry() {
     let store = fixture.store(&budget);
     let original = owned_bytes(&store);
     let _write = store.0.access.write().unwrap();
-    let result = store.append_with(b"TILE", 12, [1; 32], &mut okay, |offset, _| {
+    let result = store.append_with(b"TILE", 12, [1; 32], &mut okay, None, |offset, _| {
         write_all_at(&store.0.file, offset, &[1, 2])?;
         Err(Error::Io(std::io::ErrorKind::StorageFull.into()))
     });
@@ -1231,6 +1274,182 @@ fn held_owner_selects_old_checkpoint_without_advancing_head_or_bypassing_guards(
 }
 
 #[test]
+fn recovered_owner_selects_later_prefixes_without_changing_its_head_or_write_policy() {
+    for depth in [8, 16] {
+        let fixture = Fixture::new();
+        let budget = ResidentBudget::new(1024 * 1024).unwrap();
+        let store = fixture.store(&budget);
+        let spec = TileSpec::new(1, 1, depth).unwrap();
+        let mut refs = Vec::new();
+        let mut commits = Vec::new();
+        for revision in 0..3 {
+            let block = store
+                .put(spec, &bytes(spec, 137 + revision), &mut okay)
+                .unwrap();
+            let commit = store
+                .commit(
+                    [9; 16],
+                    revision as u64,
+                    commits.last().copied(),
+                    &[revision as u8],
+                    &[block],
+                    &mut okay,
+                )
+                .unwrap()
+                .reference();
+            refs.push(block);
+            commits.push(commit);
+        }
+        let original = owned_bytes(&store);
+        drop(store);
+        let first = Store::recover(
+            &fixture.root(),
+            commits[0],
+            budget.clone(),
+            limits(),
+            &mut okay,
+        )
+        .unwrap();
+        let store = first.store();
+        let newest = store
+            .snapshot(commits[2], &mut || {
+                assert!(store.0.state.try_lock().is_ok());
+                assert_eq!(store.checkpoint_reference().unwrap(), Some(commits[0]));
+                Ok(())
+            })
+            .unwrap();
+        let middle = store.snapshot(commits[1], &mut okay).unwrap();
+        for (at, snapshot) in [&first, &middle, &newest].into_iter().enumerate() {
+            assert!(snapshot.store().same_owner(&store));
+            assert_eq!(&*snapshot.metadata(&mut okay).unwrap(), &[at as u8]);
+            assert_eq!(
+                snapshot.store().pin(refs[at], &mut okay).unwrap().bytes(),
+                bytes(spec, 137 + at as u16)
+            );
+            assert!(snapshot.has_unconfirmed_tail().unwrap());
+        }
+        assert_eq!(store.checkpoint_reference().unwrap(), Some(commits[0]));
+        assert_eq!(store.state().unwrap().indexed, Some(commits[2]));
+        assert!(store.put(spec, &bytes(spec, 999), &mut okay).is_err());
+        assert!(store
+            .commit(
+                [9; 16],
+                3,
+                Some(commits[0]),
+                b"refused",
+                &[refs[2]],
+                &mut okay
+            )
+            .is_err());
+        assert_eq!(owned_bytes(&store), original);
+    }
+}
+
+#[test]
+fn later_selection_cancel_budget_and_forged_reference_leave_old_snapshots_usable() {
+    let fixture = Fixture::new();
+    let budget = ResidentBudget::new(1024 * 1024).unwrap();
+    let store = fixture.store(&budget);
+    let spec = TileSpec::new(1, 1, 16).unwrap();
+    let first = store.put(spec, &[17; 8], &mut okay).unwrap();
+    let old = store
+        .commit([11; 16], 0, None, b"first", &[first], &mut okay)
+        .unwrap()
+        .reference();
+    let next = store.put(spec, &[29; 8], &mut okay).unwrap();
+    let new = store
+        .commit([11; 16], 1, Some(old), b"second", &[next], &mut okay)
+        .unwrap()
+        .reference();
+    let original = owned_bytes(&store);
+    drop(store);
+    let first = Store::recover(&fixture.root(), old, budget.clone(), limits(), &mut okay).unwrap();
+    let store = first.store();
+    let _metadata = first.metadata(&mut okay).unwrap();
+    let baseline = budget.used();
+    for fail_at in [1, 5, 10] {
+        let mut count = 0;
+        assert!(matches!(
+            store.snapshot(new, &mut || {
+                count += 1;
+                if count == fail_at {
+                    Err(Error::Cancelled)
+                } else {
+                    Ok(())
+                }
+            }),
+            Err(Error::Cancelled)
+        ));
+        assert_eq!(budget.used(), baseline);
+        assert_eq!(store.state().unwrap().indexed, Some(old));
+        assert_eq!(&*first.metadata(&mut okay).unwrap(), b"first");
+    }
+    let ballast = budget
+        .reserve_bytes(budget.limit() - budget.used(), budget.limit())
+        .unwrap();
+    assert!(matches!(store.snapshot(new, &mut okay), Err(Error::Budget)));
+    drop(ballast);
+    for field in 0..5 {
+        let mut forged = new;
+        match field {
+            0 => forged.digest[0] ^= 1,
+            1 => forged.source[0] ^= 1,
+            2 => forged.offset += 1,
+            3 => forged.end -= 1,
+            _ => forged.revision += 1,
+        }
+        assert!(store.snapshot(forged, &mut okay).is_err());
+        assert_eq!(store.state().unwrap().indexed, Some(old));
+        assert_eq!(budget.used(), baseline);
+    }
+    assert_eq!(owned_bytes(&store), original);
+    assert!(store.snapshot(new, &mut okay).is_ok());
+    assert_eq!(&*first.metadata(&mut okay).unwrap(), b"first");
+    assert_eq!(store.checkpoint_reference().unwrap(), Some(old));
+}
+
+#[test]
+fn later_selection_rejects_same_stamp_corruption_without_replacing_the_index() {
+    let fixture = Fixture::new();
+    let budget = ResidentBudget::new(1024 * 1024).unwrap();
+    let store = fixture.store(&budget);
+    let spec = TileSpec::new(1, 1, 16).unwrap();
+    let block = store.put(spec, &[31; 8], &mut okay).unwrap();
+    let old = store
+        .commit([13; 16], 0, None, b"old", &[block], &mut okay)
+        .unwrap()
+        .reference();
+    let new = store
+        .commit([13; 16], 1, Some(old), b"new", &[block], &mut okay)
+        .unwrap()
+        .reference();
+    let original = owned_bytes(&store);
+    drop(store);
+    let first = Store::recover(&fixture.root(), old, budget, limits(), &mut okay).unwrap();
+    let store = first.store();
+    let modified = store.0.file.metadata().unwrap().modified().unwrap();
+    for at in [0, 8, FILE_HEADER + RECORD_HEADER + 8] {
+        write_all_at(&store.0.file, at, &[original[at as usize] ^ 0xff]).unwrap();
+        store
+            .0
+            .file
+            .set_times(fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        assert!(store.snapshot(new, &mut okay).is_err());
+        assert_eq!(store.state().unwrap().indexed, Some(old));
+        assert_eq!(store.checkpoint_reference().unwrap(), Some(old));
+        write_all_at(&store.0.file, 0, &original).unwrap();
+        store
+            .0
+            .file
+            .set_times(fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+    }
+    assert!(store.snapshot(new, &mut okay).is_ok());
+    assert_eq!(&*first.metadata(&mut okay).unwrap(), b"old");
+}
+
+#[test]
 fn embedded_manifest_bytes_are_not_a_selected_record_boundary() {
     let fixture = Fixture::new();
     let store = fixture.store(&ResidentBudget::new(1024).unwrap());
@@ -1382,6 +1601,81 @@ fn failed_partial_source_append_keeps_its_conservative_disk_charge() {
     let charged = disk.used().unwrap();
     drop(store);
     assert_eq!(disk.used().unwrap(), charged);
+}
+
+#[test]
+fn guarded_tile_put_checks_active_chunks_and_refuses_late_owner_loss() {
+    let fixture = Fixture::new();
+    let store = fixture.store(&ResidentBudget::new(4 * 1024 * 1024).unwrap());
+    let spec = TileSpec::new(256, 256, 16).unwrap();
+    let payload = bytes(spec, 131);
+    let mut active = 0;
+    let mut owner = 0;
+    let reference = store.put_guarded(spec, &payload, &mut || {
+        active += 1;
+        Ok(())
+    }, &mut || {
+        owner += 1;
+        Ok(())
+    }).unwrap();
+    assert!(active >= 3 * spec.bytes().div_ceil(CHUNK));
+    assert!(owner >= 4 && owner < active);
+    assert_eq!(store.pin(reference, &mut okay).unwrap().bytes(), payload);
+    assert_eq!(store.put_guarded(spec, &payload, &mut okay, &mut okay).unwrap(), reference);
+
+    let end = store.0.file.metadata().unwrap().len();
+    let mut owner = 0;
+    let lost = store.put_guarded(spec, &bytes(spec, 132), &mut okay, &mut || {
+        owner += 1;
+        if owner == 6 { Err(Error::Changed) } else { Ok(()) }
+    });
+    assert!(matches!(lost, Err(Error::Changed)));
+    assert!(store.0.file.metadata().unwrap().len() > end);
+    assert!(store.put(spec, &payload, &mut okay).is_err());
+}
+
+#[test]
+fn guarded_tile_pin_batch_releases_all_pins_on_cancellation_or_owner_change() {
+    let fixture = Fixture::new();
+    let pool = ResidentBudget::new(8 * 1024 * 1024).unwrap();
+    let store = fixture.store(&pool);
+    let spec = TileSpec::new(256, 256, 16).unwrap();
+    let a = bytes(spec, 91);
+    let b = bytes(spec, 112);
+    let first = store.put(spec, &a, &mut okay).unwrap();
+    let second = store.put(spec, &b, &mut okay).unwrap();
+    let references = [Some(first), None, Some(second)];
+    let mut output = [None, None, None];
+    let mut owners = 0;
+    store.pin_batch(&references, &mut output, &mut okay, &mut || {
+        owners += 1;
+        Ok(())
+    }).unwrap();
+    assert_eq!(owners, 2);
+    assert_eq!(output[0].as_ref().unwrap().bytes(), a);
+    assert!(output[1].is_none());
+    assert_eq!(output[2].as_ref().unwrap().bytes(), b);
+    output.fill_with(|| None);
+    let mut active = 0;
+    assert!(matches!(
+        store.pin_batch(&references, &mut output, &mut || {
+            active += 1;
+            if active > 22 { Err(Error::Cancelled) } else { Ok(()) }
+        }, &mut okay),
+        Err(Error::Cancelled)
+    ));
+    assert!(output.iter().all(Option::is_none));
+    let mut owners = 0;
+    assert!(matches!(
+        store.pin_batch(&references, &mut output, &mut okay, &mut || {
+            owners += 1;
+            if owners == 2 { Err(Error::Changed) } else { Ok(()) }
+        }),
+        Err(Error::Changed)
+    ));
+    assert!(output.iter().all(Option::is_none));
+    store.pin_batch(&references, &mut output, &mut okay, &mut okay).unwrap();
+    assert_eq!(output[2].as_ref().unwrap().bytes(), b);
 }
 
 #[test]
@@ -1594,4 +1888,343 @@ fn in_place_fragment_publication_mark_retains_token_and_irreversibly_refuses_abo
     assert_eq!(disk.used().unwrap(), retained);
     assert!(fixture.root().join("blocks.pbt").is_file());
     assert_eq!(resident.used(), 0);
+}
+
+#[test]
+fn retained_custody_resumes_exact_handles_index_precision_and_publication_head() {
+    for depth in [8, 16] {
+        for readonly in [false, true] {
+            let fixture = Fixture::new();
+            let pool = ResidentBudget::new(1024 * 1024).unwrap();
+            let disk = DiskBudget::new(1024 * 1024, 4).unwrap();
+            let store = Store::create_with_disk_budget(
+                &fixture.root(),
+                pool.clone(),
+                disk.clone(),
+                limits(),
+            )
+            .unwrap();
+            let spec = TileSpec::new(2, 2, depth).unwrap();
+            let a_bytes = bytes(spec, 12347);
+            let b_bytes = bytes(spec, 23459);
+            let a = store.put(spec, &a_bytes, &mut okay).unwrap();
+            let first = store
+                .commit([9; 16], 1, None, b"first", &[a], &mut okay)
+                .unwrap();
+            let a_commit = first.reference();
+            let b = store.put(spec, &b_bytes, &mut okay).unwrap();
+            let second = store
+                .commit([9; 16], 2, Some(a_commit), b"second", &[b], &mut okay)
+                .unwrap();
+            let b_commit = second.reference();
+            let physical = store.filesystem_identity();
+            let identity = store.identity();
+            drop((first, second));
+            let store = if readonly {
+                drop(store);
+                let selected = Store::recover_with_disk_budget(
+                    &fixture.root(),
+                    a_commit,
+                    pool.clone(),
+                    disk.clone(),
+                    limits(),
+                    &mut okay,
+                )
+                .unwrap();
+                let store = selected.store();
+                drop(selected);
+                // The read index knows both explicit prefixes; the write head stays first.
+                drop(store.snapshot(b_commit, &mut okay).unwrap());
+                store
+            } else {
+                store
+            };
+            drop(store.pin(a, &mut okay).unwrap());
+            drop(store.pin(b, &mut okay).unwrap());
+            let original = store.file_bytes_for_test().unwrap();
+            let head = store.checkpoint_reference().unwrap();
+            let custodian = store.downgrade().unwrap();
+            assert!(custodian.resume().unwrap().same_owner(&store));
+            let baseline = pool.used();
+            let charged = disk.used().unwrap();
+            drop(store);
+            assert!(custodian.upgrade().is_none());
+            assert_eq!(pool.used(), baseline);
+            assert_eq!(pool.payload_used(), 0);
+            for _ in 0..3 {
+                let resumed = custodian.resume().unwrap();
+                assert_eq!(resumed.identity(), identity);
+                assert_eq!(resumed.filesystem_identity(), physical);
+                assert_eq!(resumed.checkpoint_reference().unwrap(), head);
+                assert_eq!(
+                    resumed.state().unwrap().indexed,
+                    if readonly { Some(b_commit) } else { None }
+                );
+                assert_eq!(resumed.state().unwrap().readonly, readonly);
+                assert_eq!(resumed.pin(a, &mut okay).unwrap().bytes(), a_bytes);
+                assert_eq!(resumed.pin(b, &mut okay).unwrap().bytes(), b_bytes);
+                if readonly {
+                    assert!(resumed.put(spec, &a_bytes, &mut okay).is_err());
+                } else {
+                    assert_eq!(resumed.put(spec, &a_bytes, &mut okay).unwrap(), a);
+                }
+                assert_eq!(resumed.file_bytes_for_test().unwrap(), original);
+                drop(resumed);
+                assert!(custodian.upgrade().is_none());
+                assert_eq!(pool.used(), baseline);
+                assert_eq!(disk.used().unwrap(), charged);
+            }
+            drop(custodian);
+            assert_eq!(pool.used(), 0);
+            assert_eq!(disk.used().unwrap(), charged);
+        }
+    }
+}
+
+#[test]
+fn custody_admission_refusal_keeps_live_owner_and_unique_abort_cannot_be_resumed() {
+    let fixture = Fixture::new();
+    let pool = ResidentBudget::new(16384).unwrap();
+    let disk = DiskBudget::new(1024 * 1024, 4).unwrap();
+    let fragment =
+        FreshFragment::create(&fixture.root(), pool.clone(), disk.clone(), limits()).unwrap();
+    let original = fragment.store().file_bytes_for_test().unwrap();
+    let baseline = pool.used();
+    let ballast = pool
+        .reserve_bytes(pool.limit() - baseline, pool.limit())
+        .unwrap();
+    assert!(matches!(fragment.store().downgrade(), Err(Error::Budget)));
+    assert_eq!(fragment.store().file_bytes_for_test().unwrap(), original);
+    drop(ballast);
+    assert_eq!(pool.used(), baseline);
+    let custodian = fragment.store().downgrade().unwrap();
+    fragment.abort(&mut okay).unwrap();
+    assert!(custodian.upgrade().is_none());
+    assert!(custodian.resume().is_err());
+    assert_eq!(disk.used().unwrap(), 0);
+    assert!(!fixture.root().join("blocks.pbt").exists());
+    drop(custodian);
+    assert_eq!(pool.used(), 0);
+}
+
+#[test]
+fn concurrent_custody_resumption_has_one_actual_logical_owner() {
+    let fixture = Fixture::new();
+    let pool = ResidentBudget::new(16384).unwrap();
+    let store = fixture.store(&pool);
+    let physical = store.filesystem_identity();
+    let custodian = Arc::new(store.downgrade().unwrap());
+    drop(store);
+    let barrier = Arc::new(Barrier::new(3));
+    let threads: Vec<_> = (0..2)
+        .map(|_| {
+            let custodian = custodian.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                let store = loop {
+                    match custodian.resume() {
+                        Ok(store) => break store,
+                        Err(Error::Busy) => std::thread::yield_now(),
+                        Err(error) => panic!("{error}"),
+                    }
+                };
+                barrier.wait();
+                store
+            })
+        })
+        .collect();
+    barrier.wait();
+    barrier.wait();
+    let stores: Vec<_> = threads
+        .into_iter()
+        .map(|thread| thread.join().unwrap())
+        .collect();
+    assert!(stores[0].same_owner(&stores[1]));
+    assert_eq!(stores[0].filesystem_identity(), physical);
+    drop(stores);
+    assert!(custodian.upgrade().is_none());
+    drop(custodian);
+    assert_eq!(pool.used(), 0);
+}
+
+#[test]
+fn parked_source_claim_preserves_live_roots_and_restores_verified_or_refused_backing() {
+    for depth in [8, 16] {
+        let fixture = Fixture::new();
+        let pool = ResidentBudget::new(1024 * 1024).unwrap();
+        let store = fixture.store(&pool);
+        let spec = TileSpec::new(2, 2, depth).unwrap();
+        let a = store.put(spec, &bytes(spec, 19), &mut okay).unwrap();
+        let snapshot = store
+            .commit([1; 16], 1, None, b"retained", &[a], &mut okay)
+            .unwrap();
+        // A known, uncommitted tile is still part of this writable owner's index.
+        let b = store.put(spec, &bytes(spec, 29), &mut okay).unwrap();
+        let original = owned_bytes(&store);
+        let physical = store.filesystem_identity();
+        let id = store.identity();
+        let custodian = store.downgrade().unwrap();
+        assert!(custodian.claim_parked().unwrap().is_none());
+        drop(store);
+        assert!(custodian.claim_parked().unwrap().is_none());
+        drop(snapshot);
+        let baseline = pool.used();
+        for cancel in [true, false] {
+            let claim = custodian.claim_parked().unwrap().unwrap();
+            assert_eq!(claim.identity(), id);
+            assert_eq!(claim.filesystem_identity(), physical);
+            assert!(matches!(custodian.resume(), Err(Error::Busy)));
+            assert!(custodian.claim_parked().unwrap().is_none());
+            if cancel {
+                assert!(matches!(
+                    claim.verify(&mut || Err(Error::Cancelled)),
+                    Err(Error::Cancelled)
+                ));
+            } else {
+                claim.verify(&mut okay).unwrap();
+            }
+            drop(claim);
+            let resumed = custodian.resume().unwrap();
+            assert_eq!(owned_bytes(&resumed), original);
+            assert_eq!(resumed.state().unwrap().blocks.get(&b.digest), Some(&b));
+            drop(resumed);
+            assert_eq!(pool.used(), baseline);
+        }
+    }
+}
+
+#[test]
+fn parked_validation_never_adopts_an_unconfirmed_readonly_prefix() {
+    let fixture = Fixture::new();
+    let pool = ResidentBudget::new(1024 * 1024).unwrap();
+    let store = fixture.store(&pool);
+    let spec = TileSpec::new(2, 2, 16).unwrap();
+    let a = store.put(spec, &bytes(spec, 17), &mut okay).unwrap();
+    let first = store
+        .commit([2; 16], 1, None, b"first", &[a], &mut okay)
+        .unwrap();
+    let old = first.reference();
+    let b = store.put(spec, &bytes(spec, 23), &mut okay).unwrap();
+    let second = store
+        .commit([2; 16], 2, Some(old), b"second", &[b], &mut okay)
+        .unwrap();
+    let newest = second.reference();
+    let original = owned_bytes(&store);
+    drop((first, second, store));
+    let selected = Store::recover(&fixture.root(), old, pool.clone(), limits(), &mut okay).unwrap();
+    let store = selected.store();
+    let custodian = store.downgrade().unwrap();
+    drop((selected, store));
+    let claim = custodian.claim_parked().unwrap().unwrap();
+    assert!(claim.verify(&mut okay).is_err());
+    drop(claim);
+    let resumed = custodian.resume().unwrap();
+    assert_eq!(resumed.checkpoint_reference().unwrap(), Some(old));
+    assert_eq!(resumed.state().unwrap().indexed, Some(old));
+    assert_eq!(owned_bytes(&resumed), original);
+    drop(resumed.snapshot(newest, &mut okay).unwrap());
+    drop(resumed);
+    let claim = custodian.claim_parked().unwrap().unwrap();
+    claim.verify(&mut okay).unwrap();
+    drop(claim);
+    let resumed = custodian.resume().unwrap();
+    assert_eq!(resumed.checkpoint_reference().unwrap(), Some(old));
+    assert_eq!(resumed.state().unwrap().indexed, Some(newest));
+    assert!(resumed.state().unwrap().readonly);
+    assert_eq!(owned_bytes(&resumed), original);
+}
+
+#[test]
+fn parked_validation_refuses_same_stamp_corruption_and_scratch_exhaustion() {
+    let fixture = Fixture::new();
+    let pool = ResidentBudget::new(1024 * 1024).unwrap();
+    let store = fixture.store(&pool);
+    let spec = TileSpec::new(2, 2, 16).unwrap();
+    let reference = store.put(spec, &bytes(spec, 47), &mut okay).unwrap();
+    let original = owned_bytes(&store);
+    let modified = store.0.file.metadata().unwrap().modified().unwrap();
+    let custodian = store.downgrade().unwrap();
+    let at = reference.offset + RECORD_HEADER + 8;
+    write_all_at(&store.0.file, at, &[original[at as usize] ^ 0xff]).unwrap();
+    store
+        .0
+        .file
+        .set_times(fs::FileTimes::new().set_modified(modified))
+        .unwrap();
+    let corrupted = owned_bytes(&store);
+    drop(store);
+    let claim = custodian.claim_parked().unwrap().unwrap();
+    assert!(claim.verify(&mut okay).is_err());
+    drop(claim);
+    let store = custodian.resume().unwrap();
+    assert_eq!(owned_bytes(&store), corrupted);
+    write_all_at(&store.0.file, 0, &original).unwrap();
+    store
+        .0
+        .file
+        .set_times(fs::FileTimes::new().set_modified(modified))
+        .unwrap();
+    drop(store);
+    let claim = custodian.claim_parked().unwrap().unwrap();
+    let ballast = pool
+        .reserve_bytes(pool.limit() - pool.used(), pool.limit())
+        .unwrap();
+    assert!(matches!(claim.verify(&mut okay), Err(Error::Budget)));
+    drop(ballast);
+    claim.verify(&mut okay).unwrap();
+    drop(claim);
+    assert_eq!(owned_bytes(&custodian.resume().unwrap()), original);
+}
+
+#[test]
+fn reopened_writable_source_uses_its_new_publication_head_without_changing_old_snapshots() {
+    for depth in [8, 16] {
+        let fixture = Fixture::new();
+        let pool = ResidentBudget::new(1024 * 1024).unwrap();
+        let store = fixture.store(&pool);
+        let spec = TileSpec::new(2, 2, depth).unwrap();
+        let a_bytes = bytes(spec, 71);
+        let b_bytes = bytes(spec, 97);
+        let a = store.put(spec, &a_bytes, &mut okay).unwrap();
+        let first = store
+            .commit([9; 16], 1, None, b"old", &[a], &mut okay)
+            .unwrap();
+        let old = first.reference();
+        drop((first, store));
+        let first =
+            Store::recover(&fixture.root(), old, pool.clone(), limits(), &mut okay).unwrap();
+        let store = first.store();
+        assert!(!store.state().unwrap().readonly);
+        assert_eq!(store.state().unwrap().indexed, Some(old));
+        let b = store.put(spec, &b_bytes, &mut okay).unwrap();
+        let second = store
+            .commit([9; 16], 2, Some(old), b"new", &[a, b], &mut okay)
+            .unwrap();
+        let newest = second.reference();
+        assert_eq!(store.checkpoint_reference().unwrap(), Some(newest));
+        let selected = store.snapshot(newest, &mut okay).unwrap();
+        assert_eq!(&*selected.metadata(&mut okay).unwrap(), b"new");
+        assert_eq!(&*first.metadata(&mut okay).unwrap(), b"old");
+        assert_eq!(store.snapshot(old, &mut okay).unwrap().reference(), old);
+        assert_eq!(
+            store
+                .checkpoint_snapshot(&mut okay)
+                .unwrap()
+                .unwrap()
+                .reference(),
+            newest
+        );
+        assert_eq!(store.pin(a, &mut okay).unwrap().bytes(), a_bytes);
+        assert_eq!(store.pin(b, &mut okay).unwrap().bytes(), b_bytes);
+        let custodian = store.downgrade().unwrap();
+        drop((selected, first, second, store));
+        let claim = custodian.claim_parked().unwrap().unwrap();
+        claim.verify(&mut okay).unwrap();
+        drop(claim);
+        assert_eq!(
+            custodian.resume().unwrap().checkpoint_reference().unwrap(),
+            Some(newest)
+        );
+    }
 }

@@ -6,25 +6,52 @@ use super::{
     *,
 };
 use crate::engine::scene::SceneSnapshot;
+use std::sync::{MutexGuard, TryLockError};
+
+const PROJECT_BUSY: &str = "Project is busy; source capture deferred";
+const WORKSPACE_BUSY: &str = "Workspace is busy; source capture deferred";
+
+pub(crate) fn retryable_source_read(error: &str) -> bool {
+    matches!(error, PROJECT_BUSY | WORKSPACE_BUSY | source_runtime::INVENTORY_CHECK_BUSY)
+        || error == crate::large_document::Error::Busy.to_string()
+}
+
+pub(crate) fn try_source_engine(shared: &Shared) -> Result<MutexGuard<'_, Engine>, String> {
+    shared.try_lock().map_err(|error| match error {
+        TryLockError::WouldBlock => PROJECT_BUSY.into(),
+        TryLockError::Poisoned(_) => "Project source state is unavailable".into(),
+    })
+}
 
 /// Never attach a new registry or invent a fallback source root. Native work
 /// must use the exact service configured by the authenticated app connection.
 pub(crate) fn runtime_for(shared: &Shared) -> Result<Arc<SourceRuntime>, String> {
-    let (registry, project) = {
-        let engine = shared
-            .try_lock()
-            .map_err(|_| "Project is busy; source capture deferred")?;
+    configured_runtime_for(shared)?.ok_or_else(|| "Native source service is not configured".into())
+}
+
+pub(crate) fn configured_runtime_for(
+    shared: &Shared,
+) -> Result<Option<Arc<SourceRuntime>>, String> {
+    let (registry, project, native) = {
+        let engine = try_source_engine(shared)?;
         engine.ensure_open()?;
-        let registry = engine
-            .workspace
-            .as_ref()
-            .and_then(Weak::upgrade)
-            .ok_or("Project has no configured source workspace")?;
-        (registry, engine.project_id.clone())
+        (
+            engine.workspace.as_ref().and_then(Weak::upgrade),
+            engine.project_id.clone(),
+            engine.native_document().is_some(),
+        )
     };
-    let state = registry
-        .try_lock()
-        .map_err(|_| "Workspace is busy; source capture deferred")?;
+    let Some(registry) = registry else {
+        return if native {
+            Err("Project has no configured source workspace".into())
+        } else {
+            Ok(None)
+        };
+    };
+    let state = registry.try_lock().map_err(|error| match error {
+        TryLockError::WouldBlock => WORKSPACE_BUSY,
+        TryLockError::Poisoned(_) => "Workspace source state is unavailable",
+    })?;
     if state.exiting {
         return Err("Workspace is exiting; source capture refused".into());
     }
@@ -37,16 +64,29 @@ pub(crate) fn runtime_for(shared: &Shared) -> Result<Arc<SourceRuntime>, String>
     }) {
         return Err("Project is no longer registered in its source workspace".into());
     }
-    state
-        .source_runtime
-        .clone()
-        .ok_or_else(|| "Native source service is not configured".into())
+    if native && state.source_runtime.is_none() {
+        return Err("Native source service is not configured".into());
+    }
+    Ok(state.source_runtime.clone())
 }
 
 /// Called off-lock with the exact immutable scene captured for this project.
 /// The ordinary SourceSession retains profile/instance/inventory admission;
 /// neither metadata IDs nor this accessor grant filesystem publication rights.
 pub(crate) fn begin_scene(shared: &Shared, scene: &SceneSnapshot) -> Result<SourceSession, String> {
+    begin_scene_with(shared, scene, SourceRuntime::begin)
+}
+pub(crate) fn begin_edit_scene(
+    shared: &Shared,
+    scene: &SceneSnapshot,
+) -> Result<SourceSession, String> {
+    begin_scene_with(shared, scene, SourceRuntime::begin_foreground)
+}
+fn begin_scene_with(
+    shared: &Shared,
+    scene: &SceneSnapshot,
+    begin: impl FnOnce(&Arc<SourceRuntime>) -> Result<SourceSession, String>,
+) -> Result<SourceSession, String> {
     let runtime = runtime_for(shared)?;
     if !scene.budget().same_pool(&runtime.resident())
         || !scene.disk_budget().same_pool(&runtime.disk())
@@ -54,7 +94,7 @@ pub(crate) fn begin_scene(shared: &Shared, scene: &SceneSnapshot) -> Result<Sour
         return Err("Captured scene belongs to another source service".into());
     }
     validate_scene(shared, scene)?;
-    let session = runtime.begin()?;
+    let session = begin(&runtime)?;
     // Source admission may take time. Do not return a newly acquired worker
     // session for a project replaced or closed while that admission was running.
     validate_scene(shared, scene)?;
@@ -75,9 +115,7 @@ pub(crate) fn begin_read_scene(
     Ok(session)
 }
 fn validate_scene(shared: &Shared, scene: &SceneSnapshot) -> Result<(), String> {
-    let engine = shared
-        .try_lock()
-        .map_err(|_| "Project changed or is busy during source admission")?;
+    let engine = try_source_engine(shared)?;
     engine.ensure_open()?;
     let view = crate::engine::view::current(&engine);
     if engine.project_id != scene.identity().project_id

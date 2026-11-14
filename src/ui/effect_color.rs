@@ -15,6 +15,42 @@ struct Picker {
 fn pixel(rgba: [f64; 4]) -> Pixel {
     rgba.map(|n| (n.clamp(0., 1.) * 255.).round() as u8)
 }
+pub(super) fn format_hex(rgba: [f64; 4], native_hex: bool) -> String {
+    if !native_hex {
+        return color::format_hex(pixel(rgba));
+    }
+    let words = rgba.map(|n| (n.clamp(0., 1.) * 65535.).round() as u16);
+    if words.into_iter().all(|word| word % 257 == 0) {
+        return color::format_hex(pixel(rgba));
+    }
+    let [r, g, b, a] = words;
+    if a == u16::MAX {
+        format!("{r:04X}{g:04X}{b:04X}")
+    } else {
+        format!("{r:04X}{g:04X}{b:04X}{a:04X}")
+    }
+}
+
+pub(super) fn parse_hex(text: &str, native_hex: bool, with_alpha: bool) -> Option<([f64; 3], Option<f64>)> {
+    let digits = text.trim().trim_start_matches('#');
+    if native_hex && (digits.len() == 12 || with_alpha && digits.len() == 16) {
+        if !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return None;
+        }
+        let word = |channel: usize| {
+            let start = channel * 4;
+            u16::from_str_radix(&digits[start..start + 4], 16)
+                .ok().map(|value| f64::from(value) / 65535.)
+        };
+        let alpha = if digits.len() == 16 { Some(word(3)?) } else { None };
+        return Some(([word(0)?, word(1)?, word(2)?], alpha));
+    }
+    if !with_alpha && digits.len() == 8 {
+        return None;
+    }
+    let [r, g, b, a] = color::parse_hex(text)?.map(|value| f64::from(value) / 255.);
+    Some(([r, g, b], (digits.len() == 8).then_some(a)))
+}
 fn hsv(rgba: [f64; 4]) -> egui::ecolor::Hsva {
     // These values are encoded working RGB, matching effect settings. HSV is
     // presentation input; it does not reinterpret or convert retained sources.
@@ -51,13 +87,22 @@ pub(super) fn control(
     label: &str,
     rgb: &mut [f64; 3],
     alpha: &mut f64,
-    alpha_label: &str,
+    alpha_label: Option<&str>,
+    native_hex: bool,
 ) -> Option<egui::Response> {
+    let parse = |text: &str| parse_hex(text, native_hex, alpha_label.is_some());
+    let formats = match (native_hex, alpha_label.is_some()) {
+        (true, true) => "Use 3, 6, 8, 12 or 16 HEX digits",
+        (true, false) => "Use 3, 6 or 12 HEX digits",
+        (false, true) => "Use 3, 6 or 8 HEX digits",
+        (false, false) => "Use 3 or 6 HEX digits",
+    };
     ui.push_id(id, |ui| {
         let state_id = ui.id().with("color picker");
         let input = [rgb[0], rgb[1], rgb[2], *alpha];
+        let channels = if alpha_label.is_some() { "RGB, alpha and HEX" } else { "RGB and HEX" };
         let button = swatch(ui, input, Vec2::new(48., 22.))
-            .on_hover_text(format!("Edit {label} color · RGB, alpha and HEX"));
+            .on_hover_text(format!("Edit {label} color · {channels}"));
         button.widget_info(|| {
             egui::WidgetInfo::labeled(
                 egui::WidgetType::Button,
@@ -85,7 +130,7 @@ pub(super) fn control(
                     rgba: input,
                     original: input,
                     hsv: hsv(input),
-                    hex: color::format_hex(pixel(input)),
+                    hex: format_hex(input, native_hex),
                     field: None,
                     hex_start: input,
                     hex_control: None,
@@ -105,7 +150,7 @@ pub(super) fn control(
             picker.rgba = input;
             picker.hsv = hsv(input);
             if !editing_hex {
-                picker.hex = color::format_hex(pixel(input));
+                picker.hex = format_hex(input, native_hex);
             }
         }
         let before = picker.rgba;
@@ -139,193 +184,36 @@ pub(super) fn control(
                         controls::label(ui, "Current");
                     });
                 });
-                let hue = (picker.hsv.h * 65535.).round() as u16;
-                if picker.field.as_ref().map(|(key, _)| *key) != Some(hue) {
-                    let bytes = (0..96)
-                        .flat_map(|y| {
-                            (0..96).flat_map(move |x| {
-                                let c = egui::ecolor::Hsva::new(
-                                    f32::from(hue) / 65535.,
-                                    x as f32 / 95.,
-                                    1. - y as f32 / 95.,
-                                    1.,
-                                )
-                                .to_rgb();
-                                [
-                                    (c[0] * 255.).round() as u8,
-                                    (c[1] * 255.).round() as u8,
-                                    (c[2] * 255.).round() as u8,
-                                    255,
-                                ]
-                            })
-                        })
-                        .collect::<Vec<_>>();
-                    let image = egui::ColorImage::from_rgba_unmultiplied([96, 96], &bytes);
-                    if let Some((key, texture)) = &mut picker.field {
-                        *key = hue;
-                        texture.set(image, egui::TextureOptions::LINEAR);
-                    } else {
-                        picker.field = Some((
-                            hue,
-                            ui.ctx().load_texture(
-                                "effect color field",
-                                image,
-                                egui::TextureOptions::LINEAR,
-                            ),
-                        ));
+                let before_rgb = picker.hsv.to_rgb();
+                if let Some(response) = color::picker(ui, &mut picker.hsv, &mut picker.field, 160., |hsv| {
+                    let [r, g, b] = hsv.to_rgb().map(|value| (value * 255.).round() as u8);
+                    [r, g, b, 255]
+                }) {
+                    let rgb = picker.hsv.to_rgb();
+                    if rgb != before_rgb {
+                        picker.rgba[..3].copy_from_slice(&rgb.map(f64::from));
                     }
+                    changed = Some(response);
                 }
-                ui.horizontal(|ui| {
-                    let (rect, response) =
-                        ui.allocate_exact_size(Vec2::splat(160.), egui::Sense::click_and_drag());
-                    if response.clicked() || response.is_pointer_button_down_on() {
-                        response.request_focus();
-                    }
-                    if let Some((_, texture)) = &picker.field {
-                        ui.painter().image(
-                            texture.id(),
-                            rect,
-                            Rect::from_min_max(Pos2::ZERO, Pos2::new(1., 1.)),
-                            Color32::WHITE,
-                        );
-                    }
-                    if response.is_pointer_button_down_on() || response.dragged() {
-                        if let Some(p) = response.interact_pointer_pos() {
-                            picker.hsv.s = ((p.x - rect.left()) / rect.width()).clamp(0., 1.);
-                            picker.hsv.v = (1. - (p.y - rect.top()) / rect.height()).clamp(0., 1.);
-                            let color = picker.hsv.to_rgb();
-                            for c in 0..3 {
-                                picker.rgba[c] = f64::from(color[c]);
+                if let Some(alpha_label) = alpha_label {
+                    ui.horizontal(|ui| {
+                        controls::label(ui, alpha_label);
+                        let mut opacity = picker.rgba[3] as f32 * 100.;
+                        let response =
+                            controls::range(ui, "alpha", &mut opacity, 0.0..=100., 160., "%", 2, false);
+                        if response.changed() || response.double_clicked() {
+                            if response.changed() {
+                                picker.rgba[3] = f64::from(opacity) / 100.;
                             }
-                            changed = Some(response.clone());
+                            changed = Some(response);
                         }
-                    }
-                    if response.has_focus()
-                        && !response.is_pointer_button_down_on()
-                        && !response.dragged()
-                    {
-                        let (ds, dv) = ui.input(|i| {
-                            let step = if i.modifiers.shift { 0.1 } else { 0.01 };
-                            (
-                                step * (i32::from(i.key_pressed(egui::Key::ArrowRight))
-                                    - i32::from(i.key_pressed(egui::Key::ArrowLeft)))
-                                    as f32,
-                                step * (i32::from(i.key_pressed(egui::Key::ArrowUp))
-                                    - i32::from(i.key_pressed(egui::Key::ArrowDown)))
-                                    as f32,
-                            )
-                        });
-                        if ds != 0. || dv != 0. {
-                            picker.hsv.s = (picker.hsv.s + ds).clamp(0., 1.);
-                            picker.hsv.v = (picker.hsv.v + dv).clamp(0., 1.);
-                            let color = picker.hsv.to_rgb();
-                            for c in 0..3 {
-                                picker.rgba[c] = f64::from(color[c]);
-                            }
-                            changed = Some(response.clone());
-                        }
-                    }
-                    ui.painter().circle_stroke(
-                        Pos2::new(
-                            rect.left() + picker.hsv.s * rect.width(),
-                            rect.top() + (1. - picker.hsv.v) * rect.height(),
-                        ),
-                        4.,
-                        Stroke::new(1.5, Color32::WHITE),
-                    );
-                    response.widget_info(|| {
-                        egui::WidgetInfo::labeled(
-                            egui::WidgetType::Slider,
-                            ui.is_enabled(),
-                            "Color saturation and brightness",
-                        )
                     });
-                    let (rail, response) =
-                        ui.allocate_exact_size(Vec2::new(20., 160.), egui::Sense::click_and_drag());
-                    if response.clicked() || response.is_pointer_button_down_on() {
-                        response.request_focus();
-                    }
-                    for i in 0..96 {
-                        let rgb = egui::ecolor::Hsva::new(i as f32 / 95., 1., 1., 1.).to_rgb();
-                        ui.painter().rect_filled(
-                            Rect::from_min_size(
-                                rail.min + Vec2::new(0., i as f32 * rail.height() / 96.),
-                                Vec2::new(rail.width(), rail.height() / 96. + 0.5),
-                            ),
-                            0,
-                            Color32::from_rgb(
-                                (rgb[0] * 255.).round() as u8,
-                                (rgb[1] * 255.).round() as u8,
-                                (rgb[2] * 255.).round() as u8,
-                            ),
-                        );
-                    }
-                    if response.is_pointer_button_down_on() || response.dragged() {
-                        if let Some(p) = response.interact_pointer_pos() {
-                            picker.hsv.h = ((p.y - rail.top()) / rail.height()).clamp(0., 1.);
-                            let color = picker.hsv.to_rgb();
-                            for c in 0..3 {
-                                picker.rgba[c] = f64::from(color[c]);
-                            }
-                            changed = Some(response.clone());
-                        }
-                    }
-                    if response.has_focus()
-                        && !response.is_pointer_button_down_on()
-                        && !response.dragged()
-                    {
-                        let delta = ui.input(|i| {
-                            let step = if i.modifiers.shift { 0.1 } else { 0.01 };
-                            step * (i32::from(
-                                i.key_pressed(egui::Key::ArrowRight)
-                                    || i.key_pressed(egui::Key::ArrowDown),
-                            ) - i32::from(
-                                i.key_pressed(egui::Key::ArrowLeft)
-                                    || i.key_pressed(egui::Key::ArrowUp),
-                            )) as f32
-                        });
-                        if delta != 0. {
-                            picker.hsv.h = (picker.hsv.h + delta).rem_euclid(1.);
-                            let color = picker.hsv.to_rgb();
-                            for c in 0..3 {
-                                picker.rgba[c] = f64::from(color[c]);
-                            }
-                            changed = Some(response.clone());
-                        }
-                    }
-                    let y = rail.top() + picker.hsv.h * rail.height();
-                    ui.painter().line_segment(
-                        [
-                            Pos2::new(rail.left() - 2., y),
-                            Pos2::new(rail.right() + 2., y),
-                        ],
-                        Stroke::new(2., Color32::WHITE),
-                    );
-                    response.widget_info(|| {
-                        egui::WidgetInfo::labeled(
-                            egui::WidgetType::Slider,
-                            ui.is_enabled(),
-                            "Color hue",
-                        )
-                    });
-                });
-                ui.horizontal(|ui| {
-                    controls::label(ui, alpha_label);
-                    let mut opacity = picker.rgba[3] as f32 * 100.;
-                    let response =
-                        controls::range(ui, "alpha", &mut opacity, 0.0..=100., 160., "%", 2, false);
-                    if response.changed() || response.double_clicked() {
-                        if response.changed() {
-                            picker.rgba[3] = f64::from(opacity) / 100.;
-                        }
-                        changed = Some(response);
-                    }
-                });
+                }
                 if picker.rgba != before && !editing_hex {
-                    picker.hex = color::format_hex(pixel(picker.rgba));
+                    picker.hex = format_hex(picker.rgba, native_hex);
                 }
                 ui.horizontal(|ui| {
-                    controls::label(ui, "HEX");
+                    let label = ui.label("HEX");
                     let control = ui.id().with("hex");
                     picker.hex_control = Some(control);
                     let editor = control.with("number");
@@ -334,7 +222,7 @@ pub(super) fn control(
                             .id(editor)
                             .frame(false)
                             .desired_width(140.),
-                    );
+                    ).labelled_by(label.id).on_hover_text(formats);
                     let mut response = ui.interact(edit.rect, control, egui::Sense::hover());
                     if edit.has_focus() {
                         if !controls::number_editing(ui.ctx(), control) {
@@ -344,12 +232,10 @@ pub(super) fn control(
                             .data_mut(|data| data.insert_temp(editor, picker.hex.clone()));
                     }
                     if edit.changed() {
-                        if let Some(p) = color::parse_hex(&picker.hex) {
-                            for c in 0..3 {
-                                picker.rgba[c] = f64::from(p[c]) / 255.;
-                            }
-                            if picker.hex.trim().trim_start_matches('#').len() == 8 {
-                                picker.rgba[3] = f64::from(p[3]) / 255.;
+                        if let Some((rgb, alpha)) = parse(&picker.hex) {
+                            picker.rgba[..3].copy_from_slice(&rgb);
+                            if let Some(alpha) = alpha {
+                                picker.rgba[3] = alpha;
                             }
                             picker.hsv = hsv(picker.rgba);
                             response.mark_changed();
@@ -358,7 +244,7 @@ pub(super) fn control(
                     if edit.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                         ui.ctx().data_mut(|data| data.remove::<String>(editor));
                         edit.surrender_focus();
-                        if color::parse_hex(&picker.hex).is_none() {
+                        if parse(&picker.hex).is_none() {
                             ui.ctx().data_mut(|data| {
                                 data.insert_temp(control.with("cancel parameter"), true)
                             });
@@ -370,9 +256,9 @@ pub(super) fn control(
                         changed = Some(response);
                     }
                 });
-                if color::parse_hex(&picker.hex).is_none() {
+                if parse(&picker.hex).is_none() {
                     ui.label(
-                        RichText::new("Use 3, 6 or 8 HEX digits")
+                        RichText::new(formats)
                             .size(11.)
                             .color(ACCENT),
                     );
@@ -462,11 +348,11 @@ mod tests {
             ] {
                 let ctx = egui::Context::default();
                 let mut engine = crate::engine::Engine::new();
-                engine.doc = Document::new_depth(8, 8, depth).unwrap();
-                engine.doc.layers[0]
+                engine.resident_state_mut().expect("resident fixture").document = Document::new_depth(8, 8, depth).unwrap();
+                engine.resident_state_mut().expect("resident fixture").document.layers[0]
                     .pixels
                     .set16(2, 3, [12347, 23459, 34571, 32769]);
-                let layer = engine.doc.layers[0].id.clone();
+                let layer = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
                 let rgba = [
                     0.171234567890123,
                     0.371234567890123,
@@ -474,8 +360,8 @@ mod tests {
                     0.61234567890123,
                 ];
                 engine.edit("human",&[json!({"op":"effect.add","layer":layer,"kind":"color_overlay","settings":{"color":[rgba[0],rgba[1],rgba[2]],"opacity":rgba[3]}})],None,None,"Fixture").unwrap();
-                engine.undo.clear();
-                let before = engine.doc.clone();
+                engine.resident_state_mut().expect("resident fixture").undo.clear();
+                let before = engine.resident_state().expect("resident fixture").document.clone();
                 let effect = before.layers[0].effects[0].id.clone();
                 let shared = Arc::new(std::sync::Mutex::new(engine));
                 let mut app = PeerBrush::init(
@@ -561,7 +447,7 @@ mod tests {
                     draw(&mut app, vec![]);
                     output = draw(&mut app, vec![]);
                 }
-                let hex = color::format_hex(p);
+                let hex = format_hex(rgba, true);
                 let at = output
                     .shapes
                     .iter()
@@ -577,6 +463,7 @@ mod tests {
                     vec![egui::Event::PointerMoved(at), button(at, true)],
                 );
                 draw(&mut app, vec![button(at, false)]);
+                let entered = if depth == 16 && action == "enter" { "F001400380058007" } else { "F0408080" };
                 let key = |key, pressed, modifiers| egui::Event::Key {
                     key,
                     physical_key: None,
@@ -596,7 +483,7 @@ mod tests {
                                 ..Default::default()
                             },
                         ),
-                        egui::Event::Text("F0408080".into()),
+                        egui::Event::Text(entered.into()),
                     ],
                 );
                 let commands = app
@@ -610,15 +497,22 @@ mod tests {
                 assert_eq!(ctx.memory(|memory| memory.focused()), Some(editor));
                 assert_eq!(
                     ctx.data(|data| data.get_temp::<String>(editor)).as_deref(),
-                    Some("F0408080"),
+                    Some(entered),
                     "{depth}/{action}: actual HEX text must own the draft"
                 );
                 let draft =
                     crate::engine::Engine::preview_edits(before.clone(), &commands).unwrap();
+                if depth == 16 && action == "enter" {
+                    let settings = &draft.layers[0].effects[0].settings;
+                    for (value, word) in settings["color"].as_array().unwrap().iter().zip([0xF001u16, 0x4003, 0x8005]) {
+                        assert_eq!(value.as_f64(), Some(f64::from(word) / 65535.));
+                    }
+                    assert_eq!(settings["opacity"].as_f64(), Some(f64::from(0x8007u16) / 65535.));
+                }
                 assert_ne!(draft.export_png().unwrap(), before.export_png().unwrap());
-                assert!(shared.lock().unwrap().undo.is_empty());
+                assert!(shared.lock().unwrap().resident_state().expect("resident fixture").undo.is_empty());
                 assert_eq!(
-                    serde_json::to_value(&shared.lock().unwrap().doc).unwrap(),
+                    serde_json::to_value(&shared.lock().unwrap().resident_state().expect("resident fixture").document).unwrap(),
                     serde_json::to_value(&before).unwrap()
                 );
                 let mut expected = before.clone();
@@ -634,7 +528,7 @@ mod tests {
                             "Later work",
                         )
                         .unwrap();
-                    expected = shared.lock().unwrap().doc.clone();
+                    expected = shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
                     1
                 } else {
                     0
@@ -684,9 +578,9 @@ mod tests {
                     assert_eq!(ctx.memory(|memory| memory.focused()), Some(editor));
                     assert!(controls::number_editing(&ctx, control));
                     assert_eq!(app.parameter_gesture.as_ref().unwrap().commands, commands);
-                    assert!(shared.lock().unwrap().undo.is_empty());
+                    assert!(shared.lock().unwrap().resident_state().expect("resident fixture").undo.is_empty());
                     assert_eq!(
-                        serde_json::to_value(&shared.lock().unwrap().doc).unwrap(),
+                        serde_json::to_value(&shared.lock().unwrap().resident_state().expect("resident fixture").document).unwrap(),
                         serde_json::to_value(&before).unwrap()
                     );
                     if action == "invalid_blur" {
@@ -796,31 +690,31 @@ mod tests {
                 assert!(app.parameter_gesture.is_none(), "{depth}/{action}");
                 let mut engine = shared.lock().unwrap();
                 if action == "enter" {
-                    assert_eq!(engine.undo.len(), 1);
+                    assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), 1);
                     assert_eq!(
-                        engine.doc.export_png().unwrap(),
+                        engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
                         draft.export_png().unwrap()
                     );
                     assert_eq!(
-                        engine.doc.layers[0].pixels.rgba16(),
+                        engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(),
                         before.layers[0].pixels.rgba16()
                     );
                     engine.undo("human").unwrap();
                     assert_eq!(
-                        engine.doc.export_png().unwrap(),
+                        engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
                         before.export_png().unwrap()
                     );
                 } else {
-                    if engine.undo.len() != history {
+                    if engine.resident_state().expect("resident fixture").undo.len() != history {
                         eprintln!(
                             "\nPB_EFFECT_COLOR_HISTORY depth={depth} action={action} before={history} after={}",
-                            engine.undo.len(),
+                            engine.resident_state().expect("resident fixture").undo.len(),
                             action = if action.starts_with("invalid") { "invalid" } else { action }
                         );
                     }
-                    assert_eq!(engine.undo.len(), history, "{depth}/{action}");
+                    assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), history, "{depth}/{action}");
                     assert_eq!(
-                        serde_json::to_value(&engine.doc).unwrap(),
+                        serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap(),
                         serde_json::to_value(&expected).unwrap(),
                         "{depth}/{action}"
                     );
@@ -833,10 +727,10 @@ mod tests {
         for depth in [8, 16] {
             let ctx = egui::Context::default();
             let mut engine = crate::engine::Engine::new();
-            engine.doc = Document::new_depth(32, 32, depth).unwrap();
+            engine.resident_state_mut().expect("resident fixture").document = Document::new_depth(32, 32, depth).unwrap();
             for y in 8..24 {
                 for x in 7..23 {
-                    engine.doc.layers[0].pixels.set16(
+                    engine.resident_state_mut().expect("resident fixture").document.layers[0].pixels.set16(
                         x,
                         y,
                         [
@@ -848,12 +742,12 @@ mod tests {
                     );
                 }
             }
-            let layer = engine.doc.layers[0].id.clone();
+            let layer = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
             let rgb = [0.171234567890123, 0.371234567890123, 0.731234567890123];
             let alpha = 0.61234567890123;
             engine.edit("human",&[json!({"op":"effect.add","layer":layer,"kind":"color_overlay","settings":{"color":rgb,"opacity":alpha}})],None,None,"Fixture").unwrap();
-            engine.undo.clear();
-            let before = engine.doc.clone();
+            engine.resident_state_mut().expect("resident fixture").undo.clear();
+            let before = engine.resident_state().expect("resident fixture").document.clone();
             let effect = before.layers[0].effects[0].id.clone();
             let shared = Arc::new(std::sync::Mutex::new(engine));
             let mut app = PeerBrush::init(
@@ -914,9 +808,9 @@ mod tests {
             draw(&mut app, vec![button(swatch, false)]);
             draw(&mut app, vec![]);
             let output = draw(&mut app, vec![]);
-            assert!(shared.lock().unwrap().undo.is_empty());
+            assert!(shared.lock().unwrap().resident_state().expect("resident fixture").undo.is_empty());
             assert_eq!(
-                serde_json::to_value(&shared.lock().unwrap().doc).unwrap(),
+                serde_json::to_value(&shared.lock().unwrap().resident_state().expect("resident fixture").document).unwrap(),
                 serde_json::to_value(&before).unwrap()
             );
             let field = output
@@ -959,43 +853,43 @@ mod tests {
                     .any(|c| (c.as_f64().unwrap() * 255.).fract().abs() > 0.00001),
                 "Color input retains float precision beyond display bytes"
             );
-            assert!(shared.lock().unwrap().undo.is_empty());
+            assert!(shared.lock().unwrap().resident_state().expect("resident fixture").undo.is_empty());
             assert_eq!(
-                serde_json::to_value(&shared.lock().unwrap().doc).unwrap(),
+                serde_json::to_value(&shared.lock().unwrap().resident_state().expect("resident fixture").document).unwrap(),
                 serde_json::to_value(&before).unwrap()
             );
             draw(&mut app, vec![button(end, false)]);
             let mut engine = shared.lock().unwrap();
-            assert_eq!(engine.undo.len(), 1);
+            assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), 1);
             assert_eq!(
-                engine.doc.export_png().unwrap(),
+                engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
                 draft.export_png().unwrap()
             );
             assert_eq!(
-                engine.doc.layers[0].pixels.rgba16(),
+                engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(),
                 before.layers[0].pixels.rgba16()
             );
-            let restored = crate::psd::decode(&crate::psd::encode(&engine.doc).unwrap()).unwrap();
+            let restored = crate::psd::decode(&crate::psd::encode(&engine.resident_state().expect("resident fixture").document).unwrap()).unwrap();
             assert_eq!(
                 restored.layers[0].pixels.rgba16(),
                 before.layers[0].pixels.rgba16()
             );
             assert_eq!(
                 restored.layers[0].effects[0].settings,
-                engine.doc.layers[0].effects[0].settings
+                engine.resident_state().expect("resident fixture").document.layers[0].effects[0].settings
             );
             assert_eq!(
                 restored.export_png().unwrap(),
-                engine.doc.export_png().unwrap()
+                engine.resident_state().expect("resident fixture").document.export_png().unwrap()
             );
             engine.undo("human").unwrap();
             assert_eq!(
-                engine.doc.export_png().unwrap(),
+                engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
                 before.export_png().unwrap()
             );
             engine.redo("human").unwrap();
             assert_eq!(
-                engine.doc.export_png().unwrap(),
+                engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
                 draft.export_png().unwrap()
             );
         }

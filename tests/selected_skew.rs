@@ -92,7 +92,7 @@ fn edit(engine: &mut Engine, commands: &[Value]) {
         .edit(
             "human",
             commands,
-            Some(engine.doc.revision),
+            Some(engine.resident_state().expect("resident fixture").document.revision),
             None,
             "Selected skew",
         )
@@ -105,15 +105,15 @@ fn state(engine: &Engine) -> Value {
         "task":entry.task,"scopes":entry.scopes,"gesture":entry.gesture,"reverted":entry.reverted
     })).collect::<Vec<_>>()
     };
-    json!({"document":engine.doc,"undo":history(&engine.undo),"redo":history(&engine.redo)})
+    json!({"document":engine.resident_state().expect("resident fixture").document,"undo":history(&engine.resident_state().expect("resident fixture").undo),"redo":history(&engine.resident_state().expect("resident fixture").redo)})
 }
 fn fixture(depth: u16) -> Engine {
     let mut engine = Engine::new();
-    engine.doc = Document::new_depth(64, 48, depth).unwrap();
-    engine.doc.layers[0].pixels = Raster::new_depth(16, 14, depth);
-    let id = engine.doc.layers[0].id.clone();
+    engine.resident_state_mut().expect("resident fixture").document = Document::new_depth(64, 48, depth).unwrap();
+    engine.resident_state_mut().expect("resident fixture").document.layers[0].pixels = Raster::new_depth(16, 14, depth);
+    let id = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
     edit(&mut engine, &[json!({"op":"mask.add","layer":id})]);
-    let layer = &mut engine.doc.layers[0];
+    let layer = &mut engine.resident_state_mut().expect("resident fixture").document.layers[0];
     for y in 0..14 {
         for x in 0..16 {
             let alpha = if (x, y) == (5, 5) || (x, y) == (15, 13) {
@@ -151,13 +151,13 @@ fn fixture(depth: u16) -> Engine {
         }
     }
     let coverage = selection::from_mask(mask).unwrap();
-    engine.doc.selection = Some(coverage.bounds);
-    engine.doc.selection_coverage = Some(coverage);
-    engine.undo.clear();
+    engine.resident_state_mut().expect("resident fixture").document.selection = Some(coverage.bounds);
+    engine.resident_state_mut().expect("resident fixture").document.selection_coverage = Some(coverage);
+    engine.resident_state_mut().expect("resident fixture").undo.clear();
     engine
 }
 fn command(engine: &Engine, fields: Value) -> Value {
-    let mut command = json!({"op":"transform","layer":engine.doc.layers[0].id,
+    let mut command = json!({"op":"transform","layer":engine.resident_state().expect("resident fixture").document.layers[0].id,
         "pivot":[0.,0.5],"selection_only":true});
     command
         .as_object_mut()
@@ -325,14 +325,14 @@ fn selected_horizontal_skew_has_analytic_native_color_mask_soft_hole_remainder_a
         for target in ["linked", "color", "mask", "step"] {
             let mut engine = fixture(depth);
             if target != "linked" {
-                let id = engine.doc.layers[0].id.clone();
+                let id = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
                 edit(
                     &mut engine,
                     &[json!({"op":"mask.link","layer":id,"linked":false})],
                 );
-                engine.undo.clear();
+                engine.resident_state_mut().expect("resident fixture").undo.clear();
             }
-            let before = engine.doc.clone();
+            let before = engine.resident_state().expect("resident fixture").document.clone();
             let before_state = state(&engine);
             let coverage = selection::current(&before).unwrap();
             let mut c = command(
@@ -345,12 +345,12 @@ fn selected_horizontal_skew_has_analytic_native_color_mask_soft_hole_remainder_a
             let preview = Engine::preview_edits(before.clone(), &[c.clone()]).unwrap();
             assert_eq!(state(&engine), before_state);
             edit(&mut engine, &[c]);
-            assert_eq!(engine.undo.len(), 1);
+            assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), 1);
             assert_eq!(
-                engine.doc.export_png().unwrap(),
+                engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
                 preview.export_png().unwrap()
             );
-            let layer = &engine.doc.layers[0];
+            let layer = &engine.resident_state().expect("resident fixture").document.layers[0];
             let moved_color = target == "linked" || target == "color";
             let moved_mask = target != "color";
             // About (0,.5), Hx(45deg) maps pixel centers to (x+y,y).
@@ -378,7 +378,7 @@ fn selected_horizontal_skew_has_analytic_native_color_mask_soft_hole_remainder_a
                         "{depth} {target} mask {x},{y}"
                     );
                     assert_eq!(
-                        selection::current(&engine.doc)
+                        selection::current(&engine.resident_state().expect("resident fixture").document)
                             .unwrap()
                             .value(x + y + 12, y + 3),
                         factor
@@ -411,19 +411,19 @@ fn selected_horizontal_skew_has_analytic_native_color_mask_soft_hole_remainder_a
             // A hole and unselected transparent color keep their hidden native RGB.
             assert_eq!(color(layer, 5, 5), color(&before.layers[0], 5, 5));
             assert_eq!(color(layer, 15, 13), color(&before.layers[0], 15, 13));
-            storage(&engine.doc);
-            let after = engine.doc.clone();
+            storage(&engine.resident_state().expect("resident fixture").document);
+            let after = engine.resident_state().expect("resident fixture").document.clone();
             engine.undo("human").unwrap();
-            assert_eq!(engine.doc.layers[0].pixels, before.layers[0].pixels);
-            assert_eq!(engine.doc.selection_coverage, before.selection_coverage);
+            assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].pixels, before.layers[0].pixels);
+            assert_eq!(engine.resident_state().expect("resident fixture").document.selection_coverage, before.selection_coverage);
             assert_eq!(
-                engine.doc.export_png().unwrap(),
+                engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
                 before.export_png().unwrap()
             );
             engine.redo("human").unwrap();
-            assert_eq!(engine.doc.layers[0].pixels, after.layers[0].pixels);
+            assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].pixels, after.layers[0].pixels);
             assert_eq!(
-                engine.doc.export_png().unwrap(),
+                engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
                 after.export_png().unwrap()
             );
         }
@@ -451,7 +451,7 @@ fn scalar(coverage: &Coverage, x: f32, y: f32) -> u8 {
 fn combined_shears_reflection_scale_rotation_and_translation_use_one_analytic_inverse() {
     for depth in [8, 16] {
         let mut engine = fixture(depth);
-        let before = engine.doc.clone();
+        let before = engine.resident_state().expect("resident fixture").document.clone();
         let coverage = selection::current(&before).unwrap();
         let mut cut = Raster::new_depth(16, 14, depth);
         for y in 0..14 {
@@ -477,9 +477,9 @@ fn combined_shears_reflection_scale_rotation_and_translation_use_one_analytic_in
         let bounds = selection::bounds(&expected_polygon).unwrap();
         let preview = Engine::preview_edits(before.clone(), &[c.clone()]).unwrap();
         edit(&mut engine, &[c]);
-        let layer = &engine.doc.layers[0];
+        let layer = &engine.resident_state().expect("resident fixture").document.layers[0];
         assert_eq!(
-            engine.doc.export_png().unwrap(),
+            engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
             preview.export_png().unwrap()
         );
         for y in bounds[1]..bounds[3] {
@@ -501,14 +501,14 @@ fn combined_shears_reflection_scale_rotation_and_translation_use_one_analytic_in
                 }
                 assert_eq!(color(layer, x, y), expected, "{depth} native {x},{y}");
                 assert_eq!(
-                    (selection::current(&engine.doc).unwrap().value(x, y) * 255.).round() as u8,
+                    (selection::current(&engine.resident_state().expect("resident fixture").document).unwrap().value(x, y) * 255.).round() as u8,
                     scalar(&coverage, u, v),
                     "{depth} scalar {x},{y}"
                 );
             }
         }
         assert_eq!(color(layer, 15, 13), color(&before.layers[0], 15, 13));
-        assert_eq!(engine.undo.len(), 1);
+        assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), 1);
     }
 }
 
@@ -516,29 +516,29 @@ fn combined_shears_reflection_scale_rotation_and_translation_use_one_analytic_in
 fn polygon_skew_has_analytic_vertices_and_omitted_or_zero_skew_preserves_legacy_selected_words() {
     for depth in [8, 16] {
         let mut engine = fixture(depth);
-        engine.doc.selection_coverage = None;
+        engine.resident_state_mut().expect("resident fixture").document.selection_coverage = None;
         let polygon = vec![[2., 2.], [10., 2.], [8., 9.], [3., 7.]];
-        engine.doc.selection = Some(selection::bounds(&polygon).unwrap());
-        engine.doc.selection_polygon = Some(polygon);
-        let before = engine.doc.clone();
+        engine.resident_state_mut().expect("resident fixture").document.selection = Some(selection::bounds(&polygon).unwrap());
+        engine.resident_state_mut().expect("resident fixture").document.selection_polygon = Some(polygon);
+        let before = engine.resident_state().expect("resident fixture").document.clone();
         let c = command(&engine, json!({"skew_x":45.,"skew_y":45.,"dx":12.,"dy":3.}));
         let preview = Engine::preview_edits(before.clone(), &[c.clone()]).unwrap();
         assert_eq!(
             preview.selection_polygon,
             Some(vec![[15.5, 8.5], [23.5, 16.5], [28.5, 28.5], [21.5, 19.5]])
         );
-        assert_eq!(engine.doc.selection, before.selection);
+        assert_eq!(engine.resident_state().expect("resident fixture").document.selection, before.selection);
         edit(&mut engine, &[c]);
-        assert_eq!(engine.doc.layers[0].pixels, preview.layers[0].pixels);
-        assert_eq!(engine.doc.selection_polygon, preview.selection_polygon);
+        assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].pixels, preview.layers[0].pixels);
+        assert_eq!(engine.resident_state().expect("resident fixture").document.selection_polygon, preview.selection_polygon);
         engine.undo("human").unwrap();
-        assert_eq!(engine.doc.layers[0].pixels, before.layers[0].pixels);
+        assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].pixels, before.layers[0].pixels);
         for covered in [false, true] {
             let mut engine = fixture(depth);
             if !covered {
-                engine.doc.selection_coverage = None;
-                engine.doc.selection_polygon =
-                    Some(selection::rectangle(engine.doc.selection.unwrap()));
+                engine.resident_state_mut().expect("resident fixture").document.selection_coverage = None;
+                engine.resident_state_mut().expect("resident fixture").document.selection_polygon =
+                    Some(selection::rectangle(engine.resident_state().expect("resident fixture").document.selection.unwrap()));
             }
             let c = command(
                 &engine,
@@ -548,8 +548,8 @@ fn polygon_skew_has_analytic_vertices_and_omitted_or_zero_skew_preserves_legacy_
             zero["skew_x"] = json!(0.);
             zero["skew_y"] = json!(-0.);
             assert_eq!(engine.scopes(&c), engine.scopes(&zero));
-            let a = Engine::preview_edits(engine.doc.clone(), &[c]).unwrap();
-            let b = Engine::preview_edits(engine.doc.clone(), &[zero]).unwrap();
+            let a = Engine::preview_edits(engine.resident_state().expect("resident fixture").document.clone(), &[c]).unwrap();
+            let b = Engine::preview_edits(engine.resident_state().expect("resident fixture").document.clone(), &[zero]).unwrap();
             assert_eq!(a.layers[0].pixels, b.layers[0].pixels);
             assert_eq!(a.selection, b.selection);
             assert_eq!(a.selection_polygon, b.selection_polygon);
@@ -576,12 +576,12 @@ fn polygon_skew_has_analytic_vertices_and_omitted_or_zero_skew_preserves_legacy_
 fn multiple_roots_share_the_original_soft_selection_and_one_history_entry() {
     for depth in [8, 16] {
         let mut engine = fixture(depth);
-        let mut second = engine.doc.layers[0].clone();
+        let mut second = engine.resident_state().expect("resident fixture").document.layers[0].clone();
         second.id = peerbrush::engine::id();
         second.name = "Hidden second root".into();
         second.visible = false;
-        engine.doc.layers.push(second);
-        let before = engine.doc.clone();
+        engine.resident_state_mut().expect("resident fixture").document.layers.push(second);
+        let before = engine.resident_state().expect("resident fixture").document.clone();
         let commands = before
             .layers
             .iter()
@@ -600,18 +600,18 @@ fn multiple_roots_share_the_original_soft_selection_and_one_history_entry() {
             .collect::<Vec<_>>();
         let preview = Engine::preview_edits(before.clone(), &commands).unwrap();
         edit(&mut engine, &commands);
-        assert_eq!(engine.undo.len(), 1);
+        assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), 1);
         for (index, expected) in expected.iter().enumerate() {
             assert_eq!(
-                engine.doc.layers[index].pixels,
+                engine.resident_state().expect("resident fixture").document.layers[index].pixels,
                 expected.layers[index].pixels
             );
-            assert_eq!(engine.doc.layers[index].parent, before.layers[index].parent);
+            assert_eq!(engine.resident_state().expect("resident fixture").document.layers[index].parent, before.layers[index].parent);
             assert_eq!(
-                engine.doc.layers[index].visible,
+                engine.resident_state().expect("resident fixture").document.layers[index].visible,
                 before.layers[index].visible
             );
-            for (a, b) in engine.doc.layers[index]
+            for (a, b) in engine.resident_state().expect("resident fixture").document.layers[index]
                 .mask
                 .as_ref()
                 .unwrap()
@@ -622,17 +622,17 @@ fn multiple_roots_share_the_original_soft_selection_and_one_history_entry() {
                 assert_eq!(a.pixels, b.pixels);
             }
             assert!(independent_coverage_eq(
-                engine.doc.selection_coverage.as_ref(),
+                engine.resident_state().expect("resident fixture").document.selection_coverage.as_ref(),
                 expected.selection_coverage.as_ref()
             ));
         }
         assert_eq!(
-            engine.doc.export_png().unwrap(),
+            engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
             preview.export_png().unwrap()
         );
         engine.undo("human").unwrap();
-        assert_eq!(engine.doc.selection_coverage, before.selection_coverage);
-        for (a, b) in engine.doc.layers.iter().zip(&before.layers) {
+        assert_eq!(engine.resident_state().expect("resident fixture").document.selection_coverage, before.selection_coverage);
+        for (a, b) in engine.resident_state().expect("resident fixture").document.layers.iter().zip(&before.layers) {
             assert_eq!(a.pixels, b.pixels);
         }
     }
@@ -643,7 +643,7 @@ fn selected_skew_destination_selection_source_and_partial_batch_guards_are_atomi
     use base64::Engine as _;
     for depth in [8, 16] {
         let mut engine = fixture(depth);
-        let before = engine.doc.clone();
+        let before = engine.resident_state().expect("resident fixture").document.clone();
         let id = before.layers[0].id.clone();
         let mut c = command(&engine, json!({"skew_x":45.,"dx":12.,"dy":3.}));
         c["document_id"] = json!(before.id);
@@ -679,13 +679,13 @@ fn selected_skew_destination_selection_source_and_partial_batch_guards_are_atomi
         let png = base64::engine::general_purpose::STANDARD
             .decode(result["images"][0]["data"].as_str().unwrap())
             .unwrap();
-        let after = shared.lock().unwrap().doc.clone();
+        let after = shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
         let (_, _, expected, _) = after.preview(None, 64, None, false).unwrap();
         assert_eq!(
             image::load_from_memory(&png).unwrap().to_rgba8().into_raw(),
             expected
         );
-        assert_eq!(shared.lock().unwrap().undo.len(), 1);
+        assert_eq!(shared.lock().unwrap().resident_state().expect("resident fixture").undo.len(), 1);
         assert!(
             server::dispatch(&shared, "edit", &request).is_err(),
             "A consumed source revision must not silently rebase"
@@ -698,13 +698,13 @@ fn selected_skew_destination_selection_source_and_partial_batch_guards_are_atomi
         )
         .unwrap();
         assert_eq!(
-            shared.lock().unwrap().doc.export_png().unwrap(),
+            shared.lock().unwrap().resident_state().expect("resident fixture").document.export_png().unwrap(),
             before.export_png().unwrap()
         );
 
         let mut engine = fixture(depth);
         let before = state(&engine);
-        let first = json!({"op":"layer.update","layer":engine.doc.layers[0].id,"name":"Would change first"});
+        let first = json!({"op":"layer.update","layer":engine.resident_state().expect("resident fixture").document.layers[0].id,"name":"Would change first"});
         for fields in [
             json!({"skew_x":"45"}),
             json!({"skew_y":true}),
@@ -724,15 +724,15 @@ fn selected_skew_destination_selection_source_and_partial_batch_guards_are_atomi
                 )
                 .is_err());
             assert_eq!(state(&engine), before);
-            assert!(Engine::preview_edits(engine.doc.clone(), &[c]).is_err());
+            assert!(Engine::preview_edits(engine.resident_state().expect("resident fixture").document.clone(), &[c]).is_err());
         }
-        engine.doc.layers[0].locked = true;
+        engine.resident_state_mut().expect("resident fixture").document.layers[0].locked = true;
         let before = state(&engine);
         let c = command(&engine, json!({"skew_x":45.}));
         assert!(engine.edit("human", &[c], None, None, "Locked").is_err());
         assert_eq!(state(&engine), before);
-        engine.doc.layers[0].locked = false;
-        engine.doc.layers[0].mask.as_mut().unwrap().steps[1].kind = "invert".into();
+        engine.resident_state_mut().expect("resident fixture").document.layers[0].locked = false;
+        engine.resident_state_mut().expect("resident fixture").document.layers[0].mask.as_mut().unwrap().steps[1].kind = "invert".into();
         let before = state(&engine);
         let c = command(&engine, json!({"skew_x":45.}));
         assert!(engine
@@ -741,7 +741,7 @@ fn selected_skew_destination_selection_source_and_partial_batch_guards_are_atomi
         assert_eq!(state(&engine), before);
 
         let mut engine = Engine::new();
-        engine.doc = Document::new_depth(64, 48, depth).unwrap();
+        engine.resident_state_mut().expect("resident fixture").document = Document::new_depth(64, 48, depth).unwrap();
         let source = Source {
             width: 24,
             height: 16,
@@ -793,8 +793,8 @@ fn thin_large_pivot_skew_scopes_enclose_actual_f32_polygon_without_large_allocat
         ),
     ] {
         let mut engine = Engine::new();
-        engine.doc = Document::new(8, 8).unwrap();
-        engine.doc.selection = Some(area);
+        engine.resident_state_mut().expect("resident fixture").document = Document::new(8, 8).unwrap();
+        engine.resident_state_mut().expect("resident fixture").document.selection = Some(area);
         let mut c = command(&engine, fields);
         c["pivot"] = json!(pivot);
         let (sin, cos) = c["angle"].as_f64().unwrap().to_radians().sin_cos();
@@ -823,7 +823,7 @@ fn thin_large_pivot_skew_scopes_enclose_actual_f32_polygon_without_large_allocat
         let scope = engine
             .scopes(&c)
             .into_iter()
-            .find(|s| s.target.as_deref() == Some(engine.doc.layers[0].id.as_str()))
+            .find(|s| s.target.as_deref() == Some(engine.resident_state().expect("resident fixture").document.layers[0].id.as_str()))
             .unwrap()
             .rect
             .unwrap();

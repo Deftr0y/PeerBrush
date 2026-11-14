@@ -1,7 +1,10 @@
 //! Streaming scalar bounds and exact pixel-boundary contours. Workspace and
 //! retained contour capacities remain in the caller's shared resident ledger.
 use super::backed::ContourOwner;
-use crate::large_document::{Error, ResidentBudget, Result, ScratchBytes};
+use crate::{
+    large_document::{Error, ResidentBudget, Result, ScratchBytes},
+    raster::TILE,
+};
 use std::sync::Arc;
 
 const MAX_EDGES: usize = 500_000;
@@ -86,32 +89,41 @@ impl Contours {
                 "Selection contour rows differ from their source",
             ));
         }
-        for x in 0..self.width {
-            if x % 4096 == 0 {
+        let zero = [0; TILE as usize];
+        for (column, samples) in values.chunks(TILE as usize).enumerate() {
+            if column * TILE as usize % 4096 == 0 {
                 check()?;
             }
-            let value = values[x as usize];
-            let inside = value >= 128;
-            let above = self.previous[x as usize] >= 128;
-            if value > 0 {
-                self.bounds = [
-                    self.bounds[0].min(x as i32),
-                    self.bounds[1].min(y as i32),
-                    self.bounds[2].max(x as i32 + 1),
-                    self.bounds[3].max(y as i32 + 1),
-                ];
+            let start = column * TILE as usize;
+            if samples == &zero[..samples.len()]
+                && self.previous[start..start + samples.len()] == zero[..samples.len()]
+            {
+                continue;
             }
-            if inside && !above {
-                self.edge((x, y), (x + 1, y))?;
-            }
-            if above && !inside {
-                self.edge((x + 1, y), (x, y))?;
-            }
-            if inside && (x == 0 || values[x as usize - 1] < 128) {
-                self.edge((x, y + 1), (x, y))?;
-            }
-            if inside && (x + 1 == self.width || values[x as usize + 1] < 128) {
-                self.edge((x + 1, y), (x + 1, y + 1))?;
+            for (i, &value) in samples.iter().enumerate() {
+                let x = (start + i) as u32;
+                let inside = value >= 128;
+                let above = self.previous[x as usize] >= 128;
+                if value > 0 {
+                    self.bounds = [
+                        self.bounds[0].min(x as i32),
+                        self.bounds[1].min(y as i32),
+                        self.bounds[2].max(x as i32 + 1),
+                        self.bounds[3].max(y as i32 + 1),
+                    ];
+                }
+                if inside && !above {
+                    self.edge((x, y), (x + 1, y))?;
+                }
+                if above && !inside {
+                    self.edge((x + 1, y), (x, y))?;
+                }
+                if inside && (x == 0 || values[x as usize - 1] < 128) {
+                    self.edge((x, y + 1), (x, y))?;
+                }
+                if inside && (x + 1 == self.width || values[x as usize + 1] < 128) {
+                    self.edge((x + 1, y), (x + 1, y + 1))?;
+                }
             }
         }
         self.previous.copy_from_slice(values);

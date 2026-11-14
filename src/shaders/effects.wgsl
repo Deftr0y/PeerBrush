@@ -118,6 +118,7 @@ fn color(@builtin(global_invocation_id) id: vec3<u32>) {
             }
             case 3u: { result = vec4<u32>(bytes(hsl(vec3<f32>(p.xyz) / 255.0) * 255.0), p.w); }
             case 4u: { result = vec4<u32>(bytes(balance(vec3<f32>(p.xyz) / 255.0) * 255.0), p.w); }
+            case 5u: { result = vec4<u32>(table[p.x], table[256u + p.y], table[512u + p.z], p.w); }
             default: {}
         }
     }

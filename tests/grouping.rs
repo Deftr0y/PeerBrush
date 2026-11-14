@@ -2,8 +2,8 @@ use peerbrush::engine::{Document, Engine, Layer, Scope};
 use serde_json::json;
 fn setup() -> Engine {
     let mut e = Engine::new();
-    e.doc = Document::new(8, 8).unwrap();
-    e.doc.layers = (0..3)
+    e.resident_state_mut().expect("resident fixture").document = Document::new(8, 8).unwrap();
+    e.resident_state_mut().expect("resident fixture").document.layers = (0..3)
         .map(|i| Layer::new(&format!("Layer {i}"), "paint", 8, 8))
         .collect();
     e
@@ -11,7 +11,7 @@ fn setup() -> Engine {
 #[test]
 fn selected_layers_enter_new_folder_in_order_with_one_undo() {
     let mut e = setup();
-    let ids = vec![e.doc.layers[0].id.clone(), e.doc.layers[2].id.clone()];
+    let ids = vec![e.resident_state().expect("resident fixture").document.layers[0].id.clone(), e.resident_state().expect("resident fixture").document.layers[2].id.clone()];
     let result = e
         .edit(
             "human",
@@ -22,17 +22,17 @@ fn selected_layers_enter_new_folder_in_order_with_one_undo() {
         )
         .unwrap();
     let folder = result["created"][0].as_str().unwrap();
-    assert_eq!(e.doc.layers[0].id, folder);
-    assert_eq!(e.doc.layers[1].id, ids[0]);
-    assert_eq!(e.doc.layers[2].id, ids[1]);
-    assert_eq!(e.doc.layers[1].parent.as_deref(), Some(folder));
-    assert_eq!(e.doc.layers[2].parent.as_deref(), Some(folder));
-    assert_eq!(e.undo.len(), 1);
+    assert_eq!(e.resident_state().expect("resident fixture").document.layers[0].id, folder);
+    assert_eq!(e.resident_state().expect("resident fixture").document.layers[1].id, ids[0]);
+    assert_eq!(e.resident_state().expect("resident fixture").document.layers[2].id, ids[1]);
+    assert_eq!(e.resident_state().expect("resident fixture").document.layers[1].parent.as_deref(), Some(folder));
+    assert_eq!(e.resident_state().expect("resident fixture").document.layers[2].parent.as_deref(), Some(folder));
+    assert_eq!(e.resident_state().expect("resident fixture").undo.len(), 1);
     e.undo("human").unwrap();
-    assert_eq!(e.doc.layers.len(), 3);
-    assert!(e.doc.layers.iter().all(|l| l.parent.is_none()));
+    assert_eq!(e.resident_state().expect("resident fixture").document.layers.len(), 3);
+    assert!(e.resident_state().expect("resident fixture").document.layers.iter().all(|l| l.parent.is_none()));
     e.redo("human").unwrap();
-    assert_eq!(e.doc.layers.len(), 4);
+    assert_eq!(e.resident_state().expect("resident fixture").document.layers.len(), 4);
 }
 #[test]
 fn folders_keep_children_and_nested_sources_use_common_ancestor() {
@@ -40,12 +40,12 @@ fn folders_keep_children_and_nested_sources_use_common_ancestor() {
     let mut a = Layer::new("A", "group", 8, 8);
     let b = Layer::new("B", "group", 8, 8);
     a.parent = Some(b.id.clone());
-    e.doc.layers[0].parent = Some(a.id.clone());
-    let child = e.doc.layers[0].id.clone();
-    let outside = e.doc.layers[2].id.clone();
+    e.resident_state_mut().expect("resident fixture").document.layers[0].parent = Some(a.id.clone());
+    let child = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
+    let outside = e.resident_state().expect("resident fixture").document.layers[2].id.clone();
     let a_id = a.id.clone();
-    e.doc.layers.insert(0, a);
-    e.doc.layers.insert(0, b);
+    e.resident_state_mut().expect("resident fixture").document.layers.insert(0, a);
+    e.resident_state_mut().expect("resident fixture").document.layers.insert(0, b);
     let r = e
         .edit(
             "human",
@@ -57,7 +57,7 @@ fn folders_keep_children_and_nested_sources_use_common_ancestor() {
         .unwrap();
     let group = r["created"][0].as_str().unwrap();
     assert!(e
-        .doc
+        .resident_state().expect("resident fixture").document
         .layers
         .iter()
         .find(|l| l.id == group)
@@ -65,7 +65,7 @@ fn folders_keep_children_and_nested_sources_use_common_ancestor() {
         .parent
         .is_none());
     assert_eq!(
-        e.doc
+        e.resident_state().expect("resident fixture").document
             .layers
             .iter()
             .find(|l| l.id == a_id)
@@ -75,7 +75,7 @@ fn folders_keep_children_and_nested_sources_use_common_ancestor() {
         Some(group)
     );
     assert_eq!(
-        e.doc
+        e.resident_state().expect("resident fixture").document
             .layers
             .iter()
             .find(|l| l.id == child)
@@ -88,8 +88,8 @@ fn folders_keep_children_and_nested_sources_use_common_ancestor() {
 #[test]
 fn grouping_rejects_locked_descendants_and_reservations_atomically() {
     let mut e = setup();
-    let id = e.doc.layers[0].id.clone();
-    e.doc.layers[0].locked = true;
+    let id = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
+    e.resident_state_mut().expect("resident fixture").document.layers[0].locked = true;
     assert!(e
         .edit(
             "human",
@@ -99,9 +99,9 @@ fn grouping_rejects_locked_descendants_and_reservations_atomically() {
             "Group"
         )
         .is_err());
-    assert!(e.undo.is_empty());
-    assert_eq!(e.doc.layers.len(), 3);
-    e.doc.layers[0].locked = false;
+    assert!(e.resident_state().expect("resident fixture").undo.is_empty());
+    assert_eq!(e.resident_state().expect("resident fixture").document.layers.len(), 3);
+    e.resident_state_mut().expect("resident fixture").document.layers[0].locked = false;
     e.reserve("artist", "Painting", vec![Scope::layer(&id)])
         .unwrap();
     assert!(e
@@ -114,7 +114,7 @@ fn grouping_rejects_locked_descendants_and_reservations_atomically() {
         )
         .unwrap_err()
         .contains("Reserved"));
-    assert!(e.undo.is_empty());
+    assert!(e.resident_state().expect("resident fixture").undo.is_empty());
 }
 
 #[test]
@@ -127,7 +127,7 @@ fn grouping_uses_visible_hierarchy_order_even_when_storage_is_not_preorder() {
     let mut child_b = Layer::new("Child B", "paint", 8, 8);
     child_b.parent = Some(b.id.clone());
     let ids = vec![child_b.id.clone(), child_a.id.clone()];
-    e.doc.layers = vec![child_b, a, child_a, b];
+    e.resident_state_mut().expect("resident fixture").document.layers = vec![child_b, a, child_a, b];
     let r = e
         .edit(
             "human",
@@ -139,7 +139,7 @@ fn grouping_uses_visible_hierarchy_order_even_when_storage_is_not_preorder() {
         .unwrap();
     let group = r["created"][0].as_str().unwrap();
     let children = e
-        .doc
+        .resident_state().expect("resident fixture").document
         .layers
         .iter()
         .filter(|l| l.parent.as_deref() == Some(group))
@@ -151,13 +151,13 @@ fn grouping_uses_visible_hierarchy_order_even_when_storage_is_not_preorder() {
 #[test]
 fn native16_grouping_keeps_complete_sources_composite_and_single_undo() {
     let mut e = setup();
-    e.doc.bit_depth = 16;
-    for (index, l) in e.doc.layers.iter_mut().enumerate() {
+    e.resident_state_mut().expect("resident fixture").document.bit_depth = 16;
+    for (index, l) in e.resident_state_mut().expect("resident fixture").document.layers.iter_mut().enumerate() {
         l.pixels.promote16();
         l.pixels
             .set16(index as i32, 3, [12347, 23459, 34571, 65535]);
     }
-    let ids: Vec<_> = e.doc.layers.iter().map(|l| l.id.clone()).collect();
+    let ids: Vec<_> = e.resident_state().expect("resident fixture").document.layers.iter().map(|l| l.id.clone()).collect();
     e.edit(
         "human",
         &[
@@ -169,7 +169,7 @@ fn native16_grouping_keeps_complete_sources_composite_and_single_undo() {
         "Sources",
     )
     .unwrap();
-    e.doc.layers[0]
+    e.resident_state_mut().expect("resident fixture").document.layers[0]
         .mask
         .as_mut()
         .unwrap()
@@ -178,25 +178,25 @@ fn native16_grouping_keeps_complete_sources_composite_and_single_undo() {
         .unwrap()
         .pixels
         .set16(0, 3, [40001, 40001, 40001, 65535]);
-    e.undo.clear();
-    let before = e.doc.clone();
+    e.resident_state_mut().expect("resident fixture").undo.clear();
+    let before = e.resident_state().expect("resident fixture").document.clone();
     let result = e
         .edit(
             "human",
             &[json!({"op":"group.create_selected","layers":ids,"name":"Native folder"})],
-            Some(e.doc.revision),
+            Some(e.resident_state().expect("resident fixture").document.revision),
             None,
             "Group",
         )
         .unwrap();
     let group = result["created"][0].as_str().unwrap();
-    assert_eq!(e.doc.layers[0].id, group);
-    assert_eq!(e.doc.layers[0].pixels.depth, 16);
-    assert_eq!(e.undo.len(), 1);
-    assert_eq!(e.doc.export_png().unwrap(), before.export_png().unwrap());
+    assert_eq!(e.resident_state().expect("resident fixture").document.layers[0].id, group);
+    assert_eq!(e.resident_state().expect("resident fixture").document.layers[0].pixels.depth, 16);
+    assert_eq!(e.resident_state().expect("resident fixture").undo.len(), 1);
+    assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), before.export_png().unwrap());
     for old in &before.layers {
         let mut current = e
-            .doc
+            .resident_state().expect("resident fixture").document
             .layers
             .iter()
             .find(|l| l.id == old.id)
@@ -208,13 +208,13 @@ fn native16_grouping_keeps_complete_sources_composite_and_single_undo() {
             serde_json::to_value(old).unwrap()
         );
     }
-    let loaded = peerbrush::psd::decode(&peerbrush::psd::encode(&e.doc).unwrap()).unwrap();
+    let loaded = peerbrush::psd::decode(&peerbrush::psd::encode(&e.resident_state().expect("resident fixture").document).unwrap()).unwrap();
     assert!(!loaded.read_only);
     assert_eq!(loaded.bit_depth, 16);
-    assert_eq!(loaded.export_png().unwrap(), e.doc.export_png().unwrap());
+    assert_eq!(loaded.export_png().unwrap(), e.resident_state().expect("resident fixture").document.export_png().unwrap());
     e.undo("human").unwrap();
     assert_eq!(
-        serde_json::to_value(&e.doc.layers).unwrap(),
+        serde_json::to_value(&e.resident_state().expect("resident fixture").document.layers).unwrap(),
         serde_json::to_value(&before.layers).unwrap()
     );
 }

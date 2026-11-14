@@ -1,7 +1,7 @@
 //! Memory-only foreground fills and clears on explicitly prepared native tiles.
 use crate::{
     large_document::{PinnedBytes, ResidentBudget, ScratchBytes},
-    raster::{blend, blend16, Pixel, TILE},
+    raster::{blend, blend16, project16, Pixel16, TILE},
 };
 
 struct TileArea {
@@ -105,7 +105,8 @@ impl TileArea {
 
 pub(crate) struct PreparedFill<'a> {
     frame: TileArea,
-    color: Pixel,
+    color: Pixel16,
+    literal: bool,
     polygon: Option<&'a [[f32; 2]]>,
 }
 impl<'a> PreparedFill<'a> {
@@ -116,7 +117,7 @@ impl<'a> PreparedFill<'a> {
         depth: u16,
         area: [i32; 4],
         origin: [i32; 2],
-        color: Pixel,
+        color: Pixel16,
         polygon: Option<&'a [[f32; 2]]>,
         budget: &ResidentBudget,
     ) -> Result<Self, String> {
@@ -126,11 +127,16 @@ impl<'a> PreparedFill<'a> {
         Ok(Self {
             frame: TileArea::new(width, height, depth, area, origin, budget)?,
             color,
+            literal: false,
             polygon,
         })
     }
+    pub(crate) fn literal(mut self) -> Self {
+        self.literal = true;
+        self
+    }
     pub(crate) fn tiles(&self) -> impl Iterator<Item = (u32, u32)> {
-        self.frame.tiles(self.color[3] != 0)
+        self.frame.tiles(self.literal || self.color[3] != 0)
     }
     pub(crate) fn render_tile(
         &self,
@@ -138,7 +144,7 @@ impl<'a> PreparedFill<'a> {
         source: &PinnedBytes,
         check: &mut dyn FnMut() -> Result<(), String>,
     ) -> Result<PinnedBytes, String> {
-        if self.color[3] == 0 {
+        if !self.literal && self.color[3] == 0 {
             return Err("Transparent native fill has no prepared tiles".into());
         }
         let WorkingTile {
@@ -147,7 +153,8 @@ impl<'a> PreparedFill<'a> {
             origin,
         } = self.frame.copy_tile(key, source, check)?;
         let stride = if self.frame.depth == 16 { 8 } else { 4 };
-        let color16 = self.color.map(|v| u16::from(v) * 257);
+        let color16 = self.color;
+        let color8 = color16.map(project16);
         for y in area[1]..area[3] {
             check()?;
             for x in area[0]..area[2] {
@@ -166,7 +173,7 @@ impl<'a> PreparedFill<'a> {
                     let old = std::array::from_fn(|i| {
                         u16::from_be_bytes([bytes[at + i * 2], bytes[at + i * 2 + 1]])
                     });
-                    let result = if color16[3] == 65535 {
+                    let result = if self.literal || color16[3] == 65535 {
                         color16
                     } else {
                         blend16(old, color16, 1., "normal")
@@ -176,10 +183,10 @@ impl<'a> PreparedFill<'a> {
                     }
                 } else {
                     let old = bytes[at..at + 4].try_into().unwrap();
-                    let result = if self.color[3] == 255 {
-                        self.color
+                    let result = if self.literal || color8[3] == 255 {
+                        color8
                     } else {
-                        blend(old, self.color, 1., "normal")
+                        blend(old, color8, 1., "normal")
                     };
                     bytes[at..at + 4].copy_from_slice(&result);
                 }
@@ -359,7 +366,7 @@ mod tests {
                 depth,
                 [256, 256, 257, 259],
                 [0, 0],
-                [71, 137, 211, 127],
+                [71, 137, 211, 127].map(crate::fill::expand_byte),
                 None,
                 &pool,
             )
@@ -394,7 +401,7 @@ mod tests {
             16,
             [0, 0, 512, 256],
             [0, 0],
-            [17, 71, 201, 255],
+            [17, 71, 201, 255].map(crate::fill::expand_byte),
             None,
             &pool,
         )

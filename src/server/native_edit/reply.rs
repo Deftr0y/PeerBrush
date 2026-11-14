@@ -9,8 +9,21 @@ pub(crate) struct EditReply {
     pub(super) value: Value,
     #[serde(skip)]
     admission: Option<ReplyAdmission>,
+    #[serde(skip)]
+    native_key: Option<native::DocumentKey>,
 }
 impl EditReply {
+    pub(super) fn history(
+        candidate: &native::NativeDocument,
+    ) -> Result<Self, String> {
+        let mut admission = ReplyAdmission::new(true);
+        admission.admit(candidate.budget(), 4096)?;
+        Ok(Self {
+            value: json!({"revision":candidate.metadata().revision()}),
+            admission: Some(admission),
+            native_key: Some(candidate.key()),
+        })
+    }
     pub(crate) fn data(&self) -> &Value {
         &self.value
     }
@@ -18,13 +31,16 @@ impl EditReply {
         Self {
             value,
             admission: None,
+            native_key: None,
         }
     }
     pub(in crate::server) fn into_response(
         self,
         target: &mut ReplyAdmission,
     ) -> Result<Value, String> {
-        let Self { value, admission } = self;
+        let Self {
+            value, admission, ..
+        } = self;
         if let Some(mut admission) = admission {
             if let Err(error) = target.absorb_projection(&mut admission) {
                 drop(value);
@@ -34,7 +50,7 @@ impl EditReply {
         }
         Ok(value)
     }
-    pub(super) fn native(
+    pub(crate) fn native(
         prepared: &native::worker::PreparedNative,
         applied: usize,
     ) -> Result<Self, String> {
@@ -59,7 +75,20 @@ impl EditReply {
         Ok(Self {
             value,
             admission: Some(admission),
+            native_key: Some(prepared.preview().key()),
         })
+    }
+    pub(crate) fn native_key(&self) -> Option<native::DocumentKey> {
+        self.native_key
+    }
+    pub(crate) fn native_pool(&self) -> Option<&crate::large_document::ResidentBudget> {
+        self.admission
+            .as_ref()
+            .and_then(ReplyAdmission::pool_option)
+    }
+    pub(crate) fn cleanup_pending(&mut self) {
+        self.value["cleanup_warning"] =
+            Value::String("Edit applied; provisional source cleanup is pending.".into());
     }
 }
 #[derive(Serialize)]

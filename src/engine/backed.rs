@@ -42,7 +42,7 @@ impl Source {
     /// The initial bridge deliberately covers exactly one complete aligned tile.
     /// Shifted/partial tiles would need separately admitted reframe/COW ownership.
     pub fn capture(engine: &Engine, target: &str, rect: [i32; 4]) -> Result<Self, String> {
-        let doc = &engine.doc;
+        let doc = &engine.authority.resident_state()?.document;
         if doc.read_only {
             return Err("Backing preparation requires an editable document".into());
         }
@@ -234,6 +234,7 @@ impl Engine {
             None,
             None,
             Some(pixels),
+            None,
         )
     }
 }
@@ -267,17 +268,17 @@ mod tests {
     }
     fn engine(depth: u16) -> Engine {
         let mut engine = Engine::new();
-        engine.doc = Document::new_depth(512, 256, depth).unwrap();
-        engine.doc.layers[0]
+        engine.resident_state_mut().expect("resident fixture").document = Document::new_depth(512, 256, depth).unwrap();
+        engine.resident_state_mut().expect("resident fixture").document.layers[0]
             .pixels
             .set16(2, 3, [12345, 22222, 33333, 65535]);
-        engine.doc.layers[0]
+        engine.resident_state_mut().expect("resident fixture").document.layers[0]
             .pixels
             .set16(300, 3, [40000, 50000, 60000, 65535]);
         engine
     }
     fn prepare(engine: &Engine, store: Store) -> PreparedPixels {
-        Source::capture(engine, &engine.doc.layers[0].id, [0, 0, 256, 256])
+        Source::capture(engine, &engine.resident_state().expect("resident fixture").document.layers[0].id, [0, 0, 256, 256])
             .unwrap()
             .prepare(store, &mut || Ok(()), |_| [10001, 20002, 30003, 65535])
             .unwrap()
@@ -302,7 +303,7 @@ mod tests {
             for soft in [false, true] {
                 let (store, path) = store(16 * 1024 * 1024);
                 let mut typed = engine(depth);
-                typed.doc.selection = Some([1, 1, 120, 120]);
+                typed.resident_state_mut().expect("resident fixture").document.selection = Some([1, 1, 120, 120]);
                 if soft {
                     let mut mask = Raster::new(512, 256);
                     for y in 1..120 {
@@ -310,22 +311,22 @@ mod tests {
                             mask.set(x, y, [127; 4]);
                         }
                     }
-                    typed.doc.selection_coverage = Some(crate::selection::Coverage {
+                    typed.resident_state_mut().expect("resident fixture").document.selection_coverage = Some(crate::selection::Coverage {
                         mask,
                         bounds: [1, 1, 120, 120],
                         origin: [0, 0],
                         contours: vec![],
                     });
                 }
-                let original = typed.doc.layers[0].pixels.clone();
-                typed.doc.layers[0].pixels.retained = Some(Box::new(crate::retained::Original {
+                let original = typed.resident_state().expect("resident fixture").document.layers[0].pixels.clone();
+                typed.resident_state_mut().expect("resident fixture").document.layers[0].pixels.retained = Some(Box::new(crate::retained::Original {
                     pixels: Box::new(original),
                     matrix: crate::retained::IDENTITY,
                     projective: None,
                     warps: vec![],
                 }));
                 let mut wire = engine(depth);
-                wire.doc = typed.doc.clone();
+                wire.resident_state_mut().expect("resident fixture").document = typed.resident_state().expect("resident fixture").document.clone();
                 let prepared = prepare(&typed, store.clone());
                 let mut command = prepared.command.clone();
                 let mut bytes = prepared.bytes.to_vec();
@@ -341,20 +342,20 @@ mod tests {
                     .commit_backed_pixels("human", prepared, None, "Native tile")
                     .unwrap();
                 assert_eq!(
-                    serde_json::to_value(&typed.doc).unwrap(),
-                    serde_json::to_value(&wire.doc).unwrap()
+                    serde_json::to_value(&typed.resident_state().expect("resident fixture").document).unwrap(),
+                    serde_json::to_value(&wire.resident_state().expect("resident fixture").document).unwrap()
                 );
-                assert_eq!(typed.undo.len(), 1);
+                assert_eq!(typed.resident_state().expect("resident fixture").undo.len(), 1);
                 assert_eq!(
-                    typed.doc.layers[0].pixels.get16(300, 3),
-                    wire.doc.layers[0].pixels.get16(300, 3)
+                    typed.resident_state().expect("resident fixture").document.layers[0].pixels.get16(300, 3),
+                    wire.resident_state().expect("resident fixture").document.layers[0].pixels.get16(300, 3)
                 );
                 typed.undo("human").unwrap();
                 wire.undo("human").unwrap();
-                assert_eq!(typed.doc.layers[0].pixels, wire.doc.layers[0].pixels);
+                assert_eq!(typed.resident_state().expect("resident fixture").document.layers[0].pixels, wire.resident_state().expect("resident fixture").document.layers[0].pixels);
                 typed.redo("human").unwrap();
                 wire.redo("human").unwrap();
-                assert_eq!(typed.doc.layers[0].pixels, wire.doc.layers[0].pixels);
+                assert_eq!(typed.resident_state().expect("resident fixture").document.layers[0].pixels, wire.resident_state().expect("resident fixture").document.layers[0].pixels);
                 assert_store_metadata_only(&store);
                 cleanup(store, path);
             }
@@ -368,21 +369,21 @@ mod tests {
             let mut e = engine(16);
             let prepared = prepare(&e, store.clone());
             match case {
-                0 => e.doc.revision += 1,
-                1 => e.doc.id = super::super::id(),
-                2 => e.doc.layers[0].locked = true,
-                3 => e.doc.read_only = true,
+                0 => e.resident_state_mut().expect("resident fixture").document.revision += 1,
+                1 => e.resident_state_mut().expect("resident fixture").document.id = super::super::id(),
+                2 => e.resident_state_mut().expect("resident fixture").document.layers[0].locked = true,
+                3 => e.resident_state_mut().expect("resident fixture").document.read_only = true,
                 4 => {
                     e.reserve("other", "Conflict", e.scopes(&prepared.command))
                         .unwrap();
                 }
                 _ => {
-                    e.doc.layers[0].kind = "folder".into();
+                    e.resident_state_mut().expect("resident fixture").document.layers[0].kind = "folder".into();
                 }
             }
-            let before = serde_json::to_value(&e.doc).unwrap();
+            let before = serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap();
             let mut wire = engine(16);
-            wire.doc = e.doc.clone();
+            wire.resident_state_mut().expect("resident fixture").document = e.resident_state().expect("resident fixture").document.clone();
             wire.leases = e.leases.clone();
             let mut command = prepared.command.clone();
             let mut bytes = prepared.bytes.to_vec();
@@ -393,12 +394,12 @@ mod tests {
             assert!(wire
                 .edit("human", &[command], Some(0), None, "Refused")
                 .is_err());
-            assert_eq!(serde_json::to_value(&wire.doc).unwrap(), before);
+            assert_eq!(serde_json::to_value(&wire.resident_state().expect("resident fixture").document).unwrap(), before);
             assert!(e
                 .commit_backed_pixels("human", prepared, None, "Refused")
                 .is_err());
-            assert_eq!(serde_json::to_value(&e.doc).unwrap(), before);
-            assert!(e.undo.is_empty());
+            assert_eq!(serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap(), before);
+            assert!(e.resident_state().expect("resident fixture").undo.is_empty());
             assert_store_metadata_only(&store);
             cleanup(store, path);
         }
@@ -412,7 +413,7 @@ mod tests {
         for key in ["layer", "rect", "bit_depth", "rgba", "op"] {
             let mut changed = p.command.clone();
             changed[key] = json!("ambiguous");
-            assert!(p.validate(&e.doc, &changed).is_err());
+            assert!(p.validate(&e.resident_state().expect("resident fixture").document, &changed).is_err());
         }
         drop(p);
         cleanup(store, path);
@@ -422,7 +423,7 @@ mod tests {
     fn malformed_prepared_length_and_multi_command_batches_rollback() {
         let (store, path) = store(16 * 1024 * 1024);
         let mut e = engine(16);
-        let before = serde_json::to_value(&e.doc).unwrap();
+        let before = serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap();
         let mut p = prepare(&e, store.clone());
         p.bytes = ScratchBytes::new(&store.resident_budget(), 8, 8)
             .unwrap()
@@ -430,7 +431,7 @@ mod tests {
         assert!(e
             .commit_backed_pixels("human", p, None, "Malformed")
             .is_err());
-        assert_eq!(serde_json::to_value(&e.doc).unwrap(), before);
+        assert_eq!(serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap(), before);
         let p = prepare(&e, store.clone());
         let commands = [p.command.clone(), p.command.clone()];
         assert!(e
@@ -445,11 +446,12 @@ mod tests {
                 None,
                 None,
                 None,
-                Some(p)
+                Some(p),
+                None,
             )
             .is_err());
-        assert_eq!(serde_json::to_value(&e.doc).unwrap(), before);
-        assert!(e.undo.is_empty());
+        assert_eq!(serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap(), before);
+        assert!(e.resident_state().expect("resident fixture").undo.is_empty());
         assert_store_metadata_only(&store);
         cleanup(store, path);
     }
@@ -459,7 +461,7 @@ mod tests {
         assert!(Document::new_depth(16000, 16000, 8).is_err());
         assert!(Document::new_depth(16000, 16000, 16).is_err());
         let mut e = engine(16);
-        let target = e.doc.layers[0].id.clone();
+        let target = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
         for rect in [
             [0, 0, 512, 256],
             [1, 0, 257, 256],
@@ -468,7 +470,7 @@ mod tests {
         ] {
             assert!(Source::capture(&e, &target, rect).is_err());
         }
-        e.doc.layers[0].x = 1;
+        e.resident_state_mut().expect("resident fixture").document.layers[0].x = 1;
         assert!(Source::capture(&e, &target, [0, 0, 256, 256]).is_err());
     }
 
@@ -476,18 +478,18 @@ mod tests {
     fn cancellation_survives_preparation_and_refuses_queued_publication() {
         let (store, path) = store(16 * 1024 * 1024);
         let mut e = engine(16);
-        let source = Source::capture(&e, &e.doc.layers[0].id, [0, 0, 256, 256]).unwrap();
+        let source = Source::capture(&e, &e.resident_state().expect("resident fixture").document.layers[0].id, [0, 0, 256, 256]).unwrap();
         let cancellation = source.cancellation();
         let prepared = source
             .prepare(store.clone(), &mut || Ok(()), |_| [10001; 4])
             .unwrap();
-        let before = serde_json::to_value(&e.doc).unwrap();
+        let before = serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap();
         cancellation.cancel();
         assert!(e
             .commit_backed_pixels("human", prepared, None, "Cancelled")
             .is_err());
-        assert_eq!(serde_json::to_value(&e.doc).unwrap(), before);
-        assert!(e.undo.is_empty());
+        assert_eq!(serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap(), before);
+        assert!(e.resident_state().expect("resident fixture").undo.is_empty());
         assert_store_metadata_only(&store);
         cleanup(store, path);
     }
@@ -501,8 +503,8 @@ mod tests {
                 1024 * 1024
             });
             let e = engine(16);
-            let before = serde_json::to_value(&e.doc).unwrap();
-            let source = Source::capture(&e, &e.doc.layers[0].id, [0, 0, 256, 256]).unwrap();
+            let before = serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap();
+            let source = Source::capture(&e, &e.resident_state().expect("resident fixture").document.layers[0].id, [0, 0, 256, 256]).unwrap();
             let mut calls = 0;
             assert!(source
                 .prepare(
@@ -518,7 +520,7 @@ mod tests {
                     |p| p
                 )
                 .is_err());
-            assert_eq!(serde_json::to_value(&e.doc).unwrap(), before);
+            assert_eq!(serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap(), before);
             assert_store_metadata_only(&store);
             cleanup(store, path);
         }

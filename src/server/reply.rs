@@ -11,6 +11,7 @@ use serde::ser::SerializeMap;
 use serde::{Serialize, Serializer};
 use serde_json::Value;
 use std::io::Write;
+use std::sync::Arc;
 
 const TICKETS: usize = 256;
 const SLOTS: usize = 8;
@@ -27,10 +28,10 @@ struct Slot {
     data: Data,
 }
 enum Data {
-    Png(Segments),
+    Png(Arc<Segments>),
     JsonText(Value),
 }
-pub(super) struct ReplyAdmission {
+pub(crate) struct ReplyAdmission {
     allowed: bool,
     slots: Vec<Slot>,
     tickets: Vec<Reservation>,
@@ -50,7 +51,7 @@ impl ReplyAdmission {
         self.tickets.append(&mut other.tickets);
         Ok(())
     }
-    pub(super) fn new(allowed: bool) -> Self {
+    pub(crate) fn new(allowed: bool) -> Self {
         Self {
             allowed,
             slots: Vec::new(),
@@ -59,7 +60,7 @@ impl ReplyAdmission {
             index: None,
         }
     }
-    pub(super) fn admit(&mut self, pool: &ResidentBudget, mut bytes: usize) -> Result<(), String> {
+    pub(crate) fn admit(&mut self, pool: &ResidentBudget, mut bytes: usize) -> Result<(), String> {
         if !self.allowed {
             return Err("Native responses require an owned transport reply".into());
         }
@@ -112,7 +113,10 @@ impl ReplyAdmission {
             .as_ref()
             .ok_or_else(|| "Response has no native admission".into())
     }
-    pub(super) fn admit_projection<T: Serialize + ?Sized>(
+    pub(crate) fn pool_option(&self) -> Option<&ResidentBudget> {
+        self.pool.as_ref()
+    }
+    pub(crate) fn admit_projection<T: Serialize + ?Sized>(
         &mut self,
         pool: &ResidentBudget,
         value: &T,
@@ -120,6 +124,13 @@ impl ReplyAdmission {
         self.admit(pool, admission::bound(value)?)
     }
     pub(super) fn image(&mut self, index: usize, bytes: Segments) -> Result<(), String> {
+        self.image_shared(index, Arc::new(bytes))
+    }
+    pub(super) fn image_shared(
+        &mut self,
+        index: usize,
+        bytes: Arc<Segments>,
+    ) -> Result<(), String> {
         if !bytes.uses_budget(self.pool()?) {
             return Err("Response image uses another admission".into());
         }
@@ -148,7 +159,7 @@ impl ReplyAdmission {
         });
         Ok(())
     }
-    pub(super) fn finish(self, value: Value) -> Result<OwnedReply, String> {
+    pub(crate) fn finish(self, value: Value) -> Result<OwnedReply, String> {
         for slot in &self.slots {
             if wire::at(&value, &slot.path[..slot.length]) != Some(&Value::Null) {
                 return Err("Response image or text slot is not its sealed placeholder".into());

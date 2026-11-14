@@ -4,15 +4,20 @@ use super::input::{InputBinding, InputTile, RasterInput};
 use crate::{
     engine::native::{NativeDocument, OutputDraft, RefusedOutput, StagedOutput},
     large_document::{
-        BlockRef, Error, FreshFragment, PinnedBytes, Reservation, ScratchBytes, TileSpec,
+        BlockRef, Error, FreshFragment, PinnedBytes, PinnedTile, Reservation, ScratchBytes,
+        TileSpec,
     },
-    raster::{surface::TilePatch, Surface, TILE},
+    raster::{
+        backed::{PinnedRegion, Region, RegionPins},
+        surface::TilePatch,
+        Surface, TILE,
+    },
     workspace::source_runtime::SourceSession,
 };
 use std::collections::BTreeMap;
 #[path = "output/frame.rs"]
 mod frame;
-pub(crate) use frame::{stage_frame, stage_frame_seed, stage_frame_with, FrameSeed};
+pub(crate) use frame::{prepare_frame_tile, stage_frame, stage_frame_seed, stage_frame_with, FrameSeed};
 
 enum Replacement {
     Zero,
@@ -168,24 +173,69 @@ impl<'d, 's> TileOutput<'d, 's> {
     pub(crate) fn has_replacement(&self, key: (u32, u32)) -> bool {
         self.replacements.contains_key(&key)
     }
-    /// Explicit worker preparation of the complete provisional result. These
-    /// reads include every successfully staged prior dab, without adoption.
+    fn ensure_working(&self, check: &mut dyn FnMut() -> Result<(), String>) -> Result<(), String> {
+        if self.poisoned {
+            return Err("Native output was refused and cannot publish partial work".into());
+        }
+        self.session.check()?;
+        check()
+    }
+    /// Resolve a single immutable block from the ordered working overlay.
+    /// Explicit zero overrides the original block, while a missing entry uses it.
+    fn pin_working_tile(
+        &self,
+        key: (u32, u32),
+        check: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<Option<PinnedTile>, String> {
+        self.ensure_working(check)?;
+        let stored = match self.replacements.get(&key) {
+            Some(Replacement::Zero) => None,
+            Some(Replacement::Stored(reference)) => Some((
+                self.fragment
+                    .as_ref()
+                    .ok_or("Native fragment is missing")?
+                    .store()
+                    .clone(),
+                *reference,
+            )),
+            None => self
+                .source
+                .physical_tile(key)
+                .map(|tile| (tile.owner().clone(), tile.reference())),
+        };
+        stored
+            .map(|(store, reference)| {
+                store
+                    .pin(reference, &mut || {
+                        self.session.check().map_err(|_| Error::Changed)?;
+                        check().map_err(|_| Error::Cancelled)
+                    })
+                    .map_err(|e| e.to_string())
+            })
+            .transpose()
+    }
+    /// Reads include every successfully staged prior dab, without adoption.
     pub(crate) fn prepare_working_tile(
         &self,
         key: (u32, u32),
         check: &mut dyn FnMut() -> Result<(), String>,
     ) -> Result<PinnedBytes, String> {
-        let surface = self.candidate(check)?;
-        let tile = surface
-            .prepare_tile(key, &mut || {
-                self.session.check().map_err(|_| Error::Changed)?;
-                check().map_err(|_| Error::Cancelled)
-            })
+        let shape = self.binding.shape();
+        if key.0 >= shape[0].div_ceil(TILE) || key.1 >= shape[1].div_ceil(TILE) {
+            return Err("Native tile is outside the source plane".into());
+        }
+        let spec = TileSpec::new(TILE as u16, TILE as u16, self.binding.depth())
             .map_err(|e| e.to_string())?;
-        let bytes = tile
-            .copy_to_scratch(self.base.budget())
+        let tile = self.pin_working_tile(key, check)?;
+        let mut bytes = ScratchBytes::new(self.base.budget(), spec.bytes(), spec.bytes())
             .map_err(|e| e.to_string())?;
-        check()?;
+        if let Some(tile) = tile {
+            if tile.spec() != spec {
+                return Err("Native working tile differs from its captured depth or shape".into());
+            }
+            bytes.copy_from_slice(tile.bytes());
+        }
+        self.ensure_working(check)?;
         Ok(bytes.freeze())
     }
     pub(crate) fn prepare_working_strip(
@@ -193,19 +243,38 @@ impl<'d, 's> TileOutput<'d, 's> {
         area: [i32; 4],
         check: &mut dyn FnMut() -> Result<(), String>,
     ) -> Result<PinnedBytes, String> {
+        let shape = self.binding.shape();
         let width = i64::from(area[2]) - i64::from(area[0]);
         let height = i64::from(area[3]) - i64::from(area[1]);
         if width <= 0
             || height <= 0
             || area[0] < 0
             || area[1] < 0
-            || area[2] > self.binding.shape()[0] as i32
-            || area[3] > self.binding.shape()[1] as i32
+            || area[2] > shape[0] as i32
+            || area[3] > shape[1] as i32
             || width * height > crate::raster::backed::MAX_REGION_PIXELS as i64
         {
             return Err("Native working strip is outside its bounded captured frame".into());
         }
-        let bpp = if self.binding.depth() == 16 { 8 } else { 4 };
+        self.ensure_working(check)?;
+        let region = Region::new(area).map_err(|e| e.to_string())?;
+        let [left, top, right, bottom] = area.map(|n| n as u32);
+        let xs = left / TILE..right.div_ceil(TILE);
+        let ys = top / TILE..bottom.div_ceil(TILE);
+        let mut pins =
+            RegionPins::new(self.base.budget(), xs.len() * ys.len()).map_err(|e| e.to_string())?;
+        for y in ys {
+            for x in xs.clone() {
+                let key = (x, y);
+                if let Some(tile) = self.pin_working_tile(key, check)? {
+                    pins.push(key, tile).map_err(|e| e.to_string())?;
+                }
+            }
+        }
+        let depth = self.binding.depth();
+        let view = PinnedRegion::from_pins(shape[0], shape[1], depth, region, pins)
+            .map_err(|e| e.to_string())?;
+        let bpp = if depth == 16 { 8 } else { 4 };
         let stride = width as usize * bpp;
         let mut bytes = ScratchBytes::new(
             self.base.budget(),
@@ -213,22 +282,12 @@ impl<'d, 's> TileOutput<'d, 's> {
             stride * height as usize,
         )
         .map_err(|e| e.to_string())?;
-        let surface = self.candidate(check)?;
-        let view = surface
-            .prepare_region(
-                crate::raster::backed::Region::new(area).map_err(|e| e.to_string())?,
-                &mut || {
-                    self.session.check().map_err(|_| Error::Changed)?;
-                    check().map_err(|_| Error::Cancelled)
-                },
-            )
-            .map_err(|e| e.to_string())?;
         for (index, row) in bytes.chunks_exact_mut(stride).enumerate() {
             check()?;
             view.copy_row(area[1] + index as i32, row)
                 .map_err(|e| e.to_string())?;
         }
-        check()?;
+        self.ensure_working(check)?;
         Ok(bytes.freeze())
     }
     fn replace_inner(
@@ -287,11 +346,7 @@ impl<'d, 's> TileOutput<'d, 's> {
         Ok(())
     }
     fn candidate(&self, check: &mut dyn FnMut() -> Result<(), String>) -> Result<Surface, String> {
-        if self.poisoned {
-            return Err("Native output was refused and cannot publish partial work".into());
-        }
-        self.session.check()?;
-        check()?;
+        self.ensure_working(check)?;
         let mut patches = Vec::new();
         patches
             .try_reserve_exact(self.replacements.len())

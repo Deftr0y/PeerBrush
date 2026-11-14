@@ -12,17 +12,17 @@ fn calibrated_pressure_matches_explicit_shared_force_at_native_depths_and_reopen
         for mask in [false, true] {
             for op in ["paint", "smudge", "clone", "heal"] {
                 let mut calibrated = Engine::new();
-                calibrated.doc = Document::new_depth(96, 64, depth).unwrap();
+                calibrated.resident_state_mut().expect("resident fixture").document = Document::new_depth(96, 64, depth).unwrap();
                 for y in 0..64 {
                     for x in 0..96 {
-                        calibrated.doc.layers[0].pixels.set16(
+                        calibrated.resident_state_mut().expect("resident fixture").document.layers[0].pixels.set16(
                             x,
                             y,
                             [12001 + x as u16 * 251, 22003 + y as u16 * 113, 32007, 51013],
                         );
                     }
                 }
-                let layer = calibrated.doc.layers[0].id.clone();
+                let layer = calibrated.resident_state().expect("resident fixture").document.layers[0].id.clone();
                 if mask {
                     calibrated
                         .edit(
@@ -34,10 +34,10 @@ fn calibrated_pressure_matches_explicit_shared_force_at_native_depths_and_reopen
                         )
                         .unwrap();
                 }
-                calibrated.undo.clear();
-                let before = calibrated.doc.clone();
+                calibrated.resident_state_mut().expect("resident fixture").undo.clear();
+                let before = calibrated.resident_state().expect("resident fixture").document.clone();
                 let mut explicit = Engine::new();
-                explicit.doc = before.clone();
+                explicit.resident_state_mut().expect("resident fixture").document = before.clone();
                 // Binary-exact endpoints isolate calibration from reassociation rounding.
                 let forces = [0.25_f32, 0.375, 0.5, 0.75];
                 let mapped = forces.map(|force| ((force - 0.25) / 0.5).clamp(0., 1.));
@@ -61,29 +61,29 @@ fn calibrated_pressure_matches_explicit_shared_force_at_native_depths_and_reopen
                     .edit("human", &[equivalent], None, None, "Explicit pressure")
                     .unwrap();
                 assert_eq!(
-                    calibrated.doc.export_png().unwrap(),
-                    explicit.doc.export_png().unwrap(),
+                    calibrated.resident_state().expect("resident fixture").document.export_png().unwrap(),
+                    explicit.resident_state().expect("resident fixture").document.export_png().unwrap(),
                     "{depth} {mask} {op}"
                 );
                 assert_eq!(
-                    calibrated.doc.export_png().unwrap(),
+                    calibrated.resident_state().expect("resident fixture").document.export_png().unwrap(),
                     preview.export_png().unwrap()
                 );
-                assert_eq!(calibrated.undo.len(), 1);
-                let reopened = psd::decode(&psd::encode(&calibrated.doc).unwrap()).unwrap();
+                assert_eq!(calibrated.resident_state().expect("resident fixture").undo.len(), 1);
+                let reopened = psd::decode(&psd::encode(&calibrated.resident_state().expect("resident fixture").document).unwrap()).unwrap();
                 assert!(!reopened.read_only);
                 assert_eq!(reopened.bit_depth, depth);
                 assert_eq!(
                     reopened.export_png().unwrap(),
-                    calibrated.doc.export_png().unwrap()
+                    calibrated.resident_state().expect("resident fixture").document.export_png().unwrap()
                 );
                 calibrated.undo("human").unwrap();
                 assert_eq!(
-                    calibrated.doc.export_png().unwrap(),
+                    calibrated.resident_state().expect("resident fixture").document.export_png().unwrap(),
                     before.export_png().unwrap()
                 );
                 assert_eq!(
-                    calibrated.doc.layers[0].pixels.rgba16(),
+                    calibrated.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(),
                     before.layers[0].pixels.rgba16()
                 );
             }
@@ -98,12 +98,12 @@ fn invalid_calibration_and_reserved_strokes_preserve_sources_and_history() {
     assert!(Settings::from_command(&json!({"pressure_min":0.99,"pressure_max":1.})).is_ok());
     for depth in [8, 16] {
         let mut e = Engine::new();
-        e.doc = Document::new_depth(32, 24, depth).unwrap();
-        e.doc.layers[0]
+        e.resident_state_mut().expect("resident fixture").document = Document::new_depth(32, 24, depth).unwrap();
+        e.resident_state_mut().expect("resident fixture").document.layers[0]
             .pixels
             .set16(2, 2, [12345, 23457, 34569, 65535]);
-        let before = e.doc.export_png().unwrap();
-        let layer = e.doc.layers[0].id.clone();
+        let before = e.resident_state().expect("resident fixture").document.export_png().unwrap();
+        let layer = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
         let valid = json!({"op":"paint","layer":layer,"points":[[16,12]],"pressures":[0.5],"pressure_min":0.2,"pressure_max":0.8});
         let mut invalid = valid.clone();
         invalid["pressure_max"] = json!(0.1);
@@ -116,13 +116,13 @@ fn invalid_calibration_and_reserved_strokes_preserve_sources_and_history() {
                 "Invalid batch"
             )
             .is_err());
-        assert_eq!(e.doc.export_png().unwrap(), before);
-        assert!(e.undo.is_empty());
+        assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), before);
+        assert!(e.resident_state().expect("resident fixture").undo.is_empty());
         e.reserve("agent", "Pixel work", vec![Scope::layer(&layer)])
             .unwrap();
         assert!(e.edit("human", &[valid], None, None, "Reserved").is_err());
-        assert_eq!(e.doc.export_png().unwrap(), before);
-        assert!(e.undo.is_empty());
+        assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), before);
+        assert!(e.resident_state().expect("resident fixture").undo.is_empty());
     }
 }
 #[test]

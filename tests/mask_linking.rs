@@ -13,7 +13,7 @@ fn edit(engine: &mut Engine, command: Value) {
         .edit(
             "human",
             &[command],
-            Some(engine.doc.revision),
+            Some(engine.resident_state().expect("resident fixture").document.revision),
             None,
             "Mask transform",
         )
@@ -21,10 +21,10 @@ fn edit(engine: &mut Engine, command: Value) {
 }
 fn fixture(depth: u16) -> Engine {
     let mut engine = Engine::new();
-    engine.doc = Document::new_depth(12, 10, depth).unwrap();
-    let id = engine.doc.layers[0].id.clone();
+    engine.resident_state_mut().expect("resident fixture").document = Document::new_depth(12, 10, depth).unwrap();
+    let id = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
     edit(&mut engine, json!({"op":"mask.add","layer":id}));
-    let layer = &mut engine.doc.layers[0];
+    let layer = &mut engine.resident_state_mut().expect("resident fixture").document.layers[0];
     for y in 0..10 {
         for x in 0..12 {
             layer.pixels.set16(
@@ -38,11 +38,11 @@ fn fixture(depth: u16) -> Engine {
                 .set16(x, y, [gray, gray, gray, 65535]);
         }
     }
-    engine.undo.clear();
+    engine.resident_state_mut().expect("resident fixture").undo.clear();
     engine
 }
 fn command(engine: &Engine, op: &str, mask: bool) -> Value {
-    json!({"op":op,"layer":engine.doc.layers[0].id,"mask":mask,"selection_only":false})
+    json!({"op":op,"layer":engine.resident_state().expect("resident fixture").document.layers[0].id,"mask":mask,"selection_only":false})
 }
 fn move_by(engine: &mut Engine, mask: bool, dx: i32, dy: i32) {
     let mut cmd = command(engine, "move", mask);
@@ -59,7 +59,7 @@ fn rotate(engine: &mut Engine, mask: bool, angle: f64) {
 fn unlink(engine: &mut Engine) {
     edit(
         engine,
-        json!({"op":"mask.link","layer":engine.doc.layers[0].id,"linked":false}),
+        json!({"op":"mask.link","layer":engine.resident_state().expect("resident fixture").document.layers[0].id,"linked":false}),
     );
 }
 
@@ -67,10 +67,10 @@ fn unlink(engine: &mut Engine) {
 fn linking_is_metadata_with_shared_preview_atomic_guards_and_undo() {
     for depth in [8, 16] {
         let mut engine = fixture(depth);
-        let id = engine.doc.layers[0].id.clone();
-        let before = engine.doc.export_png().unwrap();
-        assert!(engine.doc.layers[0].mask.as_ref().unwrap().linked);
-        let mut legacy = serde_json::to_value(&engine.doc).unwrap();
+        let id = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
+        let before = engine.resident_state().expect("resident fixture").document.export_png().unwrap();
+        assert!(engine.resident_state().expect("resident fixture").document.layers[0].mask.as_ref().unwrap().linked);
+        let mut legacy = serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap();
         legacy["layers"][0]["mask"]
             .as_object_mut()
             .unwrap()
@@ -78,12 +78,12 @@ fn linking_is_metadata_with_shared_preview_atomic_guards_and_undo() {
         let legacy: Document = serde_json::from_value(legacy).unwrap();
         assert!(legacy.layers[0].mask.as_ref().unwrap().linked);
         let cmd = json!({"op":"mask.link","layer":id,"linked":false});
-        let preview = Engine::preview_edits(engine.doc.clone(), &[cmd.clone()]).unwrap();
+        let preview = Engine::preview_edits(engine.resident_state().expect("resident fixture").document.clone(), &[cmd.clone()]).unwrap();
         assert!(!preview.layers[0].mask.as_ref().unwrap().linked);
-        assert!(engine.doc.layers[0].mask.as_ref().unwrap().linked);
+        assert!(engine.resident_state().expect("resident fixture").document.layers[0].mask.as_ref().unwrap().linked);
         assert_eq!(preview.export_png().unwrap(), before);
         for invalid in [json!(null), json!("false"), json!(0)] {
-            let snapshot = serde_json::to_value(&engine.doc).unwrap();
+            let snapshot = serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap();
             assert!(engine
                 .edit(
                     "human",
@@ -93,8 +93,8 @@ fn linking_is_metadata_with_shared_preview_atomic_guards_and_undo() {
                     "Invalid"
                 )
                 .is_err());
-            assert_eq!(serde_json::to_value(&engine.doc).unwrap(), snapshot);
-            assert!(engine.undo.is_empty());
+            assert_eq!(serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap(), snapshot);
+            assert!(engine.resident_state().expect("resident fixture").undo.is_empty());
         }
         engine
             .reserve("other", "Mask work", vec![Scope::layer(&id)])
@@ -104,12 +104,12 @@ fn linking_is_metadata_with_shared_preview_atomic_guards_and_undo() {
             .is_err());
         engine.leases.clear();
         edit(&mut engine, cmd);
-        assert_eq!(engine.undo.len(), 1);
+        assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), 1);
         engine.undo("human").unwrap();
-        assert!(engine.doc.layers[0].mask.as_ref().unwrap().linked);
+        assert!(engine.resident_state().expect("resident fixture").document.layers[0].mask.as_ref().unwrap().linked);
         engine.redo("human").unwrap();
-        assert!(!engine.doc.layers[0].mask.as_ref().unwrap().linked);
-        assert_eq!(engine.doc.export_png().unwrap(), before);
+        assert!(!engine.resident_state().expect("resident fixture").document.layers[0].mask.as_ref().unwrap().linked);
+        assert_eq!(engine.resident_state().expect("resident fixture").document.export_png().unwrap(), before);
     }
 }
 
@@ -118,9 +118,9 @@ fn linked_whole_moves_and_rotations_follow_either_selected_channel() {
     for depth in [8, 16] {
         for mask in [false, true] {
             let mut engine = fixture(depth);
-            let original = engine.doc.layers[0].clone();
+            let original = engine.resident_state().expect("resident fixture").document.layers[0].clone();
             move_by(&mut engine, mask, 3, 2);
-            let layer = &engine.doc.layers[0];
+            let layer = &engine.resident_state().expect("resident fixture").document.layers[0];
             assert_eq!((layer.x, layer.y), (3, 2));
             assert_eq!(layer.pixels.rgba16(), original.pixels.rgba16());
             assert_eq!(
@@ -129,7 +129,7 @@ fn linked_whole_moves_and_rotations_follow_either_selected_channel() {
             );
             engine.undo("human").unwrap();
             rotate(&mut engine, mask, 90.);
-            let layer = &engine.doc.layers[0];
+            let layer = &engine.resident_state().expect("resident fixture").document.layers[0];
             for y in 0..10 {
                 for x in 0..12 {
                     let (nx, ny) = (10 - y, x - 1);
@@ -154,9 +154,9 @@ fn unlinked_color_preserves_document_mask_positions_and_off_frame_originals() {
     for depth in [8, 16] {
         let mut engine = fixture(depth);
         unlink(&mut engine);
-        let before = engine.doc.layers[0].clone();
+        let before = engine.resident_state().expect("resident fixture").document.layers[0].clone();
         move_by(&mut engine, false, 3, 2);
-        let layer = &engine.doc.layers[0];
+        let layer = &engine.resident_state().expect("resident fixture").document.layers[0];
         for y in 2..10 {
             for x in 3..12 {
                 assert_eq!(
@@ -169,13 +169,13 @@ fn unlinked_color_preserves_document_mask_positions_and_off_frame_originals() {
         }
         move_by(&mut engine, false, -3, -2);
         assert_eq!(
-            engine.doc.layers[0].mask.as_ref().unwrap().steps[1]
+            engine.resident_state().expect("resident fixture").document.layers[0].mask.as_ref().unwrap().steps[1]
                 .pixels
                 .rgba16(),
             before.mask.as_ref().unwrap().steps[1].pixels.rgba16()
         );
         rotate(&mut engine, false, 90.);
-        let layer = &engine.doc.layers[0];
+        let layer = &engine.resident_state().expect("resident fixture").document.layers[0];
         for y in 0..10 {
             for x in 1..11 {
                 assert_eq!(
@@ -187,9 +187,9 @@ fn unlinked_color_preserves_document_mask_positions_and_off_frame_originals() {
             }
         }
         rotate(&mut engine, false, -90.);
-        assert_eq!(engine.doc.layers[0].pixels.rgba16(), before.pixels.rgba16());
+        assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(), before.pixels.rgba16());
         assert_eq!(
-            engine.doc.layers[0].mask.as_ref().unwrap().steps[1]
+            engine.resident_state().expect("resident fixture").document.layers[0].mask.as_ref().unwrap().steps[1]
                 .pixels
                 .rgba16(),
             before.mask.as_ref().unwrap().steps[1].pixels.rgba16()
@@ -202,15 +202,15 @@ fn unlinked_mask_moves_every_paint_step_without_moving_color() {
     for depth in [8, 16] {
         let mut engine = fixture(depth);
         unlink(&mut engine);
-        let mask = engine.doc.layers[0].mask.as_mut().unwrap();
+        let mask = engine.resident_state_mut().expect("resident fixture").document.layers[0].mask.as_mut().unwrap();
         let mut second = mask.steps[1].clone();
         second.id = peerbrush::engine::id();
         second.pixels = Raster::new_depth(12, 10, depth);
         second.pixels.set16(2, 3, [45683, 45683, 45683, 65535]);
         mask.steps.push(second);
-        let before = engine.doc.layers[0].clone();
+        let before = engine.resident_state().expect("resident fixture").document.layers[0].clone();
         move_by(&mut engine, true, 2, 1);
-        let layer = &engine.doc.layers[0];
+        let layer = &engine.resident_state().expect("resident fixture").document.layers[0];
         assert_eq!((layer.x, layer.y), (before.x, before.y));
         assert_eq!(layer.pixels.rgba16(), before.pixels.rgba16());
         for index in [1, 2] {
@@ -232,13 +232,13 @@ fn unlinked_mask_moves_every_paint_step_without_moving_color() {
         rotate(&mut engine, true, -90.);
         for index in [1, 2] {
             assert_eq!(
-                engine.doc.layers[0].mask.as_ref().unwrap().steps[index]
+                engine.resident_state().expect("resident fixture").document.layers[0].mask.as_ref().unwrap().steps[index]
                     .pixels
                     .rgba16(),
                 before.mask.as_ref().unwrap().steps[index].pixels.rgba16()
             );
         }
-        assert_eq!(engine.doc.layers[0].pixels.rgba16(), before.pixels.rgba16());
+        assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(), before.pixels.rgba16());
     }
 }
 
@@ -247,21 +247,21 @@ fn linked_selection_moves_only_selected_color_and_mask_pixels() {
     for depth in [8, 16] {
         for mask in [false, true] {
             let mut engine = fixture(depth);
-            engine.doc.selection = Some([2, 2, 5, 5]);
-            let before = engine.doc.layers[0].clone();
+            engine.resident_state_mut().expect("resident fixture").document.selection = Some([2, 2, 5, 5]);
+            let before = engine.resident_state().expect("resident fixture").document.layers[0].clone();
             let mut cmd = command(&engine, "move", mask);
             cmd["selection_only"] = json!(true);
             cmd["dx"] = json!(5);
             cmd["dy"] = json!(1);
-            let preview = Engine::preview_edits(engine.doc.clone(), &[cmd.clone()]).unwrap();
-            assert!(engine.undo.is_empty());
+            let preview = Engine::preview_edits(engine.resident_state().expect("resident fixture").document.clone(), &[cmd.clone()]).unwrap();
+            assert!(engine.resident_state().expect("resident fixture").undo.is_empty());
             edit(&mut engine, cmd);
             assert_eq!(
-                engine.doc.export_png().unwrap(),
+                engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
                 preview.export_png().unwrap()
             );
-            assert_eq!(engine.doc.selection, Some([7, 3, 10, 6]));
-            let layer = &engine.doc.layers[0];
+            assert_eq!(engine.resident_state().expect("resident fixture").document.selection, Some([7, 3, 10, 6]));
+            let layer = &engine.resident_state().expect("resident fixture").document.layers[0];
             for y in 0..10 {
                 for x in 0..12 {
                     for (source, result) in [
@@ -287,9 +287,9 @@ fn linked_selection_moves_only_selected_color_and_mask_pixels() {
                 }
             }
             engine.undo("human").unwrap();
-            assert_eq!(engine.doc.layers[0].pixels.rgba16(), before.pixels.rgba16());
+            assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(), before.pixels.rgba16());
             assert_eq!(
-                engine.doc.layers[0].mask.as_ref().unwrap().steps[1]
+                engine.resident_state().expect("resident fixture").document.layers[0].mask.as_ref().unwrap().steps[1]
                     .pixels
                     .rgba16(),
                 before.mask.as_ref().unwrap().steps[1].pixels.rgba16()
@@ -302,22 +302,22 @@ fn linked_selection_moves_only_selected_color_and_mask_pixels() {
 fn unsupported_independent_mask_effects_fail_without_rasterizing_or_history() {
     for depth in [8, 16] {
         let mut engine = fixture(depth);
-        let id = engine.doc.layers[0].id.clone();
+        let id = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
         edit(
             &mut engine,
             json!({"op":"mask.step.add","layer":id,"kind":"invert"}),
         );
         unlink(&mut engine);
-        let before = serde_json::to_value(&engine.doc).unwrap();
-        let history = engine.undo.len();
+        let before = serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap();
+        let history = engine.resident_state().expect("resident fixture").undo.len();
         let mut cmd = command(&engine, "transform", false);
         cmd["angle"] = json!(30);
         assert!(engine
             .edit("human", &[cmd], None, None, "Unsupported")
             .unwrap_err()
             .contains("fill/paint"));
-        assert_eq!(serde_json::to_value(&engine.doc).unwrap(), before);
-        assert_eq!(engine.undo.len(), history);
+        assert_eq!(serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap(), before);
+        assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), history);
     }
 }
 
@@ -330,49 +330,44 @@ fn source_save_reopen_preserves_link_choice_native_words_and_current_composite()
                 unlink(&mut engine);
                 move_by(&mut engine, false, 2, 1);
             }
-            let pixels = engine.doc.export_png().unwrap();
-            let report = compatibility::report(&engine.doc).unwrap();
-            assert_eq!(
-                report
-                    .losses
-                    .iter()
-                    .any(|loss| loss.code == LossCode::MaskLinkPrivate),
-                !linked
-            );
+            let pixels = engine.resident_state().expect("resident fixture").document.export_png().unwrap();
+            let report = compatibility::report(&engine.resident_state().expect("resident fixture").document).unwrap();
+            assert!(report.layers[0].standard_mask);
+            assert!(!report.losses.iter().any(|loss| loss.code == LossCode::MaskLinkPrivate));
             for data in [
-                psd::encode(&engine.doc).unwrap(),
-                psd::encode_psb(&engine.doc).unwrap(),
+                psd::encode(&engine.resident_state().expect("resident fixture").document).unwrap(),
+                psd::encode_psb(&engine.resident_state().expect("resident fixture").document).unwrap(),
             ] {
                 let reopened = psd::decode(&data).unwrap();
                 assert!(!reopened.read_only, "{:?}", reopened.warnings);
                 assert_eq!(reopened.layers[0].mask.as_ref().unwrap().linked, linked);
                 assert_eq!(
                     reopened.layers[0].pixels.rgba16(),
-                    engine.doc.layers[0].pixels.rgba16()
+                    engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16()
                 );
                 assert_eq!(reopened.export_png().unwrap(), pixels);
                 assert_eq!(
                     reopened.layers[0].mask.as_ref().unwrap().steps[1]
                         .pixels
                         .rgba16(),
-                    engine.doc.layers[0].mask.as_ref().unwrap().steps[1]
+                    engine.resident_state().expect("resident fixture").document.layers[0].mask.as_ref().unwrap().steps[1]
                         .pixels
                         .rgba16()
                 );
                 if !linked {
                     let mut inverse = Engine::new();
-                    inverse.doc = reopened;
+                    inverse.resident_state_mut().expect("resident fixture").document = reopened;
                     move_by(&mut inverse, false, -2, -1);
                     let original = fixture(depth);
                     assert_eq!(
-                        inverse.doc.layers[0].pixels.rgba16(),
-                        original.doc.layers[0].pixels.rgba16()
+                        inverse.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(),
+                        original.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16()
                     );
                     assert_eq!(
-                        inverse.doc.layers[0].mask.as_ref().unwrap().steps[1]
+                        inverse.resident_state().expect("resident fixture").document.layers[0].mask.as_ref().unwrap().steps[1]
                             .pixels
                             .rgba16(),
-                        original.doc.layers[0].mask.as_ref().unwrap().steps[1]
+                        original.resident_state().expect("resident fixture").document.layers[0].mask.as_ref().unwrap().steps[1]
                             .pixels
                             .rgba16()
                     );
@@ -386,7 +381,7 @@ fn source_save_reopen_preserves_link_choice_native_words_and_current_composite()
 fn selective_agent_undo_restores_link_state_without_losing_later_human_paint() {
     for depth in [8, 16] {
         let mut engine = fixture(depth);
-        let id = engine.doc.layers[0].id.clone();
+        let id = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
         let task = engine.reserve("agent", "Link mask", vec![]).unwrap().id;
         engine
             .edit(
@@ -401,19 +396,19 @@ fn selective_agent_undo_restores_link_state_without_losing_later_human_paint() {
             &mut engine,
             json!({"op":"paint","layer":id,"points":[[4,4],[8,6]],"radius":2,"color":[233,84,32,255]}),
         );
-        let painted = engine.doc.layers[0].pixels.rgba16();
+        let painted = engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16();
         engine.undo_task("human", "agent", &task).unwrap();
-        assert!(engine.doc.layers[0].mask.as_ref().unwrap().linked);
-        assert_eq!(engine.doc.layers[0].pixels.rgba16(), painted);
+        assert!(engine.resident_state().expect("resident fixture").document.layers[0].mask.as_ref().unwrap().linked);
+        assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(), painted);
     }
 }
 
 #[test]
 fn protocol_reports_link_state_and_rejects_stale_or_locked_updates() {
     let engine = fixture(16);
-    let id = engine.doc.layers[0].id.clone();
-    let document = engine.doc.id.clone();
-    let revision = engine.doc.revision;
+    let id = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
+    let document = engine.resident_state().expect("resident fixture").document.id.clone();
+    let revision = engine.resident_state().expect("resident fixture").document.revision;
     let shared = Arc::new(Mutex::new(engine));
     let params = json!({"actor":"human","document_id":document,"expected_revision":revision,"commands":[{"op":"mask.link","layer":id,"linked":false}]});
     server::dispatch(&shared, "edit", &params).unwrap();
@@ -421,8 +416,8 @@ fn protocol_reports_link_state_and_rejects_stale_or_locked_updates() {
     assert_eq!(result["state"]["layers"][0]["mask"]["linked"], false);
     assert!(server::dispatch(&shared, "edit", &params).is_err());
     let mut engine = shared.lock().unwrap();
-    engine.doc.layers[0].locked = true;
-    let snapshot = serde_json::to_value(&engine.doc).unwrap();
+    engine.resident_state_mut().expect("resident fixture").document.layers[0].locked = true;
+    let snapshot = serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap();
     assert!(engine
         .edit(
             "human",
@@ -432,7 +427,7 @@ fn protocol_reports_link_state_and_rejects_stale_or_locked_updates() {
             "Locked"
         )
         .is_err());
-    assert_eq!(serde_json::to_value(&engine.doc).unwrap(), snapshot);
+    assert_eq!(serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap(), snapshot);
 }
 
 #[test]
@@ -441,21 +436,21 @@ fn folder_targets_respect_links_and_preserve_hidden_child_masks() {
         for linked in [false, true] {
             for mask_target in [false, true] {
                 let mut engine = fixture(depth);
-                let before = engine.doc.layers[0].clone();
+                let before = engine.resident_state().expect("resident fixture").document.layers[0].clone();
                 let mut folder = Layer::new("Folder", "group", 12, 10);
                 folder.pixels = Raster::new_depth(12, 10, depth);
                 folder.mask = before.mask.clone();
                 folder.mask.as_mut().unwrap().linked = linked;
                 let id = folder.id.clone();
-                engine.doc.layers[0].parent = Some(id.clone());
-                engine.doc.layers[0].visible = false;
-                engine.doc.layers[0].mask.as_mut().unwrap().linked = false;
-                engine.doc.layers.insert(0, folder);
+                engine.resident_state_mut().expect("resident fixture").document.layers[0].parent = Some(id.clone());
+                engine.resident_state_mut().expect("resident fixture").document.layers[0].visible = false;
+                engine.resident_state_mut().expect("resident fixture").document.layers[0].mask.as_mut().unwrap().linked = false;
+                engine.resident_state_mut().expect("resident fixture").document.layers.insert(0, folder);
                 edit(
                     &mut engine,
                     json!({"op":"move","layer":id,"mask":mask_target,"dx":3,"dy":2,"selection_only":false}),
                 );
-                let child = &engine.doc.layers[1];
+                let child = &engine.resident_state().expect("resident fixture").document.layers[1];
                 let child_moved = !mask_target || linked;
                 assert_eq!(
                     (child.x, child.y),
@@ -473,9 +468,9 @@ fn folder_targets_respect_links_and_preserve_hidden_child_masks() {
                     }
                 }
                 engine.undo("human").unwrap();
-                assert_eq!(engine.doc.layers[1].pixels.rgba16(), before.pixels.rgba16());
+                assert_eq!(engine.resident_state().expect("resident fixture").document.layers[1].pixels.rgba16(), before.pixels.rgba16());
                 assert_eq!(
-                    engine.doc.layers[1].mask.as_ref().unwrap().steps[1]
+                    engine.resident_state().expect("resident fixture").document.layers[1].mask.as_ref().unwrap().steps[1]
                         .pixels
                         .rgba16(),
                     before.mask.as_ref().unwrap().steps[1].pixels.rgba16()
@@ -490,7 +485,7 @@ fn large_mask_transforms_reject_excess_work_before_allocating_or_changing_histor
     for depth in [8, 16] {
         let mut engine = fixture(depth);
         unlink(&mut engine);
-        let layer = &mut engine.doc.layers[0];
+        let layer = &mut engine.resident_state_mut().expect("resident fixture").document.layers[0];
         layer.pixels = Raster::new_depth(8192, 4096, depth);
         let mask = layer.mask.as_mut().unwrap();
         let mut paint = mask.steps[1].clone();
@@ -500,8 +495,8 @@ fn large_mask_transforms_reject_excess_work_before_allocating_or_changing_histor
             paint.id = format!("large-mask-{index}");
             mask.steps.push(paint.clone());
         }
-        engine.undo.clear();
-        let original = serde_json::to_value(&engine.doc).unwrap();
+        engine.resident_state_mut().expect("resident fixture").undo.clear();
+        let original = serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap();
         for op in ["move", "transform"] {
             let mut cmd = command(&engine, op, true);
             cmd["dx"] = json!(1);
@@ -510,8 +505,8 @@ fn large_mask_transforms_reject_excess_work_before_allocating_or_changing_histor
                 .edit("human", &[cmd], None, None, "Too much work")
                 .unwrap_err();
             assert!(error.contains("work budget"), "{error}");
-            assert_eq!(serde_json::to_value(&engine.doc).unwrap(), original);
-            assert!(engine.undo.is_empty());
+            assert_eq!(serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap(), original);
+            assert!(engine.resident_state().expect("resident fixture").undo.is_empty());
         }
     }
 }

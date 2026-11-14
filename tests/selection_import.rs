@@ -12,7 +12,7 @@ fn apply(e: &mut Engine, c: Value) {
     e.edit(
         "human",
         &[c],
-        Some(e.doc.revision),
+        Some(e.resident_state().expect("resident fixture").document.revision),
         None,
         "Import confidence",
     )
@@ -21,51 +21,51 @@ fn apply(e: &mut Engine, c: Value) {
 #[test]
 fn confidence_coordinates_soft_edges_native_sources_and_psd_roundtrip() {
     let mut e = Engine::new();
-    e.doc = Document::new_depth(12, 8, 16).unwrap();
-    e.doc.layers[0].pixels.set16(5, 3, [123, 271, 539, 65535]);
-    let source = e.doc.export_png().unwrap();
+    e.resident_state_mut().expect("resident fixture").document = Document::new_depth(12, 8, 16).unwrap();
+    e.resident_state_mut().expect("resident fixture").document.layers[0].pixels.set16(5, 3, [123, 271, 539, 65535]);
+    let source = e.resident_state().expect("resident fixture").document.export_png().unwrap();
     apply(
         &mut e,
         json!({"op":"selection.import","rect":[4,2,8,4],"png":mask()}),
     );
-    let m = selection::current(&e.doc).unwrap();
+    let m = selection::current(&e.resident_state().expect("resident fixture").document).unwrap();
     assert_eq!(
         (4..8).map(|x| m.mask.get(x, 2)[0]).collect::<Vec<_>>(),
         vec![0, 64, 191, 255]
     );
     assert_eq!(m.value(8, 2), 0.);
     assert_eq!(m.value(7, 4), 0.);
-    assert_eq!(e.doc.export_png().unwrap(), source);
-    let copy = psd::decode(&psd::encode(&e.doc).unwrap()).unwrap();
+    assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), source);
+    let copy = psd::decode(&psd::encode(&e.resident_state().expect("resident fixture").document).unwrap()).unwrap();
     assert_eq!(copy.bit_depth, 16);
     assert_eq!(copy.export_png().unwrap(), source);
     assert_eq!(selection::current(&copy).unwrap().mask.get(6, 2)[0], 191);
     e.undo("human").unwrap();
-    assert!(e.doc.selection.is_none());
-    assert_eq!(e.doc.export_png().unwrap(), source);
+    assert!(e.resident_state().expect("resident fixture").document.selection.is_none());
+    assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), source);
 }
 #[test]
 fn alpha_modes_and_reselect_keep_confidence() {
     let mut e = Engine::new();
-    e.doc = Document::new(12, 8).unwrap();
+    e.resident_state_mut().expect("resident fixture").document = Document::new(12, 8).unwrap();
     apply(
         &mut e,
         json!({"op":"selection.import","rect":[4,2,6,3],"png":mask(),"channel":"alpha"}),
     );
-    assert_eq!(selection::current(&e.doc).unwrap().mask.get(4, 2)[0], 17);
+    assert_eq!(selection::current(&e.resident_state().expect("resident fixture").document).unwrap().mask.get(4, 2)[0], 17);
     apply(
         &mut e,
         json!({"op":"selection.import","rect":[4,2,6,3],"png":mask(),"channel":"alpha","mode":"subtract"}),
     );
-    assert_eq!(selection::current(&e.doc).unwrap().mask.get(5, 2)[0], 62);
+    assert_eq!(selection::current(&e.resident_state().expect("resident fixture").document).unwrap().mask.get(5, 2)[0], 62);
     apply(&mut e, json!({"op":"selection.clear"}));
     apply(&mut e, json!({"op":"selection.reselect"}));
-    assert_eq!(selection::current(&e.doc).unwrap().mask.get(5, 2)[0], 62);
+    assert_eq!(selection::current(&e.resident_state().expect("resident fixture").document).unwrap().mask.get(5, 2)[0], 62);
 }
 #[test]
 fn malformed_or_stale_import_is_atomic_and_mcp_feedback_has_actual_mask_coordinates() {
     let mut e = Engine::new();
-    e.doc = Document::new(12, 8).unwrap();
+    e.resident_state_mut().expect("resident fixture").document = Document::new(12, 8).unwrap();
     for extra in [
         json!({"png":"invalid"}),
         json!({"rect":[0,0,13,1]}),
@@ -79,12 +79,12 @@ fn malformed_or_stale_import_is_atomic_and_mcp_feedback_has_actual_mask_coordina
         for (k, v) in extra.as_object().unwrap() {
             c[k] = v.clone();
         }
-        let revision = e.doc.revision;
+        let revision = e.resident_state().expect("resident fixture").document.revision;
         assert!(e
             .edit("human", &[c], Some(revision), None, "Import")
             .is_err());
-        assert_eq!(e.doc.revision, revision);
-        assert!(e.doc.selection.is_none());
+        assert_eq!(e.resident_state().expect("resident fixture").document.revision, revision);
+        assert!(e.resident_state().expect("resident fixture").document.selection.is_none());
     }
     apply(
         &mut e,
@@ -112,7 +112,7 @@ fn malformed_or_stale_import_is_atomic_and_mcp_feedback_has_actual_mask_coordina
         .any(|t| t["name"] == "peerbrush_segment"));
     assert!(server::capabilities()["segmentation"]["configured"].is_boolean());
     let mut e = shared.lock().unwrap();
-    let revision = e.doc.revision;
+    let revision = e.resident_state().expect("resident fixture").document.revision;
     e.edit(
         "selection-agent",
         &[json!({"op":"selection.import","rect":[4,2,8,4],"png":mask()})],

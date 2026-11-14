@@ -15,6 +15,9 @@ fn main() {
     if let Some(code) = peerbrush::jpeg_xl::main_entry() {
         std::process::exit(code);
     }
+    if let Some(code) = peerbrush::code::main_entry() {
+        std::process::exit(code);
+    }
     if let Err(error) = run() {
         eprintln!("PeerBrush: {error}");
         // Finder and Explorer launches have no visible console, including when
@@ -108,7 +111,17 @@ fn run() -> Result<(), String> {
                         local_preferences.then_some(state_dir.as_path()),
                     )?)
                 }
-                _ => return Err("Use discover or discover --status [--state-dir PATH]".into()),
+                [_, option] if option == "--connect" => {
+                    let report = peerbrush::discovery::connect_running(&state_dir)?;
+                    let needs_retry = report.needs_retry();
+                    println!("{}", serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?);
+                    return if needs_retry {
+                        Err("Review the discovery and client registration results before retrying".into())
+                    } else {
+                        Ok(())
+                    };
+                }
+                _ => return Err("Use discover [--status | --connect] [--state-dir PATH]".into()),
             }
             .map_err(|e| e.to_string())?;
             println!("{report}");
@@ -157,7 +170,7 @@ fn run() -> Result<(), String> {
             return Ok(());
         }
         Some("--help") => {
-            println!("PeerBrush — You and your AI. Same canvas.\npeerbrush [--state-dir PATH] [FILE ...]\npeerbrush [--state-dir PATH] --open FILE [--open FILE ...]\npeerbrush [--state-dir PATH] -- FILE ...\npeerbrush [--state-dir PATH] --headless\npeerbrush mcp [--state-dir PATH]\npeerbrush --build-info\npeerbrush --installation-info\npeerbrush discover\npeerbrush discover --status [--state-dir PATH]\npeerbrush cli METHOD [JSON | @file.json] [--state-dir PATH]\npeerbrush updates check [--preview]\npeerbrush settings paths\npeerbrush settings migrate --from LEGACY_STATE_DIR\nFiles open in independent project tabs, preserving existing work.\nDefault launches use per-user preferences; --state-dir retains instance-local preferences.");
+            println!("PeerBrush — You and your AI. Same canvas.\npeerbrush [--state-dir PATH] [FILE ...]\npeerbrush [--state-dir PATH] --open FILE [--open FILE ...]\npeerbrush [--state-dir PATH] -- FILE ...\npeerbrush [--state-dir PATH] --headless\npeerbrush mcp [--state-dir PATH]\npeerbrush --build-info\npeerbrush --installation-info\npeerbrush discover [--status | --connect] [--state-dir PATH]\npeerbrush cli METHOD [JSON | @file.json] [--state-dir PATH]\npeerbrush updates check [--preview]\npeerbrush settings paths\npeerbrush settings migrate --from LEGACY_STATE_DIR\nFiles open in independent project tabs, preserving existing work.\nDefault launches use per-user preferences; --state-dir retains instance-local preferences.");
             return Ok(());
         }
         _ => {}
@@ -279,17 +292,7 @@ fn run() -> Result<(), String> {
         },
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title(window_title)
-            .with_icon({
-                let mark = image::load_from_memory(include_bytes!("../assets/peerbrush-logo.png"))
-                    .map_err(|e| e.to_string())?
-                    .resize(256, 256, image::imageops::FilterType::Lanczos3)
-                    .to_rgba8();
-                eframe::egui::IconData {
-                    width: mark.width(),
-                    height: mark.height(),
-                    rgba: mark.into_raw(),
-                }
-            })
+            .with_icon(peerbrush::ui::window_icon())
             .with_inner_size([1360.0, 900.0])
             .with_min_inner_size([980.0, 640.0]),
         ..Default::default()

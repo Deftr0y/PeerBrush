@@ -303,13 +303,11 @@ pub(crate) fn write_to<'scene, 'output>(
                 raw_bytes = raw_bytes
                     .checked_add(bytes.len() as u64)
                     .ok_or("Native PNG row count overflow")?;
-                for row in bytes.chunks_exact(row_bytes) {
-                    active()?;
-                    stream.write_all(row).map_err(|e| {
-                        failed.set(true);
-                        e.to_string()
-                    })?;
-                }
+                // The encoder consumes complete rows internally. HashOutput guards each encoded write.
+                stream.write_all(bytes).map_err(|e| {
+                    failed.set(true);
+                    e.to_string()
+                })?;
                 first += count;
             }
             active()?;

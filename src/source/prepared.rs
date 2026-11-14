@@ -9,12 +9,13 @@ use crate::{
     },
 };
 use std::sync::Arc;
+use super::text_position::NativeCarets;
 #[path = "prepared/shape.rs"]
 mod shape;
 #[path = "prepared/text.rs"]
 mod text;
 #[path = "prepared/validation.rs"]
-mod validation;
+pub(crate) mod validation;
 pub(crate) use validation::validate_definition;
 #[cfg(test)]
 #[path = "prepared/tests.rs"]
@@ -71,6 +72,30 @@ impl<'a> PreparedSource<'a> {
         };
         (32_000_000 / (vertices * 128)).clamp(1, MAX_REGION_PIXELS)
     }
+    /// At unit placement the output samples the original grid exactly.
+    pub(super) fn direct_shape_bounds(&self, frame: [u32; 2]) -> Option<[u32; 4]> {
+        if self.matrix != [1., 0., 0., 1., 0., 0.] {
+            return None;
+        }
+        let [left, top, right, bottom] = self.shape()?.bounds([self.definition.width, self.definition.height]);
+        Some([left, top, right.min(frame[0]), bottom.min(frame[1])])
+    }
+
+    fn shape(&self) -> Option<shape::Shape<'_>> {
+        Some(match &self.kind {
+            Kind::Shape(s) => *s,
+            Kind::Bezier { points, closed, fill, stroke, width } => shape::Shape {
+                kind: "path",
+                bounds: [0., 0., self.definition.width as f32, self.definition.height as f32],
+                points,
+                closed: *closed,
+                fill: *fill,
+                stroke: *stroke,
+                stroke_width: *width,
+            },
+            _ => return None,
+        })
+    }
     pub(crate) fn new(
         source: &'a Source36,
         font: Option<Arc<crate::fonts::prepared::FontOwner>>,
@@ -79,12 +104,55 @@ impl<'a> PreparedSource<'a> {
     ) -> Result<Self, String> {
         Self::new_transformed(source, source.matrix, font, pool, check)
     }
+    pub(crate) fn load(
+        source: &'a Source36,
+        pool: &ResidentBudget,
+        check: Check<'_>,
+    ) -> Result<Self, String> {
+        Self::load_transformed(source, source.matrix, pool, check)
+    }
+    pub(crate) fn load_transformed(
+        source: &'a Source36,
+        matrix: [f32; 6],
+        pool: &ResidentBudget,
+        check: Check<'_>,
+    ) -> Result<Self, String> {
+        Self::load_with_carets(source, matrix, pool, check, None)
+    }
+    pub(crate) fn load_with_carets(
+        source: &'a Source36,
+        matrix: [f32; 6],
+        pool: &ResidentBudget,
+        check: Check<'_>,
+        carets: Option<&mut Option<NativeCarets>>,
+    ) -> Result<Self, String> {
+        let font = match source.definition() {
+            Content36::Text { font, .. } => {
+                validate_definition(source, pool, check)?;
+                Some(Arc::new(crate::fonts::prepared::FontOwner::load(
+                    font, pool, check,
+                )?))
+            }
+            _ => None,
+        };
+        Self::new_with_carets(source, matrix, font, pool, check, carets)
+    }
     pub(crate) fn new_transformed(
         source: &'a Source36,
         matrix: [f32; 6],
         font: Option<Arc<crate::fonts::prepared::FontOwner>>,
         pool: &ResidentBudget,
         check: Check<'_>,
+    ) -> Result<Self, String> {
+        Self::new_with_carets(source, matrix, font, pool, check, None)
+    }
+    fn new_with_carets(
+        source: &'a Source36,
+        matrix: [f32; 6],
+        font: Option<Arc<crate::fonts::prepared::FontOwner>>,
+        pool: &ResidentBudget,
+        check: Check<'_>,
+        carets: Option<&mut Option<NativeCarets>>,
     ) -> Result<Self, String> {
         validate_definition(source, pool, check)?;
         validation::matrix(matrix)?;
@@ -132,7 +200,7 @@ impl<'a> PreparedSource<'a> {
                 if !font.uses_budget(pool) || !font.matches(reference) {
                     return Err("Editable text font identity or resident pool differs".into());
                 }
-                Kind::Text(text::TextPlan::new(source, font, pool, check)?)
+                Kind::Text(text::TextPlan::new(source, font, pool, check, carets)?)
             }
             Content36::Svg { svg } => Kind::Svg(crate::svg::prepared::PreparedSvg::new(
                 svg,
@@ -175,30 +243,7 @@ impl<'a> PreparedSource<'a> {
         if let Kind::Svg(svg) = &self.kind {
             return svg.render(frame, self.matrix, region, depth, pool, check);
         }
-        let shape = match &self.kind {
-            Kind::Shape(s) => *s,
-            Kind::Bezier {
-                points,
-                closed,
-                fill,
-                stroke,
-                width,
-            } => shape::Shape {
-                kind: "path",
-                bounds: [
-                    0.,
-                    0.,
-                    self.definition.width as f32,
-                    self.definition.height as f32,
-                ],
-                points,
-                closed: *closed,
-                fill: *fill,
-                stroke: *stroke,
-                stroke_width: *width,
-            },
-            _ => return Err("Native source region kernel was not prepared".into()),
-        };
+        let shape = self.shape().ok_or("Native source region kernel was not prepared")?;
         let work = region
             .pixels()
             .checked_mul(shape.points.len().max(4))
@@ -214,6 +259,7 @@ impl<'a> PreparedSource<'a> {
         let length = region.pixels() * stride;
         let mut output = ScratchBytes::new(pool, length, length).map_err(|e| e.to_string())?;
         let source_frame = [self.definition.width, self.definition.height];
+        let bounds = shape.bounds(source_frame);
         let [a, bb, c, d, tx, ty] = self.matrix;
         let det = a * d - bb * c;
         let direct = self.matrix == [1., 0., 0., 1., 0., 0.] && frame == source_frame;
@@ -222,14 +268,14 @@ impl<'a> PreparedSource<'a> {
             check()?;
             for x in b[0]..b[2] {
                 let pixel = if direct {
-                    shape.pixel(source_frame, x, y, depth)
+                    shape.pixel(bounds, x, y, depth)
                 } else {
                     let xx = x as f32 + 0.5 - tx;
                     let yy = y as f32 + 0.5 - ty;
                     let u = (d * xx - c * yy) / det - 0.5;
                     let v = (-bb * xx + a * yy) / det - 0.5;
                     sample(u, v, source_frame, depth, |sx, sy| {
-                        Ok(shape.pixel(source_frame, sx, sy, depth))
+                        Ok(shape.pixel(bounds, sx, sy, depth))
                     })?
                 };
                 if depth == 16 {

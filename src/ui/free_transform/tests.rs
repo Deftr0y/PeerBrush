@@ -131,13 +131,96 @@ fn settle_size(app: &mut PeerBrush, ctx: &egui::Context, size: Vec2) -> egui::Fu
         std::thread::sleep(Duration::from_millis(2));
     }
 }
+
+#[test]
+fn native_drag_displays_progress_without_certifying_the_newest_transform() {
+    use crate::engine::{authority::DocumentAuthority, native::{worker::tests::Fixture, NativeDocument}};
+    use std::time::{Duration, Instant};
+
+    for depth in [8, 16] {
+        let fixture = Fixture::new();
+        let (runtime, _connection) = fixture.runtime_with_budgets(128 * 1024 * 1024, 32 * 1024 * 1024);
+        let blank = NativeDocument::new_blank(
+            64, 48, depth, &runtime.resident(), &runtime.disk(), &|| Ok(()),
+        ).unwrap();
+        let (mut app, ctx) = workspace::fixture(depth);
+        app.set_preview_quality(false).unwrap();
+        app.workspace.lock().unwrap().source_runtime = Some(runtime);
+        app.shared.lock().unwrap().authority = DocumentAuthority::from_native(blank.clone(), 4).unwrap();
+        let layer = blank.metadata().layer(0).unwrap().id().to_owned();
+        app.select_content(&layer);
+        crate::server::edit_shared(
+            &app.shared, "human", &[json!({"op":"paint", "layer":layer,
+                "points":[[8,8]], "radius":3, "color":[233,84,32,255]})],
+            Some(blank.metadata().revision()), None, "Seed pixels", None, Some(blank.metadata().id()),
+        ).unwrap();
+        let document = app.shared.lock().unwrap().native_document().unwrap().clone();
+        let origin = document.metadata().layer(0).unwrap().origin();
+        app.doc_snapshot = document.clone().into();
+        let view = Rect::from_min_size(Pos2::ZERO, Vec2::new(64., 48.));
+        app.view_rect = Some(view);
+        app.canvas_viewport = Some(view);
+        let project = app.project_id.clone();
+        app.open_free_transform(&ctx, &document);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.preparing_free_transform() {
+            app.sync_free_transform(&ctx, &document);
+            assert!(Instant::now() < deadline, "Native transform geometry: {}", app.message);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let editor = app.free_transform.as_mut().unwrap();
+        editor.drag = Some(Drag { origin: [8., 8.], start: editor.values.clone(), handle: Handle::Move, warp_preset: None });
+        editor.values.offset = [7., 0.];
+        app.transient = editor.commands().unwrap();
+        let first = app.capture_native_canvas(&ctx, &project, &document).unwrap().unwrap();
+        app.queue_native_canvas(first, &ctx).unwrap();
+        let first_generation = app.canvas_generation;
+        let epoch = app.preview_epoch.load(std::sync::atomic::Ordering::Relaxed);
+
+        let editor = app.free_transform.as_mut().unwrap();
+        editor.values.offset = [15., 0.];
+        editor.changed();
+        app.transient = editor.commands().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.native_dispatch.pending() {
+            app.request_native_canvas(&ctx, &project, &document);
+            assert!(Instant::now() < deadline, "Intermediate native preview: {}", app.message);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(app.preview_epoch.load(std::sync::atomic::Ordering::Relaxed), epoch);
+        assert_eq!(app.canvas_generation, first_generation + 1);
+        assert!(app.native_dispatch.gesture_deferred);
+        assert!(app.free_transform.as_ref().unwrap().rendered.is_none());
+        assert!(!app.canvas_capture_ready((&document).into()));
+        assert_eq!(app.shared.lock().unwrap().history_lengths(), [1, 0]);
+
+        app.free_transform.as_mut().unwrap().drag = None;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            app.request_native_canvas(&ctx, &project, &document);
+            let editor = app.free_transform.as_ref().unwrap();
+            if editor.rendered == Some(editor.key().unwrap()) { break; }
+            assert!(Instant::now() < deadline, "Settled native preview: {}", app.message);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(app.canvas_generation, first_generation + 2);
+        app.apply_free_transform();
+        super::super::text_tests::wait_edit(&mut app);
+        assert!(app.free_transform.is_none(), "{}", app.message);
+        let engine = app.shared.lock().unwrap();
+        assert_eq!(engine.history_lengths(), [2, 0]);
+        assert_eq!(engine.native_document().unwrap().metadata().layer(0).unwrap().origin(),
+            [origin[0] + 15, origin[1]]);
+    }
+}
+
 fn actual_preview(app: &PeerBrush, output: &egui::FullOutput) {
-    let doc = app.shared.lock().unwrap().doc.clone();
+    let doc = app.shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
     let editor = app.free_transform.as_ref().unwrap();
     let commands = editor.commands().unwrap();
     assert_eq!(commands.len(), editor.roots.len());
     let expected = crate::engine::Engine::preview_edits(doc, &commands).unwrap();
-    let (w, h, bytes, _) = expected.preview(None, 1536, None, false).unwrap();
+    let (w, h, bytes, _) = expected.preview(None, 8192, None, false).unwrap();
     assert_eq!(app.canvas_pixels.as_ref(), Some(&(w, h, bytes)));
     let texture = app.texture.as_ref().unwrap().id();
     assert!(
@@ -150,10 +233,13 @@ fn actual_preview(app: &PeerBrush, output: &egui::FullOutput) {
 
 #[test]
 fn affine_session_uses_actual_controls_pixels_and_one_native_commit_across_modes() {
+    use egui::accesskit::{Action, ActionRequest, Role, Toggled};
+
     for depth in [8, 16] {
         let (mut app, ctx) = workspace::fixture(depth);
+        ctx.enable_accesskit();
         let before = workspace::source(&app);
-        let prior_undo = app.shared.lock().unwrap().undo.len();
+        let prior_undo = app.shared.lock().unwrap().resident_state().expect("resident fixture").undo.len();
         open(&mut app, &ctx);
         settle(&mut app, &ctx);
         // Real unboxed numeric editing; Enter completes the field, not the session.
@@ -207,7 +293,10 @@ fn affine_session_uses_actual_controls_pixels_and_one_native_commit_across_modes
             vec![egui::Event::PointerMoved(start), pointer(start, true)],
         );
         frame(&mut app, &ctx, vec![egui::Event::PointerMoved(end)]);
-        frame(&mut app, &ctx, vec![pointer(end, false)]);
+        let held = app.free_transform.as_ref().unwrap().values.clone();
+        frame(&mut app, &ctx, vec![pointer(end, false), egui::Event::PointerMoved(start)]);
+        assert!(app.free_transform.as_ref().unwrap().values == held);
+        assert!(app.free_transform.as_ref().unwrap().drag.is_none());
         assert!(app.free_transform.as_ref().unwrap().values.scale[0] > 1.);
         assert_eq!(
             workspace::source(&app),
@@ -216,8 +305,15 @@ fn affine_session_uses_actual_controls_pixels_and_one_native_commit_across_modes
         );
         let output = settle(&mut app, &ctx);
         actual_preview(&app, &output);
-        let flip = workspace::label(&output, "Flip H");
-        workspace::click(&mut app, &ctx, SIZE, flip);
+        let tree = output.platform_output.accesskit_update.unwrap();
+        let (flip, node) = tree.nodes.iter()
+            .find(|(_, node)| node.label() == Some("Flip horizontally"))
+            .unwrap();
+        assert_eq!(node.role(), Role::CheckBox);
+        assert_eq!(node.toggled(), Some(Toggled::False));
+        frame(&mut app, &ctx, vec![egui::Event::AccessKitActionRequest(ActionRequest {
+            action: Action::Click, target: *flip, data: None,
+        })]);
         let output = settle(&mut app, &ctx);
         actual_preview(&app, &output);
         let commands = app.free_transform.as_ref().unwrap().commands().unwrap();
@@ -228,21 +324,41 @@ fn affine_session_uses_actual_controls_pixels_and_one_native_commit_across_modes
         );
         assert_eq!(commands[0]["op"], "transform");
         assert_eq!(commands[0]["dx"], 6.);
+        assert_eq!(commands[0]["mirror_x"], true);
         let expected =
-            crate::engine::Engine::preview_edits(app.shared.lock().unwrap().doc.clone(), &commands)
+            crate::engine::Engine::preview_edits(app.shared.lock().unwrap().resident_state().expect("resident fixture").document.clone(), &commands)
                 .unwrap();
         workspace::click(&mut app, &ctx, SIZE, workspace::label(&output, "Apply"));
         assert!(app.free_transform.is_none(), "{}", app.message);
         let mut engine = app.shared.lock().unwrap();
-        assert_eq!(engine.undo.len(), prior_undo + 1);
-        assert_eq!(engine.doc.bit_depth, depth);
         assert_eq!(
-            engine.doc.export_png().unwrap(),
+            engine
+                .resident_state()
+                .expect("resident fixture")
+                .undo
+                .len(),
+            prior_undo + 1
+        );
+        assert_eq!(
+            engine
+                .resident_state()
+                .expect("resident fixture")
+                .document
+                .bit_depth,
+            depth
+        );
+        assert_eq!(
+            engine
+                .resident_state()
+                .expect("resident fixture")
+                .document
+                .export_png()
+                .unwrap(),
             expected.export_png().unwrap()
         );
         engine.undo("human").unwrap();
         assert_eq!(
-            engine.doc.layers[0].pixels.rgba16(),
+            engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(),
             serde_json::from_value::<Document>(before["document"].clone())
                 .unwrap()
                 .layers[0]
@@ -250,7 +366,7 @@ fn affine_session_uses_actual_controls_pixels_and_one_native_commit_across_modes
                 .rgba16()
         );
         assert_eq!(
-            engine.doc.export_png().unwrap(),
+            engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
             before["png"]
                 .as_array()
                 .unwrap()
@@ -260,7 +376,7 @@ fn affine_session_uses_actual_controls_pixels_and_one_native_commit_across_modes
         );
         engine.redo("human").unwrap();
         assert_eq!(
-            engine.doc.export_png().unwrap(),
+            engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
             expected.export_png().unwrap()
         );
     }
@@ -285,7 +401,9 @@ fn actual_menu_cancel_and_held_pointer_escape_do_not_replay_brush_or_destructive
         assert!(app.free_transform.is_none());
         assert_eq!(workspace::source(&app), before);
         open(&mut app, &ctx);
-        app.free_transform.as_mut().unwrap().values.offset = [3., 0.];
+        let editor = app.free_transform.as_mut().unwrap();
+        editor.values.offset = [3., 0.];
+        editor.set_mode(Tool::Scale);
         let output = settle(&mut app, &ctx);
         actual_preview(&app, &output);
         let editor = app.free_transform.as_ref().unwrap();
@@ -324,7 +442,10 @@ fn actual_menu_cancel_and_held_pointer_escape_do_not_replay_brush_or_destructive
             &ctx,
             vec![egui::Event::PointerMoved(point + Vec2::new(20., 10.))],
         );
-        assert!(app.free_transform.as_ref().unwrap().drag.is_some());
+        assert!(matches!(
+            app.free_transform.as_ref().unwrap().drag.as_ref().map(|drag| drag.handle),
+            Some(Handle::Move)
+        ));
         frame(
             &mut app,
             &ctx,
@@ -388,7 +509,7 @@ fn stale_preview_focus_target_source_and_reserved_apply_keep_exact_human_work() 
         editor.values.angle = 15.;
         editor.changed();
         app.transient = editor.commands().unwrap();
-        let doc = app.shared.lock().unwrap().doc.clone();
+        let doc = app.shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
         let live = app.live_key();
         while app.preview_rx.try_recv().is_ok() {}
         app.pending = true;
@@ -406,10 +527,11 @@ fn stale_preview_focus_target_source_and_reserved_apply_keep_exact_human_work() 
                 w: 1,
                 h: 1,
                 bytes: vec![1, 2, 3, 255],
-                dirty: None,
+                patch: None,
                 selection: doc.selection,
                 selection_polygon: doc.selection_polygon.clone(),
                 selection_coverage: doc.selection_coverage.clone(),
+                text: None,
                 target: "old-session-parameters".into(),
                 mask: false,
             })
@@ -536,7 +658,7 @@ fn selection_choice_pivot_reset_and_pure_move_keep_one_command_and_explicit_boun
             &mut app,
             &ctx,
             SIZE,
-            workspace::label(&output, "Whole target (keep selection)"),
+            workspace::label(&output, "Whole target"),
         );
         let output = settle(&mut app, &ctx);
         actual_preview(&app, &output);
@@ -602,7 +724,7 @@ fn existing_live_tool_and_file_loading_guards_refuse_session_without_discarding_
     for depth in [8, 16] {
         let (mut app, ctx) = workspace::fixture(depth);
         frame(&mut app, &ctx, vec![]);
-        let doc = app.shared.lock().unwrap().doc.clone();
+        let doc = app.shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
         let before = workspace::source(&app);
         app.live_gesture = Some("existing-tool-gesture".into());
         app.open_free_transform(&ctx, &doc);
@@ -632,8 +754,8 @@ fn selected_skew_numeric_control_previews_native_result_then_applies_once_and_un
                 "Soft selection",
             )
             .unwrap();
-        let before = app.shared.lock().unwrap().doc.clone();
-        let history = app.shared.lock().unwrap().undo.len();
+        let before = app.shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
+        let history = app.shared.lock().unwrap().resident_state().expect("resident fixture").undo.len();
         open(&mut app, &ctx);
         settle(&mut app, &ctx);
         let at = app.free_transform.as_ref().unwrap().inputs[5]
@@ -666,36 +788,56 @@ fn selected_skew_numeric_control_previews_native_result_then_applies_once_and_un
         assert_eq!(commands[0]["selection_only"], true);
         let expected = crate::engine::Engine::preview_edits(before.clone(), &commands).unwrap();
         assert_eq!(
-            app.shared.lock().unwrap().doc.layers[0].pixels,
+            app.shared.lock().unwrap().resident_state().expect("resident fixture").document.layers[0].pixels,
             before.layers[0].pixels
         );
         workspace::click(&mut app, &ctx, SIZE, workspace::label(&output, "Apply"));
         assert!(app.free_transform.is_none(), "{}", app.message);
         let mut engine = app.shared.lock().unwrap();
-        assert_eq!(engine.doc.bit_depth, depth);
-        assert_eq!(engine.undo.len(), history + 1);
-        assert_eq!(engine.doc.layers[0].pixels, expected.layers[0].pixels);
+        assert_eq!(engine.resident_state().expect("resident fixture").document.bit_depth, depth);
+        assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), history + 1);
+        assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].pixels, expected.layers[0].pixels);
         assert!(independent_coverage_eq(
-            engine.doc.selection_coverage.as_ref(),
+            engine.resident_state().expect("resident fixture").document.selection_coverage.as_ref(),
             expected.selection_coverage.as_ref()
         ));
-        let applied_coverage = engine.doc.selection_coverage.clone();
+        let applied_coverage = engine.resident_state().expect("resident fixture").document.selection_coverage.clone();
         assert_eq!(
-            engine.doc.export_png().unwrap(),
+            engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
             expected.export_png().unwrap()
         );
         engine.undo("human").unwrap();
-        assert_eq!(engine.doc.layers[0].pixels, before.layers[0].pixels);
-        assert_eq!(engine.doc.selection_coverage, before.selection_coverage);
         assert_eq!(
-            engine.doc.export_png().unwrap(),
+            engine
+                .resident_state()
+                .expect("resident fixture")
+                .document
+                .layers[0]
+                .pixels,
+            before.layers[0].pixels
+        );
+        assert_eq!(
+            engine
+                .resident_state()
+                .expect("resident fixture")
+                .document
+                .selection_coverage,
+            before.selection_coverage
+        );
+        assert_eq!(
+            engine
+                .resident_state()
+                .expect("resident fixture")
+                .document
+                .export_png()
+                .unwrap(),
             before.export_png().unwrap()
         );
         engine.redo("human").unwrap();
-        assert_eq!(engine.doc.layers[0].pixels, expected.layers[0].pixels);
-        assert_eq!(engine.doc.selection_coverage, applied_coverage);
+        assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].pixels, expected.layers[0].pixels);
+        assert_eq!(engine.resident_state().expect("resident fixture").document.selection_coverage, applied_coverage);
         assert!(independent_coverage_eq(
-            engine.doc.selection_coverage.as_ref(),
+            engine.resident_state().expect("resident fixture").document.selection_coverage.as_ref(),
             expected.selection_coverage.as_ref()
         ));
     }
@@ -820,6 +962,13 @@ fn moved_reference_preserves_exact_command_then_anchors_the_next_affine_change()
     let commands = editor.commands().unwrap();
     assert!(editor.set_reference([100001., 0.]).is_err());
     assert_eq!(editor.commands().unwrap(), commands);
+
+    let corners = editor.corners();
+    let anchors = editor.reference_anchors();
+    assert_eq!([anchors[0], anchors[2], anchors[8], anchors[6]], corners);
+    editor.set_reference(anchors[7]).unwrap();
+    assert_eq!(editor.reference_point(), anchors[7]);
+    assert_eq!(editor.commands().unwrap(), commands);
 }
 
 #[test]
@@ -839,7 +988,15 @@ fn actual_reference_fields_keep_painted_result_then_rotate_once_with_native_mask
                         "Mask",
                     )
                     .unwrap();
-                engine.doc.layers[0].mask.as_mut().unwrap().steps[1]
+                engine
+                    .resident_state_mut()
+                    .expect("resident fixture")
+                    .document
+                    .layers[0]
+                    .mask
+                    .as_mut()
+                    .unwrap()
+                    .steps[1]
                     .pixels
                     .set16(8, 8, [23459, 23459, 23459, 65535]);
                 if selected {
@@ -855,8 +1012,8 @@ fn actual_reference_fields_keep_painted_result_then_rotate_once_with_native_mask
                 }
             }
             let before = workspace::source(&app);
-            let original = app.shared.lock().unwrap().doc.clone();
-            let history = app.shared.lock().unwrap().undo.len();
+            let original = app.shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
+            let history = app.shared.lock().unwrap().resident_state().expect("resident fixture").undo.len();
             open(&mut app, &ctx);
             app.free_transform.as_mut().unwrap().values.scale = [1.2, 0.9];
             let output = settle(&mut app, &ctx);
@@ -900,31 +1057,59 @@ fn actual_reference_fields_keep_painted_result_then_rotate_once_with_native_mask
             workspace::click(&mut app, &ctx, SIZE, workspace::label(&output, "Apply"));
             assert!(app.free_transform.is_none(), "{}", app.message);
             let mut engine = app.shared.lock().unwrap();
-            assert_eq!(engine.undo.len(), history + 1);
-            assert_eq!(engine.doc.bit_depth, depth);
-            assert_eq!(engine.doc.layers[0].pixels, expected.layers[0].pixels);
-            reference_mask_eq(&engine.doc.layers[0].mask, &expected.layers[0].mask);
+            assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), history + 1);
+            assert_eq!(engine.resident_state().expect("resident fixture").document.bit_depth, depth);
+            assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].pixels, expected.layers[0].pixels);
+            reference_mask_eq(&engine.resident_state().expect("resident fixture").document.layers[0].mask, &expected.layers[0].mask);
             assert!(independent_coverage_eq(
-                engine.doc.selection_coverage.as_ref(),
+                engine.resident_state().expect("resident fixture").document.selection_coverage.as_ref(),
                 expected.selection_coverage.as_ref()
             ));
             assert_eq!(
-                engine.doc.export_png().unwrap(),
+                engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
                 expected.export_png().unwrap()
             );
-            let applied = engine.doc.clone();
+            let applied = engine.resident_state().expect("resident fixture").document.clone();
             engine.undo("human").unwrap();
-            assert_eq!(engine.doc.layers[0].pixels, original.layers[0].pixels);
-            reference_mask_eq(&engine.doc.layers[0].mask, &original.layers[0].mask);
-            assert_eq!(engine.doc.selection_coverage, original.selection_coverage);
             assert_eq!(
-                engine.doc.export_png().unwrap(),
+                engine
+                    .resident_state()
+                    .expect("resident fixture")
+                    .document
+                    .layers[0]
+                    .pixels,
+                original.layers[0].pixels
+            );
+            reference_mask_eq(
+                &engine
+                    .resident_state()
+                    .expect("resident fixture")
+                    .document
+                    .layers[0]
+                    .mask,
+                &original.layers[0].mask,
+            );
+            assert_eq!(
+                engine
+                    .resident_state()
+                    .expect("resident fixture")
+                    .document
+                    .selection_coverage,
+                original.selection_coverage
+            );
+            assert_eq!(
+                engine
+                    .resident_state()
+                    .expect("resident fixture")
+                    .document
+                    .export_png()
+                    .unwrap(),
                 original.export_png().unwrap()
             );
             engine.redo("human").unwrap();
-            assert_eq!(engine.doc.layers[0].pixels, applied.layers[0].pixels);
-            reference_mask_eq(&engine.doc.layers[0].mask, &applied.layers[0].mask);
-            assert_eq!(engine.doc.selection_coverage, applied.selection_coverage);
+            assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].pixels, applied.layers[0].pixels);
+            reference_mask_eq(&engine.resident_state().expect("resident fixture").document.layers[0].mask, &applied.layers[0].mask);
+            assert_eq!(engine.resident_state().expect("resident fixture").document.selection_coverage, applied.selection_coverage);
         }
     }
 }
@@ -999,6 +1184,8 @@ fn scale_crossing_uses_signed_axes_about_the_reference_with_rotation_skew_and_pr
         ([1.25, -0.75], false, false, [true, true], [1.25, -0.75]),
         ([-1.25, -0.75], false, false, [true, true], [-1.25, -0.75]),
         ([-0.75, 1.5], true, false, [true, true], [-1.5, 1.5]),
+        ([-0.75, 1.5], true, true, [true, true], [-0.75, 1.5]),
+        ([-0.75, 1.5], false, true, [true, true], [-1.5, 1.5]),
         ([-1.25, 1.], false, true, [true, false], [-1.25, 1.25]),
     ];
     for depth in [8, 16] {
@@ -1037,6 +1224,7 @@ fn scale_crossing_uses_signed_axes_about_the_reference_with_rotation_skew_and_pr
                     origin,
                     start: start.clone(),
                     handle: Handle::Scale(axes[0], axes[1]),
+                    warp_preset: None,
                 });
                 editor.drag_to(position(input), shift);
                 for i in 0..2 {
@@ -1065,12 +1253,12 @@ fn real_corner_crossing_previews_one_native_flip_then_commits_and_roundtrips_onc
     for depth in [8, 16] {
         let (mut app, ctx) = workspace::fixture(depth);
         let before = workspace::source(&app);
-        let original = app.shared.lock().unwrap().doc.clone();
-        let undo = app.shared.lock().unwrap().undo.len();
+        let original = app.shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
+        let undo = app.shared.lock().unwrap().resident_state().expect("resident fixture").undo.len();
         open(&mut app, &ctx);
         settle(&mut app, &ctx);
-        workspace::key(&mut app, &ctx, SIZE, egui::Key::R, Default::default());
         let editor = app.free_transform.as_ref().unwrap();
+        assert_eq!(editor.mode(), Some(Tool::Move));
         let corner = editor.corners()[2];
         let center = editor.reference_point();
         let reflected = [2. * center[0] - corner[0], corner[1]];
@@ -1113,35 +1301,54 @@ fn real_corner_crossing_previews_one_native_flip_then_commits_and_roundtrips_onc
         workspace::click(&mut app, &ctx, SIZE, workspace::label(&output, "Apply"));
         assert!(app.free_transform.is_none(), "{}", app.message);
         let mut engine = app.shared.lock().unwrap();
-        assert_eq!(engine.undo.len(), undo + 1);
-        assert_eq!(engine.doc.bit_depth, depth);
         assert_eq!(
-            engine.doc.export_png().unwrap(),
+            engine
+                .resident_state()
+                .expect("resident fixture")
+                .undo
+                .len(),
+            undo + 1
+        );
+        assert_eq!(
+            engine
+                .resident_state()
+                .expect("resident fixture")
+                .document
+                .bit_depth,
+            depth
+        );
+        assert_eq!(
+            engine
+                .resident_state()
+                .expect("resident fixture")
+                .document
+                .export_png()
+                .unwrap(),
             expected.export_png().unwrap()
         );
         for encoded in [
-            crate::psd::encode(&engine.doc).unwrap(),
-            crate::psd::encode_psb(&engine.doc).unwrap(),
+            crate::psd::encode(&engine.resident_state().expect("resident fixture").document).unwrap(),
+            crate::psd::encode_psb(&engine.resident_state().expect("resident fixture").document).unwrap(),
         ] {
             let reopened = crate::psd::decode(&encoded).unwrap();
             assert!(!reopened.read_only, "Roundtrip must retain editability");
             assert_eq!(reopened.bit_depth, depth);
             assert_eq!(
                 reopened.export_png().unwrap(),
-                engine.doc.export_png().unwrap()
+                engine.resident_state().expect("resident fixture").document.export_png().unwrap()
             );
             assert_eq!(
                 reopened.layers[0].pixels.rgba16(),
-                engine.doc.layers[0].pixels.rgba16()
+                engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16()
             );
         }
         engine.undo("human").unwrap();
         assert_eq!(
-            engine.doc.export_png().unwrap(),
+            engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
             original.export_png().unwrap()
         );
         assert_eq!(
-            engine.doc.layers[0].pixels.rgba16(),
+            engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(),
             original.layers[0].pixels.rgba16()
         );
     }
@@ -1170,6 +1377,7 @@ fn proportional_zero_magnitude_preserves_the_other_axis_crossing_and_never_flips
                 origin,
                 start: editor.values.clone(),
                 handle: Handle::Scale(true, true),
+                warp_preset: None,
             });
             editor.drag_to(
                 [
@@ -1253,6 +1461,7 @@ fn edge_skew_follows_the_actual_sheared_axes_and_reference_and_restores_exact_co
                         origin,
                         start: start.clone(),
                         handle: Handle::Skew(axis),
+                        warp_preset: None,
                     });
                     editor.drag_to(target, false);
                     assert!((editor.values.skew[axis] - values.skew[axis]).abs() < 1e-10);
@@ -1282,6 +1491,7 @@ fn edge_skew_follows_the_actual_sheared_axes_and_reference_and_restores_exact_co
             origin,
             start: editor.values.clone(),
             handle: Handle::Skew(0),
+            warp_preset: None,
         });
         let pivot = editor.reference_point();
         editor.drag_to(
@@ -1424,7 +1634,11 @@ fn real_skew_handles_share_selected_masks_folders_preview_storage_and_one_guarde
                         "Painted mask",
                     )
                     .unwrap();
-                let layer = &mut engine.doc.layers[0];
+                let layer = &mut engine
+                    .resident_state_mut()
+                    .expect("resident fixture")
+                    .document
+                    .layers[0];
                 for y in 0..24 {
                     for x in 0..32 {
                         layer.pixels.set16(
@@ -1459,7 +1673,7 @@ fn real_skew_handles_share_selected_masks_folders_preview_storage_and_one_guarde
                 if target == "folder" {
                     let mut root = crate::engine::Layer::new("Skew folder", "group", 32, 24);
                     root.pixels = crate::raster::Raster::new_depth(32, 24, depth);
-                    let mut child = engine.doc.layers[0].clone();
+                    let mut child = engine.resident_state().expect("resident fixture").document.layers[0].clone();
                     child.parent = Some(root.id.clone());
                     let mut hidden = child.clone();
                     hidden.id = crate::engine::id();
@@ -1468,7 +1682,11 @@ fn real_skew_handles_share_selected_masks_folders_preview_storage_and_one_guarde
                     hidden.pixels.set16(7, 6, [14143, 25253, 36367, 0]);
                     hidden.mask = None;
                     app.selected = root.id.clone();
-                    engine.doc.layers = vec![root, child, hidden];
+                    engine
+                        .resident_state_mut()
+                        .expect("resident fixture")
+                        .document
+                        .layers = vec![root, child, hidden];
                 }
                 engine.edit("human", &[
                     json!({"op":"selection","kind":"ellipse","rect":[4,4,26,21],"feather":2.}),
@@ -1479,7 +1697,7 @@ fn real_skew_handles_share_selected_masks_folders_preview_storage_and_one_guarde
             app.mask = target == "unlinked-mask" || target == "paint-step";
             if target == "paint-step" {
                 app.mask_step = Some(
-                    app.shared.lock().unwrap().doc.layers[0]
+                    app.shared.lock().unwrap().resident_state().expect("resident fixture").document.layers[0]
                         .mask
                         .as_ref()
                         .unwrap()
@@ -1488,9 +1706,9 @@ fn real_skew_handles_share_selected_masks_folders_preview_storage_and_one_guarde
                         .clone(),
                 );
             }
-            let original = app.shared.lock().unwrap().doc.clone();
+            let original = app.shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
             let unchanged = workspace::source(&app);
-            let history = app.shared.lock().unwrap().undo.len();
+            let history = app.shared.lock().unwrap().resident_state().expect("resident fixture").undo.len();
             open(&mut app, &ctx);
             settle(&mut app, &ctx);
             skew_edge_drag(&mut app, &ctx, 0);
@@ -1544,44 +1762,44 @@ fn real_skew_handles_share_selected_masks_folders_preview_storage_and_one_guarde
             workspace::click(&mut app, &ctx, SIZE, workspace::label(&output, "Apply"));
             assert!(app.free_transform.is_none(), "{}", app.message);
             let mut engine = app.shared.lock().unwrap();
-            assert_eq!(engine.undo.len(), history + 1);
-            skew_native_layers_eq(&engine.doc, &expected);
+            assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), history + 1);
+            skew_native_layers_eq(&engine.resident_state().expect("resident fixture").document, &expected);
             assert!(independent_coverage_eq(
-                engine.doc.selection_coverage.as_ref(),
+                engine.resident_state().expect("resident fixture").document.selection_coverage.as_ref(),
                 expected.selection_coverage.as_ref()
             ));
             assert_eq!(
-                engine.doc.export_png().unwrap(),
+                engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
                 expected.export_png().unwrap()
             );
             for encoded in [
-                crate::psd::encode(&engine.doc).unwrap(),
-                crate::psd::encode_psb(&engine.doc).unwrap(),
+                crate::psd::encode(&engine.resident_state().expect("resident fixture").document).unwrap(),
+                crate::psd::encode_psb(&engine.resident_state().expect("resident fixture").document).unwrap(),
             ] {
                 let reopened = crate::psd::decode(&encoded).unwrap();
                 assert!(!reopened.read_only);
                 assert_eq!(reopened.bit_depth, depth);
                 assert_eq!(
                     reopened.export_png().unwrap(),
-                    engine.doc.export_png().unwrap()
+                    engine.resident_state().expect("resident fixture").document.export_png().unwrap()
                 );
-                skew_native_layers_eq(&reopened, &engine.doc);
+                skew_native_layers_eq(&reopened, &engine.resident_state().expect("resident fixture").document);
             }
-            let applied = engine.doc.clone();
+            let applied = engine.resident_state().expect("resident fixture").document.clone();
             engine.undo("human").unwrap();
             assert_eq!(
-                engine.doc.export_png().unwrap(),
+                engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
                 original.export_png().unwrap()
             );
-            assert_eq!(engine.doc.selection_coverage, original.selection_coverage);
-            skew_native_layers_eq(&engine.doc, &original);
+            assert_eq!(engine.resident_state().expect("resident fixture").document.selection_coverage, original.selection_coverage);
+            skew_native_layers_eq(&engine.resident_state().expect("resident fixture").document, &original);
             engine.redo("human").unwrap();
             assert_eq!(
-                engine.doc.export_png().unwrap(),
+                engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
                 applied.export_png().unwrap()
             );
-            assert_eq!(engine.doc.selection_coverage, applied.selection_coverage);
-            skew_native_layers_eq(&engine.doc, &applied);
+            assert_eq!(engine.resident_state().expect("resident fixture").document.selection_coverage, applied.selection_coverage);
+            skew_native_layers_eq(&engine.resident_state().expect("resident fixture").document, &applied);
         }
     }
 }
@@ -1602,6 +1820,7 @@ fn skew_mode_cancel_and_reference_axis_leave_native_history_exact() {
             origin,
             start: editor.values.clone(),
             handle: Handle::Skew(0),
+            warp_preset: None,
         });
         editor.drag_to([origin[0] + 20., origin[1]], false);
         assert_eq!(
@@ -1673,7 +1892,7 @@ fn skew_handles_keep_selected_source_protection_and_support_explicit_whole_sourc
                     "Editable source",
                 )
                 .unwrap();
-            app.selected = engine.doc.layers[0].id.clone();
+            app.selected = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
             engine
                 .edit(
                     "human",
@@ -1733,7 +1952,7 @@ fn skew_handles_keep_selected_source_protection_and_support_explicit_whole_sourc
             &mut app,
             &ctx,
             SIZE,
-            workspace::label(&output, "Whole target (keep selection)"),
+            workspace::label(&output, "Whole target"),
         );
         let output = settle(&mut app, &ctx);
         actual_preview(&app, &output);
@@ -1826,10 +2045,7 @@ fn projective_corners_share_affine_order_pair_constraints_and_moved_reference() 
     }
 }
 
-fn real_projective_corner_drag(app: &mut PeerBrush, ctx: &egui::Context, mode: &str) {
-    let output = frame(app, ctx, vec![]);
-    workspace::click(app, ctx, SIZE, workspace::label(&output, mode));
-    frame(app, ctx, vec![]);
+fn expose_transform_handles(app: &mut PeerBrush, ctx: &egui::Context) {
     let editor = app.free_transform.as_ref().unwrap();
     let rect = app.view_rect.unwrap();
     let reference = app.view.point(
@@ -1846,6 +2062,13 @@ fn real_projective_corner_drag(app: &mut PeerBrush, ctx: &egui::Context, mode: &
     assert!(left < right, "The fixture needs unobscured canvas space");
     app.pan.x += (left + right) * 0.5 - reference.x;
     frame(app, ctx, vec![]);
+}
+
+fn real_projective_corner_drag(app: &mut PeerBrush, ctx: &egui::Context, mode: &str) {
+    let output = frame(app, ctx, vec![]);
+    workspace::click(app, ctx, SIZE, workspace::label(&output, mode));
+    frame(app, ctx, vec![]);
+    expose_transform_handles(app, ctx);
     let editor = app.free_transform.as_ref().unwrap();
     assert!(editor.mode().is_none());
     let rect = app.view_rect.unwrap();
@@ -1891,6 +2114,55 @@ fn real_projective_corner_drag(app: &mut PeerBrush, ctx: &egui::Context, mode: &
 }
 
 #[test]
+fn modifier_drag_uses_press_chord_and_keeps_perspective_pending_after_release() {
+    let (mut app, ctx) = workspace::fixture(16);
+    let before = workspace::source(&app);
+    open(&mut app, &ctx);
+    settle(&mut app, &ctx);
+    expose_transform_handles(&mut app, &ctx);
+    let editor = app.free_transform.as_ref().unwrap();
+    let rect = app.view_rect.unwrap();
+    let available = app.canvas_input_region.unwrap().0;
+    let start = editor
+        .projective_handles()
+        .unwrap()
+        .into_iter()
+        .map(|point| app.view.point(point.map(|v| v as f32), rect, rect.width() / 32.))
+        .find(|point| {
+            available.shrink(24.).contains(*point)
+                && ctx
+                    .layer_id_at(*point)
+                    .is_some_and(|layer| layer.order == egui::Order::Background)
+        })
+        .expect("An exposed transform corner");
+    let chord = egui::Modifiers {
+        ctrl: !cfg!(target_os = "macos"),
+        mac_cmd: cfg!(target_os = "macos"),
+        command: true,
+        alt: true,
+        shift: true,
+    };
+    let press = egui::Event::PointerButton {
+        pos: start,
+        button: egui::PointerButton::Primary,
+        pressed: true,
+        modifiers: chord,
+    };
+    frame(&mut app, &ctx, vec![egui::Event::PointerMoved(start), press]);
+    assert!(matches!(
+        app.free_transform.as_ref().unwrap().drag.as_ref().map(|drag| drag.handle),
+        Some(Handle::PerspectiveShortcut(_))
+    ));
+    let end = start + Vec2::new(8., 0.);
+    frame(&mut app, &ctx, vec![egui::Event::PointerMoved(end), pointer(end, false)]);
+    let editor = app.free_transform.as_ref().unwrap();
+    assert!(editor.drag.is_none());
+    assert!(editor.projective_mode.is_none());
+    assert!(editor.commands().unwrap()[0]["projective"].is_object());
+    assert_eq!(workspace::source(&app), before);
+}
+
+#[test]
 fn real_projective_modes_preview_native_selected_color_masks_folders_and_commit_once() {
     for depth in [8, 16] {
         for target in ["color", "mask", "folder"] {
@@ -1908,7 +2180,11 @@ fn real_projective_modes_preview_native_selected_color_masks_folders_and_commit_
                     .unwrap();
                 for y in 0..24 {
                     for x in 0..32 {
-                        let layer = &mut engine.doc.layers[0];
+                        let layer = &mut engine
+                            .resident_state_mut()
+                            .expect("resident fixture")
+                            .document
+                            .layers[0];
                         layer.pixels.set16(
                             x,
                             y,
@@ -1941,7 +2217,7 @@ fn real_projective_modes_preview_native_selected_color_masks_folders_and_commit_
                 if target == "folder" {
                     let mut root = crate::engine::Layer::new("Projective folder", "group", 32, 24);
                     root.pixels = crate::raster::Raster::new_depth(32, 24, depth);
-                    let mut child = engine.doc.layers[0].clone();
+                    let mut child = engine.resident_state().expect("resident fixture").document.layers[0].clone();
                     child.parent = Some(root.id.clone());
                     let mut hidden = child.clone();
                     hidden.id = crate::engine::id();
@@ -1949,7 +2225,11 @@ fn real_projective_modes_preview_native_selected_color_masks_folders_and_commit_
                     hidden.mask = None;
                     hidden.pixels.set16(7, 6, [14143, 25253, 36367, 0]);
                     app.selected = root.id.clone();
-                    engine.doc.layers = vec![root, child, hidden];
+                    engine
+                        .resident_state_mut()
+                        .expect("resident fixture")
+                        .document
+                        .layers = vec![root, child, hidden];
                 }
                 engine
                     .edit(
@@ -1965,9 +2245,9 @@ fn real_projective_modes_preview_native_selected_color_masks_folders_and_commit_
             app.selection_layers = [app.selected.clone()].into_iter().collect();
             app.mask = target == "mask";
             app.zoom = 0.4;
-            let original = app.shared.lock().unwrap().doc.clone();
+            let original = app.shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
             let before = workspace::source(&app);
-            let history = app.shared.lock().unwrap().undo.len();
+            let history = app.shared.lock().unwrap().resident_state().expect("resident fixture").undo.len();
             open(&mut app, &ctx);
             settle(&mut app, &ctx);
             for mode in ["Distort", "Perspective"] {
@@ -2036,31 +2316,31 @@ fn real_projective_modes_preview_native_selected_color_masks_folders_and_commit_
             workspace::click(&mut app, &ctx, SIZE, workspace::label(&output, "Apply"));
             assert!(app.free_transform.is_none(), "{}", app.message);
             let mut engine = app.shared.lock().unwrap();
-            assert_eq!(engine.undo.len(), history + 1);
-            assert_eq!(engine.doc.bit_depth, depth);
-            skew_native_layers_eq(&engine.doc, &expected);
+            assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), history + 1);
+            assert_eq!(engine.resident_state().expect("resident fixture").document.bit_depth, depth);
+            skew_native_layers_eq(&engine.resident_state().expect("resident fixture").document, &expected);
             assert!(independent_coverage_eq(
-                engine.doc.selection_coverage.as_ref(),
+                engine.resident_state().expect("resident fixture").document.selection_coverage.as_ref(),
                 expected.selection_coverage.as_ref()
             ));
             for data in [
-                crate::psd::encode(&engine.doc).unwrap(),
-                crate::psd::encode_psb(&engine.doc).unwrap(),
+                crate::psd::encode(&engine.resident_state().expect("resident fixture").document).unwrap(),
+                crate::psd::encode_psb(&engine.resident_state().expect("resident fixture").document).unwrap(),
             ] {
                 let reopened = crate::psd::decode(&data).unwrap();
                 assert!(!reopened.read_only);
                 assert_eq!(reopened.bit_depth, depth);
-                skew_native_layers_eq(&reopened, &engine.doc);
+                skew_native_layers_eq(&reopened, &engine.resident_state().expect("resident fixture").document);
                 assert_eq!(
                     reopened.export_png().unwrap(),
-                    engine.doc.export_png().unwrap()
+                    engine.resident_state().expect("resident fixture").document.export_png().unwrap()
                 );
             }
             engine.undo("human").unwrap();
-            skew_native_layers_eq(&engine.doc, &original);
-            assert_eq!(engine.doc.selection_coverage, original.selection_coverage);
+            skew_native_layers_eq(&engine.resident_state().expect("resident fixture").document, &original);
+            assert_eq!(engine.resident_state().expect("resident fixture").document.selection_coverage, original.selection_coverage);
             engine.redo("human").unwrap();
-            skew_native_layers_eq(&engine.doc, &expected);
+            skew_native_layers_eq(&engine.resident_state().expect("resident fixture").document, &expected);
         }
     }
 }
@@ -2164,7 +2444,7 @@ fn pending_projective_selection_scope_reuses_one_map_when_toggling_whole_target(
             &mut app,
             &ctx,
             SIZE,
-            workspace::label(&output, "Whole target (keep selection)"),
+            workspace::label(&output, "Selected pixels"),
         );
         assert!(!app.free_transform.as_ref().unwrap().whole);
         assert_eq!(
@@ -2467,7 +2747,11 @@ fn warp_fixture(depth: u16, target: &str) -> (PeerBrush, egui::Context) {
             .unwrap();
         for y in 0..24 {
             for x in 0..32 {
-                let layer = &mut engine.doc.layers[0];
+                let layer = &mut engine
+                    .resident_state_mut()
+                    .expect("resident fixture")
+                    .document
+                    .layers[0];
                 layer.pixels.set16(
                     x,
                     y,
@@ -2487,19 +2771,31 @@ fn warp_fixture(depth: u16, target: &str) -> (PeerBrush, egui::Context) {
             }
         }
         if target == "mask" {
-            engine.doc.layers[0].mask.as_mut().unwrap().linked = false;
+            engine
+                .resident_state_mut()
+                .expect("resident fixture")
+                .document
+                .layers[0]
+                .mask
+                .as_mut()
+                .unwrap()
+                .linked = false;
         }
         if target == "folder" {
             let mut root = crate::engine::Layer::new("Warp folder", "group", 32, 24);
             root.pixels = crate::raster::Raster::new_depth(32, 24, depth);
-            let mut child = engine.doc.layers[0].clone();
+            let mut child = engine.resident_state().expect("resident fixture").document.layers[0].clone();
             child.parent = Some(root.id.clone());
             let mut hidden = child.clone();
             hidden.id = crate::engine::id();
             hidden.visible = false;
             hidden.pixels.set16(7, 6, [14143, 25253, 36367, 0]);
             app.selected = root.id.clone();
-            engine.doc.layers = vec![root, child, hidden];
+            engine
+                .resident_state_mut()
+                .expect("resident fixture")
+                .document
+                .layers = vec![root, child, hidden];
         }
         let mut mask = crate::raster::Raster::new(32, 24);
         for y in 4..21 {
@@ -2520,9 +2816,21 @@ fn warp_fixture(depth: u16, target: &str) -> (PeerBrush, egui::Context) {
             }
         }
         let coverage = crate::selection::from_mask(mask).unwrap();
-        engine.doc.selection = Some(coverage.bounds);
-        engine.doc.selection_polygon = None;
-        engine.doc.selection_coverage = Some(coverage);
+        engine
+            .resident_state_mut()
+            .expect("resident fixture")
+            .document
+            .selection = Some(coverage.bounds);
+        engine
+            .resident_state_mut()
+            .expect("resident fixture")
+            .document
+            .selection_polygon = None;
+        engine
+            .resident_state_mut()
+            .expect("resident fixture")
+            .document
+            .selection_coverage = Some(coverage);
     }
     app.selection_layers = [app.selected.clone()].into_iter().collect();
     app.mask = target == "mask";
@@ -2582,6 +2890,20 @@ fn warp_node_drag(app: &mut PeerBrush, ctx: &egui::Context, release: bool) {
 }
 
 #[test]
+fn overlapping_warp_handles_choose_the_closest_visible_node() {
+    let mut nodes = [Pos2::new(100., 100.); 9];
+    nodes[0] = Pos2::new(10., 10.);
+    nodes[4] = Pos2::new(15., 14.);
+    assert!(nodes[0].distance(nodes[4]) < 9.);
+    assert_eq!(Editor::nearest_warp_node(&nodes, nodes[4]), Some(4));
+    assert_eq!(
+        Editor::nearest_warp_node(&nodes, Pos2::new(11., 10.)),
+        Some(0)
+    );
+    assert_eq!(Editor::nearest_warp_node(&nodes, Pos2::new(40., 40.)), None);
+}
+
+#[test]
 fn warp_nodes_use_post_map_while_projective_controls_keep_their_reference_plane() {
     for depth in [8, 16] {
         let (mut app, ctx) = warp_fixture(depth, "color");
@@ -2619,12 +2941,19 @@ fn warp_nodes_use_post_map_while_projective_controls_keep_their_reference_plane(
             editor.values.angle,
             editor.values.skew,
         );
-        let origin = editor.grid_points().unwrap()[4];
-        let destination = [origin[0] + 0.25, origin[1] - 0.125];
-        editor.drag_node(4, origin, destination, false).unwrap();
-        let displayed = editor.grid_points().unwrap()[4];
+        editor.snap = false;
+        let points = editor.grid_points().unwrap();
+        let anchor = points[4];
+        let origin = [anchor[0] + 1.125, anchor[1] - 0.75];
+        let delta = [0.25, -0.125];
+        let pointer = [origin[0] + delta[0], origin[1] + delta[1]];
+        editor.drag_node(4, origin, pointer, false).unwrap();
+        let displayed = editor.grid_points().unwrap();
         for axis in 0..2 {
-            assert!((displayed[axis] - destination[axis]).abs() < 1e-9);
+            assert!((displayed[4][axis] - anchor[axis] - delta[axis]).abs() < 1e-9);
+        }
+        for index in [0, 1, 2, 3, 5, 6, 7, 8] {
+            assert_eq!(displayed[index], points[index]);
         }
         assert!(editor.values.projective == projection);
         assert_eq!(
@@ -2678,8 +3007,8 @@ fn actual_grid_presets_nodes_and_mixed_modes_preview_then_apply_native_targets_o
         for target in ["color", "mask", "folder"] {
             let (mut app, ctx) = warp_fixture(depth, target);
             let before = workspace::source(&app);
-            let original = app.shared.lock().unwrap().doc.clone();
-            let history = app.shared.lock().unwrap().undo.len();
+            let original = app.shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
+            let history = app.shared.lock().unwrap().resident_state().expect("resident fixture").undo.len();
             open(&mut app, &ctx);
             settle(&mut app, &ctx);
             warp_click(&mut app, &ctx, SIZE, "Grid Warp");
@@ -2715,6 +3044,13 @@ fn actual_grid_presets_nodes_and_mixed_modes_preview_then_apply_native_targets_o
             );
             warp_enter(&mut app, &ctx, SIZE, "Move X", WarpInput::Base(0), "2");
             warp_enter(&mut app, &ctx, SIZE, "Angle", WarpInput::Base(4), "11");
+            let key = app.free_transform.as_ref().unwrap().key().unwrap();
+            warp_click(&mut app, &ctx, SIZE, "Back to Transform");
+            let editor = app.free_transform.as_ref().unwrap();
+            assert_eq!(editor.mode(), Some(Tool::Move));
+            assert_eq!(editor.key().unwrap(), key);
+            warp_click(&mut app, &ctx, SIZE, "Grid Warp");
+            assert_eq!(app.free_transform.as_ref().unwrap().key().unwrap(), key);
             warp_click(&mut app, &ctx, SIZE, "Distort");
             real_projective_corner_drag(&mut app, &ctx, "Distort");
             let output = settle(&mut app, &ctx);
@@ -2749,17 +3085,17 @@ fn actual_grid_presets_nodes_and_mixed_modes_preview_then_apply_native_targets_o
             warp_click(&mut app, &ctx, SIZE, "Apply");
             assert!(app.free_transform.is_none(), "{}", app.message);
             let mut engine = app.shared.lock().unwrap();
-            assert_eq!(engine.undo.len(), history + 1);
-            assert_eq!(engine.doc.bit_depth, depth);
-            skew_native_layers_eq(&engine.doc, &expected);
+            assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), history + 1);
+            assert_eq!(engine.resident_state().expect("resident fixture").document.bit_depth, depth);
+            skew_native_layers_eq(&engine.resident_state().expect("resident fixture").document, &expected);
             assert!(independent_coverage_eq(
-                engine.doc.selection_coverage.as_ref(),
+                engine.resident_state().expect("resident fixture").document.selection_coverage.as_ref(),
                 expected.selection_coverage.as_ref()
             ));
-            let applied = engine.doc.clone();
+            let applied = engine.resident_state().expect("resident fixture").document.clone();
             for data in [
-                crate::psd::encode(&engine.doc).unwrap(),
-                crate::psd::encode_psb(&engine.doc).unwrap(),
+                crate::psd::encode(&engine.resident_state().expect("resident fixture").document).unwrap(),
+                crate::psd::encode_psb(&engine.resident_state().expect("resident fixture").document).unwrap(),
             ] {
                 let reopened = crate::psd::decode(&data).unwrap();
                 assert!(!reopened.read_only);
@@ -2771,11 +3107,11 @@ fn actual_grid_presets_nodes_and_mixed_modes_preview_then_apply_native_targets_o
                 );
             }
             engine.undo("human").unwrap();
-            skew_native_layers_eq(&engine.doc, &original);
-            assert_eq!(engine.doc.selection_coverage, original.selection_coverage);
+            skew_native_layers_eq(&engine.resident_state().expect("resident fixture").document, &original);
+            assert_eq!(engine.resident_state().expect("resident fixture").document.selection_coverage, original.selection_coverage);
             engine.redo("human").unwrap();
-            skew_native_layers_eq(&engine.doc, &applied);
-            assert_eq!(engine.doc.selection_coverage, applied.selection_coverage);
+            skew_native_layers_eq(&engine.resident_state().expect("resident fixture").document, &applied);
+            assert_eq!(engine.resident_state().expect("resident fixture").document.selection_coverage, applied.selection_coverage);
         }
     }
 }
@@ -2860,8 +3196,8 @@ fn warp_scope_toggle_preserves_pending_map_and_explicit_reset_keeps_affine_value
     for depth in [8, 16] {
         let (mut app, ctx) = warp_fixture(depth, "color");
         let before = workspace::source(&app);
-        let original = app.shared.lock().unwrap().doc.clone();
-        let history = app.shared.lock().unwrap().undo.len();
+        let original = app.shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
+        let history = app.shared.lock().unwrap().resident_state().expect("resident fixture").undo.len();
         open(&mut app, &ctx);
         warp_enter(&mut app, &ctx, SIZE, "Move X", WarpInput::Base(0), "2");
         warp_enter(&mut app, &ctx, SIZE, "Angle", WarpInput::Base(4), "7");
@@ -2878,7 +3214,7 @@ fn warp_scope_toggle_preserves_pending_map_and_explicit_reset_keeps_affine_value
         settle(&mut app, &ctx);
         let key = app.free_transform.as_ref().unwrap().key().unwrap();
         let values = app.free_transform.as_ref().unwrap().values.clone();
-        warp_click(&mut app, &ctx, SIZE, "Whole target (keep selection)");
+        warp_click(&mut app, &ctx, SIZE, "Whole target");
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
             frame(&mut app, &ctx, vec![]);
@@ -2897,11 +3233,11 @@ fn warp_scope_toggle_preserves_pending_map_and_explicit_reset_keeps_affine_value
         warp_click(&mut app, &ctx, SIZE, "Apply");
         assert!(app.free_transform.is_some());
         assert_eq!(workspace::source(&app), before);
-        warp_click(&mut app, &ctx, SIZE, "Whole target (keep selection)");
+        warp_click(&mut app, &ctx, SIZE, "Selected pixels");
         assert_eq!(app.free_transform.as_ref().unwrap().key().unwrap(), key);
         let output = settle(&mut app, &ctx);
         actual_preview(&app, &output);
-        warp_click(&mut app, &ctx, SIZE, "Whole target (keep selection)");
+        warp_click(&mut app, &ctx, SIZE, "Whole target");
         warp_click(&mut app, &ctx, SIZE, "Grid Warp");
         warp_click(&mut app, &ctx, SIZE, "Reset Warp");
         let editor = app.free_transform.as_ref().unwrap();
@@ -2922,11 +3258,32 @@ fn warp_scope_toggle_preserves_pending_map_and_explicit_reset_keeps_affine_value
         warp_click(&mut app, &ctx, SIZE, "Apply");
         assert!(app.free_transform.is_none());
         let mut engine = app.shared.lock().unwrap();
-        assert_eq!(engine.undo.len(), history + 1);
-        skew_native_layers_eq(&engine.doc, &expected);
-        assert_eq!(engine.doc.selection_coverage, original.selection_coverage);
         assert_eq!(
-            engine.doc.layers[0]
+            engine
+                .resident_state()
+                .expect("resident fixture")
+                .undo
+                .len(),
+            history + 1
+        );
+        skew_native_layers_eq(
+            &engine.resident_state().expect("resident fixture").document,
+            &expected,
+        );
+        assert_eq!(
+            engine
+                .resident_state()
+                .expect("resident fixture")
+                .document
+                .selection_coverage,
+            original.selection_coverage
+        );
+        assert_eq!(
+            engine
+                .resident_state()
+                .expect("resident fixture")
+                .document
+                .layers[0]
                 .pixels
                 .retained
                 .as_ref()
@@ -2936,21 +3293,21 @@ fn warp_scope_toggle_preserves_pending_map_and_explicit_reset_keeps_affine_value
             1
         );
         for bytes in [
-            crate::psd::encode(&engine.doc).unwrap(),
-            crate::psd::encode_psb(&engine.doc).unwrap(),
+            crate::psd::encode(&engine.resident_state().expect("resident fixture").document).unwrap(),
+            crate::psd::encode_psb(&engine.resident_state().expect("resident fixture").document).unwrap(),
         ] {
             let reopened = crate::psd::decode(&bytes).unwrap();
             assert!(!reopened.read_only);
             assert_eq!(reopened.bit_depth, depth);
-            skew_native_layers_eq(&reopened, &engine.doc);
+            skew_native_layers_eq(&reopened, &engine.resident_state().expect("resident fixture").document);
             assert_eq!(
                 reopened.export_png().unwrap(),
-                engine.doc.export_png().unwrap()
+                engine.resident_state().expect("resident fixture").document.export_png().unwrap()
             );
         }
         engine.undo("human").unwrap();
-        skew_native_layers_eq(&engine.doc, &original);
-        assert_eq!(engine.doc.selection_coverage, original.selection_coverage);
+        skew_native_layers_eq(&engine.resident_state().expect("resident fixture").document, &original);
+        assert_eq!(engine.resident_state().expect("resident fixture").document.selection_coverage, original.selection_coverage);
     }
 }
 
@@ -3092,9 +3449,9 @@ fn transform_context_choose(app: &mut PeerBrush, ctx: &egui::Context, label: &st
 fn canvas_context_modes_keep_the_same_native_map_and_flips_apply_once() {
     for depth in [8, 16] {
         let (mut app, ctx) = warp_fixture(depth, "color");
-        let original = app.shared.lock().unwrap().doc.clone();
+        let original = app.shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
         let unchanged = workspace::source(&app);
-        let undo = app.shared.lock().unwrap().undo.len();
+        let undo = app.shared.lock().unwrap().resident_state().expect("resident fixture").undo.len();
         open(&mut app, &ctx);
         warp_click(&mut app, &ctx, SIZE, "Grid Warp");
         warp_click(&mut app, &ctx, SIZE, "Arc");
@@ -3160,19 +3517,19 @@ fn canvas_context_modes_keep_the_same_native_map_and_flips_apply_once() {
         warp_click(&mut app, &ctx, SIZE, "Apply");
         assert!(app.free_transform.is_none());
         let mut engine = app.shared.lock().unwrap();
-        assert_eq!(engine.undo.len(), undo + 1);
-        skew_native_layers_eq(&engine.doc, &expected);
+        assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), undo + 1);
+        skew_native_layers_eq(&engine.resident_state().expect("resident fixture").document, &expected);
         assert!(independent_coverage_eq(
-            engine.doc.selection_coverage.as_ref(),
+            engine.resident_state().expect("resident fixture").document.selection_coverage.as_ref(),
             expected.selection_coverage.as_ref()
         ));
-        let applied = engine.doc.clone();
+        let applied = engine.resident_state().expect("resident fixture").document.clone();
         engine.undo("human").unwrap();
-        skew_native_layers_eq(&engine.doc, &original);
-        assert_eq!(engine.doc.selection_coverage, original.selection_coverage);
+        skew_native_layers_eq(&engine.resident_state().expect("resident fixture").document, &original);
+        assert_eq!(engine.resident_state().expect("resident fixture").document.selection_coverage, original.selection_coverage);
         engine.redo("human").unwrap();
-        skew_native_layers_eq(&engine.doc, &applied);
-        assert_eq!(engine.doc.selection_coverage, applied.selection_coverage);
+        skew_native_layers_eq(&engine.resident_state().expect("resident fixture").document, &applied);
+        assert_eq!(engine.resident_state().expect("resident fixture").document.selection_coverage, applied.selection_coverage);
     }
 }
 
@@ -3688,8 +4045,8 @@ fn numeric_escape_keeps_the_session_and_blocks_same_frame_canvas_or_apply_until_
 fn numeric_escape_held_apply_press_needs_a_fresh_click_and_commits_only_once() {
     for depth in [8, 16] {
         let (mut app, ctx) = warp_fixture(depth, "color");
-        let original = app.shared.lock().unwrap().doc.clone();
-        let undo = app.shared.lock().unwrap().undo.len();
+        let original = app.shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
+        let undo = app.shared.lock().unwrap().resident_state().expect("resident fixture").undo.len();
         let unchanged = workspace::source(&app);
         open(&mut app, &ctx);
         settle(&mut app, &ctx);
@@ -3742,15 +4099,15 @@ fn numeric_escape_held_apply_press_needs_a_fresh_click_and_commits_only_once() {
         warp_click(&mut app, &ctx, SIZE, "Apply");
         assert!(app.free_transform.is_none());
         let mut engine = app.shared.lock().unwrap();
-        assert_eq!(engine.undo.len(), undo + 1);
-        skew_native_layers_eq(&engine.doc, &expected);
+        assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), undo + 1);
+        skew_native_layers_eq(&engine.resident_state().expect("resident fixture").document, &expected);
         assert!(independent_coverage_eq(
-            engine.doc.selection_coverage.as_ref(),
+            engine.resident_state().expect("resident fixture").document.selection_coverage.as_ref(),
             expected.selection_coverage.as_ref()
         ));
         engine.undo("human").unwrap();
-        skew_native_layers_eq(&engine.doc, &original);
-        assert_eq!(engine.doc.selection_coverage, original.selection_coverage);
+        skew_native_layers_eq(&engine.resident_state().expect("resident fixture").document, &original);
+        assert_eq!(engine.resident_state().expect("resident fixture").document.selection_coverage, original.selection_coverage);
     }
 }
 
@@ -3789,4 +4146,375 @@ fn numeric_escape_release_and_fresh_press_in_one_input_batch_cancels() {
         );
         assert_eq!(workspace::source(&app), unchanged);
     }
+}
+
+#[test]
+fn shared_apply_preserves_pending_transform_until_its_own_terminal_result() {
+    for depth in [8, 16] {
+        for outcome in ["commit", "cancel", "reserved", "replacement"] {
+            let (mut app, ctx) = workspace::fixture(depth);
+            let doc = app
+                .shared
+                .lock()
+                .unwrap()
+                .resident_state()
+                .expect("resident fixture")
+                .document
+                .clone();
+            app.open_free_transform(&ctx, &doc);
+            let editor = app.free_transform.as_mut().unwrap();
+            editor.values.offset = [3., 0.];
+            let key = editor.key().unwrap();
+            let commands = editor.commands().unwrap();
+            let expected = crate::engine::Engine::preview_edits(doc.clone(), &commands).unwrap();
+            let token = egui::Id::new(&editor.gesture);
+            editor.pending = true;
+            app.transient = commands.clone();
+            let shared = app.shared.clone();
+            if outcome == "reserved" {
+                shared
+                    .lock()
+                    .unwrap()
+                    .reserve(
+                        "agent",
+                        "Protected transform",
+                        vec![crate::engine::Scope::layer(&doc.layers[0].id)],
+                    )
+                    .unwrap();
+            }
+            let mut guard = shared.lock().unwrap();
+            if outcome == "replacement" {
+                guard
+                    .resident_state_mut()
+                    .expect("resident fixture")
+                    .document
+                    .id = crate::engine::id();
+            }
+            let before =
+                serde_json::to_value(&guard.resident_state().expect("resident fixture").document)
+                    .unwrap();
+            let history = guard.history_lengths();
+            app.submit_edit_job(
+                edit_job::Request {
+                    project: app.project_id.clone(),
+                    document: doc.id.clone(),
+                    revision: doc.revision,
+                    label: "Free Transform".into(),
+                    selection_edit: false,
+                    origin: edit_job::Origin::FreeTransform(token, None),
+                },
+                edit_job::Commands::resident(commands),
+                &ctx,
+            )
+            .unwrap();
+            app.sync_free_transform(&ctx, &doc);
+            app.free_transform_finished(egui::Id::new("different transform"), Ok(()));
+            app.free_transform_action(&json!({"angle":90}));
+            app.select_tool(Tool::Rotate);
+            app.apply_free_transform();
+            assert!(app.free_transform_pending());
+            assert_eq!(app.free_transform.as_ref().unwrap().key().unwrap(), key);
+            assert!(!app.transient.is_empty());
+            assert_eq!(guard.history_lengths(), history);
+            if outcome == "cancel" {
+                app.cancel_free_transform();
+                assert!(app.free_transform_pending());
+            }
+            drop(guard);
+            super::super::text_tests::wait_edit(&mut app);
+            let engine = shared.lock().unwrap();
+            if outcome == "commit" {
+                assert!(app.free_transform.is_none());
+                assert!(app.transient.is_empty());
+                assert_eq!(engine.history_lengths(), [history[0] + 1, 0]);
+                assert_eq!(
+                    engine
+                        .resident_state()
+                        .expect("resident fixture")
+                        .document
+                        .layers[0]
+                        .pixels,
+                    expected.layers[0].pixels
+                );
+                assert_eq!(
+                    engine
+                        .resident_state()
+                        .expect("resident fixture")
+                        .document
+                        .bit_depth,
+                    depth
+                );
+            } else {
+                let editor = app.free_transform.as_ref().unwrap();
+                assert!(!editor.pending);
+                assert!(editor.apply_error.is_some());
+                assert_eq!(editor.key().unwrap(), key);
+                assert_eq!(engine.history_lengths(), history);
+                assert_eq!(
+                    serde_json::to_value(
+                        &engine.resident_state().expect("resident fixture").document
+                    )
+                    .unwrap(),
+                    before
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn rotation_handle_stays_outside_reflected_and_sheared_bounds() {
+    for bottom in [Vec2::new(12., 18.), Vec2::new(-12., -18.)] {
+        let start = Pos2::new(40., 50.);
+        let top = Vec2::new(32., -24.);
+        let corners = [start, start + top, start + top + bottom, start + bottom];
+        let middle = start + top * 0.5;
+        let handle = rotation_handle(corners, middle);
+        let outward = handle - middle;
+        assert!(outward.dot(bottom) < 0.);
+        assert!(outward.dot(top).abs() < 0.001);
+        assert!((outward.length() - 26.).abs() < 0.001);
+        assert!(near_transform_edge(middle + outward * 0.75, corners));
+        assert!(!near_transform_edge(middle + outward * 2., corners));
+    }
+}
+
+#[test]
+fn free_transform_of_text_preserves_draft_on_cancel_and_changes_only_draft_on_apply() {
+    let (mut app, ctx) = workspace::fixture(16);
+    let original = app.shared.lock().unwrap().resident_state().unwrap().document.clone();
+    let view = DocumentView::from(&original);
+    app.select_tool(Tool::Text);
+    app.open_source(view, "text");
+    frame(&mut app, &ctx, vec![]);
+    assert!(app.source_editor.as_ref().unwrap().has_canvas_focus(&ctx));
+    let input = ctx.memory(|memory| memory.focused()).unwrap();
+    let mut state = egui::TextEdit::load_state(&ctx, input).unwrap();
+    let caret = egui::text::CCursorRange::one(egui::text::CCursor::new(1));
+    state.cursor.set_char_range(Some(caret));
+    egui::TextEdit::store_state(&ctx, input, state);
+    let before = app.source_editor.as_ref().unwrap().command();
+    let history = app.shared.lock().unwrap().history_lengths();
+    for apply in [false, true] {
+        if apply {
+            let toolbar_focus = egui::Id::new("text toolbar fixture button");
+            ctx.memory_mut(|memory| memory.request_focus(toolbar_focus));
+            assert!(ctx.wants_keyboard_input());
+            app.open_free_transform_from(&ctx, view, true);
+        } else {
+            app.open_free_transform(&ctx, view);
+        }
+        let mut editor = app.free_transform.take().unwrap();
+        assert!(editor.mode() == Some(Tool::Scale));
+        editor.values.offset = [13.25, -5.5];
+        let starting_corners = editor.draft.as_ref().unwrap().corners;
+        assert_eq!(editor.corners(), starting_corners.map(|[x, y]| [x + 13.25, y - 5.5]));
+        app.preview_text_transform(&editor, editor.draft.as_ref().unwrap(), view).unwrap();
+        let preview = app.transient[0].clone();
+        assert_eq!(preview["fit_text"], true);
+        assert_eq!(preview["source"]["matrix"], json!([1., 0., 0., 1., 13.25, -5.5]));
+        let document = crate::engine::Engine::preview_edits(original.clone(), &[preview.clone()]).unwrap();
+        assert_eq!(document.layers[0].source.as_ref().unwrap().label(), "Text");
+        assert_eq!(document.layers[0].pixels.depth, 16);
+        app.free_transform = Some(editor);
+        if apply {
+            app.apply_free_transform();
+        } else {
+            app.cancel_free_transform();
+        }
+        assert!(app.tool == Tool::Text);
+        assert_eq!(&app.source_editor.as_ref().unwrap().command(), if apply { &preview } else { &before });
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.source_editor.as_ref().unwrap().has_canvas_focus(&ctx));
+        assert_eq!(egui::TextEdit::load_state(&ctx, input).unwrap().cursor.char_range(), Some(caret));
+        assert_eq!(app.shared.lock().unwrap().history_lengths(), history);
+    }
+    app.open_free_transform(&ctx, view);
+    let mut editor = app.free_transform.take().unwrap();
+    editor.values.angle = 31.;
+    let rotated = editor.corners();
+    app.preview_text_transform(&editor, editor.draft.as_ref().unwrap(), view).unwrap();
+    app.free_transform = Some(editor);
+    app.apply_free_transform();
+    frame(&mut app, &ctx, vec![]);
+    app.open_free_transform(&ctx, view);
+    let corners = app.free_transform.as_ref().unwrap().corners();
+    for (actual, expected) in corners.into_iter().flatten().zip(rotated.into_iter().flatten()) {
+        assert!((actual - expected).abs() < 0.001);
+    }
+}
+
+#[test]
+fn immediate_transform_apply_checks_document_identity_and_keeps_refused_draft() {
+    for replaced in [false, true] {
+        let (mut app, ctx) = workspace::fixture(16);
+        let doc = app
+            .shared
+            .lock()
+            .unwrap()
+            .resident_state()
+            .expect("resident fixture")
+            .document
+            .clone();
+        app.open_free_transform(&ctx, &doc);
+        app.free_transform.as_mut().unwrap().values.offset = [2., 0.];
+        if replaced {
+            app.shared
+                .lock()
+                .unwrap()
+                .resident_state_mut()
+                .expect("resident fixture")
+                .document
+                .id = crate::engine::id();
+        }
+        let before = workspace::source(&app);
+        app.apply_free_transform();
+        assert!(!app.free_transform_pending());
+        if replaced {
+            assert!(app
+                .free_transform
+                .as_ref()
+                .unwrap()
+                .apply_error
+                .as_ref()
+                .unwrap()
+                .contains("changed"));
+            assert_eq!(workspace::source(&app), before);
+        } else {
+            assert!(app.free_transform.is_none());
+            assert_eq!(
+                app.shared
+                    .lock()
+                    .unwrap()
+                    .resident_state()
+                    .expect("resident fixture")
+                    .undo
+                    .last()
+                    .unwrap()
+                    .label,
+                "Free Transform"
+            );
+            assert_eq!(
+                app.shared
+                    .lock()
+                    .unwrap()
+                    .resident_state()
+                    .expect("resident fixture")
+                    .document
+                    .bit_depth,
+                16
+            );
+        }
+    }
+}
+
+#[test]
+fn free_transform_apply_refuses_a_replaced_native_generation_at_the_same_revision() {
+    use crate::engine::{
+        native::{worker::tests::Fixture, NativeDocument},
+        scene::{CapturedScene, LegacyTileCache},
+        Engine,
+    };
+    let (mut app, ctx) = workspace::fixture(16);
+    let project = app.project_id.clone();
+    let doc = app.shared.lock().unwrap().resident_state().unwrap().document.clone();
+    let fixture = Fixture::new();
+    let (runtime, _connection) = fixture.runtime();
+    let cache = LegacyTileCache::new(&runtime.resident(), 8).unwrap();
+    let stage = |doc| {
+        let staged = CapturedScene::from_parts(doc, project.clone(), vec![], None, None)
+            .stage(&runtime, &cache, &|| Ok(())).unwrap();
+        NativeDocument::from_pending(staged.scene.into_provisional_pending().unwrap()).unwrap()
+    };
+    let original = stage(doc.clone());
+    let mut changed = doc;
+    changed.layers[0].pixels.set16(0, 0, [21111, 33333, 47777, 65535]);
+    let replacement = stage(changed);
+    assert_ne!(original.key(), replacement.key());
+    assert_eq!(original.metadata().id(), replacement.metadata().id());
+    assert_eq!(original.metadata().revision(), replacement.metadata().revision());
+
+    let mut engine = Engine::from_native(original.clone(), 8).unwrap();
+    engine.project_id = project.clone();
+    *app.shared.lock().unwrap() = engine;
+    app.doc_snapshot = original.clone().into();
+    app.open_free_transform(&ctx, &original);
+    assert!(!app.free_transform_stale(&original));
+    assert!(app.free_transform_stale(&replacement));
+    let editor = app.free_transform.as_mut().unwrap();
+    editor.geometry_pending = false;
+    editor.values.offset = [3., 0.];
+    editor.rendered = editor.key().ok();
+
+    let mut engine = Engine::from_native(replacement.clone(), 8).unwrap();
+    engine.project_id = project;
+    *app.shared.lock().unwrap() = engine;
+    // Replace the engine after the frame has captured its old preview, before Apply.
+    app.apply_free_transform();
+    assert!(app.free_transform_pending());
+    app.transient = app.free_transform.as_ref().unwrap().commands().unwrap();
+    app.sync_free_transform(&ctx, &replacement);
+    assert!(app.transient.is_empty());
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while app.edit_worker.pending() {
+        assert!(std::time::Instant::now() < deadline);
+        app.poll_edit_job();
+        std::thread::yield_now();
+    }
+    assert!(app.free_transform.as_ref().unwrap().apply_error.as_ref().unwrap().contains("source changed"));
+    let engine = app.shared.lock().unwrap();
+    assert_eq!(engine.native_document().unwrap().key(), replacement.key());
+    assert_eq!(engine.history_lengths(), [0, 0]);
+    drop(engine);
+    app.sync_free_transform(&ctx, &replacement);
+    assert!(app.free_transform.is_none());
+}
+
+#[test]
+fn pending_transform_window_remains_visible_and_tracks_escape_through_lifecycle_gate() {
+    let (mut app, ctx) = workspace::fixture(16);
+    let doc = app
+        .shared
+        .lock()
+        .unwrap()
+        .resident_state()
+        .expect("resident fixture")
+        .document
+        .clone();
+    app.open_free_transform(&ctx, &doc);
+    let editor = app.free_transform.as_mut().unwrap();
+    editor.pending = true;
+    let token = egui::Id::new(&editor.gesture);
+    let (release, held) = mpsc::channel();
+    app.edit_worker
+        .submit(
+            edit_job::Request {
+                project: app.project_id.clone(),
+                document: doc.id.clone(),
+                revision: doc.revision,
+                label: "Free Transform".into(),
+                selection_edit: false,
+                origin: edit_job::Origin::FreeTransform(token, None),
+            },
+            edit_job::Commands::resident(vec![]),
+            move |_, _| {
+                held.recv().unwrap();
+                Err("Apply cancelled".into())
+            },
+            || {},
+        )
+        .unwrap();
+    let output = frame(
+        &mut app,
+        &ctx,
+        vec![key_event(egui::Key::Escape, Default::default())],
+    );
+    workspace::label(&output, "Applying Free Transform…");
+    workspace::label(&output, "Cancel apply");
+    assert!(app.free_transform_pending());
+    assert!(app.selection_shortcut_keys.contains(&egui::Key::Escape));
+    release.send(()).unwrap();
+    super::super::text_tests::wait_edit(&mut app);
+    assert!(app.free_transform.is_some());
+    assert!(!app.free_transform_pending());
 }

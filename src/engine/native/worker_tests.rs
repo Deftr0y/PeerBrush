@@ -15,6 +15,9 @@ pub(crate) struct Fixture {
     held: Option<Directory>,
 }
 impl Fixture {
+    pub(crate) fn path(&self) -> &std::path::Path {
+        &self.path
+    }
     pub(crate) fn new() -> Self {
         let path = fs::canonicalize(std::env::temp_dir())
             .unwrap()
@@ -26,6 +29,13 @@ impl Fixture {
         }
     }
     pub(crate) fn runtime(&self) -> (Arc<SourceRuntime>, crate::server::Connection) {
+        self.runtime_with_budgets(32 * 1024 * 1024, 8 * 1024 * 1024)
+    }
+    pub(crate) fn runtime_with_budgets(
+        &self,
+        resident_bytes: usize,
+        disk_bytes: u64,
+    ) -> (Arc<SourceRuntime>, crate::server::Connection) {
         let connection = crate::server::start(
             Arc::new(Mutex::new(crate::engine::Engine::new())),
             self.path.join("state"),
@@ -34,11 +44,11 @@ impl Fixture {
         let runtime = SourceRuntime::new(
             PersistentRootContext::from_explicit_state(&connection).unwrap(),
             Limits {
-                resident_bytes: 32 * 1024 * 1024,
-                disk_bytes: 8 * 1024 * 1024,
+                resident_bytes,
+                disk_bytes,
                 max_files: 16,
                 store: crate::large_document::Limits {
-                    disk_bytes: 4 * 1024 * 1024,
+                    disk_bytes: disk_bytes / 2,
                     max_blocks: 32,
                     max_resident_blocks: 8,
                     manifest_bytes: 65536,
@@ -199,7 +209,7 @@ fn worker_preflight_late_parameter_refusal_and_cancel_preserve_live_authority() 
     let disk = session.disk().used().unwrap();
     for (second, expected_reason) in [
         (
-            serde_json::json!({"op":"source.update","layer":layer,"opacity":2}),
+            serde_json::json!({"op":"selection.quick_update"}),
             "Native command has no connected bounded producer",
         ),
         (
@@ -277,14 +287,14 @@ fn shared_worker_brush_fill_and_clear_match_legacy_native_pixels_at_both_depths(
         let mut state = DocumentAuthority::from_native(doc, 8).unwrap();
         let layer = state.view().layer(0).unwrap().id().to_owned();
         let mut legacy = crate::engine::Engine::new();
-        legacy.doc = crate::engine::Document::new_depth(4, 2, depth).unwrap();
+        legacy.resident_state_mut().expect("resident fixture").document = crate::engine::Document::new_depth(4, 2, depth).unwrap();
         let commands = [
             serde_json::json!({"op":"paint","layer":layer,"points":[[0.5,0.5,0.4],[3.5,1.5,0.8]],"radius":0.8,"hardness":0.3,"flow":0.8,"opacity":0.6,"color":[239,39,71,233]}),
             serde_json::json!({"op":"paint.fill","layer":layer,"rect":[1,0,3,2],"color":[20,101,201,177]}),
         ];
         let mut oracle = commands.to_vec();
         for command in &mut oracle {
-            command["layer"] = serde_json::json!(legacy.doc.layers[0].id);
+            command["layer"] = serde_json::json!(legacy.resident_state().expect("resident fixture").document.layers[0].id);
         }
         legacy
             .edit("human", &oracle, Some(0), None, "Paint")
@@ -309,7 +319,7 @@ fn shared_worker_brush_fill_and_clear_match_legacy_native_pixels_at_both_depths(
                 }
             }
         };
-        compare(prepared.preview(), &legacy.doc);
+        compare(prepared.preview(), &legacy.resident_state().expect("resident fixture").document);
         let (base, history, delta) = prepared.into_parts();
         let commit = history
             .prepare_commit(
@@ -361,16 +371,132 @@ fn shared_worker_brush_fill_and_clear_match_legacy_native_pixels_at_both_depths(
             .unwrap_or_else(|refused| panic!("{}", refused.reason()));
         let current = current.adopt(selected).unwrap();
         let state = DocumentAuthority::from_native(current, 8).unwrap();
-        legacy.doc.selection = Some([1, 0, 3, 2]);
-        legacy.doc.revision = state.view().revision();
+        legacy.resident_state_mut().expect("resident fixture").document.selection = Some([1, 0, 3, 2]);
+        legacy.resident_state_mut().expect("resident fixture").document.revision = state.view().revision();
         let command = serde_json::json!({"op":"paint.clear_selection","layer":layer});
-        legacy.edit("human",&[serde_json::json!({"op":"paint.clear_selection","layer":legacy.doc.layers[0].id})],Some(state.view().revision()),None,"Clear").unwrap();
+        legacy.edit("human",&[serde_json::json!({"op":"paint.clear_selection","layer":legacy.resident_state().expect("resident fixture").document.layers[0].id})],Some(state.view().revision()),None,"Clear").unwrap();
         let prepared = prepare(capture(&state, &[command]), &session, &|| Ok(())).unwrap();
-        compare(prepared.preview(), &legacy.doc);
+        compare(prepared.preview(), &legacy.resident_state().expect("resident fixture").document);
         prepared
             .abort(&session, &|| session.cleanup_check())
             .unwrap();
         drop(state);
     }
     drop((session, runtime, connection));
+}
+
+fn compare_document(
+    actual: &NativeDocument,
+    expected: &crate::engine::Document,
+    original: &crate::engine::Document,
+) {
+    let mut expected = expected.clone();
+    super::duplicate_tests::align_ids(&mut expected, actual, original);
+    super::import_tests::pixels(actual, &expected, original);
+}
+pub(super) fn exercise_edits(
+    original: crate::engine::Document,
+    commands: &[serde_json::Value],
+    succeeds: bool,
+) {
+    exercise_edits_with_budget(original, commands, succeeds, 512 * 1024 * 1024)
+}
+pub(super) fn exercise_edits_with_budget(
+    original: crate::engine::Document,
+    commands: &[serde_json::Value],
+    succeeds: bool,
+    resident_bytes: usize,
+) {
+    use super::grouping_tests::gate;
+    use crate::engine::{
+        scene::{CapturedScene, LegacyTileCache},
+        Engine,
+    };
+    let expected = Engine::preview_edits(original.clone(), commands);
+    assert_eq!(expected.is_ok(), succeeds, "{expected:?}");
+    let fixture = Fixture::new();
+    let (runtime, connection) = fixture.runtime_with_budgets(resident_bytes, 256 * 1024 * 1024);
+    let cache = LegacyTileCache::new(&runtime.resident(), 64).unwrap();
+    let mut staged = CapturedScene::from_parts(
+        original.clone(),
+        "edit-comparison".into(),
+        vec![],
+        None,
+        None,
+    )
+    .stage(&runtime, &cache, &|| Ok(()))
+    .unwrap();
+    let native =
+        NativeDocument::from_pending(staged.scene.into_provisional_pending().unwrap()).unwrap();
+    let session = staged.session.take().unwrap();
+    let mut state = DocumentAuthority::from_native(native.clone(), 4).unwrap();
+    let baseline = runtime.disk().used().unwrap();
+    let preview = prepare(capture(&state, commands), &session, &|| Ok(()));
+    if let Ok(mut expected) = expected {
+        expected.revision = original.revision + 1;
+        let preview = preview.unwrap();
+        compare_document(preview.preview(), &expected, &original);
+        for (old, kept) in [
+            (
+                native.metadata().selection_coverage(),
+                preview.preview().metadata().selection_coverage(),
+            ),
+            (
+                native.metadata().selection_previous(),
+                preview.preview().metadata().selection_previous(),
+            ),
+        ] {
+            if let (Some(old), Some(kept)) = (old, kept) {
+                assert_eq!(
+                    native.source(old.mask().slot()).unwrap().key(),
+                    preview.preview().source(kept.mask().slot()).unwrap().key()
+                );
+            }
+        }
+        preview
+            .abort(&session, &|| session.cleanup_check())
+            .unwrap();
+        assert_eq!(runtime.disk().used().unwrap(), baseline);
+        let prepared = prepare(capture(&state, commands), &session, &|| Ok(())).unwrap();
+        let (base, history, delta) = prepared.into_parts();
+        let commit = history
+            .prepare_commit(
+                &base,
+                delta,
+                HistoryRequest {
+                    actor: "human",
+                    label: "Edit",
+                    task: None,
+                    gesture: None,
+                },
+                &|| Ok(()),
+            )
+            .unwrap();
+        state
+            .commit_native(gate(&[]), commit)
+            .unwrap()
+            .retire(&session, &|| session.cleanup_check())
+            .unwrap();
+        for (direction, mut expected) in [
+            (Direction::Undo, original.clone()),
+            (Direction::Redo, expected),
+        ] {
+            let moved = state
+                .native_history()
+                .unwrap()
+                .prepare_move(state.native().unwrap(), direction, "human", &|| Ok(()))
+                .unwrap();
+            drop(state.move_native(gate(&[]), moved).unwrap());
+            expected.revision = state.view().revision();
+            compare_document(state.native().unwrap(), &expected, &original);
+        }
+    } else {
+        let refused = preview.err().expect("Invalid edit was accepted");
+        assert!(refused.cleanup_error.is_none(), "{}", refused.reason);
+        assert_eq!(state.native().unwrap().key(), native.key());
+        assert_eq!(state.history_lengths(), [0, 0]);
+    }
+    drop(state);
+    assert_eq!(runtime.disk().used().unwrap(), baseline);
+    drop((native, session, staged.seals, cache, runtime, connection));
 }

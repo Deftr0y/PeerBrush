@@ -12,6 +12,8 @@ use std::{
     io::{BufRead, Cursor, Read, Seek, SeekFrom},
 };
 
+#[path = "apng.rs"]
+pub(crate) mod apng;
 #[path = "png_file.rs"]
 mod file;
 pub(crate) use file::{FileLimits, FilePng};
@@ -28,7 +30,15 @@ pub(crate) enum ColorPolicy {
     /// Existing selection imports ignore ICC; do not decompress unused iCCP.
     /// Exact encoded-source hash and chunk CRC still bind those original bytes.
     RawSelection,
+    /// Validate import color declarations, but keep staged pass samples raw.
+    /// Native import preparation must convert complete rows and apply EXIF.
+    ImportSource,
     ToSrgb,
+}
+impl ColorPolicy {
+    fn managed(self) -> bool {
+        matches!(self, Self::ImportSource | Self::ToSrgb)
+    }
 }
 #[derive(Clone, Copy)]
 pub(crate) struct Limits {
@@ -37,14 +47,19 @@ pub(crate) struct Limits {
     pub encoded: usize,
 }
 impl Limits {
+    pub(crate) const NATIVE_COMMAND: Self = Self {
+        edge: crate::raster::NATIVE_EDGE,
+        pixels: 256_000_000,
+        encoded: 128 * 1024 * 1024,
+    };
     pub(crate) const PATTERN: Self = Self {
         edge: 512,
         pixels: 512 * 512,
         encoded: PATTERN_BYTES,
     };
     pub(crate) const SELECTION: Self = Self {
-        edge: 8192,
-        pixels: 16_000_000,
+        edge: crate::raster::NATIVE_EDGE,
+        pixels: 256_000_000,
         encoded: 64 * 1024 * 1024,
     };
     fn validate(self) -> Result<(), String> {
@@ -68,6 +83,13 @@ pub(super) struct SourceBinding {
     pool: ResidentBudget,
 }
 impl SourceBinding {
+    pub(super) fn file(source: [u8; 32], pool: ResidentBudget) -> Self {
+        Self {
+            source,
+            transport: None,
+            pool,
+        }
+    }
     pub(super) fn source_sha256(&self) -> [u8; 32] {
         self.source
     }
@@ -188,6 +210,21 @@ pub(crate) struct Header {
     /// RawSelection uses the same default IDAT image as ImageReader, not an
     /// animation compositor. Patterns remain static-only.
     pub animated: bool,
+}
+impl Header {
+    fn oriented_size(self) -> [u32; 2] {
+        if matches!(
+            self.orientation,
+            Orientation::Rotate90
+                | Orientation::Rotate270
+                | Orientation::Rotate90FlipH
+                | Orientation::Rotate270FlipH
+        ) {
+            [self.height, self.width]
+        } else {
+            [self.width, self.height]
+        }
+    }
 }
 pub(crate) struct Complete {
     header: Header,
@@ -467,6 +504,37 @@ fn decode_input(
     {
         return Err("Prepared PNG header differs from its static container".into());
     }
+    let complete = decode_frame(
+        &mut reader,
+        width,
+        height,
+        binding,
+        color,
+        pool,
+        &mut || (cancellation.borrow_mut())(),
+        row,
+    )?;
+    reader.finish().map_err(|e| e.to_string())?;
+    validate_metadata(reader.info(), &complete)?;
+    drop(reader);
+    drop(checked);
+    drop(decoder_charge);
+    (cancellation.borrow_mut())()?;
+    Ok(complete)
+}
+
+// The same provisional row expansion serves static images and selected APNG frames.
+fn decode_frame(
+    reader: &mut png::Reader<impl BufRead + Seek>,
+    width: u32,
+    height: u32,
+    binding: SourceBinding,
+    color: ColorPolicy,
+    pool: &ResidentBudget,
+    check: &mut dyn FnMut() -> Result<(), String>,
+    mut row: impl FnMut(Header, PassRow, &[u8]) -> Result<(), String>,
+) -> Result<Complete, String> {
+    let cancellation = RefCell::new(check);
     let orientation = reader
         .info()
         .exif_metadata
@@ -531,6 +599,9 @@ fn decode_input(
         (cancellation.borrow_mut())()?;
         if data.len() != event.samples as usize * pixel_bytes {
             return Err("Prepared PNG row length differs".into());
+        }
+        if depth == 16 && channels == 4 {
+            return row(header, event, data);
         }
         for (source, target) in data.chunks_exact(pixel_bytes).zip(rgba.chunks_exact_mut(8)) {
             let get = |c: usize| {
@@ -625,29 +696,6 @@ fn decode_input(
             return Err("Prepared PNG has excess rows".into());
         }
     }
-    reader.finish().map_err(|e| e.to_string())?;
-    if reader.info().icc_profile.as_deref() != profile.as_deref()
-        || reader.info().coding_independent_code_points.map(|v| {
-            [
-                v.color_primaries,
-                v.transfer_function,
-                v.matrix_coefficients,
-                u8::from(v.is_video_full_range_image),
-            ]
-        }) != header.cicp
-        || reader
-            .info()
-            .exif_metadata
-            .as_deref()
-            .and_then(Orientation::from_exif_chunk)
-            .unwrap_or(Orientation::NoTransforms)
-            != orientation
-    {
-        return Err("Prepared PNG color/orientation metadata changed after image rows".into());
-    }
-    drop(reader);
-    drop(checked);
-    drop(decoder_charge);
     (cancellation.borrow_mut())()?;
     Ok(Complete {
         header,
@@ -656,6 +704,28 @@ fn decode_input(
         profile,
         color_policy: color,
     })
+}
+
+fn validate_metadata(info: &png::Info<'_>, complete: &Complete) -> Result<(), String> {
+    if info.icc_profile.as_deref() != complete.profile()
+        || info.coding_independent_code_points.map(|v| {
+            [
+                v.color_primaries,
+                v.transfer_function,
+                v.matrix_coefficients,
+                u8::from(v.is_video_full_range_image),
+            ]
+        }) != complete.header.cicp
+        || info
+            .exif_metadata
+            .as_deref()
+            .and_then(Orientation::from_exif_chunk)
+            .unwrap_or(Orientation::NoTransforms)
+            != complete.header.orientation
+    {
+        return Err("Prepared PNG color/orientation metadata changed after image rows".into());
+    }
+    Ok(())
 }
 
 /// Interlace reconstruction is segmented into1MiB admitted allocations. This
@@ -761,14 +831,7 @@ pub(crate) fn pattern(
                 let length = header.width as usize * header.height as usize * 8;
                 pixels = Some(ScratchBytes::new(pool, length, length).map_err(|e| e.to_string())?);
             }
-            let swap = matches!(
-                header.orientation,
-                Orientation::Rotate90
-                    | Orientation::Rotate270
-                    | Orientation::Rotate90FlipH
-                    | Orientation::Rotate270FlipH
-            );
-            let target_width = if swap { header.height } else { header.width };
+            let [target_width, _] = header.oriented_size();
             for (x, value) in row.chunks_exact(8).enumerate() {
                 let (x, y) = oriented(x as u32, y, header);
                 let at = (y as usize * target_width as usize + x as usize) * 8;
@@ -777,24 +840,10 @@ pub(crate) fn pattern(
             Ok(())
         },
     )?;
-    let swap = matches!(
-        complete.header.orientation,
-        Orientation::Rotate90
-            | Orientation::Rotate270
-            | Orientation::Rotate90FlipH
-            | Orientation::Rotate270FlipH
-    );
+    let [width, height] = complete.header.oriented_size();
     Ok(PreparedPng {
-        width: if swap {
-            complete.header.height
-        } else {
-            complete.header.width
-        },
-        height: if swap {
-            complete.header.width
-        } else {
-            complete.header.height
-        },
+        width,
+        height,
         depth: complete.header.depth,
         source_sha256: complete
             .base64_sha256
@@ -843,6 +892,66 @@ fn container_stream(
     color: ColorPolicy,
     check: &mut dyn FnMut() -> Result<(), String>,
 ) -> Result<(u32, u32, bool), String> {
+    container_stream_animation(input, length, edge, pixels, color, false, check).map(|v| v.0)
+}
+
+/// Validate the complete original clipboard container before a bitmap decoder
+/// allocates pixels. Clipboard paste cannot silently choose an animation frame.
+pub(crate) fn validate_clipboard(bytes: &[u8]) -> Result<bool, String> {
+    inspect_clipboard(bytes, &mut || Ok(())).map(|(_, _, profile)| profile)
+}
+
+pub(crate) fn clipboard_dimensions(
+    bytes: &[u8],
+    check: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<[u32; 2], String> {
+    check()?;
+    let facts = inspect_clipboard(bytes, check)?;
+    // The clipboard owns the bounded encoded bytes. Reserve only decoder,
+    // profile, and one expanded row of working storage here.
+    let pool = ResidentBudget::new(
+        DECODER_BYTES + crate::color_profile::MAX_PROFILE_BYTES + facts.0 as usize * 8,
+    ).map_err(|error| error.to_string())?;
+    let binding = SourceBinding { source: sha(bytes), transport: None, pool: pool.clone() };
+    let complete = decode_input(
+        Cursor::new(bytes), facts, binding, ColorPolicy::ImportSource, &pool,
+        check, |_, _, _| Ok(()),
+    )?;
+    if let Some(profile) = complete.profile() {
+        crate::color_profile::supported(profile)?;
+    }
+    check()?;
+    Ok(complete.header.oriented_size())
+}
+
+fn inspect_clipboard(
+    bytes: &[u8],
+    check: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<(u32, u32, bool), String> {
+    let limits = Limits::NATIVE_COMMAND;
+    if bytes.len() > limits.encoded {
+        return Err("Clipboard PNG exceeds 128 MiB".into());
+    }
+    let (facts, frames) = container_stream_animation(
+        &mut Cursor::new(bytes), bytes.len() as u64, limits.edge, limits.pixels,
+        ColorPolicy::ImportSource, true, check,
+    )?;
+    if frames.is_some() {
+        return Err("Choose an explicit frame before importing this PNG animation".into());
+    }
+    Ok(facts)
+}
+
+fn container_stream_animation(
+    input: &mut impl BufRead,
+    length: u64,
+    edge: u32,
+    pixels: u64,
+    color: ColorPolicy,
+    allow_animation: bool,
+    check: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<((u32, u32, bool), Option<u32>), String> {
+    let mut animation = apng::Inspection::default();
     check()?;
     let mut signature = [0; 8];
     input
@@ -902,6 +1011,9 @@ fn container_stream(
         if at == 8 && kind != b"IHDR" {
             return Err("Prepared PNG starts without IHDR".into());
         }
+        if allow_animation {
+            animation.chunk(kind, data, size)?;
+        }
         match kind {
             b"IHDR" => {
                 if shape.is_some() || size != 13 {
@@ -919,7 +1031,9 @@ fn container_stream(
                 }
                 shape = Some((width, height));
             }
-            b"acTL" | b"fcTL" | b"fdAT" if color != ColorPolicy::RawSelection => {
+            b"acTL" | b"fcTL" | b"fdAT"
+                if !allow_animation && color != ColorPolicy::RawSelection =>
+            {
                 return Err(
                     "Prepared PNG requires one static image; choose an animation frame explicitly"
                         .into(),
@@ -933,7 +1047,7 @@ fn container_stream(
                 }
             }
             b"sRGB" => managed = true,
-            b"cICP" if color == ColorPolicy::ToSrgb && (size != 4 || data != [1, 13, 0, 1]) => {
+            b"cICP" if color.managed() && (size != 4 || data != [1, 13, 0, 1]) => {
                 return Err("Prepared PNG HDR/non-sRGB CICP requires explicit conversion".into());
             }
             b"gAMA" => {
@@ -955,14 +1069,14 @@ fn container_stream(
                 if size != 0 || end != length {
                     return Err("Prepared PNG end or trailing data differs".into());
                 }
-                if color == ColorPolicy::ToSrgb && nonstandard && !managed {
+                if color.managed() && nonstandard && !managed {
                     return Err(
                         "Prepared PNG non-sRGB gamma/chromaticities require explicit conversion"
                             .into(),
                     );
                 }
                 return shape
-                    .map(|(w, h)| (w, h, profiles == 1))
+                    .map(|(w, h)| ((w, h, profiles == 1), animation.frames()))
                     .ok_or("Prepared PNG has no shape".into());
             }
             _ => {}
@@ -995,10 +1109,10 @@ const fn crc_table() -> [u32; 256] {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use std::{borrow::Cow, io::Write};
-    fn fixture(
+    pub(in crate::image_import) fn fixture(
         color: png::ColorType,
         bits: png::BitDepth,
         profile: Option<Vec<u8>>,
@@ -1153,7 +1267,7 @@ mod tests {
             1,
         ));
     }
-    fn chunk(bytes: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+    pub(in crate::image_import) fn chunk(bytes: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
         bytes.extend_from_slice(&(data.len() as u32).to_be_bytes());
         let start = bytes.len();
         bytes.extend_from_slice(kind);
@@ -1167,7 +1281,7 @@ mod tests {
         }
         bytes.extend_from_slice(&(!crc).to_be_bytes());
     }
-    fn adam7_fixture(depth: u16) -> Vec<u8> {
+    pub(in crate::image_import) fn adam7_fixture(depth: u16) -> Vec<u8> {
         let (width, height) = (9u32, 7u32);
         let mut scan = Vec::new();
         for (sx, sy, dx, dy) in [
@@ -1553,6 +1667,7 @@ mod tests {
         let mut bad = bytes[..at].to_vec();
         chunk(&mut bad, b"IDAT", &data);
         bad.extend_from_slice(&bytes[at + 12 + length..]);
+        assert!(clipboard_dimensions(&bad, &mut || Ok(())).is_err());
         let encoded = EncodedPng::base64(
             &STANDARD.encode(bad),
             Limits::PATTERN,

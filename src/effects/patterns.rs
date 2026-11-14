@@ -19,6 +19,22 @@ pub(crate) struct PreparedBitmap {
     words: crate::large_document::PinnedBytes,
 }
 impl PreparedBitmap {
+    pub(crate) fn from_png(
+        source: &str,
+        pool: &crate::large_document::ResidentBudget,
+        check: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<Self, String> {
+        let png = crate::image_import::prepared_png::pattern(source, pool, check)?;
+        Self::from_native(
+            source,
+            png.width(),
+            png.height(),
+            png.depth(),
+            png.into_pixels(),
+            pool,
+            check,
+        )
+    }
     pub(crate) fn from_native(
         source: &str,
         width: u32,
@@ -117,7 +133,7 @@ fn source_text(source: &str) -> Result<(), String> {
 pub const ENCODED_LIMIT: usize = 4 * 1024 * 1024;
 pub const EDGE_LIMIT: u32 = 512;
 const CACHE_LIMIT: usize = 16 * 1024 * 1024;
-const DOCUMENT_LIMIT: usize = 32 * 1024 * 1024;
+pub(crate) const DOCUMENT_LIMIT: usize = 32 * 1024 * 1024;
 type Cache = VecDeque<(String, Arc<Bitmap>)>;
 
 pub struct Bitmap {

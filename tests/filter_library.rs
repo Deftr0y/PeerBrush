@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 #[test]
 fn curated_filters_have_deterministic_native_rendered_thumbnails_and_unique_ids() {
     let presets = filter_library::curated();
-    assert_eq!(presets.len(), 15);
+    assert_eq!(presets.len(), 16);
     let mut ids = std::collections::HashSet::new();
     let mut images = std::collections::HashSet::new();
     for p in presets {
@@ -89,8 +89,8 @@ fn custom_presets_roundtrip_rename_import_export_and_preserve_bad_or_changed_fil
 #[test]
 fn preset_commands_are_frozen_and_shared_across_tabs_and_proposals() {
     let mut e = Engine::new();
-    e.doc = Document::new_depth(12, 8, 16).unwrap();
-    e.doc.layers[0]
+    e.resident_state_mut().expect("resident fixture").document = Document::new_depth(12, 8, 16).unwrap();
+    e.resident_state_mut().expect("resident fixture").document.layers[0]
         .pixels
         .set16(2, 2, [12345, 23456, 45678, 65535]);
     let shared = Arc::new(Mutex::new(e));
@@ -100,7 +100,7 @@ fn preset_commands_are_frozen_and_shared_across_tabs_and_proposals() {
         .unwrap()
         .save(None, "Draft", "Tone", "posterize", json!({"levels":3}), 0.5)
         .unwrap();
-    let source = shared.lock().unwrap().doc.clone();
+    let source = shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
     let draft=collaboration::propose(&shared,"agent",&json!({"document_id":source.id,"expected_revision":0,"commands":[{"op":"filter.add","preset":p.id}]})).unwrap();
     let id = draft["id"].as_str().unwrap();
     let expected = shared
@@ -120,7 +120,7 @@ fn preset_commands_are_frozen_and_shared_across_tabs_and_proposals() {
         .unwrap()
         .accept_proposal("human", id, &source.id, 0)
         .unwrap();
-    assert_eq!(shared.lock().unwrap().doc.export_png().unwrap(), expected);
+    assert_eq!(shared.lock().unwrap().resident_state().expect("resident fixture").document.export_png().unwrap(), expected);
     let workspace = peerbrush::workspace::attach(&shared);
     let other = peerbrush::workspace::register_in(&workspace, Engine::new(), None).unwrap();
     assert!(Arc::ptr_eq(&other.lock().unwrap().filter_library, &library));
@@ -135,17 +135,17 @@ fn preset_commands_are_frozen_and_shared_across_tabs_and_proposals() {
             "Library filter",
         )
         .unwrap();
-    assert_eq!(other.lock().unwrap().doc.filters[0].kind, "invert");
+    assert_eq!(other.lock().unwrap().resident_state().expect("resident fixture").document.filters[0].kind, "invert");
 }
 #[test]
 fn protocol_discovery_thumbnail_and_source_bound_preview_have_distinct_coordinates() {
     let mut e = Engine::new();
-    e.doc = Document::new_depth(12, 8, 16).unwrap();
-    e.doc.layers[0]
+    e.resident_state_mut().expect("resident fixture").document = Document::new_depth(12, 8, 16).unwrap();
+    e.resident_state_mut().expect("resident fixture").document.layers[0]
         .pixels
         .set16(2, 2, [12345, 23456, 45678, 65535]);
     let project = e.project_id.clone();
-    let doc = e.doc.clone();
+    let doc = e.resident_state().expect("resident fixture").document.clone();
     let shared = Arc::new(Mutex::new(e));
     assert!(server::tools()
         .as_array()
@@ -182,8 +182,8 @@ fn protocol_discovery_thumbnail_and_source_bound_preview_have_distinct_coordinat
     wrong["document_id"] = json!("changed");
     assert!(server::dispatch(&shared, "filters", &wrong).is_err());
     let mut e = shared.lock().unwrap();
-    assert!(e.undo.is_empty());
-    assert_eq!(e.doc.revision, 0);
+    assert!(e.resident_state().expect("resident fixture").undo.is_empty());
+    assert_eq!(e.resident_state().expect("resident fixture").document.revision, 0);
     let commands = preview["commands"].as_array().unwrap();
     let expected = Engine::preview_edits(doc, commands)
         .unwrap()
@@ -191,15 +191,15 @@ fn protocol_discovery_thumbnail_and_source_bound_preview_have_distinct_coordinat
         .unwrap()
         .2;
     e.edit("human", commands, Some(0), None, "Apply").unwrap();
-    assert_eq!(e.doc.preview(None, 32, None, false).unwrap().2, expected);
+    assert_eq!(e.resident_state().expect("resident fixture").document.preview(None, 32, None, false).unwrap().2, expected);
     assert_eq!(
-        e.state()["document"]["filters"].as_array().unwrap().len(),
+        e.capture_state().unwrap().project().unwrap()["document"]["filters"].as_array().unwrap().len(),
         1
     );
-    assert_eq!(e.undo.len(), 1);
-    let revision = e.doc.revision;
+    assert_eq!(e.resident_state().expect("resident fixture").undo.len(), 1);
+    let revision = e.resident_state().expect("resident fixture").document.revision;
     assert!(e
         .edit("human", commands, Some(revision), None, "Stale preview")
         .is_err());
-    assert_eq!(e.undo.len(), 1);
+    assert_eq!(e.resident_state().expect("resident fixture").undo.len(), 1);
 }

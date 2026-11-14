@@ -24,7 +24,10 @@ fn fixture() -> Document36 {
 }
 fn bound(pool: &ResidentBudget) -> Admitted<Document36> {
     let charge = MetadataCharge::reserve(pool, 1024 * 1024, &|| Ok(())).unwrap();
-    Admitted::from_parts(Arc::new(fixture()), charge)
+    let mut fixture = fixture();
+    fixture.psd_global_metadata = Some(crate::psd::global_metadata::tests::fixtures().into());
+    fixture.psd_file_info = Some(crate::psd::file_info::fixture().into());
+    Admitted::from_parts(Arc::new(fixture), charge)
         .rehome_unique(|metadata, _| metadata.bind_runtime(pool, &|| Ok(())))
         .unwrap()
 }
@@ -59,6 +62,13 @@ fn typed_projection_restores_every_asset_without_copying_its_payload() {
         .as_ref()
         .unwrap()
         .same_allocation(original.icc_profile.as_ref().unwrap()));
+    assert!(candidate
+        .psd_global_metadata
+        .as_ref()
+        .unwrap()
+        .same_allocation(original.psd_global_metadata.as_ref().unwrap()));
+    assert!(candidate.psd_file_info.as_ref().unwrap()
+        .same_allocation(original.psd_file_info.as_ref().unwrap()));
     drop(candidate);
     drop(projected);
     assert_eq!(pool.used(), retained);

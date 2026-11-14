@@ -1,8 +1,10 @@
 //! Compiled native-16 topology; source samples never pass through an 8-bit projection.
 use super::{Gray16 as GrayMask, Image16 as Image};
 use crate::{
+    compositor::{clip_fill_factor, folder_merge_blend, passes_backdrop, restore_clip_coverage},
     engine::Document,
-    raster::{blend16 as blend, Pixel16 as Pixel},
+    psd::blend_channels,
+    raster::{blend16 as blend, fill_blend::SpecialFill, Pixel16 as Pixel},
 };
 use std::sync::Arc;
 type Masks = [Option<Arc<GrayMask>>];
@@ -66,13 +68,17 @@ pub struct Plan16<'a> {
     kinds: Vec<Kind>,
     clips: Vec<Vec<usize>>,
     normal: Vec<bool>,
+    opacity: Vec<(f64, Option<SpecialFill>, Option<crate::psd::blend_ranges::Ranges>, u8)>,
     bounds: Vec<Option<[i32; 4]>>,
 }
 impl<'a> Plan16<'a> {
     pub fn new(doc: &'a Document) -> Result<Self, String> {
+        Self::new_checked(doc, &|| Ok(()))
+    }
+    pub(crate) fn new_checked(doc: &'a Document, check: &crate::render::Check<'_>) -> Result<Self, String> {
         super::validate_budget(doc)?;
-        let masks = super::prepare_masks(doc)?;
-        let colors = super::prepare_with_masks(doc, &masks)?;
+        let masks = super::prepare_masks_checked(doc, check)?;
+        let colors = super::prepare_with_masks_checked(doc, &masks, check)?;
         Ok(Self::with_prepared(doc, &masks, &colors))
     }
     pub fn pixel(&self, x: i32, y: i32) -> Pixel {
@@ -95,7 +101,19 @@ impl<'a> Plan16<'a> {
             .as_deref()
             .and_then(|id| self.doc.layers.iter().position(|l| l.id == id))
         {
-            self.unit_from(base, index + 1, x, y)
+            let ranged = self.opacity[base].2.is_some();
+            let outside = if ranged {
+                self.sample_below(self.group(layer.parent.as_deref()), base + 1, x, y,
+                    self.group_backdrop(layer.parent.as_deref(), x, y))
+            } else {
+                [0; 4]
+            };
+            let (mut pixel, visible) = self.unit_from(base, index + 1, x, y, outside);
+            if ranged {
+                let scale = self.amount(base, x, y) * visible;
+                pixel[3] = (f64::from(pixel[3]) * scale).round() as u16;
+            }
+            pixel
         } else {
             self.sample_below(
                 self.group(layer.parent.as_deref()),
@@ -107,7 +125,7 @@ impl<'a> Plan16<'a> {
         }
     }
 
-    fn group_backdrop(&self, parent: Option<&str>, x: i32, y: i32) -> Pixel {
+    fn group_backdrop(&self, parent: Option<&str>, x: i32, y: i32) -> (Pixel, u8) {
         let Some((i, folder)) = self
             .doc
             .layers
@@ -115,18 +133,20 @@ impl<'a> Plan16<'a> {
             .enumerate()
             .find(|(_, l)| Some(l.id.as_str()) == parent)
         else {
-            return [0; 4];
+            return ([0; 4], 0);
         };
-        if folder.blend != "pass_through" {
-            return [0; 4];
+        if !passes_backdrop(&folder.blend, self.opacity[i].2.is_some()) {
+            return ([0; 4], 0);
         }
-        self.sample_below(
+        let backdrop = self.group_backdrop(folder.parent.as_deref(), x, y);
+        let out = self.sample_below(
             self.group(folder.parent.as_deref()),
             i + 1,
             x,
             y,
-            self.group_backdrop(folder.parent.as_deref(), x, y),
-        )
+            backdrop,
+        );
+        (out, backdrop.1 | self.opacity[i].3)
     }
 
     pub fn with_prepared(doc: &'a Document, masks: &Masks, colors: &Colors) -> Self {
@@ -174,7 +194,7 @@ impl<'a> Plan16<'a> {
         let normal = doc
             .layers
             .iter()
-            .map(|layer| layer.blend == "normal")
+            .map(|layer| folder_merge_blend(&layer.blend) == "normal")
             .collect();
         fn envelope(
             index: usize,
@@ -252,6 +272,10 @@ impl<'a> Plan16<'a> {
             kinds,
             clips,
             normal,
+            opacity: doc.layers.iter().map(|layer| {
+                let (opacity, fill) = crate::psd::fill_opacity::render(layer.opacity, &layer.blend, &layer.psd_metadata);
+                (opacity, fill, crate::psd::blend_ranges::ranges(&layer.psd_metadata), blend_channels::excluded(&layer.psd_metadata))
+            }).collect(),
             bounds,
         }
     }
@@ -263,9 +287,10 @@ impl<'a> Plan16<'a> {
         self.raw(index, x, y)
     }
     pub fn sample(&self, group: usize, x: i32, y: i32) -> Pixel {
-        self.sample_below(group, 0, x, y, [0; 4])
+        self.sample_below(group, 0, x, y, ([0; 4], 0))
     }
-    fn sample_below(&self, group: usize, above: usize, x: i32, y: i32, mut out: Pixel) -> Pixel {
+    fn sample_below(&self, group: usize, above: usize, x: i32, y: i32, backdrop: (Pixel, u8)) -> Pixel {
+        let (mut out, inherited) = backdrop;
         let Some(children) = self.groups.get(group) else {
             return out;
         };
@@ -273,24 +298,27 @@ impl<'a> Plan16<'a> {
             if i < above {
                 continue;
             }
+            let excluded = inherited | self.opacity[i].3;
+            if excluded == blend_channels::ALL {
+                continue;
+            }
+            let before = out;
             if let Kind::Group(children) = self.kinds[i] {
-                if self.doc.layers[i].blend == "pass_through" {
+                if passes_backdrop(&self.doc.layers[i].blend, self.opacity[i].2.is_some()) {
                     out = mix(
                         out,
-                        self.sample_below(children, 0, x, y, out),
+                        self.sample_below(children, 0, x, y, (out, excluded)),
                         self.amount(i, x, y),
                     );
+                    out = blend_channels::keep(before, out, excluded, 65535);
                     continue;
                 }
             }
             if matches!(self.kinds[i], Kind::Adjustment) {
                 if let Some(image) = &self.colors[i] {
-                    out = backdrop_adjust(
-                        out,
-                        image.get(x, y),
-                        self.amount(i, x, y),
-                        &self.doc.layers[i].blend,
-                    );
+                    let source = image.get(x, y);
+                    let amount = self.gated_amount(i, out, source, self.amount(i, x, y));
+                    out = backdrop_adjust(out, source, amount, &self.doc.layers[i].blend);
                 }
             } else {
                 if !self.bounds[i].is_some_and(|b| x >= b[0] && y >= b[1] && x < b[2] && y < b[3]) {
@@ -300,23 +328,30 @@ impl<'a> Plan16<'a> {
                     }
                     continue;
                 }
-                out = compose(
-                    out,
-                    self.unit_from(i, above, x, y),
-                    self.amount(i, x, y),
-                    &self.doc.layers[i].blend,
-                    self.normal[i],
-                );
+                let (source, visible) = self.unit_from(i, above, x, y, out);
+                let amount = self.amount(i, x, y) * visible;
+                out = self.compose_layer(i, out, source, amount);
             }
+            out = blend_channels::keep(before, out, excluded, 65535);
         }
         out
+    }
+    fn gated_amount(&self, i: usize, dst: Pixel, src: Pixel, amount: f64) -> f64 {
+        self.opacity[i].2.map_or(amount, |ranges| amount * ranges.coverage(dst, src, 65535))
+    }
+    fn compose_layer(&self, i: usize, dst: Pixel, src: Pixel, amount: f64) -> Pixel {
+        if let Some(fill) = self.opacity[i].1 {
+            fill.compose(dst, src, amount, 65535)
+        } else {
+            compose(dst, src, amount, folder_merge_blend(&self.doc.layers[i].blend), self.normal[i])
+        }
     }
     fn amount(&self, i: usize, x: i32, y: i32) -> f64 {
         let layer = &self.doc.layers[i];
         if layer.mask.as_ref().is_none_or(|mask| !mask.enabled) {
-            f64::from(layer.opacity)
+            self.opacity[i].0
         } else {
-            f64::from(layer.opacity)
+            self.opacity[i].0
                 * super::mask::value(
                     layer,
                     x - layer.x,
@@ -356,28 +391,45 @@ impl<'a> Plan16<'a> {
             Kind::Raster => layer.pixels.get16(lx, ly),
         }
     }
-    fn unit_from(&self, base: usize, above: usize, x: i32, y: i32) -> Pixel {
+    fn unit_from(&self, base: usize, above: usize, x: i32, y: i32, outside: Pixel) -> (Pixel, f64) {
         let mut pixel = self.raw(base, x, y);
+        let mut visible = self.opacity[base].2.map_or(1., |ranges| ranges.coverage(outside, pixel, 65535));
+        if visible == 0. {
+            pixel[..3].fill(0);
+        }
         for &i in &self.clips[base] {
             if i < above {
                 continue;
             }
+            let excluded = self.opacity[i].3;
+            if excluded == blend_channels::ALL {
+                continue;
+            }
+            let (before, before_visible) = (pixel, visible);
             let mut source = self.raw(i, x, y);
             let t = self.amount(i, x, y);
+            let t = self.opacity[i].2.map_or(t, |ranges| {
+                let scale = self.amount(base, x, y) * clip_fill_factor(self.opacity[base].1);
+                t * ranges.coverage_scaled(pixel, source, 65535, scale * visible)
+            });
             if matches!(self.kinds[i], Kind::Adjustment) {
-                if self.colors[i].is_none() {
+                if self.colors[i].is_none() || visible == 0. {
                     continue;
                 }
                 pixel = color_adjust(pixel, source, t, &self.doc.layers[i].blend);
             } else {
+                if visible != 1. {
+                    visible = restore_clip_coverage(visible, source[3], 65535, t, self.opacity[i].1);
+                }
                 let alpha = pixel[3];
                 let mut opaque = pixel;
                 opaque[3] = 65535;
-                source = compose(opaque, source, t, &self.doc.layers[i].blend, self.normal[i]);
+                source = self.compose_layer(i, opaque, source, t);
                 pixel = [source[0], source[1], source[2], alpha];
             }
+            pixel = blend_channels::keep_clipped(before, pixel, excluded, before_visible, visible);
         }
-        pixel
+        (pixel, visible)
     }
 }
 // These identities preserve straight-alpha bytes, including hidden RGB at zero rounded alpha.

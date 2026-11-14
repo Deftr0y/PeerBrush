@@ -18,6 +18,9 @@ const SLOTS: usize = 256;
 pub const ATLAS_BYTES: u64 = (SLOTS * TILE_BYTES) as u64;
 const OUTPUT_BUDGET: usize = 32 * 1024 * 1024;
 const METADATA_BUDGET: usize = 32 * 1024 * 1024;
+// Node field 14 packs a one-based Blend If table offset above the Fill code.
+const BLEND_IF_SHIFT: u32 = 16;
+const RANGED_CLIP_BASE: u32 = 5;
 static COMPOSITOR: OnceLock<Mutex<Option<Compositor>>> = OnceLock::new();
 static STATUS: OnceLock<Mutex<Status>> = OnceLock::new();
 
@@ -144,6 +147,16 @@ mod tests {
         doc.layers[1].blend = "normal".into();
         doc.bit_depth = 16;
         assert!(Scene::new(&doc, &colors).is_err());
+        doc.bit_depth = 8;
+        doc.layers[1].clip_to = Some(doc.layers[2].id.clone());
+        crate::psd::blend_ranges::update(&mut doc.layers[2].psd_metadata, &serde_json::json!({
+            "blend_if":[[50,80,255,255,0,0,255,255]]
+        })).unwrap();
+        let scene = Scene::new(&doc, &colors).unwrap();
+        let raw = scene.nodes.iter().find(|node| node[15] == RANGED_CLIP_BASE).unwrap();
+        let base = &scene.nodes[raw[9] as usize];
+        assert_eq!(base[0], 4);
+        assert_ne!(base[14] >> BLEND_IF_SHIFT, 0);
     }
     #[test]
     fn source_budget_and_native_slot_allocation_use_the_original_depth() {
@@ -170,6 +183,212 @@ mod tests {
     }
     #[test]
     #[ignore = "requires a GPU device"]
+    fn gpu_blend_if_matches_cpu_at_native_cutoffs_and_split_edges() {
+        let backend = crate::gpu::headless().unwrap();
+        let mut gpu = Compositor::new(&backend).unwrap();
+        let xs: Vec<_> = (-1..10).collect();
+        let ys: Vec<_> = (0..3).collect();
+        let neutral = crate::psd::blend_ranges::DEFAULT;
+        for depth in [8, 16] {
+            let mut doc = Document::new_depth(9, 3, depth).unwrap();
+            let mut backdrop = Layer::new("Backdrop", "paint", 9, 3);
+            backdrop.pixels.convert_depth(depth);
+            let unit = if depth == 8 { 1 } else { 257 };
+            for &y in &ys {
+                for x in 0..9 {
+                    let edge = x % 3 - 1;
+                    let source = [128 * unit + edge, (118 + x) * unit, 190 * unit, 255 * unit];
+                    let below = [
+                        80 * unit + edge, 180 * unit, (186 + x) * unit,
+                        [0, 127 * unit, 255 * unit][y as usize],
+                    ];
+                    for (layer, samples) in [(&mut doc.layers[0], source), (&mut backdrop, below)] {
+                        if depth == 8 {
+                            layer.pixels.set(x, y, samples.map(|v| v as u8));
+                        } else {
+                            layer.pixels.set16(x, y, samples.map(|v| v as u16));
+                        }
+                    }
+                }
+            }
+            doc.layers.push(backdrop);
+            for pairs in [
+                [neutral, [128, 128, 255, 255, 80, 80, 255, 255], neutral, neutral],
+                [
+                    [130, 137, 255, 255, 0, 0, 150, 152],
+                    neutral,
+                    [120, 125, 255, 255, 0, 0, 255, 255],
+                    [0, 0, 255, 255, 0, 0, 188, 192],
+                ],
+            ] {
+                crate::psd::blend_ranges::update(
+                    &mut doc.layers[0].psd_metadata,
+                    &serde_json::json!({"blend_if":pairs}),
+                ).unwrap();
+                for (mode, fill) in [("normal", 255), ("multiply", 128), ("linear_dodge", 128)] {
+                    doc.layers[0].blend = mode.into();
+                    crate::psd::blend_channels::update(
+                        &mut doc.layers[0].psd_metadata,
+                        &serde_json::json!({"blend_channels":[mode != "multiply", true, mode != "multiply"]}),
+                    ).unwrap();
+                    crate::psd::fill_opacity::update(
+                        &mut doc.layers[0].psd_metadata,
+                        &serde_json::json!({"fill_opacity":fill}),
+                    ).unwrap();
+                    if depth == 8 {
+                        let colors = vec![None; doc.layers.len()];
+                        let expected = reference(&doc, &colors, &xs, &ys);
+                        assert_eq!(gpu.render(&doc, &colors, &xs, &ys).unwrap(), expected, "{mode}");
+                    } else {
+                        let colors = vec![None; doc.layers.len()];
+                        let masks = crate::depth16::prepare_masks(&doc).unwrap();
+                        let plan = crate::depth16::Plan16::with_prepared(&doc, &masks, &colors);
+                        let expected: Vec<_> = ys.iter().flat_map(|&y| {
+                            let plan = &plan;
+                            xs.iter().flat_map(move |&x| plan.pixel(x, y))
+                        }).collect();
+                        assert_eq!(gpu.render16(&doc, &colors, &xs, &ys).unwrap(), expected, "{mode}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a GPU device"]
+    fn gpu_ranged_clipping_base_restores_coverage_without_expanding_shape() {
+        let backend = crate::gpu::headless().unwrap();
+        let mut gpu = Compositor::new(&backend).unwrap();
+        let xs = [0, 1, 2, 3];
+        let ys = [0];
+        let neutral = crate::psd::blend_ranges::DEFAULT;
+        for depth in [8, 16] {
+            let mut doc = Document::new_depth(4, 1, depth).unwrap();
+            let base = &mut doc.layers[0];
+            let base_id = base.id.clone();
+            for (x, red, alpha) in [(0, 192, 128), (1, 192, 128), (2, 80, 128), (3, 192, 0)] {
+                base.pixels.set16(x, 0, [red, 70, 90, alpha].map(|sample| sample * 257));
+            }
+            crate::psd::blend_ranges::update(&mut base.psd_metadata, &serde_json::json!({
+                "blend_if":[neutral, [0,0,100,100,0,0,255,255]]
+            })).unwrap();
+            crate::psd::blend_channels::update(&mut base.psd_metadata, &serde_json::json!({
+                "blend_channels":[false,true,true]
+            })).unwrap();
+            for name in ["Lower paint", "Upper paint"] {
+                let mut member = Layer::new(name, "paint", 4, 1);
+                member.clip_to = Some(base_id.clone());
+                member.pixels.convert_depth(depth);
+                for x in [0, 2, 3] {
+                    member.pixels.set16(x, 0, [49344, 38550, 46260, 32896]);
+                }
+                if name == "Upper paint" {
+                    crate::psd::blend_ranges::update(&mut member.psd_metadata, &serde_json::json!({
+                        "blend_if":[neutral, [0,0,255,255,0,0,110,110]]
+                    })).unwrap();
+                    crate::psd::blend_channels::update(&mut member.psd_metadata, &serde_json::json!({
+                        "blend_channels":[true,false,true]
+                    })).unwrap();
+                }
+                doc.layers.insert(0, member);
+            }
+            let mut adjustment = Layer::new("Clipped invert", "adjustment", 4, 1);
+            adjustment.clip_to = Some(base_id);
+            adjustment.pixels.convert_depth(depth);
+            adjustment.effects.push(crate::effects::Effect {
+                id: crate::engine::id(),
+                kind: "invert".into(),
+                enabled: true,
+                weight: 1.0,
+                settings: serde_json::json!({}).into(),
+            });
+            doc.layers.insert(0, adjustment);
+            let actual: Vec<u16> = if depth == 8 {
+                let colors = crate::effects::prepare(&doc, &vec![None; doc.layers.len()]).unwrap();
+                let expected = reference(&doc, &colors, &xs, &ys);
+                let actual = gpu.render(&doc, &colors, &xs, &ys).unwrap();
+                assert_eq!(actual, expected);
+                actual.into_iter().map(u16::from).collect()
+            } else {
+                let masks = crate::depth16::prepare_masks(&doc).unwrap();
+                let colors = crate::depth16::prepare_with_masks(&doc, &masks).unwrap();
+                let plan = crate::depth16::Plan16::with_prepared(&doc, &masks, &colors);
+                let expected: Vec<_> = xs.into_iter().flat_map(|x| plan.pixel(x, 0)).collect();
+                let actual = gpu.render16(&doc, &colors, &xs, &ys).unwrap();
+                assert_eq!(actual, expected);
+                actual
+            };
+            assert_eq!(actual[3], if depth == 8 { 96 } else { 24736 });
+            assert_eq!(actual[0], 0);
+            assert_eq!(actual[7], 0);
+            assert_eq!(actual[15], 0);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a GPU device"]
+    fn gpu_clipping_group_fill_matches_shared_composition() {
+        let backend = crate::gpu::headless().unwrap();
+        let mut gpu = Compositor::new(&backend).unwrap();
+        let xs: Vec<_> = (-7..119).collect();
+        let ys: Vec<_> = (-11..99).collect();
+        for depth in [8, 16] {
+            let mut doc = fixture(113);
+            doc.bit_depth = depth;
+            doc.layers[1].clip_to = Some(doc.layers[2].id.clone());
+            for layer in &mut doc.layers {
+                layer.pixels.convert_depth(depth);
+                if depth == 16 {
+                    for tile in layer.pixels.samples16.values_mut() {
+                        for (i, sample) in Arc::make_mut(tile).iter_mut().enumerate() {
+                            *sample = sample.saturating_add((i % 127) as u16);
+                        }
+                    }
+                }
+            }
+            for (follower, base) in [
+                ("color_burn", "color_dodge"),
+                ("linear_burn", "linear_dodge"),
+                ("difference", "hard_mix"),
+                ("linear_light", "vivid_light"),
+            ] {
+                for (index, mode, fill) in [(1, follower, 128), (2, base, 231)] {
+                    let layer = &mut doc.layers[index];
+                    layer.blend = mode.into();
+                    crate::psd::fill_opacity::update(
+                        &mut layer.psd_metadata,
+                        &serde_json::json!({"fill_opacity":fill}),
+                    ).unwrap();
+                }
+                let ranges = if follower == "difference" {
+                    serde_json::json!([[10,25,210,240,0,0,90,150]])
+                } else {
+                    serde_json::Value::Null
+                };
+                crate::psd::blend_ranges::update(
+                    &mut doc.layers[1].psd_metadata,
+                    &serde_json::json!({"blend_if":ranges}),
+                ).unwrap();
+                if depth == 8 {
+                    parity(&mut gpu, &doc, &vec![None; doc.layers.len()], &xs, &ys);
+                } else {
+                    let colors = vec![None; doc.layers.len()];
+                    let masks = crate::depth16::prepare_masks(&doc).unwrap();
+                    let plan = crate::depth16::Plan16::with_prepared(&doc, &masks, &colors);
+                    let expected: Vec<_> = ys.iter().flat_map(|&y| {
+                        let plan = &plan;
+                        xs.iter().flat_map(move |&x| plan.pixel(x, y))
+                    }).collect();
+                    let actual = gpu.render16(&doc, &colors, &xs, &ys).unwrap();
+                    assert!(actual.iter().any(|word| word % 257 != 0));
+                    assert_eq!(actual, expected, "{follower} clipped to {base}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a GPU device"]
     fn gpu_all_blends_native16_masks_clipping_pass_through_and_adjustments_match_cpu() {
         use crate::{effects::Effect, engine::MaskStep};
         let backend = crate::gpu::headless().unwrap();
@@ -192,6 +411,16 @@ mod tests {
                         }
                     }
                     doc.layers[0].blend = if pass { "pass_through" } else { mode }.into();
+                    if pass && mode == "screen" {
+                        crate::psd::blend_ranges::update(&mut doc.layers[0].psd_metadata, &serde_json::json!({
+                            "blend_if":[[0,0,200,230,30,50,255,255]]
+                        })).unwrap();
+                    }
+                    if pass && mode == "normal" {
+                        crate::psd::blend_channels::update(&mut doc.layers[0].psd_metadata, &serde_json::json!({
+                            "blend_channels":[false,true,true]
+                        })).unwrap();
+                    }
                     doc.layers[1].blend = mode.into();
                     doc.layers[2].blend = mode.into();
                     doc.layers[1].clip_to = Some(doc.layers[2].id.clone());
@@ -241,6 +470,11 @@ mod tests {
                         weight: 0.417,
                         settings: serde_json::json!({}).into(),
                     });
+                    if matches!(mode, "normal" | "multiply") {
+                        crate::psd::blend_ranges::update(&mut adjustment.psd_metadata, &serde_json::json!({
+                            "blend_if":[[37,75,220,250,0,0,200,227]]
+                        })).unwrap();
+                    }
                     doc.layers.insert(0, adjustment);
                     let before = serde_json::to_vec(&doc).unwrap();
                     if depth == 8 {
@@ -595,12 +829,14 @@ struct Scene<'a> {
     doc: &'a Document,
     colors: Colors<'a>,
     // op, dimensions/fill; origin, opacity, lookup; columns, source index,
-    // mask index, blend; native fill high word, sample maximum, reserved, action.
+    // mask index, blend; native fill high word, sample maximum/channels, Fill/ranges, action.
+    // Ranged clip nodes use the source-index slot to reference the stack opening.
     nodes: Vec<[u32; 16]>,
     sources: Vec<Source<'a>>,
     origins: Vec<[i32; 2]>,
     offsets: Vec<usize>,
     masks: Vec<(&'a crate::engine::Layer, PreparedMask)>,
+    ranges: Vec<u32>,
     lookup_len: usize,
 }
 impl<'a> Scene<'a> {
@@ -646,6 +882,7 @@ impl<'a> Scene<'a> {
             origins: vec![],
             offsets: vec![],
             masks: vec![],
+            ranges: vec![],
             lookup_len: 0,
         };
         scene.children(doc, colors, None, 0)?;
@@ -681,16 +918,30 @@ impl<'a> Scene<'a> {
             if clips.is_empty() || layer.kind == "adjustment" || layer.blend == "pass_through" {
                 self.layer(doc, colors, i, 0, false, depth)?;
             } else {
-                self.push(
-                    [4, 0, 0, 0, 0, 0, 0, 0, 0, 0, u32::MAX, 0, 0, 0, 0, 0],
-                    depth,
-                )?;
-                self.layer(doc, colors, i, 0, true, depth + 1)?;
-                for clip in clips {
-                    self.layer(doc, colors, clip, 1, false, depth + 1)?;
-                }
                 let mut end = self.node(doc, i, false)?;
                 end[0] = 5;
+                let base = self.nodes.len() as u32;
+                let mut begin = end;
+                begin[0] = 4;
+                self.push(begin, depth)?;
+                let start = self.nodes.len();
+                self.layer(doc, colors, i, 0, true, depth + 1)?;
+                if end[14] >> BLEND_IF_SHIFT != 0 {
+                    let [raw] = &mut self.nodes[start..] else {
+                        return Err("Ranged clip base preview requires one color node".into());
+                    };
+                    raw[9] = base;
+                    raw[15] = RANGED_CLIP_BASE;
+                }
+                for clip in clips {
+                    let start = self.nodes.len();
+                    self.layer(doc, colors, clip, 1, false, depth + 1)?;
+                    if let Some(node) = self.nodes.get_mut(start) {
+                        if node[14] >> BLEND_IF_SHIFT != 0 && matches!(node[15], 1 | 3) {
+                            node[9] = base;
+                        }
+                    }
+                }
                 self.push(end, depth + 1)?;
             }
         }
@@ -706,7 +957,19 @@ impl<'a> Scene<'a> {
         n[2] = l.pixels.height;
         n[4] = l.x as u32;
         n[5] = l.y as u32;
-        n[6] = if raw { 1.0f32 } else { l.opacity }.to_bits();
+        let opacity = if raw {
+            1.
+        } else {
+            let (opacity, special) = crate::psd::fill_opacity::render(l.opacity, &l.blend, &l.psd_metadata);
+            n[14] = special.map_or(0, |fill| u32::from(fill.amount()) + 1);
+            if let Some(pairs) = crate::psd::blend_ranges::value(&l.psd_metadata) {
+                n[14] |= (self.ranges.len() as u32 + 1) << BLEND_IF_SHIFT;
+                self.ranges.extend(pairs.as_flattened().chunks_exact(4)
+                    .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap())));
+            }
+            opacity as f32
+        };
+        n[6] = opacity.to_bits();
         n[10] = u32::MAX;
         n[11] = if raw || l.blend == "pass_through" {
             0
@@ -717,6 +980,9 @@ impl<'a> Scene<'a> {
                 .ok_or("Unsupported preview blend")? as u32
         };
         n[13] = if doc.bit_depth == 16 { 65535 } else { 255 };
+        if !raw {
+            n[13] |= u32::from(crate::psd::blend_channels::excluded(&l.psd_metadata)) << 16;
+        }
         if !raw && l.mask.as_ref().is_some_and(|m| m.enabled) {
             n[10] = self.masks.len() as u32;
             let prepared = if doc.bit_depth == 16 {
@@ -744,7 +1010,8 @@ impl<'a> Scene<'a> {
         let l = &doc.layers[i];
         let mut n = self.node(doc, i, raw)?;
         n[15] = action;
-        let pass = l.kind == "group" && l.blend == "pass_through" && !raw && action == 0;
+        let pass = l.kind == "group" && !raw && action == 0
+            && crate::compositor::passes_backdrop(&l.blend, n[14] >> BLEND_IF_SHIFT != 0);
         let source = if pass { None } else { colors.source(i) };
         if l.kind == "group" && source.is_none() {
             let mut begin = n;
@@ -993,7 +1260,9 @@ impl Compositor {
             .filter(|n| *n > 0 && *n <= OUTPUT_BUDGET)
             .ok_or("Preview output exceeds the GPU budget")?;
         let tiles = xs.len().div_ceil(TILE as usize) * ys.len().div_ceil(TILE as usize);
-        if (scene.lookup_len + 512) * 4 * tiles + scene.masks.len() * len / 3 > METADATA_BUDGET {
+        if (scene.lookup_len + scene.ranges.len() + 512) * 4 * tiles + scene.masks.len() * len / 3
+            > METADATA_BUDGET
+        {
             return Err("Preview metadata exceeds the GPU budget".into());
         }
         if xs.windows(2).any(|v| v[0] > v[1]) || ys.windows(2).any(|v| v[0] > v[1]) {
@@ -1134,6 +1403,8 @@ impl Compositor {
                     let cols = scene.sources[source_id].dims().0.div_ceil(TILE);
                     lookup[scene.offsets[source_id] + (y * cols + x) as usize] = slot;
                 }
+                let range_offset = lookup.len() as u32;
+                lookup.extend_from_slice(&scene.ranges);
                 let coordinate_offset = lookup.len() as u32;
                 lookup.extend(xcoords.iter().chain(ycoords).map(|n| *n as u32));
                 let mask_offset = lookup.len() as u32;
@@ -1176,7 +1447,7 @@ impl Compositor {
                     scene.nodes.len() as u32,
                     coordinate_offset,
                     mask_offset,
-                    0,
+                    range_offset,
                     0,
                     0,
                 ];

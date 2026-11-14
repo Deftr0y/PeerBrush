@@ -8,7 +8,7 @@ import sys
 import tomllib
 
 from package import git
-from package_deb import deb_version, inspect_final
+from package_deb import deb_filename, deb_version, inspect_final
 from package_macos_dmg import bounded_file, private_inspection_directory
 import production_readiness as readiness
 import test_deb_version_upgrade as compatibility
@@ -68,7 +68,7 @@ def inputs(root, selection):
     version = stable_source(root, selection['commit'])
     if (selection['version'] != version or not sha(selection['portable_sha256']) or not sha(selection['package_sha256'])
             or Path(selection['portable']).name != f'PeerBrush-{version}-Linux-x64.zip'
-            or Path(selection['package']).name != f'peerbrush_{deb_version(version)}_amd64.deb'):
+            or Path(selection['package']).name != deb_filename(version)):
         raise ValueError('Linux input source, canonical filenames or independent pins differ.')
     portable, package = map(readiness.handoff_path, [selection['portable'], selection['package']])
     return inspect_final(root, portable, package, commit=selection['commit'], version=version,

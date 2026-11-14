@@ -25,19 +25,19 @@ mod tests {
             let path = dir.join("Artwork.psd");
             {
                 let mut e = app.shared.lock().unwrap();
-                e.doc = Document::new_depth(64, 64, depth).unwrap();
+                e.resident_state_mut().expect("resident fixture").document = Document::new_depth(64, 64, depth).unwrap();
             }
             let root = app.shared.clone();
             server::save(&root, &path).unwrap();
-            let layer = root.lock().unwrap().doc.layers[0].id.clone();
+            let layer = root.lock().unwrap().resident_state().expect("resident fixture").document.layers[0].id.clone();
             server::dispatch(&root,"edit",&json!({"actor":"human","commands":[{"op":"layer.update","layer":layer,"name":"Unsaved work"},{"op":"selection","kind":"rectangle","rect":[3,4,30,40]}]})).unwrap();
             frame(&mut app, &ctx, vec![]);
             app.select_content(&layer);
             app.zoom = 1.75;
             app.pan = Vec2::new(17., -29.);
             let original = app.project_id.clone();
-            let before = root.lock().unwrap().state();
-            let undo = root.lock().unwrap().undo.len();
+            let before = crate::server::state(&root).unwrap();
+            let undo = root.lock().unwrap().resident_state().expect("resident fixture").undo.len();
             let second = crate::workspace::new_project(&root, 32, 32, depth, None).unwrap();
             let other = second.lock().unwrap().project_id.clone();
             app.switch_project(&other);
@@ -55,8 +55,8 @@ mod tests {
             assert_eq!(app.zoom, 1.75);
             assert_eq!(app.pan, Vec2::new(17., -29.));
             assert_eq!(app.selected, layer);
-            assert_eq!(root.lock().unwrap().state(), before);
-            assert_eq!(root.lock().unwrap().undo.len(), undo);
+            assert_eq!(crate::server::state(&root).unwrap(), before);
+            assert_eq!(root.lock().unwrap().resident_state().expect("resident fixture").undo.len(), undo);
             assert_eq!(crate::workspace::handles(&root).len(), 2);
             assert!(app
                 .open_file_warning

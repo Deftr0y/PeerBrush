@@ -1,6 +1,9 @@
-use super::{extrema, Grid, Mapping};
+use super::{Grid, Mapping};
 use crate::{
-    engine::{Document, Layer},
+    engine::{
+        view::{DocumentView, LayerView, MaskStepView},
+        Layer,
+    },
     projective::{self, Map},
 };
 use serde_json::Value;
@@ -54,6 +57,17 @@ impl CommandMap {
             .filter(|p| p.iter().all(|v| v.is_finite() && v.abs() < 1e6))
             .map(|p| p.map(|n| n as f32))
             .unwrap_or([-2.; 2])
+    }
+    /// An empty footprint is distinct from an uncertain inverse near a horizon.
+    pub(crate) fn sample_bounds(&self, bounds: [f64; 4]) -> Option<Option<[f64; 4]>> {
+        let bounds = self.inverse.sampling_bounds(bounds)?;
+        Some(match &self.warp {
+            Some(warp) => warp.inverse_bounds(bounds),
+            None => Some(bounds),
+        })
+    }
+    pub(crate) fn sample_cost(&self) -> u64 {
+        if self.warp.is_some() { 10 } else { 1 }
     }
     pub(crate) fn covers(&self, bounds: [f64; 4]) -> Result<(), String> {
         if let Some(w) = &self.warp {
@@ -112,90 +126,166 @@ fn native_bounds(layer: &Layer, raster: &crate::raster::Raster) -> Result<[f64; 
     }
 }
 
+fn include(bounds: &mut Option<[f64; 4]>, b: [f64; 4]) {
+    *bounds = Some(bounds.map_or(b, |a| {
+        [
+            a[0].min(b[0]),
+            a[1].min(b[1]),
+            a[2].max(b[2]),
+            a[3].max(b[3]),
+        ]
+    }));
+}
+fn plane_bounds(
+    doc: DocumentView<'_>,
+    layer: LayerView<'_>,
+    step: Option<MaskStepView<'_>>,
+    check: &dyn Fn() -> crate::large_document::Result<()>,
+) -> Result<[f64; 4], String> {
+    check().map_err(|e| e.to_string())?;
+    match (doc, layer, step) {
+        (DocumentView::Resident(_), LayerView::Resident(layer), None) => {
+            native_bounds(layer, &layer.pixels)
+        }
+        (
+            DocumentView::Resident(_),
+            LayerView::Resident(layer),
+            Some(MaskStepView::Resident(step)),
+        ) => native_bounds(layer, &step.pixels),
+        (DocumentView::Native(doc), LayerView::Native(layer), step) => {
+            let raster = match step {
+                None => layer.pixels(),
+                Some(MaskStepView::Native(step)) => step.pixels(),
+                _ => return Err("Warp mask differs from document storage".into()),
+            };
+            let original = crate::retained::projection::Original::raster(doc, raster)?;
+            let [x, y] = layer.origin();
+            original.support_bounds_in(
+                Map::affine_matrix([1., 0., 0., 1., x as f64, y as f64]),
+                check,
+            )
+        }
+        _ => Err("Warp target differs from document storage".into()),
+    }
+}
+
 /// Query only the original command targets; pending affine/P/W fields do not
 /// redefine its input plane. Used by UI initialization/presets and engine admission.
-pub(crate) fn domain(doc: &Document, commands: &[Value]) -> Result<[f64; 4], String> {
+pub(crate) fn domain<'a>(
+    doc: impl Into<DocumentView<'a>>,
+    commands: &[Value],
+    check: &dyn Fn() -> crate::large_document::Result<()>,
+) -> Result<[f64; 4], String> {
+    let doc = doc.into();
+    check().map_err(|e| e.to_string())?;
     if commands.is_empty() || commands.len() > 100 {
         return Err("Choose 1–100 Warp targets".into());
     }
-    let mut bounds = Vec::with_capacity(commands.len() * 4);
+    // The temporary target IDs and deduplication table own no source pixels.
+    let _charge = if let DocumentView::Native(native) = doc {
+        let bytes = doc.layers().try_fold(1024usize, |bytes, layer| {
+            layer
+                .id()
+                .len()
+                .checked_mul(3)
+                .and_then(|ids| {
+                    commands.len().checked_mul(128).and_then(|entries| {
+                        ids.checked_add(256)
+                            .and_then(|ids| entries.checked_add(ids))
+                    })
+                })
+                .and_then(|entry| bytes.checked_add(entry))
+                .ok_or("Warp target metadata exceeds admission")
+        })?;
+        Some(
+            native
+                .budget()
+                .reserve_bytes(bytes, 64 * 1024 * 1024)
+                .map_err(|e| e.to_string())?,
+        )
+    } else {
+        None
+    };
+    let mut bounds: Option<[f64; 4]> = None;
     let mut seen = std::collections::HashSet::new();
     for c in commands {
+        check().map_err(|e| e.to_string())?;
         let root = doc
-            .layers
-            .iter()
-            .find(|l| c["layer"].as_str() == Some(l.id.as_str()))
+            .layers()
+            .find(|l| c["layer"].as_str() == Some(l.id()))
             .ok_or("Warp target no longer exists")?;
         // Match Engine's linked-mask command normalization before folder dispatch.
-        let mask = c["mask"] == true && root.mask.as_ref().is_none_or(|m| !m.linked);
-        let ids = if root.kind == "group" && !mask {
-            crate::transform::tree_ids(doc, &[root.id.clone()])
+        let mask = c["mask"] == true && root.mask().is_none_or(|m| !m.linked());
+        let ids = if root.kind() == "group" && !mask {
+            crate::transform::tree_ids_view(doc, &[root.id().to_owned()])
         } else {
-            vec![root.id.clone()]
+            vec![root.id().to_owned()]
         };
-        let selected = doc.selection.filter(|_| c["selection_only"] != false);
+        let selected = doc.selection().filter(|_| c["selection_only"] != false);
         let mut selected_targets = 0;
-        for layer in doc.layers.iter().filter(|l| ids.contains(&l.id)) {
+        for layer in doc.layers().filter(|l| ids.iter().any(|id| id == l.id())) {
+            check().map_err(|e| e.to_string())?;
             if !seen.insert((
-                layer.id.as_str(),
+                layer.id(),
                 mask,
                 if mask { c["step"].as_str() } else { None },
                 selected.is_some(),
             )) {
                 continue;
             }
-            if layer.source.is_some() {
+            if layer.source().is_some() {
                 return Err("Rasterize editable sources at native precision before Warp".into());
             }
             if !mask
-                && root.kind == "group"
-                && !matches!(layer.kind.as_str(), "group" | "paint" | "fill")
+                && root.kind() == "group"
+                && !matches!(layer.kind(), "group" | "paint" | "fill")
             {
                 return Err(
                     "Rasterize adjustment children at native precision before a folder Warp".into(),
                 );
             }
             if mask
-                && layer.mask.as_ref().is_none_or(|m| {
-                    !m.steps.iter().any(|s| {
-                        s.kind == "paint" && c["step"].as_str().is_none_or(|id| id == s.id)
+                && layer.mask().is_none_or(|m| {
+                    !(0..m.step_count()).filter_map(|i| m.step(i)).any(|s| {
+                        s.kind() == "paint" && c["step"].as_str().is_none_or(|id| id == s.id())
                     })
                 })
             {
                 return Err("Choose a paint mask step to Warp".into());
             }
             if selected.is_some() {
-                if layer.kind == "group" {
+                if layer.kind() == "group" {
                     if mask {
                         selected_targets += 1;
                     }
                     continue;
                 }
-                if !mask && !matches!(layer.kind.as_str(), "paint" | "fill") {
+                if !mask && !matches!(layer.kind(), "paint" | "fill") {
                     return Err("Warp selected raster pixels or a paint mask".into());
                 }
                 selected_targets += 1;
                 continue;
             }
-            if !mask && !matches!(layer.kind.as_str(), "group" | "adjustment") {
-                bounds.push(native_bounds(layer, &layer.pixels)?);
+            if !mask && !matches!(layer.kind(), "group" | "adjustment") {
+                include(&mut bounds, plane_bounds(doc, layer, None, check)?);
             }
-            if mask || layer.mask.as_ref().is_some_and(|m| m.linked) {
-                let Some(m) = &layer.mask else {
+            if mask || layer.mask().is_some_and(|m| m.linked()) {
+                let Some(m) = layer.mask() else {
                     if mask {
                         return Err("Warp target has no mask".into());
                     }
                     continue;
                 };
                 let mut count = 0;
-                for step in &m.steps {
+                for step in (0..m.step_count()).filter_map(|i| m.step(i)) {
+                    check().map_err(|e| e.to_string())?;
                     if mask
-                        && (step.kind != "paint"
-                            || c["step"].as_str().is_some_and(|id| id != step.id))
+                        && (step.kind() != "paint"
+                            || c["step"].as_str().is_some_and(|id| id != step.id()))
                     {
                         continue;
                     }
-                    bounds.push(native_bounds(layer, &step.pixels)?);
+                    include(&mut bounds, plane_bounds(doc, layer, Some(step), check)?);
                     count += 1;
                 }
                 if mask && count == 0 {
@@ -204,25 +294,22 @@ pub(crate) fn domain(doc: &Document, commands: &[Value]) -> Result<[f64; 4], Str
             }
         }
         if let Some(b) = selected {
-            if selected_targets == 0 && bounds.is_empty() {
+            if selected_targets == 0 && bounds.is_none() {
                 return Err("Folder has no selected raster content to Warp".into());
             }
-            bounds.push([
-                b[0] as f64 - 1.,
-                b[1] as f64 - 1.,
-                b[2] as f64 + 1.,
-                b[3] as f64 + 1.,
-            ]);
+            include(
+                &mut bounds,
+                [
+                    b[0] as f64 - 1.,
+                    b[1] as f64 - 1.,
+                    b[2] as f64 + 1.,
+                    b[3] as f64 + 1.,
+                ],
+            );
         }
     }
-    if bounds.is_empty() {
-        return Err("Warp needs raster Color or a paint mask target".into());
-    }
-    let points = bounds
-        .into_iter()
-        .flat_map(|b| [[b[0], b[1]], [b[2], b[3]]])
-        .collect::<Vec<_>>();
-    let b = extrema(&points);
+    let b = bounds.ok_or("Warp needs raster Color or a paint mask target")?;
+    check().map_err(|e| e.to_string())?;
     let b = [
         b[0].floor() - 1.,
         b[1].floor() - 1.,
@@ -234,9 +321,15 @@ pub(crate) fn domain(doc: &Document, commands: &[Value]) -> Result<[f64; 4], Str
 }
 
 #[cfg(test)]
+#[path = "domain_tests.rs"]
+mod domain_tests;
+#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{engine::Engine, raster::Raster};
+    use crate::{
+        engine::{Document, Engine},
+        raster::Raster,
+    };
     use serde_json::json;
 
     #[test]
@@ -274,9 +367,9 @@ mod tests {
     fn target_domain_includes_hidden_off_frame_mask_originals_and_ignores_pending_maps() {
         for depth in [8, 16] {
             let mut e = Engine::new();
-            e.doc = Document::new_depth(32, 24, depth).unwrap();
-            let id = e.doc.layers[0].id.clone();
-            e.doc.layers[0].pixels = Raster::new_depth(8, 6, depth);
+            e.resident_state_mut().expect("resident fixture").document = Document::new_depth(32, 24, depth).unwrap();
+            let id = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
+            e.resident_state_mut().expect("resident fixture").document.layers[0].pixels = Raster::new_depth(8, 6, depth);
             e.edit(
                 "human",
                 &[
@@ -288,10 +381,10 @@ mod tests {
                 "Mask",
             )
             .unwrap();
-            e.doc.layers[0].mask.as_mut().unwrap().steps[1]
+            e.resident_state_mut().expect("resident fixture").document.layers[0].mask.as_mut().unwrap().steps[1]
                 .pixels
                 .set16(3, 2, [12347, 12347, 12347, 65535]);
-            let step = e.doc.layers[0].mask.as_ref().unwrap().steps[1].id.clone();
+            let step = e.resident_state().expect("resident fixture").document.layers[0].mask.as_ref().unwrap().steps[1].id.clone();
             let target =
                 json!({"op":"transform","layer":id,"mask":true,"step":step,"selection_only":false});
             e.edit(
@@ -303,24 +396,27 @@ mod tests {
             )
             .unwrap();
             assert_eq!(
-                e.doc.layers[0].mask.as_ref().unwrap().steps[1]
+                e.resident_state().expect("resident fixture").document.layers[0].mask.as_ref().unwrap().steps[1]
                     .pixels
                     .bytes(),
                 0
             );
-            let bounds = domain(&e.doc, &[target.clone()]).unwrap();
+            let bounds = domain(&e.resident_state().expect("resident fixture").document, &[target.clone()], &|| Ok(())).unwrap();
             assert!(bounds[0] <= 19. && bounds[1] <= -1. && bounds[2] >= 29. && bounds[3] >= 7.);
             assert!(bounds[0] >= 17. && bounds[1] >= -3. && bounds[2] <= 31. && bounds[3] <= 9.);
-            let before = serde_json::to_value(&e.doc).unwrap();
+            let before = serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap();
             let mut pending = target.clone();
             pending["angle"] = json!(45.);
             pending["warp"] = json!({"preset":"arc","rect":bounds,"amount":0.25});
-            assert_eq!(domain(&e.doc, &[pending]).unwrap(), bounds);
-            assert_eq!(serde_json::to_value(&e.doc).unwrap(), before);
-            e.doc.selection = Some([2, 2, 6, 5]);
+            assert_eq!(domain(&e.resident_state().expect("resident fixture").document, &[pending], &|| Ok(())).unwrap(), bounds);
+            assert_eq!(serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap(), before);
+            e.resident_state_mut().expect("resident fixture").document.selection = Some([2, 2, 6, 5]);
             let mut selected = target;
             selected["selection_only"] = json!(true);
-            assert_eq!(domain(&e.doc, &[selected]).unwrap(), [0., 0., 8., 7.]);
+            assert_eq!(
+                domain(&e.resident_state().expect("resident fixture").document, &[selected], &|| Ok(())).unwrap(),
+                [0., 0., 8., 7.]
+            );
         }
     }
 

@@ -11,7 +11,52 @@ use crate::{
     psd::standard36::{NativeRows, RowRequest, RowSource},
     raster::{backed::Region, Raster, Surface},
 };
-use std::{cell::Cell, fs, io::Seek, path::PathBuf};
+use std::{
+    cell::Cell,
+    fs,
+    io::{Read, Seek},
+    path::PathBuf,
+};
+
+#[test]
+fn streaming_standard_digest_matches_readback_after_short_spool_writes() {
+    struct ShortWrites(Vec<u8>);
+    impl Write for ShortWrites {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.write(&bytes[..bytes.len().min(3)])
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.0.flush()
+        }
+    }
+    let layer = b"native layer bytes";
+    let composite = b"native composite bytes";
+    let mut layers = ShortWrites(Vec::new());
+    let mut merged = ShortWrites(Vec::new());
+    let mut hash = bulk36::standard_hasher(layer.len() as u64, composite.len() as u64);
+    for (output, bytes) in [
+        (&mut layers, layer.as_slice()),
+        (&mut merged, composite.as_slice()),
+    ] {
+        StandardWriter {
+            output,
+            hash: &mut hash,
+        }
+        .write_all(bytes)
+        .unwrap();
+    }
+    assert_eq!(layers.0.as_slice(), layer);
+    assert_eq!(merged.0.as_slice(), composite);
+    let observed = bulk36::standard_digest(
+        &mut layers.0.as_slice(),
+        layer.len() as u64,
+        &mut merged.0.as_slice(),
+        composite.len() as u64,
+        &|| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(hash.finish().as_ref(), observed.as_slice());
+}
 
 struct Fixture {
     root: PathBuf,
@@ -350,7 +395,19 @@ fn actual_owned_small_native8_native16_psd_psb_driver_reopens_and_retires_comple
     ] {
         for depth in [8, 16] {
             let f = Fixture::new();
-            let doc = document(depth);
+            let mut doc = document(depth);
+            doc.psd_resolution = Some([1, 44, 128, 0, 0, 1, 0, 1, 1, 145, 64, 0, 0, 2, 0, 2]);
+            doc.psd_print_scale = Some(crate::psd::TEST_PRINT_SCALE);
+            doc.psd_pixel_aspect = Some(crate::psd::TEST_PIXEL_ASPECT);
+            doc.psd_grid = Some(crate::psd::TEST_GRID);
+            doc.psd_layer_id_seed = Some(crate::psd::TEST_LAYER_ID_SEED);
+            doc.psd_print_flags = Some(crate::psd::TEST_PRINT_FLAGS);
+            doc.psd_print_flags_info = Some(crate::psd::TEST_PRINT_FLAGS_INFO);
+            doc.psd_copyright = Some([u8::from(depth == 16)]);
+            doc.psd_file_info = Some(Arc::new(super::super::file_info::fixture()));
+            doc.psd_global_angle = Some(if depth == 16 { 359u32 } else { 0 }.to_be_bytes());
+            doc.psd_global_altitude = Some(if depth == 16 { 45u32 } else { 0 }.to_be_bytes());
+            doc.psd_intentionally_untagged = true;
             let scene = if native {
                 native_capture(&f, &doc)
             } else {
@@ -404,12 +461,35 @@ fn actual_owned_small_native8_native16_psd_psb_driver_reopens_and_retires_comple
                         &|| Ok(()),
                     )
                     .unwrap(),
-                structural::Limits::current(),
+                structural::Limits::source36(done.bytes(), 0).unwrap(),
                 || Ok(()),
             )
             .unwrap();
             assert_eq!(index.header.depth, depth);
             assert_eq!(index.header.height, 259);
+            let file_info = doc.psd_file_info.as_deref().unwrap();
+            assert!(super::super::file_info::matches_indexed(&source, &index, file_info, &|| Ok(())).unwrap());
+            assert!(!super::super::file_info::matches_indexed(&source, &index, &[], &|| Ok(())).unwrap());
+            for id in [1001, 1012, 1013, 1015, 1016, 1019, 1038, 1040, 1054, 1071, 1073, 1084, 1085] {
+                assert_eq!(index.resources.iter().filter(|resource| resource.id == id).count(), 1);
+            }
+            assert_eq!(crate::psd::indexed_resources(&source, &index, &|| Ok(())).unwrap(), crate::psd::DocumentResources {
+                resolution: doc.psd_resolution, scale: doc.psd_print_scale,
+                pixel_aspect: doc.psd_pixel_aspect,
+                grid: doc.psd_grid,
+                layer_id_seed: doc.psd_layer_id_seed,
+                print_flags: doc.psd_print_flags,
+                print_flags_info: doc.psd_print_flags_info,
+                copyright: doc.psd_copyright,
+                global_angle: doc.psd_global_angle,
+                global_altitude: doc.psd_global_altitude,
+                intentionally_untagged: true,
+            });
+            let mut extra = index.clone();
+            extra.resources.iter_mut().find(|resource| resource.id == crate::psd::RESOLUTION_RESOURCE_ID)
+                .unwrap().id = 1999;
+            assert!(crate::psd::indexed_resources(&source, &extra, &|| Ok(())).unwrap_err()
+                .contains("outside supported document metadata"));
             assert_eq!(index.layers[0].bounds, [-1, -2, 258, 3]);
             let mask = index.layers[0]
                 .channels
@@ -550,9 +630,18 @@ fn completed_save_recheck_refuses_replacement_and_never_regains_authority_after_
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
         assert!(!original.exists());
         done.recheck(&|| Ok(())).unwrap();
-        assert!(done
-            .recheck(&|| Err("Cancelled final source check".into()))
-            .is_err());
+        let checks = Cell::new(0);
+        assert_eq!(
+            done.recheck(&|| {
+                checks.set(checks.get() + 1);
+                if checks.get() == 3 {
+                    return Err("Cancelled final source check".into());
+                }
+                Ok(())
+            })
+            .unwrap_err(),
+            "Cancelled final source check"
+        );
     } else {
         fs::write(&named, b"foreign completed candidate").unwrap();
         assert!(done.recheck(&|| Ok(())).is_err());
@@ -683,6 +772,7 @@ pub(crate) fn with_session_candidate_join<R>(
         &session,
         &mut rows,
         limits(),
+        &|_, _, _| Ok(()),
         &|| Ok(()),
         &|| Ok(()),
     )
@@ -760,6 +850,7 @@ fn actual_profile_session_save_keeps_cursor_guard_and_retires_only_owned_spools_
         &session,
         &mut rows,
         limits(),
+        &|_, _, _| Ok(()),
         &|| Ok(()),
         &|| Ok(()),
     )
@@ -841,7 +932,8 @@ fn actual_owned_native_save_import_keeps_provisional_gate_and_exact_physical_sou
     use crate::psd::import36::{self, ProvisionalImport, QualifiedImport};
     for (depth, revoke_during_handoff) in [(8, false), (16, false), (16, true)] {
         let f = Fixture::new();
-        let doc = document(depth);
+        let mut doc = document(depth);
+        doc.psd_file_info = Some(Arc::new(super::super::file_info::fixture()));
         let scene = capture(&f, &doc);
         let (layers, composite, manifest, container) = f.roots();
         let mut rows = provider(&scene);
@@ -926,9 +1018,11 @@ fn actual_owned_native_save_import_keeps_provisional_gate_and_exact_physical_sou
             "import-codec-fixture".into(),
             import_limits,
             &|| Ok(()),
+            |_, _| Ok(()),
         )
         .unwrap();
         assert_eq!(provisional.scene().metadata().id(), doc.id);
+        assert_eq!(provisional.scene().metadata().psd_file_info(), doc.psd_file_info.as_deref().unwrap());
         assert_eq!(
             provisional
                 .scene()
@@ -984,7 +1078,9 @@ fn actual_owned_native_save_import_keeps_provisional_gate_and_exact_physical_sou
             )
             .unwrap();
         drop(imported_rows);
-        let qualified = ProvisionalImport::qualify(provisional, compared, &|| Ok(())).unwrap();
+        let qualified =
+            ProvisionalImport::qualify(provisional, compared, &|| Ok(()), &|_, _, _| Ok(()))
+                .unwrap();
         let invoked = Cell::new(false);
         let result = QualifiedImport::map_pending(
             qualified,
@@ -994,6 +1090,7 @@ fn actual_owned_native_save_import_keeps_provisional_gate_and_exact_physical_sou
                 }
                 Ok(())
             },
+            &|_, _, _| Ok(()),
             |pending, _| {
                 invoked.set(true);
                 Ok(pending)

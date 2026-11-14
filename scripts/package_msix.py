@@ -126,8 +126,9 @@ def package_version(version, revision=0, explicit=None, previous=None, developme
     if not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', version):
         raise ValueError('MSIX requires a stable three-part Cargo version; select an explicit release version')
     values = [int(v) for v in version.split('.')] + [revision]
-    # Store requires a nonzero major; preserve monotonicity across Cargo 0.x.
-    values[0] += 1
+    # The 0.4 series follows the published 0.30 series. Keep the native
+    # package version increasing so Store and App Installer can upgrade it.
+    values[0] += 2 if values[:2] == [0, 4] else 1
     if any(v < 0 or v > 65535 for v in values) or not any(values):
         raise ValueError('MSIX version components must be 0..65535 and not all zero')
     # Microsoft Store reserves the fourth part for Store processing.

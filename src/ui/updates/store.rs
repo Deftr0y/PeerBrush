@@ -1018,7 +1018,7 @@ mod tests {
         let history = |entries: &[crate::engine::History]| {
             entries.iter().map(|entry| serde_json::json!({"before":entry.before,"after":entry.after,"actor":entry.actor,"label":entry.label,"task":entry.task,"scopes":entry.scopes,"gesture":entry.gesture,"reverted":entry.reverted})).collect::<Vec<_>>()
         };
-        serde_json::json!({"doc":engine.doc,"png":engine.doc.export_png().unwrap(),"undo":history(&engine.undo),"redo":history(&engine.redo),"closed":engine.closed,"saved":engine.saved_revision,"path":engine.path})
+        serde_json::json!({"doc":engine.resident_state().expect("resident fixture").document,"png":engine.resident_state().expect("resident fixture").document.export_png().unwrap(),"undo":history(&engine.resident_state().expect("resident fixture").undo),"redo":history(&engine.resident_state().expect("resident fixture").redo),"closed":engine.closed,"saved":engine.saved_revision,"path":engine.path})
     }
 
     #[test]
@@ -1047,8 +1047,8 @@ mod tests {
             }));
             {
                 let mut engine = app.shared.lock().unwrap();
-                engine.doc = Document::new_depth(32, 24, depth).unwrap();
-                let paint = engine.doc.layers[0].id.clone();
+                engine.resident_state_mut().expect("resident fixture").document = Document::new_depth(32, 24, depth).unwrap();
+                let paint = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
                 let source = crate::source::Source {
                     width: 16,
                     height: 16,
@@ -1074,16 +1074,16 @@ mod tests {
                     .unwrap();
                 engine.edit("human", &[serde_json::json!({"op":"paint","layer":paint,"points":[[4,4]],"radius":2,"color":[233,84,32,255]})], None, None, "Human stroke").unwrap();
                 engine.undo("human").unwrap();
-                assert!(engine.doc.layers.iter().any(|layer| layer.source.is_some()));
+                assert!(engine.resident_state().expect("resident fixture").document.layers.iter().any(|layer| layer.source.is_some()));
                 if depth == 16 {
-                    assert!(engine.doc.layers.iter().any(|layer| layer
+                    assert!(engine.resident_state().expect("resident fixture").document.layers.iter().any(|layer| layer
                         .pixels
                         .rgba16()
                         .chunks_exact(4)
                         .any(|pixel| pixel[..3].iter().any(|value| value % 257 != 0))));
                 }
-                assert_eq!((engine.undo.len(), engine.redo.len()), (1, 1));
-                let png = engine.doc.export_png().unwrap();
+                assert_eq!((engine.resident_state().expect("resident fixture").undo.len(), engine.resident_state().expect("resident fixture").redo.len()), (1, 1));
+                let png = engine.resident_state().expect("resident fixture").document.export_png().unwrap();
                 assert_eq!(
                     image::load_from_memory(&png).unwrap().color(),
                     if depth == 16 {

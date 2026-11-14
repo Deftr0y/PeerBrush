@@ -266,6 +266,42 @@ fn intersects(p: [f64; 2], q: [f64; 2], r: [f64; 2], s: [f64; 2]) -> bool {
 }
 
 impl Mapping {
+    fn inverse_bounds(&self, [l, t, r, b]: [f64; 4]) -> Option<[f64; 4]> {
+        let mut bounds: Option<[f64; 4]> = None;
+        for triangle in self.triangles {
+            let [left, top, right, bottom] = extrema(&triangle.target);
+            // The inverse accepts points just beyond triangle edges, then clamps
+            // their weights. Include that tolerance and roundoff in the box.
+            let [left, top, right, bottom] = [
+                l.max(left - 0.01),
+                t.max(top - 0.01),
+                r.min(right + 0.01),
+                b.min(bottom + 0.01),
+            ];
+            if left > right || top > bottom {
+                continue;
+            }
+            let weights = [[left, top], [left, bottom], [right, top], [right, bottom]]
+                .map(|point| Triangle::weights(triangle.target, point));
+            let [u0, v0, u1, v1] = extrema(&weights);
+            let u = [(u0 - 1e-6).clamp(0., 1.), (u1 + 1e-6).clamp(0., 1.)];
+            let v = [
+                (v0 - 1e-6).clamp(0., 1.).min(1. - u[1]),
+                (v1 + 1e-6).clamp(0., 1.).min(1. - u[0]),
+            ];
+            let [sl, st, sr, sb] = extrema(&[
+                Triangle::at(triangle.source, [u[0], v[0]]),
+                Triangle::at(triangle.source, [u[0], v[1]]),
+                Triangle::at(triangle.source, [u[1], v[0]]),
+                Triangle::at(triangle.source, [u[1], v[1]]),
+            ]);
+            bounds = Some(bounds.map_or([sl, st, sr, sb], |prior| {
+                [prior[0].min(sl), prior[1].min(st), prior[2].max(sr), prior[3].max(sb)]
+            }));
+        }
+        bounds
+    }
+
     pub(crate) fn covers(&self, b: [f64; 4]) -> Result<(), String> {
         if b.iter().any(|n| !n.is_finite())
             || b[0] >= b[2]
@@ -461,6 +497,21 @@ impl Placement {
             b = s.grid.bounds(s.before.bounds(b)?)?;
         }
         self.after.bounds(b)
+    }
+    /// A checked empty footprint is Some(None). Uncertain bounds require sampling.
+    pub(crate) fn inverse_bounds(&self, bounds: [f64; 4]) -> Option<Option<[f64; 4]>> {
+        let mut bounds = self.inverse.sampling_bounds(bounds)?;
+        for stage in self.stages.iter().rev() {
+            let Some([l, t, r, b]) = stage.grid.inverse_bounds(bounds) else {
+                return Some(None);
+            };
+            bounds = stage.inverse.sampling_bounds([l - 0.01, t - 0.01, r + 0.01, b + 0.01])?;
+        }
+        Some(Some(bounds.map(|value| value - 0.5)))
+    }
+
+    pub(crate) fn sample_cost(&self) -> u64 {
+        1 + self.stages.len() as u64 * 9
     }
     pub(crate) fn source(&self, point: [f64; 2]) -> Option<[f64; 2]> {
         let mut p = self.inverse.point(point).ok()?;

@@ -1,13 +1,59 @@
 //! Production settings and preview remain outside document state and history.
 use super::*;
 use crate::production_export::{
-    self as export, jobs::Existing, Control, Crop, DuplicateNames, Format, Resampling, Settings,
+    self as export, jobs::Existing, Control, Crop, DuplicateNames, Format, Settings,
     Variant,
 };
 use std::time::Instant;
-struct Pending {
-    key: String,
-    control: Control,
+
+const PREVIEW_DELAY: Duration = Duration::from_millis(150);
+const BATCH_REFRESH: Duration = Duration::from_millis(40);
+
+fn filename_template(ui: &mut egui::Ui, template: &mut String) {
+    let label = ui.label("Filename template");
+    let mut input = egui::TextEdit::singleline(template)
+        .desired_width(ui.available_width())
+        .show(ui);
+    input.response.labelled_by(label.id);
+    let mut insert = None;
+    ui.horizontal_wrapped(|ui| {
+        for (icon, label, token, help) in [
+            (Icon::CanvasBounds, "Document", "{document}", "Insert the document name."),
+            (Icon::SingleLayer, "Layer", "{layer}", "Insert the output layer or folder name."),
+            (Icon::Scale, "Size variant", "{variant}", "Insert the name of the output size variant."),
+        ] {
+            if icons::labeled_choice(ui, icon, label, None, 0.)
+                .on_hover_text(help)
+                .clicked()
+            {
+                insert = Some(token);
+            }
+        }
+    });
+    if let Some(token) = insert {
+        let count = template.chars().count();
+        let [start, end] = input.cursor_range.map_or([count; 2], |range| {
+            let a = range.primary.index.min(count);
+            let b = range.secondary.index.min(count);
+            [a.min(b), a.max(b)]
+        });
+        let offset = |index| template.char_indices().nth(index).map_or(template.len(), |(i, _)| i);
+        let bytes = offset(start)..offset(end);
+        template.replace_range(bytes, token);
+        use egui::text::{CCursor, CCursorRange};
+        input.state.cursor.set_char_range(Some(CCursorRange::one(CCursor::new(start + token.len()))));
+        input.state.store(ui.ctx(), input.response.id);
+        input.response.request_focus();
+        ui.ctx().request_repaint();
+    }
+}
+
+struct PreviewSource {
+    document: export::ObservedDocument,
+    name: String,
+    settings: Settings,
+    selected_only: bool,
+    targets: Vec<String>,
 }
 
 pub(super) struct Editor {
@@ -22,51 +68,74 @@ pub(super) struct Editor {
     preset: Option<String>,
     name: String,
     error: Option<String>,
-    desired: String,
+    preview_source: Option<PreviewSource>,
     changed_at: Instant,
-    pending: Option<Pending>,
+    pending: Option<Control>,
     preview: Option<TextureHandle>,
     preview_output: Option<export::Output>,
-    tx: mpsc::Sender<(String, Result<Value, String>)>,
-    rx: mpsc::Receiver<(String, Result<Value, String>)>,
-    folder_tx: mpsc::Sender<Option<PathBuf>>,
-    folder_rx: mpsc::Receiver<Option<PathBuf>>,
+    preview_plan: Option<Arc<export::DesktopPlan>>,
+    preview_index: usize,
+    preview_choice: Option<(Option<String>, String)>,
+    preview_encoded_bytes: Option<usize>,
+    tx: mpsc::Sender<Result<export::DesktopPreview, String>>,
+    rx: mpsc::Receiver<Result<export::DesktopPreview, String>>,
+    folder_tx: mpsc::Sender<Result<Option<PathBuf>, String>>,
+    folder_rx: mpsc::Receiver<Result<Option<PathBuf>, String>>,
     folder_pending: bool,
+    folder_error: Option<String>,
     pub(super) start_rect: Option<Rect>,
     pub(super) save_rect: Option<Rect>,
 }
 impl Drop for Editor {
     fn drop(&mut self) {
         if let Some(pending) = &self.pending {
-            pending.control.cancel();
+            pending.cancel();
         }
     }
 }
 impl Editor {
+    fn targets(&self) -> &[String] {
+        if self.selected_only {
+            &self.targets
+        } else {
+            &[]
+        }
+    }
+    #[cfg(test)]
     fn source<'a>(&self, doc: impl Into<DocumentView<'a>>) -> Value {
         let doc = doc.into();
-        let targets = if self.selected_only {
-            self.targets.clone()
-        } else {
-            vec![]
-        };
-        json!({"action":"preview","project_id":self.project,"document_id":doc.id(),"expected_revision":doc.revision(),"settings":self.settings,"targets":targets,"max_edge":512})
+        json!({"action":"preview","project_id":self.project,"document_id":doc.id(),"expected_revision":doc.revision(),"settings":self.settings,"targets":self.targets(),"output_index":self.preview_index,"max_edge":512})
     }
-    fn sync_preview<'a>(&mut self, doc: impl Into<DocumentView<'a>>) -> Value {
-        let doc = doc.into();
-        let source = self.source(doc);
-        let desired = json!({"request":source,"document_name":doc.name()}).to_string();
-        if desired != self.desired {
-            self.desired = desired;
-            self.changed_at = Instant::now();
-            self.preview = None;
-            self.preview_output = None;
-            self.error = None;
-            if let Some(pending) = &self.pending {
-                pending.control.cancel();
-            }
+    fn sync_preview(&mut self, doc: DocumentView<'_>) {
+        if self.preview_source.as_ref().is_some_and(|source| {
+            source.document.observes(doc)
+                && source.name == doc.name()
+                && source.settings == self.settings
+                && source.selected_only == self.selected_only
+                && source.targets.as_slice() == self.targets()
+        }) {
+            return;
         }
-        source
+        self.preview_source = Some(PreviewSource {
+            document: export::ObservedDocument::new(doc),
+            name: doc.name().into(),
+            settings: self.settings.clone(),
+            selected_only: self.selected_only,
+            targets: self.targets().to_vec(),
+        });
+        self.preview_plan = None;
+        self.preview_index = 0;
+        self.clear_preview();
+    }
+    fn clear_preview(&mut self) {
+        self.changed_at = Instant::now();
+        self.preview = None;
+        self.preview_output = None;
+        self.preview_encoded_bytes = None;
+        self.error = None;
+        if let Some(pending) = &self.pending {
+            pending.cancel();
+        }
     }
 }
 impl PeerBrush {
@@ -93,16 +162,21 @@ impl PeerBrush {
             preset: None,
             name: "Production".into(),
             error: None,
-            desired: String::new(),
+            preview_source: None,
             changed_at: Instant::now(),
             pending: None,
             preview: None,
             preview_output: None,
+            preview_plan: None,
+            preview_index: 0,
+            preview_choice: None,
+            preview_encoded_bytes: None,
             tx,
             rx,
             folder_tx,
             folder_rx,
             folder_pending: false,
+            folder_error: None,
             start_rect: None,
             save_rect: None,
         });
@@ -131,56 +205,43 @@ impl PeerBrush {
         editor.sync_preview(doc);
         while let Ok(folder) = editor.folder_rx.try_recv() {
             editor.folder_pending = false;
-            if let Some(folder) = folder {
-                editor.directory = folder.to_string_lossy().into();
+            match folder {
+                Ok(Some(folder)) => editor.directory = folder.to_string_lossy().into(),
+                Ok(None) => {}
+                Err(error) => editor.folder_error = Some(error),
             }
         }
-        while let Ok((key, result)) = editor.rx.try_recv() {
-            if editor
-                .pending
-                .as_ref()
-                .is_some_and(|pending| pending.key == key)
-            {
-                editor.pending = None;
-            }
-            if key != editor.desired {
+        while let Ok(result) = editor.rx.try_recv() {
+            // Each panel has its own channel and only starts a worker after the previous reply.
+            let Some(pending) = editor.pending.take() else {
+                continue;
+            };
+            // Returning to the same settings does not revive a canceled request.
+            if pending.check().is_err() {
                 continue;
             }
+            let result = result.and_then(|reply| {
+                editor.preview_index = reply.index;
+                editor.preview_choice = reply.plan.outputs().get(reply.index)
+                    .map(|output| (output.target.clone(), output.variant.clone()));
+                editor.preview_plan = Some(reply.plan);
+                reply.pixels
+            });
             match result {
-                Ok(result) => {
-                    let loaded = (|| -> Result<(TextureHandle, export::Output), String> {
-                        use base64::Engine as _;
-                        let image = &result["images"][0];
-                        let bytes = base64::engine::general_purpose::STANDARD
-                            .decode(
-                                image["data"]
-                                    .as_str()
-                                    .ok_or("Export preview pixels missing")?,
-                            )
-                            .map_err(|e| e.to_string())?;
-                        let image = image::load_from_memory(&bytes)
-                            .map_err(|e| e.to_string())?
-                            .into_rgba8();
-                        let texture = ctx.load_texture(
-                            "production export preview",
-                            egui::ColorImage::from_rgba_unmultiplied(
-                                [image.width() as usize, image.height() as usize],
-                                image.as_raw(),
-                            ),
-                            egui::TextureOptions::LINEAR,
-                        );
-                        let output = serde_json::from_value(result["plan"]["outputs"][0].clone())
-                            .map_err(|e| e.to_string())?;
-                        Ok((texture, output))
-                    })();
-                    match loaded {
-                        Ok((texture, output)) => {
-                            editor.preview = Some(texture);
-                            editor.preview_output = Some(output);
-                            editor.error = None;
-                        }
-                        Err(error) => editor.error = Some(error),
-                    }
+                Ok(pixels) => {
+                    editor.preview_encoded_bytes = pixels.encoded_bytes;
+                    editor.preview = Some(ctx.load_texture(
+                        "production export preview",
+                        egui::ColorImage::from_rgba_unmultiplied(
+                            [pixels.width as usize, pixels.height as usize],
+                            &pixels.rgba,
+                        ),
+                        egui::TextureOptions::LINEAR,
+                    ));
+                    editor.preview_output = editor.preview_plan.as_ref()
+                        .and_then(|plan| plan.outputs().get(editor.preview_index))
+                        .cloned();
+                    editor.error = None;
                 }
                 Err(error) => editor.error = Some(error),
             }
@@ -200,40 +261,54 @@ impl PeerBrush {
         let mut cancel = false;
         egui::Window::new("Production export").id(egui::Id::new("production export")).open(&mut open).collapsible(false).default_width(800.).show(ctx,|ui| {
             ui.label(RichText::new(doc.name()).strong());
-            ui.horizontal(|ui| {
-                ui.label("Format");
-                ui.selectable_value(&mut editor.settings.format,Format::Png,"PNG");
-                ui.selectable_value(&mut editor.settings.format,Format::Jxl,"JPEG XL");
-                ui.selectable_value(&mut editor.settings.format,Format::Webp,"WebP · lossless 8-bit");
+            ui.horizontal_wrapped(|ui| {
+                controls::label(ui, "Format");
+                for (format, label, help) in [
+                    (Format::Png, "PNG", "Lossless PNG at the project’s channel depth."),
+                    (Format::Jxl, "JPEG XL", "Lossless or lossy JPEG XL at the project’s channel depth."),
+                    (Format::Webp, "WebP · lossless 8-bit", "Lossless WebP with 8-bit output channels."),
+                ] {
+                    ui.selectable_value(&mut editor.settings.format, format, label).on_hover_text(help);
+                }
             });
-            ui.label(format!("{} · {}",match editor.settings.format {
-                Format::Png=>format!("Native {}-bit output",doc.depth()),
-                Format::Jxl=>format!("Native {}-bit JPEG XL output",doc.depth()),
-                Format::Webp=>format!("8-bit output · {}-bit project unchanged",doc.depth()),
-            },if editor.settings.format == Format::Jxl {
-                if doc.profile().is_none() && !doc.srgb_tagged() { "Untagged RGB encoded as sRGB" }
-                else if editor.settings.jxl.lossless { "ICC retained" }
-                else { "Decoded output may convert to sRGB" }
-            } else if doc.profile().is_some()||doc.srgb_tagged() { "ICC retained" } else { "untagged working RGB" }));
             if editor.settings.format == Format::Jxl {
                 ui.horizontal_wrapped(|ui| {
-                    ui.checkbox(&mut editor.settings.jxl.lossless, "Lossless");
-                    if !editor.settings.jxl.lossless {
-                        ui.label("Distance");
-                        controls::range(ui, "JPEG XL distance", &mut editor.settings.jxl.distance,
-                            0.1..=15., 110., "", 1, false);
+                    controls::label(ui, "Compression");
+                    for (lossless, icon, label, help) in [
+                        (true, Icon::PreserveSamples, "Lossless", "Preserve every output sample."),
+                        (false, Icon::QuantizeSamples, "Lossy", "Allow changes to color samples for a smaller file. Alpha stays lossless."),
+                    ] {
+                        if icons::labeled_choice(ui, icon, label, Some(editor.settings.jxl.lossless == lossless), 0.)
+                            .on_hover_text(help).clicked()
+                        {
+                            editor.settings.jxl.lossless = lossless;
+                        }
                     }
-                    ui.label("Effort");
+                    if !editor.settings.jxl.lossless {
+                        controls::label(ui, "Distance");
+                        controls::range(ui, "JPEG XL distance", &mut editor.settings.jxl.distance,
+                            0.1..=15., 110., "", 1, true)
+                            .on_hover_text("Lower distance preserves more detail. Double-click to enter an exact value.");
+                    }
+                    controls::label(ui, "Effort");
                     let mut effort = editor.settings.jxl.effort as f32;
                     if controls::range(ui, "JPEG XL effort", &mut effort, 1.0..=9.,
-                        95., "", 0, false).changed() {
+                        95., "", 0, false)
+                        .on_hover_text("Higher effort takes longer and can reduce file size. Double-click to enter an exact value.")
+                        .changed() {
                         editor.settings.jxl.effort = effort.round() as u32;
                     }
                 });
-                if !editor.settings.jxl.lossless {
-                    ui.label(RichText::new("Lower distance preserves more detail. Alpha stays lossless.").small().color(MUTED));
-                }
             }
+            let output_depth = if editor.settings.format == Format::Webp { 8 } else { doc.depth() };
+            let tagged = doc.profile().is_some() || doc.srgb_tagged();
+            let profile = match editor.settings.format {
+                Format::Jxl if !tagged => "Untagged RGB encoded as sRGB",
+                Format::Jxl if !editor.settings.jxl.lossless => "Decoded output may convert to sRGB",
+                _ if tagged => "ICC retained",
+                _ => "Untagged working RGB",
+            };
+            ui.label(format!("{output_depth}-bit output · {profile}"));
             if !valid {
                 ui.label(RichText::new("The document source changed. Settings are retained; choose the current document before exporting.").color(ACCENT));
                 if ui.button("Use current document").clicked(){editor.document=doc.id().to_owned();editor.targets=self.selected_layer_ids(doc);editor.selected_only=false;}
@@ -244,16 +319,25 @@ impl PeerBrush {
                     for preset in &snapshot.presets {if ui.selectable_label(editor.preset.as_ref()==Some(&preset.id),&preset.name).clicked(){editor.preset=Some(preset.id.clone());editor.name=preset.name.clone();editor.settings=preset.settings.clone();}}
                 });
                 if !snapshot.actor.is_empty() && snapshot.actor!="human" {ui.label(RichText::new("AI updated presets").color(AI_BLUE));}
-                ui.text_edit_singleline(&mut editor.name);
+                let name = ui.label("Preset name");
+                ui.add(egui::TextEdit::singleline(&mut editor.name).desired_width(140.))
+                    .labelled_by(name.id);
                 let response=ui.add_enabled(snapshot.error.is_none(),egui::Button::new("Save preset"));editor.save_rect=Some(response.rect);save=response.clicked();
                 delete=ui.add_enabled(editor.preset.is_some()&&snapshot.error.is_none(),egui::Button::new("Delete preset")).clicked();
             });
             if let Some(error)=&snapshot.error {ui.label(RichText::new(error).color(ACCENT));}
             ui.columns(2,|columns|{
                 let ui=&mut columns[0];
-                ui.horizontal(|ui|{
-                    ui.selectable_value(&mut editor.selected_only,false,"Document composite");
-                    if ui.add_enabled(!doc.read_only(),egui::Button::new("Selected layers/folders").selected(editor.selected_only)).clicked(){editor.selected_only=true;editor.targets=self.selected_layer_ids(doc);}
+                ui.horizontal_wrapped(|ui| {
+                    if icons::labeled_choice(ui, Icon::CanvasBounds, "Document composite", Some(!editor.selected_only), 0.).clicked() {
+                        editor.selected_only = false;
+                    }
+                    if ui.add_enabled_ui(!doc.read_only(), |ui| {
+                        icons::labeled_choice(ui, Icon::LayerStack, "Selected layers/folders", Some(editor.selected_only), 0.)
+                    }).inner.clicked() {
+                        editor.selected_only = true;
+                        editor.targets = self.selected_layer_ids(doc);
+                    }
                 });
                 if editor.selected_only {
                     if ui.button("Use current layer selection").clicked(){editor.targets=self.selected_layer_ids(doc);}
@@ -261,33 +345,118 @@ impl PeerBrush {
                     for id in roots {if let Some(layer)=doc.find_layer(&id){ui.label(layer.name());}}
                     ui.label(RichText::new("Isolated on transparency. Ancestor folders and document filters are excluded; a clipped layer needs its containing folder.").small().color(MUTED));
                 } else {ui.label(RichText::new("Current composite, including document filters.").small().color(MUTED));}
-                ui.label("Filename · {document} / {layer} / {variant}");ui.text_edit_singleline(&mut editor.settings.template);
-                ui.horizontal(|ui|{
-                    ui.selectable_value(&mut editor.settings.crop,Crop::Canvas,"Canvas bounds");ui.selectable_value(&mut editor.settings.crop,Crop::Alpha,"Trim transparency");
+                filename_template(ui, &mut editor.settings.template);
+                ui.horizontal_wrapped(|ui| {
+                    controls::label(ui, "Bounds");
+                    for (crop, icon, label, help) in [
+                        (Crop::Canvas, Icon::CanvasBounds, "Canvas bounds", "Keep the entire canvas."),
+                        (Crop::Alpha, Icon::TrimAlpha, "Trim transparency", "Crop to the visible pixels."),
+                    ] {
+                        let selected = Some(editor.settings.crop == crop);
+                        if icons::labeled_choice(ui, icon, label, selected, 0.).on_hover_text(help).clicked() {
+                            editor.settings.crop = crop;
+                        }
+                    }
                 });
                 ui.horizontal(|ui|{
                     ui.label("Padding");let mut padding=editor.settings.padding as f32;
                     if controls::range(ui,"export padding",&mut padding,0.0..=4096.,130.," px",0,false).changed(){editor.settings.padding=padding.round() as u32;}
                 });
-                ui.horizontal_wrapped(|ui|{
-                    egui::ComboBox::from_id_salt("export sampling").selected_text(match editor.settings.resampling {Resampling::Nearest=>"Nearest sampling",Resampling::Bilinear=>"Bilinear sampling"}).show_ui(ui,|ui|{
-                        ui.selectable_value(&mut editor.settings.resampling,Resampling::Nearest,"Nearest sampling");ui.selectable_value(&mut editor.settings.resampling,Resampling::Bilinear,"Bilinear sampling");
-                    });
-                    egui::ComboBox::from_id_salt("export duplicate names").selected_text(match editor.settings.duplicate_names {DuplicateNames::Error=>"Stop on duplicate names",DuplicateNames::Number=>"Number duplicate names"}).show_ui(ui,|ui|{
-                        ui.selectable_value(&mut editor.settings.duplicate_names,DuplicateNames::Error,"Stop on duplicate names");ui.selectable_value(&mut editor.settings.duplicate_names,DuplicateNames::Number,"Number duplicate names");
-                    });
+                ui.horizontal_wrapped(|ui| {
+                    controls::label(ui, "Sampling");
+                    if let Some((method, _)) = controls::sampling_choices(ui, editor.settings.resampling) {
+                        editor.settings.resampling = method;
+                    }
                 });
-                ui.label("Size variants");let mut remove=None;
-                for (index,variant) in editor.settings.variants.iter_mut().enumerate() {ui.push_id(index,|ui|{ui.horizontal(|ui|{
-                    ui.add(egui::TextEdit::singleline(&mut variant.name).desired_width(130.));let mut scale=variant.scale as f32;
-                    if controls::range(ui,"export scale",&mut scale,0.01..=8.,120.,"×",3,true).changed(){variant.scale=f64::from(scale);}
-                    if ui.small_button("×").clicked(){remove=Some(index);}
-                });});}
-                if let Some(index)=remove {if editor.settings.variants.len()>1 {editor.settings.variants.remove(index);}}
+                ui.horizontal_wrapped(|ui| {
+                    controls::label(ui, "Duplicate names");
+                    for (policy, icon, label, help) in [
+                        (DuplicateNames::Error, Icon::Stop, "Stop on duplicates", "Stop if two planned outputs resolve to the same filename."),
+                        (DuplicateNames::Number, Icon::NumberedList, "Number duplicates", "Give each planned output a unique filename by adding a number."),
+                    ] {
+                        let selected = Some(editor.settings.duplicate_names == policy);
+                        if icons::labeled_choice(ui, icon, label, selected, 0.).on_hover_text(help).clicked() {
+                            editor.settings.duplicate_names = policy;
+                        }
+                    }
+                });
+                ui.label("Size variants");
+                let mut remove = None;
+                let can_remove_variant = editor.settings.variants.len() > 1;
+                for (index, variant) in editor.settings.variants.iter_mut().enumerate() {
+                    ui.push_id(index, |ui| ui.horizontal_wrapped(|ui| {
+                        ui.add(egui::TextEdit::singleline(&mut variant.name).desired_width(130.));
+                        let mut scale = variant.scale as f32;
+                        let scale_control = controls::range(ui, "export scale", &mut scale, 0.01..=8., 120., "×", 3, true)
+                            .on_hover_text("Drag to resize the output. Double-click to enter an exact scale.");
+                        let label = format!("Scale for size variant {}", index + 1);
+                        if scale_control.changed() {
+                            variant.scale = f64::from(scale);
+                        }
+                        scale_control.widget_info(|| egui::WidgetInfo::slider(scale_control.enabled(), variant.scale, &label));
+                        if ui.add_enabled_ui(can_remove_variant, |ui| {
+                            icons::small_button(ui, Icon::Trash, &format!("Remove size variant {}", index + 1))
+                        }).inner.clicked() {
+                            remove = Some(index);
+                        }
+                    }));
+                }
+                if let Some(index) = remove { editor.settings.variants.remove(index); }
                 if ui.add_enabled(editor.settings.variants.len()<12,egui::Button::new("Add size variant")).clicked(){let count=editor.settings.variants.len()+1;editor.settings.variants.push(Variant {name:format!("size-{count}"),scale:1.});}
                 editor.sync_preview(doc);
                 let ui=&mut columns[1];
                 ui.label("Actual output preview");
+                if let Some(plan) = &editor.preview_plan {
+                    let outputs = plan.outputs();
+                    if outputs.len() > 1 {
+                        let mut index = editor.preview_index;
+                        let label = |i: usize| format!("{}. {}", i + 1, outputs[i].filename);
+                        ui.horizontal(|ui| {
+                            let previous = ui.add_enabled_ui(index > 0, |ui| {
+                                icons::small_button(ui, Icon::Left, "Previous output")
+                            }).inner;
+                            if previous.clicked() {
+                                index -= 1;
+                            }
+                            let width = (ui.available_width() - ui.spacing().item_spacing.x - 20.)
+                                .clamp(60., 320.);
+                            let menu = ui.allocate_ui_with_layout(
+                                Vec2::new(width, ui.spacing().interact_size.y),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| egui::ComboBox::from_id_salt("export preview output")
+                                    .width(width)
+                                    .truncate()
+                                    .selected_text(label(index))
+                                    .show_ui(ui, |ui| {
+                                        for (i, output) in outputs.iter().enumerate() {
+                                            ui.selectable_value(&mut index, i, label(i)).on_hover_text(
+                                                format!("{} · {} × {} px", output.target_name, output.width, output.height),
+                                            );
+                                        }
+                                    }),
+                            ).inner;
+                            menu.response.widget_info(|| {
+                                let mut info = egui::WidgetInfo::labeled(
+                                    egui::WidgetType::ComboBox, menu.response.enabled(), "Preview output",
+                                );
+                                info.current_text_value = Some(label(index));
+                                info
+                            });
+                            menu.response.on_hover_text(label(index));
+                            let next = ui.add_enabled_ui(index + 1 < outputs.len(), |ui| {
+                                icons::small_button(ui, Icon::Right, "Next output")
+                            }).inner;
+                            if next.clicked() {
+                                index += 1;
+                            }
+                        });
+                        if index != editor.preview_index {
+                            editor.preview_index = index;
+                            editor.preview_choice = Some((outputs[index].target.clone(), outputs[index].variant.clone()));
+                            editor.clear_preview();
+                        }
+                    }
+                }
                 if let Some(texture)=&editor.preview {
                     let size=texture.size_vec2();let scale=(ui.available_width()/size.x).min(250./size.y).min(1.);
                     let (rect,_)=ui.allocate_exact_size(size*scale,egui::Sense::hover());
@@ -298,7 +467,12 @@ impl PeerBrush {
                     ui.painter().image(texture.id(),rect,Rect::from_min_max(Pos2::ZERO,Pos2::new(1.,1.)),Color32::WHITE);
                 } else if editor.pending.is_some() {ui.spinner();ui.label("Rendering native source…");}
                 if let Some(output)=&editor.preview_output {
-                    ui.label(&output.filename);ui.label(format!("{} × {} · {} bit",output.width,output.height,output.bit_depth));
+                    ui.label(&output.filename);
+                    let mut details = format!("{} × {} · {} bit", output.width, output.height, output.bit_depth);
+                    if let Some(bytes) = editor.preview_encoded_bytes {
+                        details.push_str(&format!(" · {bytes} bytes"));
+                    }
+                    ui.label(details);
                     ui.label(format!("Document bounds: {}, {} → {}, {}",output.document_rect[0],output.document_rect[1],output.document_rect[2],output.document_rect[3]));
                 }
                 if let Some(state)=&run {
@@ -308,15 +482,51 @@ impl PeerBrush {
                     egui::ScrollArea::vertical().id_salt("export receipts").max_height(160.).show(ui,|ui|{for receipt in &state.outputs {ui.label(format!("{} · {}",receipt.output.filename,receipt.status));if let Some(message)=&receipt.message {ui.label(RichText::new(message).small().color(MUTED));}}});
                 }
             });
-            ui.horizontal(|ui|{
-                ui.label("Output folder");ui.text_edit_singleline(&mut editor.directory);
-                if ui.add_enabled(!editor.folder_pending,egui::Button::new("Choose…")).clicked(){editor.folder_pending=true;let tx=editor.folder_tx.clone();let ctx=ctx.clone();std::thread::spawn(move||{let folder=rfd::FileDialog::new().pick_folder();let _=tx.send(folder);ctx.request_repaint();});}
+            ui.horizontal_wrapped(|ui| {
+                let label = ui.label("Output folder");
+                let path = ui.add(egui::TextEdit::singleline(&mut editor.directory).interactive(!editor.folder_pending))
+                    .labelled_by(label.id);
+                if path.changed() {
+                    editor.folder_error = None;
+                }
+                if ui.add_enabled_ui(!editor.folder_pending, |ui| {
+                    icons::labeled_choice(ui, Icon::Folder, "Choose folder…", None, 0.)
+                }).inner.clicked() {
+                    editor.folder_pending = true;
+                    editor.folder_error = None;
+                    let tx = editor.folder_tx.clone();
+                    let ctx = ctx.clone();
+                    let picker = std::thread::Builder::new().name("peerbrush-export-folder".into()).spawn(move || {
+                        let folder = std::panic::catch_unwind(|| rfd::FileDialog::new().pick_folder())
+                            .map_err(|_| "The folder picker could not complete".to_owned());
+                        if tx.send(folder).is_ok() {
+                            ctx.request_repaint();
+                        }
+                    });
+                    if let Err(error) = picker {
+                        editor.folder_pending = false;
+                        editor.folder_error = Some(format!("Could not open the folder picker: {error}"));
+                    }
+                }
             });
-            ui.horizontal(|ui|{
-                egui::ComboBox::from_id_salt("existing export files").selected_text(match editor.existing {Existing::Error=>"Stop on existing files",Existing::Skip=>"Skip existing files",Existing::Replace=>"Replace existing files"}).show_ui(ui,|ui|{
-                    ui.selectable_value(&mut editor.existing,Existing::Error,"Stop on existing files");ui.selectable_value(&mut editor.existing,Existing::Skip,"Skip existing files");ui.selectable_value(&mut editor.existing,Existing::Replace,"Replace existing files");
-                });
-                let button=ui.add_enabled(valid&&!running&&!self.busy&&!editor.directory.trim().is_empty(),egui::Button::new("Export batch"));editor.start_rect=Some(button.rect);start=button.clicked();
+            if let Some(error) = &editor.folder_error {
+                ui.colored_label(ACCENT, error);
+            }
+            ui.horizontal_wrapped(|ui| {
+                controls::label(ui, "Existing files");
+                for (choice, icon, label, help) in [
+                    (Existing::Error, Icon::Stop, "Stop", "Stop the batch when an output file already exists."),
+                    (Existing::Skip, Icon::Skip, "Skip", "Keep the existing file and continue with the next output."),
+                    (Existing::Replace, Icon::Swap, "Replace", "Replace the existing file and keep a recovery copy."),
+                ] {
+                    let selected = Some(editor.existing == choice);
+                    if icons::labeled_choice(ui, icon, label, selected, 0.).on_hover_text(help).clicked() {
+                        editor.existing = choice;
+                    }
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                let button=ui.add_enabled(valid&&!running&&!self.busy&&!editor.folder_pending&&!editor.directory.trim().is_empty(),egui::Button::new("Export batch"));editor.start_rect=Some(button.rect);start=button.clicked();
                 cancel=ui.add_enabled(running,egui::Button::new("Cancel batch")).clicked();
                 ui.label(RichText::new("Completed exports are retained when a batch stops. Sources stay editable.").small().color(MUTED));
             });
@@ -350,26 +560,24 @@ impl PeerBrush {
                 }
             }
         }
-        let targets = if editor.selected_only {
-            editor.targets.clone()
-        } else {
-            vec![]
-        };
-        let source = editor.sync_preview(doc);
-        let desired = editor.desired.clone();
-        if editor.selected_only && targets.is_empty() {
+        let missing_targets = editor.selected_only && editor.targets().is_empty();
+        if missing_targets {
             editor.error = Some("Select layers or folders before exporting".into());
         }
-        if start && (!editor.selected_only || !targets.is_empty()) {
-            let mut request = source.clone();
-            request["action"] = json!("start");
-            request["actor"] = json!("human");
-            request["directory"] = json!(editor.directory);
-            request["existing"] = json!(editor.existing);
-            match server::dispatch(&self.shared, "exports", &request) {
+        if start && !missing_targets {
+            match export::desktop_start(
+                &self.shared,
+                &editor.project,
+                &export::ObservedDocument::new(doc),
+                editor.settings.clone(),
+                editor.targets().to_vec(),
+                PathBuf::from(&editor.directory),
+                editor.existing,
+            ) {
                 Ok(state) => {
-                    editor.run = state["run"].as_str().map(String::from);
+                    editor.run = Some(state.run);
                     editor.error = None;
+                    ctx.request_repaint_after(BATCH_REFRESH);
                 }
                 Err(error) => editor.error = Some(error),
             }
@@ -385,40 +593,54 @@ impl PeerBrush {
                 }
             }
         }
-        if open
+        let needs_preview = open
             && valid
             && editor.pending.is_none()
             && editor.preview.is_none()
-            && editor.error.is_none()
-            && editor.changed_at.elapsed().as_secs_f32() > 0.15
-        {
+            && editor.error.is_none();
+        let preview_wait = PREVIEW_DELAY.saturating_sub(editor.changed_at.elapsed());
+        if needs_preview && preview_wait.is_zero() {
             let control = Control::default();
-            editor.pending = Some(Pending {
-                key: desired.clone(),
-                control: control.clone(),
-            });
+            let worker_control = control.clone();
+            let project = editor.project.clone();
+            let document = export::ObservedDocument::new(doc);
+            let output = match &editor.preview_plan {
+                Some(plan) => export::PreviewOutput::Planned(plan.clone(), editor.preview_index),
+                None => export::PreviewOutput::Plan(
+                    editor.targets().to_vec(), editor.settings.clone(), editor.preview_choice.clone(),
+                ),
+            };
             let shared = self.shared.clone();
             let tx = editor.tx.clone();
             let ctx = ctx.clone();
-            std::thread::spawn(move || {
+            let worker = move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    export::request_with_control(&shared, &source, &control)
+                    export::desktop_preview(
+                        &shared, &project, &document, output, &worker_control,
+                    )
                 }))
                 .unwrap_or_else(|_| {
                     Err("Export preview could not complete; source remains unchanged".into())
                 });
-                let _ = tx.send((desired, result));
-                ctx.request_repaint();
-            });
+                if tx.send(result).is_ok() {
+                    ctx.request_repaint();
+                }
+            };
+            match std::thread::Builder::new()
+                .name("peerbrush-export-preview".into())
+                .spawn(worker)
+            {
+                Ok(_) => editor.pending = Some(control),
+                Err(error) => editor.error = Some(format!("Could not start export preview: {error}")),
+            }
         }
         if open {
-            ctx.request_repaint_after(Duration::from_millis(
-                if running || editor.pending.is_some() {
-                    40
-                } else {
-                    150
-                },
-            ));
+            if needs_preview && !preview_wait.is_zero() {
+                ctx.request_repaint_after(preview_wait);
+            }
+            if running {
+                ctx.request_repaint_after(BATCH_REFRESH);
+            }
             self.export_editor = Some(editor);
         }
     }
@@ -432,7 +654,7 @@ mod tests {
         ctx: &egui::Context,
         events: Vec<egui::Event>,
     ) -> egui::FullOutput {
-        let doc = app.shared.lock().unwrap().doc.clone();
+        let doc = app.shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
         ctx.run(
             egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1360., 900.))),
@@ -470,10 +692,10 @@ mod tests {
     fn fixture(depth: u16) -> (PeerBrush, egui::Context, Shared, PathBuf) {
         let ctx = egui::Context::default();
         let mut engine = crate::engine::Engine::new();
-        engine.doc = Document::new_depth(16, 12, depth).unwrap();
-        engine.doc.name = "Production.psd".into();
-        engine.doc.layers[0].name = "Art".into();
-        engine.doc.layers[0]
+        engine.resident_state_mut().expect("resident fixture").document = Document::new_depth(16, 12, depth).unwrap();
+        engine.resident_state_mut().expect("resident fixture").document.name = "Production.psd".into();
+        engine.resident_state_mut().expect("resident fixture").document.layers[0].name = "Art".into();
+        engine.resident_state_mut().expect("resident fixture").document.layers[0]
             .pixels
             .set16(3, 4, [12347, 23459, 34571, 65535]);
         let root =
@@ -494,19 +716,19 @@ mod tests {
                 availability: Default::default(),
             },
         );
-        let doc = shared.lock().unwrap().doc.clone();
+        let doc = shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
         app.open_exports(&doc);
         (app, ctx, shared, root)
     }
-    fn preview(app: &mut PeerBrush, ctx: &egui::Context) {
+    fn preview(app: &mut PeerBrush, ctx: &egui::Context) -> egui::FullOutput {
         frame(app, ctx, vec![]);
         app.export_editor.as_mut().unwrap().changed_at = Instant::now() - Duration::from_secs(1);
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
-            frame(app, ctx, vec![]);
+            let frame = frame(app, ctx, vec![]);
             let e = app.export_editor.as_ref().unwrap();
             if e.preview.is_some() {
-                return;
+                return frame;
             }
             assert!(e.error.is_none(), "{:?}", e.error);
             assert!(
@@ -549,7 +771,7 @@ mod tests {
     fn native_export_preview_preset_and_batch_buttons_preserve_native_sources() {
         for depth in [8, 16] {
             let (mut app, ctx, shared, root) = fixture(depth);
-            let doc = shared.lock().unwrap().doc.clone();
+            let doc = shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
             let before = serde_json::to_value(&doc).unwrap();
             let editor = app.export_editor.as_mut().unwrap();
             editor.directory = root.to_string_lossy().into();
@@ -561,7 +783,24 @@ mod tests {
                 name: "double".into(),
                 scale: 2.,
             });
-            preview(&mut app, &ctx);
+            let preview_frame = preview(&mut app, &ctx);
+            let editor = app.export_editor.as_ref().unwrap();
+            let reply = export::request(&shared, &editor.source(&doc)).unwrap();
+            use base64::Engine as _;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(reply["images"][0]["data"].as_str().unwrap())
+                .unwrap();
+            let rgba = image::load_from_memory(&bytes).unwrap().into_rgba8();
+            let expected = egui::ColorImage::from_rgba_unmultiplied(
+                [rgba.width() as usize, rgba.height() as usize],
+                rgba.as_raw(),
+            );
+            let texture = editor.preview.as_ref().unwrap().id();
+            let (_, delta) = preview_frame.textures_delta.set.iter().find(|(id, _)| *id == texture).unwrap();
+            let egui::ImageData::Color(image) = &delta.image else {
+                panic!("Export preview must upload an RGBA texture");
+            };
+            assert_eq!(image.as_ref(), &expected);
             assert_eq!(
                 app.export_editor
                     .as_ref()
@@ -572,6 +811,37 @@ mod tests {
                     .document_rect,
                 [1, 2, 6, 7]
             );
+            let plan = editor.preview_plan.as_ref().unwrap().clone();
+            let outputs = plan.outputs();
+            assert_eq!(outputs.len(), 2);
+            click_text(&mut app, &ctx, &format!("1. {}", outputs[0].filename));
+            click_text(&mut app, &ctx, &format!("2. {}", outputs[1].filename));
+            let preview_frame = preview(&mut app, &ctx);
+            let editor = app.export_editor.as_ref().unwrap();
+            assert_eq!(editor.preview_index, 1);
+            assert!(Arc::ptr_eq(editor.preview_plan.as_ref().unwrap(), &plan));
+            let output = editor.preview_output.as_ref().unwrap();
+            assert_eq!(output.variant, "double");
+            let reply = export::request(&shared, &editor.source(&doc)).unwrap();
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(reply["images"][0]["data"].as_str().unwrap())
+                .unwrap();
+            let rgba = image::load_from_memory(&bytes).unwrap().into_rgba8();
+            let expected = egui::ColorImage::from_rgba_unmultiplied(
+                [rgba.width() as usize, rgba.height() as usize],
+                rgba.as_raw(),
+            );
+            let texture = editor.preview.as_ref().unwrap().id();
+            let (_, delta) = preview_frame.textures_delta.set.iter().find(|(id, _)| *id == texture).unwrap();
+            let egui::ImageData::Color(image) = &delta.image else {
+                panic!("Export preview must upload an RGBA texture");
+            };
+            assert_eq!(image.as_ref(), &expected);
+            app.export_editor.as_mut().unwrap().settings.resampling = export::Resampling::Nearest;
+            preview(&mut app, &ctx);
+            let editor = app.export_editor.as_ref().unwrap();
+            assert!(!Arc::ptr_eq(editor.preview_plan.as_ref().unwrap(), &plan));
+            assert_eq!(editor.preview_output.as_ref().unwrap().variant, "double");
             click(&mut app, &ctx, true);
             assert!(
                 app.export_editor.as_ref().unwrap().preset.is_some(),
@@ -611,10 +881,10 @@ mod tests {
                 assert_eq!(receipt.output.bit_depth, depth);
             }
             assert_eq!(
-                serde_json::to_value(&shared.lock().unwrap().doc).unwrap(),
+                serde_json::to_value(&shared.lock().unwrap().resident_state().expect("resident fixture").document).unwrap(),
                 before
             );
-            assert!(shared.lock().unwrap().undo.is_empty());
+            assert!(shared.lock().unwrap().resident_state().expect("resident fixture").undo.is_empty());
             drop(app);
             drop(shared);
             std::fs::remove_dir_all(root).unwrap();
@@ -624,11 +894,10 @@ mod tests {
     fn native_export_discards_stale_results_on_names_settings_and_source_changes() {
         let (mut app, ctx, shared, root) = fixture(16);
         preview(&mut app, &ctx);
-        let old = app.export_editor.as_ref().unwrap().desired.clone();
         // Save As can rename a document without changing its pixel revision.
-        shared.lock().unwrap().doc.name = "Renamed.psd".into();
+        shared.lock().unwrap().resident_state_mut().expect("resident fixture").document.name = "Renamed.psd".into();
         frame(&mut app, &ctx, vec![]);
-        assert_ne!(app.export_editor.as_ref().unwrap().desired, old);
+        assert_eq!(app.export_editor.as_ref().unwrap().preview_source.as_ref().unwrap().name, "Renamed.psd");
         assert!(app.export_editor.as_ref().unwrap().preview.is_none());
         preview(&mut app, &ctx);
         assert_eq!(
@@ -642,17 +911,28 @@ mod tests {
             "Renamed_composite_native.png"
         );
         let editor = app.export_editor.as_mut().unwrap();
+        let original_padding = editor.settings.padding;
         let control = Control::default();
-        editor.pending = Some(Pending {
-            key: editor.desired.clone(),
-            control: control.clone(),
-        });
+        editor.pending = Some(control.clone());
         editor.settings.padding = 3;
         frame(&mut app, &ctx, vec![]);
         assert!(control.check().is_err());
         assert!(app.export_editor.as_ref().unwrap().preview.is_none());
+        app.export_editor.as_mut().unwrap().settings.padding = original_padding;
+        frame(&mut app, &ctx, vec![]);
+        let editor = app.export_editor.as_ref().unwrap();
+        assert_eq!(editor.preview_source.as_ref().unwrap().settings.padding, original_padding);
+        editor
+            .tx
+            .send(Err(control.check().unwrap_err()))
+            .unwrap();
+        preview(&mut app, &ctx);
+        let output = app.export_editor.as_ref().unwrap().preview_output.as_ref().unwrap();
+        assert_eq!(output.filename, "Renamed_composite_native.png");
+
+        app.export_editor.as_mut().unwrap().settings.padding = 3;
         let source = Document::new_depth(16, 12, 16).unwrap();
-        shared.lock().unwrap().doc = source;
+        shared.lock().unwrap().resident_state_mut().expect("resident fixture").document = source;
         app.export_editor.as_mut().unwrap().directory = root.to_string_lossy().into();
         click(&mut app, &ctx, false);
         assert!(app.export_editor.as_ref().unwrap().run.is_none());
@@ -667,7 +947,7 @@ mod tests {
         for format in [Format::Webp, Format::Jxl] {
             for depth in [8, 16] {
                 let (mut app, ctx, shared, root) = fixture(depth);
-                let before = serde_json::to_value(&shared.lock().unwrap().doc).unwrap();
+                let before = serde_json::to_value(&shared.lock().unwrap().resident_state().expect("resident fixture").document).unwrap();
                 click_text(
                     &mut app,
                     &ctx,
@@ -680,7 +960,7 @@ mod tests {
                 assert_eq!(app.export_editor.as_ref().unwrap().settings.format, format);
                 if format == Format::Jxl {
                     assert!(app.export_editor.as_ref().unwrap().settings.jxl.lossless);
-                    click_text(&mut app, &ctx, "Lossless");
+                    click_text(&mut app, &ctx, "Lossy");
                     assert!(!app.export_editor.as_ref().unwrap().settings.jxl.lossless);
                     for value in ["3", "1.0"] {
                         click_text(&mut app, &ctx, value);
@@ -713,6 +993,7 @@ mod tests {
                     if format == Format::Webp { 8 } else { depth }
                 );
                 assert_eq!(output.native_source_depth, depth);
+                assert!(app.export_editor.as_ref().unwrap().preview_encoded_bytes.is_some_and(|size| size > 0));
                 let texture = app
                     .export_editor
                     .as_ref()
@@ -762,7 +1043,7 @@ mod tests {
                         (16, 12, depth)
                     );
                     let expected =
-                        image::load_from_memory(&shared.lock().unwrap().doc.export_png().unwrap())
+                        image::load_from_memory(&shared.lock().unwrap().resident_state().expect("resident fixture").document.export_png().unwrap())
                             .unwrap()
                             .into_rgba16()
                             .into_raw();
@@ -785,10 +1066,10 @@ mod tests {
                     }
                 }
                 assert_eq!(
-                    serde_json::to_value(&shared.lock().unwrap().doc).unwrap(),
+                    serde_json::to_value(&shared.lock().unwrap().resident_state().expect("resident fixture").document).unwrap(),
                     before
                 );
-                assert!(shared.lock().unwrap().undo.is_empty());
+                assert!(shared.lock().unwrap().resident_state().expect("resident fixture").undo.is_empty());
                 drop(app);
                 drop(shared);
                 std::fs::remove_dir_all(root).unwrap();
@@ -807,7 +1088,7 @@ mod metadata_tests {
             let mut document = Document::new_depth(9, 7, depth).unwrap();
             document.name = "Native export".into();
             let mut engine = crate::engine::Engine::new();
-            engine.doc = document.clone();
+            engine.resident_state_mut().expect("resident fixture").document = document.clone();
             let mut app = PeerBrush::init(
                 &ctx,
                 Arc::new(std::sync::Mutex::new(engine)),
@@ -831,12 +1112,59 @@ mod metadata_tests {
             assert_eq!(request["document_id"], document.id);
             assert_eq!(request["expected_revision"], 0);
             assert_eq!(request["max_edge"], 512);
-            assert_eq!(editor.sync_preview(owner.view()), request);
-            let desired = editor.desired.clone();
-            assert_eq!(editor.sync_preview(&document), request);
-            assert_eq!(editor.desired, desired);
-            assert!(editor.pending.is_none());
+            editor.sync_preview(owner.view());
+            let settled = Instant::now() - Duration::from_secs(1);
+            editor.changed_at = settled;
+            let control = Control::default();
+            editor.pending = Some(control.clone());
+            editor.sync_preview(owner.view());
+            assert_eq!(editor.changed_at, settled);
+            assert!(control.check().is_ok());
+            editor.selected_only = true;
+            editor.targets.clear();
+            editor.sync_preview(owner.view());
+            assert!(control.check().is_err());
+            editor.error = Some("Select layers or folders before exporting".into());
+            editor.selected_only = false;
+            editor.sync_preview(owner.view());
+            assert!(editor.error.is_none());
             assert_eq!(pool.used(), admitted);
+
+            let replacement = crate::tree::presentation_tests::native(&document, &pool);
+            let replacement_view = DocumentView::Native(&replacement);
+            assert_eq!(editor.source(owner.view()), editor.source(replacement_view));
+            let control = Control::default();
+            editor.pending = Some(control.clone());
+            editor.sync_preview(replacement_view);
+            assert!(control.check().is_err());
+            assert!(editor.preview_source.as_ref().unwrap().document.observes(replacement_view));
+            assert!(!editor.preview_source.as_ref().unwrap().document.observes(owner.view()));
+
+            app.shared.lock().unwrap().authority =
+                crate::engine::authority::DocumentAuthority::from_native(replacement, 8).unwrap();
+            let stale = export::ObservedDocument::new(owner.view());
+            let result = export::desktop_preview(
+                &app.shared,
+                &app.project_id,
+                &stale,
+                export::PreviewOutput::Plan(vec![], Settings::default(), None),
+                &Control::default(),
+            );
+            assert!(matches!(result, Err(error) if error == "Export source changed before capture"));
+            let directory = crate::engine::native::worker::tests::Fixture::new();
+            let result = export::desktop_start(
+                &app.shared,
+                &app.project_id,
+                &stale,
+                Settings::default(),
+                vec![],
+                directory.path().to_owned(),
+                Existing::Error,
+            );
+            assert!(matches!(result, Err(error) if error == "Export source changed before capture"));
+            let library = app.shared.lock().unwrap().export_library.clone();
+            assert!(export::jobs::states(&library).is_empty());
+            assert!(std::fs::read_dir(directory.path()).unwrap().next().is_none());
         }
     }
 }

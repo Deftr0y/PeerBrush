@@ -5,6 +5,7 @@ use crate::{
         NativeDocument, RasterMetadata, RasterPatch, RasterSlot, RetainedUpdate, StagedOutput,
     },
     engine::scene::Warp36,
+    large_document::Result as SourceResult,
     raster::{Pixel, Surface},
     retained::{
         pose::Pose,
@@ -13,7 +14,7 @@ use crate::{
     transform::native::{
         self,
         selected::{self, Placement, Selection},
-        Mapping, Work,
+        Checks, Mapping, Work,
     },
 };
 
@@ -101,6 +102,7 @@ impl Plane {
         session: &impl Session,
         work: &mut Work,
         check: &dyn Fn() -> Result<(), String>,
+        pinned: &dyn Fn() -> SourceResult<()>,
     ) -> Result<(), String> {
         if placement.noop {
             return Ok(());
@@ -114,9 +116,12 @@ impl Plane {
                 origin,
                 layer_frame,
                 fill,
+                // A replaced provisional plane is retired below. Its tiles
+                // cannot become dependencies of the replacement.
+                matches!(&self.current, Pixels::Existing(_)),
                 store,
                 work,
-                checked,
+                Checks { active: pinned, owner: checked },
             )?;
             cleared = written.cleared_retained;
             Ok(written.surface)
@@ -139,6 +144,7 @@ impl Plane {
         session: &impl Session,
         work: &mut Work,
         check: &dyn Fn() -> Result<(), String>,
+        pinned: &dyn Fn() -> SourceResult<()>,
     ) -> Result<(), String> {
         if self.frame(base)? == frame && offset == [0, 0] && fill.is_none() {
             return Ok(());
@@ -152,7 +158,7 @@ impl Plane {
                 fill,
                 store,
                 work,
-                checked,
+                Checks { active: pinned, owner: checked },
             )?;
             cleared = written.cleared_retained;
             Ok(written.surface)
@@ -182,6 +188,7 @@ impl Plane {
         session: &impl Session,
         work: &mut Work,
         check: &dyn Fn() -> Result<(), String>,
+        pinned: &dyn Fn() -> SourceResult<()>,
     ) -> Result<(), String> {
         let had_original = self.original.is_some();
         let mut new_pose = if had_original {
@@ -221,7 +228,9 @@ impl Plane {
             &self.current
         };
         let output = transaction::stage(base, session, check, |store, checked| {
-            native::write_plane(source.surface(base)?, &mapping, frame, store, work, checked)
+            native::write_plane_guarded(
+                source.surface(base)?, &mapping, frame, store, work, pinned, checked,
+            )
         })?;
         let old = std::mem::replace(&mut self.current, Pixels::Generated(output));
         if had_original {
@@ -246,6 +255,7 @@ impl Plane {
         after_origin: [i32; 2],
         work: &mut Work,
         check: &dyn Fn() -> Result<(), String>,
+        pinned: &dyn Fn() -> SourceResult<()>,
     ) -> Result<(), String> {
         if !self.reframed {
             return Ok(());
@@ -299,7 +309,6 @@ impl Plane {
         let mut dirty: Option<[i32; 4]> = None;
         for top in (bounds[1]..bounds[3]).step_by(256) {
             for left in (bounds[0]..bounds[2]).step_by(256) {
-                check()?;
                 // Keep each admitted 64-KiPixel pair pinned while comparing it;
                 // per-row pins would repeatedly decode/read the same tiles.
                 let region = [
@@ -308,10 +317,18 @@ impl Plane {
                     (left + 256).min(bounds[2]),
                     (top + 256).min(bounds[3]),
                 ];
+                let local =
+                    |[x, y]: [i32; 2]| [region[0] - x, region[1] - y, region[2] - x, region[3] - y];
+                if !before.has_physical_tiles(local(before_origin))
+                    && !after.has_physical_tiles(local(after_origin))
+                {
+                    continue;
+                }
+                check()?;
                 let previous = prepare(before, before_origin, region, source_check)?;
                 let current = prepare(after, after_origin, region, source_check)?;
                 for y in region[1]..region[3] {
-                    check()?;
+                    pinned().map_err(|e| e.to_string())?;
                     for x in region[0]..region[2] {
                         work.claim(1)?;
                         if pixel(before, &previous, before_origin, x, y)?

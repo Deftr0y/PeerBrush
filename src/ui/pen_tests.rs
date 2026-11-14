@@ -2,20 +2,71 @@ use super::*;
 use crate::source::Content;
 use std::sync::Mutex;
 #[test]
+fn pen_places_an_off_canvas_anchor_and_uses_the_exact_handle_release() {
+    for depth in [8, 16] {
+        let (mut app, ctx) = workspace_tests::fixture(depth);
+        app.recovery.open = false;
+        app.select_tool(Tool::Pen);
+        app.zoom = 0.55;
+        app.view = view::View { angle: 25., mirror_h: true, ..Default::default() };
+        let frame = |app: &mut PeerBrush, events| {
+            let _ = ctx.run(egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1300., 950.))),
+                events,
+                ..Default::default()
+            }, |ctx| app.draw(ctx));
+        };
+        frame(&mut app, vec![]);
+        let (doc, history) = {
+            let engine = app.shared.lock().unwrap();
+            (engine.resident().unwrap().clone(), engine.history_lengths())
+        };
+        let rect = app.view_rect.unwrap();
+        let projection = app.view.projection(rect, rect.width() / doc.width as f32);
+        let anchor = [-4.5, doc.height as f32 * 0.5];
+        let handle = [9.5, anchor[1] - 3.];
+        let start = projection.point(anchor);
+        let end = projection.point(handle);
+        assert!(!projection.contains(start));
+        assert!(app.canvas_input_region.unwrap().0.contains(start));
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos, pressed, button: egui::PointerButton::Primary, modifiers: Default::default(),
+        };
+        frame(&mut app, vec![
+            egui::Event::PointerMoved(start), button(start, true), button(end, false),
+            egui::Event::PointerMoved(projection.point([24., 14.])),
+        ]);
+        let mut engine = app.shared.lock().unwrap();
+        assert_eq!(engine.history_lengths(), [history[0] + 1, 0]);
+        let current = engine.resident().unwrap();
+        assert_eq!(current.layers[1].pixels, doc.layers[0].pixels);
+        let source = current.layers[0].source.as_ref().unwrap();
+        let Content::Bezier { nodes, .. } = &source.content else { panic!("Path absent") };
+        assert_eq!(nodes.len(), 1);
+        let to_doc = |p| crate::path::document_point(&current.layers[0], p);
+        for (actual, expected) in [(to_doc(nodes[0].point), anchor), (to_doc(nodes[0].out_handle.unwrap()), handle)] {
+            assert!(actual.into_iter().zip(expected).all(|(a, b)| (a - b).abs() < 0.0001));
+        }
+        engine.undo("human").unwrap();
+        assert_eq!(engine.resident().unwrap().layers[0].pixels, doc.layers[0].pixels);
+    }
+}
+
+#[test]
 fn pen_click_drag_close_and_point_delete_render_native_previews_with_one_undo() {
     for depth in [8, 16] {
         for zoom in [0.65, 1.35] {
             let ctx = egui::Context::default();
             let mut e = crate::engine::Engine::new();
-            e.doc = Document::new_depth(64, 48, depth).unwrap();
+            e.resident_state_mut().expect("resident fixture").document = Document::new_depth(64, 48, depth).unwrap();
             for y in 0..48 {
                 for x in 0..64 {
-                    e.doc.layers[0]
+                    e.resident_state_mut().expect("resident fixture").document.layers[0]
                         .pixels
                         .set16(x, y, [10001, 20003, 40007, 65535]);
                 }
             }
-            let background = e.doc.layers[0].pixels.clone();
+            let background = e.resident_state().expect("resident fixture").document.layers[0].pixels.clone();
             let shared = Arc::new(Mutex::new(e));
             let connection = crate::server::Connection {
                 port: 0,
@@ -59,7 +110,7 @@ fn pen_click_drag_close_and_point_delete_render_native_previews_with_one_undo() 
             .into_iter()
             .enumerate()
             {
-                let before = shared.lock().unwrap().doc.clone();
+                let before = shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
                 let start = at(point);
                 let end = at(end);
                 draw(
@@ -88,13 +139,13 @@ fn pen_click_drag_close_and_point_delete_render_native_previews_with_one_undo() 
                         std::thread::sleep(Duration::from_millis(5));
                     }
                 }
-                assert_eq!(shared.lock().unwrap().doc.revision, before.revision);
-                assert_eq!(shared.lock().unwrap().undo.len(), index);
+                assert_eq!(shared.lock().unwrap().resident_state().expect("resident fixture").document.revision, before.revision);
+                assert_eq!(shared.lock().unwrap().resident_state().expect("resident fixture").undo.len(), index);
                 draw(&mut app, vec![button(end, false)]);
                 let e = shared.lock().unwrap();
-                assert_eq!(e.undo.len(), index + 1, "{}", app.message);
-                assert_eq!(e.doc.export_png().unwrap(), preview.export_png().unwrap());
-                assert_eq!(e.doc.layers[1].pixels, background);
+                assert_eq!(e.resident_state().expect("resident fixture").undo.len(), index + 1, "{}", app.message);
+                assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), preview.export_png().unwrap());
+                assert_eq!(e.resident_state().expect("resident fixture").document.layers[1].pixels, background);
             }
             let start = at([12., 34.]);
             draw(
@@ -105,14 +156,14 @@ fn pen_click_drag_close_and_point_delete_render_native_previews_with_one_undo() 
             {
                 let e = shared.lock().unwrap();
                 let Content::Bezier { nodes, closed, .. } =
-                    &e.doc.layers[0].source.as_ref().unwrap().content
+                    &e.resident_state().expect("resident fixture").document.layers[0].source.as_ref().unwrap().content
                 else {
                     panic!("Path missing")
                 };
                 assert_eq!(nodes.len(), 3);
                 assert!(*closed);
                 assert!(nodes[1].smooth);
-                assert_eq!(e.undo.len(), 4);
+                assert_eq!(e.resident_state().expect("resident fixture").undo.len(), 4);
             }
             draw(
                 &mut app,
@@ -126,18 +177,18 @@ fn pen_click_drag_close_and_point_delete_render_native_previews_with_one_undo() 
             );
             let mut e = shared.lock().unwrap();
             assert_eq!(
-                e.doc.layers.len(),
+                e.resident_state().expect("resident fixture").document.layers.len(),
                 2,
                 "Delete must remove a point rather than its layer"
             );
-            let Content::Bezier { nodes, .. } = &e.doc.layers[0].source.as_ref().unwrap().content
+            let Content::Bezier { nodes, .. } = &e.resident_state().expect("resident fixture").document.layers[0].source.as_ref().unwrap().content
             else {
                 panic!("Path missing")
             };
             assert_eq!(nodes.len(), 2);
-            assert_eq!(e.undo.len(), 5);
+            assert_eq!(e.resident_state().expect("resident fixture").undo.len(), 5);
             e.undo("human").unwrap();
-            assert_eq!(e.doc.layers[1].pixels, background);
+            assert_eq!(e.resident_state().expect("resident fixture").document.layers[1].pixels, background);
         }
     }
 }
@@ -146,8 +197,8 @@ fn pen_escape_or_shared_change_cancels_uncommitted_paths() {
     for depth in [8, 16] {
         let ctx = egui::Context::default();
         let mut e = crate::engine::Engine::new();
-        e.doc = Document::new_depth(64, 48, depth).unwrap();
-        let before = e.doc.clone();
+        e.resident_state_mut().expect("resident fixture").document = Document::new_depth(64, 48, depth).unwrap();
+        let before = e.resident_state().expect("resident fixture").document.clone();
         let shared = Arc::new(Mutex::new(e));
         let connection = crate::server::Connection {
             port: 0,
@@ -197,9 +248,9 @@ fn pen_escape_or_shared_change_cancels_uncommitted_paths() {
             }],
         );
         assert!(app.transient.is_empty());
-        assert!(shared.lock().unwrap().undo.is_empty());
+        assert!(shared.lock().unwrap().resident_state().expect("resident fixture").undo.is_empty());
         assert_eq!(
-            shared.lock().unwrap().doc.export_png().unwrap(),
+            shared.lock().unwrap().resident_state().expect("resident fixture").document.export_png().unwrap(),
             before.export_png().unwrap()
         );
         draw(
@@ -222,7 +273,7 @@ fn pen_escape_or_shared_change_cancels_uncommitted_paths() {
         );
         {
             let mut e = shared.lock().unwrap();
-            let id = e.doc.layers[0].id.clone();
+            let id = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
             e.edit(
                 "human",
                 &[json!({"op":"layer.update","layer":id,"name":"Human update"})],
@@ -234,8 +285,8 @@ fn pen_escape_or_shared_change_cancels_uncommitted_paths() {
         }
         draw(&mut app, vec![]);
         assert!(app.transient.is_empty());
-        assert_eq!(shared.lock().unwrap().doc.layers.len(), 1);
-        assert_eq!(shared.lock().unwrap().undo.len(), 1);
+        assert_eq!(shared.lock().unwrap().resident_state().expect("resident fixture").document.layers.len(), 1);
+        assert_eq!(shared.lock().unwrap().resident_state().expect("resident fixture").undo.len(), 1);
     }
 }
 
@@ -244,11 +295,11 @@ fn pen_selects_points_without_history_and_drags_existing_handles_through_native_
     for depth in [8, 16] {
         let ctx = egui::Context::default();
         let mut e = crate::engine::Engine::new();
-        e.doc = Document::new_depth(64, 48, depth).unwrap();
+        e.resident_state_mut().expect("resident fixture").document = Document::new_depth(64, 48, depth).unwrap();
         e.edit("human",&[json!({"op":"path.create","nodes":[{"point":[16,36],"out_handle":[24,8],"in_handle":[8,64],"smooth":true},{"point":[48,36],"in_handle":[40,8]}],"stroke_width":3.})],None,None,"Path").unwrap();
-        let before = e.doc.clone();
-        e.undo.clear();
-        let id = e.doc.layers[0].id.clone();
+        let before = e.resident_state().expect("resident fixture").document.clone();
+        e.resident_state_mut().expect("resident fixture").undo.clear();
+        let id = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
         let shared = Arc::new(Mutex::new(e));
         let connection = crate::server::Connection {
             port: 0,
@@ -291,7 +342,7 @@ fn pen_selects_points_without_history_and_drags_existing_handles_through_native_
             vec![egui::Event::PointerMoved(p), button(p, true)],
         );
         draw(&mut app, vec![button(p, false)]);
-        assert!(shared.lock().unwrap().undo.is_empty());
+        assert!(shared.lock().unwrap().resident_state().expect("resident fixture").undo.is_empty());
         let start = at([24., 8.]);
         let end = at([32., 16.]);
         draw(
@@ -302,18 +353,18 @@ fn pen_selects_points_without_history_and_drags_existing_handles_through_native_
         assert_eq!(app.transient[0]["op"], "path.handle.move");
         let preview = crate::engine::Engine::preview_edits(before.clone(), &app.transient).unwrap();
         assert_ne!(preview.export_png().unwrap(), before.export_png().unwrap());
-        assert!(shared.lock().unwrap().undo.is_empty());
+        assert!(shared.lock().unwrap().resident_state().expect("resident fixture").undo.is_empty());
         draw(&mut app, vec![button(end, false)]);
         let mut e = shared.lock().unwrap();
-        assert_eq!(e.undo.len(), 1);
-        assert_eq!(e.doc.export_png().unwrap(), preview.export_png().unwrap());
-        let Content::Bezier { nodes, .. } = &e.doc.layers[0].source.as_ref().unwrap().content
+        assert_eq!(e.resident_state().expect("resident fixture").undo.len(), 1);
+        assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), preview.export_png().unwrap());
+        let Content::Bezier { nodes, .. } = &e.resident_state().expect("resident fixture").document.layers[0].source.as_ref().unwrap().content
         else {
             panic!("Path absent")
         };
         assert_eq!(nodes[0].out_handle, Some([32., 16.]));
         e.undo("human").unwrap();
-        assert_eq!(e.doc.layers[0].source, before.layers[0].source);
-        assert_eq!(e.doc.export_png().unwrap(), before.export_png().unwrap());
+        assert_eq!(e.resident_state().expect("resident fixture").document.layers[0].source, before.layers[0].source);
+        assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), before.export_png().unwrap());
     }
 }

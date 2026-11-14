@@ -76,8 +76,8 @@ pub(super) fn source(app: &PeerBrush) -> Value {
         "task":entry.task,"scopes":entry.scopes,"gesture":entry.gesture,"reverted":entry.reverted,
     })).collect::<Vec<_>>()
     };
-    json!({"document":engine.doc,"png":engine.doc.export_png().unwrap(),
-        "undo":history(&engine.undo),"redo":history(&engine.redo),"closed":engine.closed})
+    json!({"document":engine.resident_state().expect("resident fixture").document,"png":engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
+        "undo":history(&engine.resident_state().expect("resident fixture").undo),"redo":history(&engine.resident_state().expect("resident fixture").redo),"closed":engine.closed})
 }
 pub(super) fn fixture(depth: u16) -> (PeerBrush, egui::Context) {
     let (mut app, ctx) = tests::fixture();
@@ -86,10 +86,10 @@ pub(super) fn fixture(depth: u16) -> (PeerBrush, egui::Context) {
     ctx.style_mut(|style| style.animation_time = 0.);
     {
         let mut engine = app.shared.lock().unwrap();
-        engine.doc = Document::new_depth(32, 24, depth).unwrap();
-        app.selected = engine.doc.layers[0].id.clone();
+        engine.resident_state_mut().expect("resident fixture").document = Document::new_depth(32, 24, depth).unwrap();
+        app.selected = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
         if depth == 16 {
-            engine.doc.layers[0]
+            engine.resident_state_mut().expect("resident fixture").document.layers[0]
                 .pixels
                 .set16(1, 1, [12347, 33559, 51237, 65535]);
         }
@@ -109,6 +109,46 @@ pub(super) fn fixture(depth: u16) -> (PeerBrush, egui::Context) {
     }
     app.selection_layers = [app.selected.clone()].into_iter().collect();
     (app, ctx)
+}
+
+#[test]
+fn accessible_tool_choices_and_view_toggles_use_normal_app_actions() {
+    use egui::accesskit::{Action, ActionRequest, Node, NodeId, Role, Toggled, TreeUpdate};
+
+    fn named<'a>(tree: &'a TreeUpdate, label: &str) -> (NodeId, &'a Node) {
+        tree.nodes.iter().find_map(|(id, node)| (node.label() == Some(label)).then_some((*id, node)))
+            .unwrap_or_else(|| panic!("Missing accessible {label}"))
+    }
+
+    let (mut app, ctx) = fixture(8);
+    app.select_tool(Tool::Brush);
+    let size = Vec2::new(1360., 900.);
+    let eraser = app.tool_caption(Tool::Eraser);
+    let closed = draw(&mut app, &ctx, size, vec![]);
+    let opener = label(&closed, "Canvas view…");
+    assert!(!closed.shapes.iter().any(|shape| {
+        matches!(&shape.shape, egui::Shape::Text(text) if text.galley.job.text == "Reset canvas view")
+    }));
+    click(&mut app, &ctx, size, opener);
+    assert!(app.show_view);
+    ctx.enable_accesskit();
+    let first = draw(&mut app, &ctx, size, vec![]).platform_output.accesskit_update.unwrap();
+    let (erase, node) = named(&first, &eraser);
+    assert_eq!(node.role(), Role::RadioButton);
+    assert_eq!(node.toggled(), Some(Toggled::False));
+    assert!(node.supports_action(Action::Click));
+    let (mirror, node) = named(&first, "Mirror view horizontally");
+    assert_eq!(node.role(), Role::CheckBox);
+    assert_eq!(node.toggled(), Some(Toggled::False));
+    assert!(node.supports_action(Action::Click));
+
+    let click = |target| egui::Event::AccessKitActionRequest(ActionRequest { action: Action::Click, target, data: None });
+    let output = draw(&mut app, &ctx, size, vec![click(erase), click(mirror)]);
+    let tree = output.platform_output.accesskit_update.unwrap();
+    assert!(app.tool == Tool::Eraser);
+    assert!(app.view.mirror_h);
+    assert_eq!(named(&tree, &eraser).1.toggled(), Some(Toggled::True));
+    assert_eq!(named(&tree, "Mirror view horizontally").1.toggled(), Some(Toggled::True));
 }
 
 fn tab_to(app: &mut PeerBrush, ctx: &egui::Context, size: Vec2, target: Pos2) {
@@ -137,7 +177,7 @@ fn connected_menus_preserve_pointer_keyboard_actions_and_native_sources_at_displ
             }
             let output = draw(&mut app, &ctx, size, vec![]);
             assert_eq!(output.pixels_per_point, scale);
-            let rectangles = ["File", "View", "Image", "Layer", "Select"].map(|name| {
+            let rectangles = ["File", "Canvas view…", "Image", "Layer", "Select"].map(|name| {
                 let center = label(&output, name);
                 output
                     .shapes

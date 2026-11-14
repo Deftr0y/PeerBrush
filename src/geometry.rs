@@ -1,10 +1,38 @@
 //! Whole-document geometry, shared by native controls, MCP and CLI.
 use crate::{
     engine::{id, Document},
-    raster::{check_size, Raster},
+    raster::Raster,
     selection::Coverage,
 };
 use serde_json::{json, Value};
+pub(crate) mod input;
+pub(crate) mod native;
+
+pub(crate) fn clipped_segment(a: [f32; 2], b: [f32; 2], bounds: [f32; 4]) -> Option<([f32; 2], [f32; 2])> {
+    let delta = [b[0] - a[0], b[1] - a[1]];
+    let (mut lo, mut hi) = (0.0_f32, 1.0_f32);
+    for (origin, d, min, max) in [
+        (a[0], delta[0], bounds[0], bounds[2]),
+        (a[1], delta[1], bounds[1], bounds[3]),
+    ] {
+        if d.abs() < 0.000001 {
+            if origin < min || origin > max {
+                return None;
+            }
+        } else {
+            let (x, y) = ((min - origin) / d, (max - origin) / d);
+            lo = lo.max(x.min(y));
+            hi = hi.min(x.max(y));
+        }
+    }
+    if hi < lo {
+        return None;
+    }
+    Some((
+        [a[0] + delta[0] * lo, a[1] + delta[1] * lo],
+        [a[0] + delta[0] * hi, a[1] + delta[1] * hi],
+    ))
+}
 
 #[derive(Clone)]
 pub struct Plan {
@@ -18,72 +46,21 @@ pub struct Plan {
     mask_settings: Vec<Vec<Option<Value>>>,
     radius_scale: f32,
 }
-fn dimension(c: &Value, key: &str) -> Result<u32, String> {
-    c[key]
-        .as_u64()
-        .filter(|v| *v <= 8192)
-        .map(|v| v as u32)
-        .ok_or_else(|| format!("{key} must be an integer from 1 to 8192"))
-}
 pub fn plan(doc: &Document, c: &Value) -> Result<Plan, String> {
-    let image = matches!(c["op"].as_str(), Some("image.resize" | "resize"));
-    let (width, height, offset) = if c["op"] == "crop" {
-        let b = c["rect"]
-            .as_array()
-            .filter(|b| b.len() == 4)
-            .ok_or("Crop needs [left,top,right,bottom]")?;
-        let mut r = [0; 4];
-        for (i, v) in b.iter().enumerate() {
-            r[i] = v
-                .as_i64()
-                .filter(|v| (-100000..=100000).contains(v))
-                .ok_or("Crop coordinates must be bounded integers")? as i32;
-        }
-        if r[0] >= r[2] || r[1] >= r[3] {
-            return Err("Crop needs a positive rectangle".into());
-        }
-        ((r[2] - r[0]) as u32, (r[3] - r[1]) as u32, [-r[0], -r[1]])
-    } else {
-        let (w, h) = (dimension(c, "width")?, dimension(c, "height")?);
-        let offset = if image {
-            [0, 0]
-        } else {
-            let anchor = c.get("anchor").and_then(Value::as_str).unwrap_or("center");
-            let (ax, ay) = match anchor {
-                "top_left" => (0., 0.),
-                "top" => (0.5, 0.),
-                "top_right" => (1., 0.),
-                "left" => (0., 0.5),
-                "center" => (0.5, 0.5),
-                "right" => (1., 0.5),
-                "bottom_left" => (0., 1.),
-                "bottom" => (0.5, 1.),
-                "bottom_right" => (1., 1.),
-                _ => return Err("Choose one of the nine canvas anchors".into()),
-            };
-            if c.get("anchor").is_some_and(|v| !v.is_string()) {
-                return Err("Canvas anchor must be a name".into());
-            }
-            [
-                ((w as f64 - doc.width as f64) * ax).round() as i32,
-                ((h as f64 - doc.height as f64) * ay).round() as i32,
-            ]
-        };
-        (w, h, offset)
-    };
-    check_size(width, height)?;
-    let scale = if image {
-        [
-            width as f32 / doc.width as f32,
-            height as f32 / doc.height as f32,
-        ]
-    } else {
-        [1., 1.]
-    };
+    let frame = input::Frame::new(
+        [doc.width, doc.height],
+        c,
+        crate::raster::CanvasLimits::Resident,
+    )?;
+    let input::Frame {
+        width,
+        height,
+        offset,
+        scale,
+        image,
+        proportional,
+    } = frame;
     let changing = offset != [0, 0] || scale != [1., 1.];
-    let proportional = !image
-        || (height as f64 - width as f64 * doc.height as f64 / doc.width as f64).abs() <= 0.500001
-        || (width as f64 - height as f64 * doc.width as f64 / doc.height as f64).abs() <= 0.500001;
     let radius_scale = (scale[0] * scale[1]).sqrt();
     let mut filter_settings = vec![];
     for filter in &doc.filters {
@@ -98,11 +75,7 @@ pub fn plan(doc: &Document, c: &Value) -> Result<Plan, String> {
     }
     let mut work = 0u64;
     for layer in &doc.layers {
-        let x = layer.x as f64 * scale[0] as f64 + offset[0] as f64;
-        let y = layer.y as f64 * scale[1] as f64 + offset[1] as f64;
-        if x.abs() > 100000. || y.abs() > 100000. {
-            return Err("Layer geometry would exceed coordinate limits".into());
-        }
+        frame.origin([layer.x, layer.y])?;
         if image {
             let (w, h) = scaled_size(&layer.pixels, scale)?;
             if layer.pixels.bytes() > 0 || layer.kind == "fill" {
@@ -175,9 +148,11 @@ pub fn plan(doc: &Document, c: &Value) -> Result<Plan, String> {
     })
 }
 fn scaled_size(source: &Raster, scale: [f32; 2]) -> Result<(u32, u32), String> {
-    let w = (source.width as f64 * scale[0] as f64).round().max(1.) as u32;
-    let h = (source.height as f64 * scale[1] as f64).round().max(1.) as u32;
-    check_size(w, h)?;
+    let [w, h] = input::scaled_size(
+        [source.width, source.height],
+        scale,
+        crate::raster::CanvasLimits::Resident,
+    )?;
     Ok((w, h))
 }
 fn resized(source: &Raster, w: u32, h: u32) -> Raster {
@@ -187,12 +162,10 @@ fn resized(source: &Raster, w: u32, h: u32) -> Raster {
     if source.bytes() == 0 {
         return Raster::new_depth(w, h, source.depth);
     }
-    let sx = source.width as f32 / w as f32;
-    let sy = source.height as f32 / h as f32;
     crate::transform::resample(source, w, h, None, |x, y| {
         [
-            ((x as f32 + 0.5) * sx - 0.5).clamp(0., source.width as f32 - 1.),
-            ((y as f32 + 0.5) * sy - 0.5).clamp(0., source.height as f32 - 1.),
+            input::coordinate(x, source.width, w),
+            input::coordinate(y, source.height, h),
         ]
     })
 }
@@ -211,26 +184,10 @@ fn mapped_coverage(m: &Coverage, scale: [f32; 2], offset: [i32; 2]) -> Result<Co
     let mut pixels = Raster::new(w, h);
     for y in 0..h {
         for x in 0..w {
-            let fx = ((x as f64 + 0.5) * m.mask.width as f64 / w as f64 - 0.5)
-                .clamp(0., m.mask.width as f64 - 1.);
-            let fy = ((y as f64 + 0.5) * m.mask.height as f64 / h as f64 - 0.5)
-                .clamp(0., m.mask.height as f64 - 1.);
-            let (ix, iy) = (fx.floor() as i32, fy.floor() as i32);
-            let (rx, ry) = (fx - fx.floor(), fy - fy.floor());
-            let mut sum = 0.;
-            for (dx, dy, weight) in [
-                (0, 0, (1. - rx) * (1. - ry)),
-                (1, 0, rx * (1. - ry)),
-                (0, 1, (1. - rx) * ry),
-                (1, 1, rx * ry),
-            ] {
-                sum += m.mask.get(
-                    (ix + dx).min(m.mask.width as i32 - 1),
-                    (iy + dy).min(m.mask.height as i32 - 1),
-                )[0] as f64
-                    * weight;
-            }
-            let value = sum.round() as u8;
+            let value = input::coverage(x, y, [m.mask.width, m.mask.height], [w, h], |x, y| {
+                Ok::<_, std::convert::Infallible>(m.mask.get(x, y)[0])
+            })
+            .unwrap();
             if value > 0 {
                 pixels.set(x as i32, y as i32, [value; 4]);
             }

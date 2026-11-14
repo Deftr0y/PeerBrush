@@ -1,36 +1,66 @@
 //! Immutable native document owners. No live Engine field is switched here.
+#[path = "native/adjustment.rs"]
+mod adjustment;
 #[path = "native/admission.rs"]
 mod admission;
+mod bake;
 #[path = "native/batch.rs"]
 mod batch;
+mod canvas;
 #[path = "native/create.rs"]
 mod create;
 #[path = "native/descriptor.rs"]
 mod descriptor;
+#[path = "native/duplicate.rs"]
+mod duplicate;
 #[path = "native/effect_patch.rs"]
 mod effect_patch;
+#[path = "native/effects.rs"]
+mod effects;
+#[path = "native/filters.rs"]
+mod filters;
 #[path = "native/history.rs"]
 mod history;
+mod image_resize;
+#[path = "native/import.rs"]
+mod import;
 #[path = "native/insertion.rs"]
 mod insertion;
 #[path = "native/intent.rs"]
 mod intent;
+#[path = "native/layer_paste.rs"]
+mod layer_paste;
+#[path = "native/liquify.rs"]
+mod liquify;
+mod merge;
 #[path = "native/metadata.rs"]
 mod metadata;
 #[path = "native/output.rs"]
 mod output;
+pub(crate) use output::AbortBatch;
 #[path = "native/patch.rs"]
 mod patch;
 #[path = "native/pixel_inverse.rs"]
 mod pixel_inverse;
+#[path = "native/placement.rs"]
+mod placement;
+pub(crate) mod presets;
 #[path = "native/publication.rs"]
 mod publication;
 #[path = "native/registration.rs"]
 mod registration;
+mod resident_clipboard;
+pub(crate) use resident_clipboard::materialize_layer_clipboard;
 #[path = "native/scopes.rs"]
 mod scopes;
+mod selection_duplicate;
+#[path = "native/settings.rs"]
+mod settings;
 #[path = "native/transaction.rs"]
 mod transaction;
+pub(super) mod validation;
+#[path = "native/wand.rs"]
+pub(crate) mod wand;
 #[path = "native/worker.rs"]
 pub(crate) mod worker;
 #[cfg(test)]
@@ -52,9 +82,9 @@ pub(crate) use descriptor::{Command, CommandDescriptor, CommandToken, Method};
 pub(crate) use effect_patch::{EffectClipPatch, EffectPatch};
 pub(crate) use history::{
     CommitRuntime, Direction, HistoryEntries, HistoryEntry, HistoryRequest, HistorySnapshot,
-    NativeHistory, PreparedCommit, PreparedMove, Publication, RefusedCommit, RefusedMove,
-    RefusedTask, RetiredHistory, TaskCandidate, TaskCapture, TaskEntry, TaskPreparationError,
-    TaskRequest,
+    NativeHistory, PreparedCommit, PreparedMove, PreparedSaveName, Publication, RefusedCommit,
+    RefusedMove, RefusedSaveName, RefusedTask, RetiredHistory, TaskCandidate, TaskCapture,
+    TaskEntry, TaskPreparationError, TaskRequest,
 };
 pub(crate) use insertion::RefusedInsertion;
 pub use intent::{Intent, IntentKind};
@@ -85,6 +115,8 @@ struct Core {
     disk: DiskBudget,
     key: DocumentKey,
     render_key: OnceLock<[u8; 32]>,
+    wand: Option<Admitted<wand::Replay>>,
+    protected_structure: Option<crate::psd::ProtectedStructure>,
 }
 struct OwnedRoster {
     roster: RasterRoster,
@@ -107,6 +139,8 @@ impl Core {
                 disk,
                 key: key(),
                 render_key: OnceLock::new(),
+                wand: None,
+                protected_structure: None,
             },
             owner,
         ))
@@ -161,6 +195,41 @@ impl NativeDocument {
     pub fn metadata(&self) -> Metadata<'_> {
         Metadata(&self.core.metadata, self.key())
     }
+    pub(crate) fn protected_structure(&self) -> Option<&[crate::psd::SourceLayerInfo]> {
+        self.core.protected_structure.as_ref().map(|records| records.as_slice())
+    }
+    /// Only the verified, flattened display layer can back a protected view
+    /// or an explicit editable copy. No original Photoshop layer is exposed.
+    pub(crate) fn protected_composite(&self) -> Result<LayerMetadata<'_>> {
+        let meta = self.metadata();
+        meta.layer(0)
+            .filter(|layer| {
+                meta.read_only()
+                    && meta.layers().len() == 1
+                    && meta.filters().len() == 0
+                    && layer.kind() == "paint"
+                    && layer.visible()
+                    && layer.opacity() == 1.
+                    && layer.fill_opacity() == 255
+                    && layer.blend() == "normal"
+                    && layer.origin() == [0, 0]
+                    && layer.mask().is_none()
+                    && layer.effects().len() == 0
+                    && layer.source().is_none()
+                    && layer.clip_to().is_none()
+                    && layer.parent().is_none()
+                    && layer.pixels().width() == meta.width()
+                    && layer.pixels().height() == meta.height()
+                    && layer.pixels().retained().is_none()
+            })
+            .ok_or_else(|| "Native protected view requires a verified saved composite".into())
+    }
+    pub(super) fn copy_render_metadata(
+        &self,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<Admitted<Document36>> {
+        copy_metadata(&self.core.metadata, self.budget(), check)
+    }
     pub fn budget(&self) -> &ResidentBudget {
         &self.core.resident
     }
@@ -175,6 +244,16 @@ impl NativeDocument {
         check: &dyn Fn() -> Result<()>,
     ) -> Result<Admitted<serde_json::Value>> {
         copy_admitted(value, self.budget(), true, check)
+    }
+    pub(crate) fn copy_commands_metadata(
+        &self,
+        commands: &[&serde_json::Value],
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<Admitted<Vec<serde_json::Value>>> {
+        if commands.len() > 100 {
+            return Err("Use at most 100 native preview commands".into());
+        }
+        copy_admitted(&commands, self.budget(), true, check)
     }
     pub(crate) fn copy_contour_metadata(
         &self,
@@ -283,21 +362,27 @@ impl NativeDocument {
         closed: bool,
         prepared: PreparedDelta,
     ) -> std::result::Result<(NativeDocument, Vec<StagedOutput>), RefusedDelta> {
-        if closed {
-            return Err(RefusedDelta {
-                reason: "Project is closed".into(),
-                prepared,
-            });
-        }
-        if let Err(reason) = prepared.intent.check(self, actor, leases, now) {
+        if let Err(reason) = self.check_publication(actor, leases, now, closed, &prepared) {
             return Err(RefusedDelta { reason, prepared });
         }
-        if let Some(admission) = &prepared.admission {
-            if let Err(reason) = admission.check_publication(self, actor, &prepared.intent) {
-                return Err(RefusedDelta { reason, prepared });
-            }
+        Ok((prepared.candidate, prepared.outputs))
+    }
+    fn check_publication(
+        &self,
+        actor: &str,
+        leases: &[super::Lease],
+        now: u64,
+        closed: bool,
+        prepared: &PreparedDelta,
+    ) -> Result<()> {
+        if closed {
+            return Err("Project is closed".into());
         }
-        self.finish_deferred(prepared)
+        prepared.intent.check(self, actor, leases, now)?;
+        if let Some(admission) = &prepared.admission {
+            admission.check_publication(self, actor, &prepared.intent)?;
+        }
+        self.check_candidate(prepared)
     }
     #[cfg(test)]
     fn finish(&self, prepared: PreparedDelta) -> std::result::Result<NativeDocument, RefusedDelta> {
@@ -307,35 +392,34 @@ impl NativeDocument {
         }
         Ok(candidate)
     }
+    #[cfg(test)]
     fn finish_deferred(
         &self,
         prepared: PreparedDelta,
     ) -> std::result::Result<(NativeDocument, Vec<StagedOutput>), RefusedDelta> {
+        if let Err(reason) = self.check_candidate(&prepared) {
+            return Err(RefusedDelta { reason, prepared });
+        }
+        Ok((prepared.candidate, prepared.outputs))
+    }
+    fn check_candidate(&self, prepared: &PreparedDelta) -> Result<()> {
         if prepared
             .admission
             .as_ref()
             .is_some_and(|a| a.is_transaction_step())
         {
-            return Err(RefusedDelta {
-                reason: "Native transaction steps cannot publish independently".into(),
-                prepared,
-            });
+            return Err("Native transaction steps cannot publish independently".into());
         }
-        if let Err(reason) = prepared.cancellation.check() {
-            return Err(RefusedDelta { reason, prepared });
-        }
+        prepared.cancellation.check()?;
         if prepared.base != self.key()
             || self.core.metadata.id != prepared.candidate.core.metadata.id
             || self.core.metadata.revision.checked_add(1)
                 != Some(prepared.candidate.core.metadata.revision)
             || self.core.metadata.read_only
         {
-            return Err(RefusedDelta {
-                reason: "Prepared native edit is stale or refused".into(),
-                prepared,
-            });
+            return Err("Prepared native edit is stale or refused".into());
         }
-        Ok((prepared.candidate, prepared.outputs))
+        Ok(())
     }
 }
 pub(super) fn key() -> DocumentKey {
@@ -392,11 +476,89 @@ impl<'a> Metadata<'a> {
     pub fn srgb_tagged(&self) -> bool {
         self.0.srgb_tagged
     }
+    pub(crate) fn global_light_angle(&self) -> Option<u32> {
+        self.0.psd_global_angle.map(u32::from_be_bytes)
+    }
+    pub(crate) fn psd_rgb8_multiply(&self) -> bool {
+        self.0.psd_rgb8_multiply
+    }
+    pub(crate) fn psd_resources(&self) -> crate::psd::DocumentResources {
+        crate::psd::DocumentResources {
+            resolution: self.0.psd_resolution,
+            scale: self.0.psd_print_scale,
+            pixel_aspect: self.0.psd_pixel_aspect,
+            grid: self.0.psd_grid,
+            layer_id_seed: self.0.psd_layer_id_seed,
+            print_flags: self.0.psd_print_flags,
+            print_flags_info: self.0.psd_print_flags_info,
+            copyright: self.0.psd_copyright,
+            global_angle: self.0.psd_global_angle,
+            global_altitude: self.0.psd_global_altitude,
+            intentionally_untagged: self.0.psd_intentionally_untagged,
+        }
+    }
+    pub(crate) fn psd_file_info(&self) -> &'a [u8] {
+        self.0.psd_file_info.as_deref().map_or(&[], Vec::as_slice)
+    }
+    pub(crate) fn share_psd_file_info(&self) -> Result<Option<super::scene::MetadataPayload<Vec<u8>>>> {
+        self.0.psd_file_info.as_ref().map(super::scene::MetadataPayload::shared).transpose()
+    }
     pub fn global_mask(&self) -> Option<&'a crate::psd::GlobalMaskSettings> {
         self.0.psd_global_mask.as_deref()
     }
+    pub fn global_metadata(&self) -> &'a [crate::psd::GlobalMetadata] {
+        self.0
+            .psd_global_metadata
+            .as_deref()
+            .map_or(&[], |v| v.as_slice())
+    }
     pub fn warnings(&self) -> &'a [String] {
         &self.0.warnings
+    }
+    pub(crate) fn selection_outline(
+        &self,
+        pool: &ResidentBudget,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<SelectionOutline> {
+        use super::scene::MetadataPayload;
+        fn own<
+            T: super::scene::payload::Footprint + serde::Serialize + serde::de::DeserializeOwned,
+        >(
+            value: &MetadataPayload<T>,
+            pool: &ResidentBudget,
+            check: &dyn Fn() -> Result<()>,
+        ) -> Result<MetadataPayload<T>> {
+            check()?;
+            match value.shared() {
+                Ok(shared) if shared.uses_budget(pool) => Ok(shared),
+                Ok(_) => Err("Selection outline uses another resident pool".into()),
+                Err(_) => MetadataPayload::copy_from(value.value(), pool, check),
+            }
+        }
+        let charge =
+            MetadataCharge::reserve(pool, std::mem::size_of::<SelectionOutline>() + 128, check)?;
+        let bounds = self.selection();
+        let polygon = self
+            .0
+            .selection_polygon
+            .as_ref()
+            .filter(|_| bounds.is_some())
+            .map(|polygon| own(polygon, pool, check))
+            .transpose()?;
+        let contours = self
+            .0
+            .selection_coverage
+            .as_ref()
+            .filter(|coverage| bounds == Some(coverage.bounds))
+            .map(|coverage| own(&coverage.contours, pool, check))
+            .transpose()?;
+        check()?;
+        Ok(SelectionOutline {
+            bounds,
+            polygon,
+            contours,
+            _charge: charge,
+        })
     }
     pub fn selection(&self) -> Option<[i32; 4]> {
         self.0.selection
@@ -459,6 +621,18 @@ impl<'a> LayerMetadata<'a> {
     pub fn opacity(&self) -> f32 {
         self.0.opacity
     }
+    pub(crate) fn fill_opacity(&self) -> u8 {
+        crate::psd::fill_opacity::value(self.psd_metadata())
+    }
+    pub(crate) fn blend_clipped_as_group(&self) -> bool {
+        crate::psd::clipping::grouped(self.psd_metadata())
+    }
+    pub(crate) fn blend_if(&self) -> Option<[[u8; 8]; 4]> {
+        crate::psd::blend_ranges::value(self.psd_metadata())
+    }
+    pub(crate) fn blend_channels(&self) -> [bool; 3] {
+        crate::psd::blend_channels::enabled(self.psd_metadata())
+    }
     pub fn blend(&self) -> &'a str {
         &self.0.blend
     }
@@ -494,6 +668,24 @@ impl<'a> LayerMetadata<'a> {
     }
     pub fn source(&self) -> Option<&'a super::scene::Source36> {
         self.0.source.as_ref()
+    }
+}
+/// Display-only selection metadata, with no mask raster or document owner.
+pub(crate) struct SelectionOutline {
+    bounds: Option<[i32; 4]>,
+    polygon: Option<super::scene::MetadataPayload<Vec<[f32; 2]>>>,
+    contours: Option<super::scene::MetadataPayload<Vec<Vec<[f32; 2]>>>>,
+    _charge: Arc<MetadataCharge>,
+}
+impl SelectionOutline {
+    pub(crate) fn bounds(&self) -> Option<[i32; 4]> {
+        self.bounds
+    }
+    pub(crate) fn polygon(&self) -> Option<&[[f32; 2]]> {
+        self.polygon.as_deref().map(Vec::as_slice)
+    }
+    pub(crate) fn contours(&self) -> Option<&[Vec<[f32; 2]>]> {
+        self.contours.as_deref().map(Vec::as_slice)
     }
 }
 #[derive(Clone, Copy)]
@@ -682,6 +874,22 @@ impl RefusedDelta {
     }
 }
 impl PreparedDelta {
+    pub(crate) fn prepare_retirement(self) -> std::result::Result<AbortBatch, (Self, String)> {
+        let mut batch = match AbortBatch::prepare(self.outputs.len()) {
+            Ok(batch) => batch,
+            Err(reason) => return Err((self, reason)),
+        };
+        let Self {
+            candidate,
+            outputs,
+            admission,
+            ..
+        } = self;
+        drop(candidate);
+        batch.capture(outputs);
+        drop(admission);
+        Ok(batch)
+    }
     /// Discard a completed preview or superseded proposal outside Engine locks.
     /// All preview scenes/source views must be dropped first; escaped owners
     /// cause verified retirement refusal and retain the actual disk debt.
@@ -940,12 +1148,73 @@ fn copy_metadata(
     metadata.visit_rasters(|_| Ok(()))?;
     metadata.rehome_unique(|value, _| value.bind_runtime(pool, check))
 }
-pub(super) fn copy_admitted<T: Serialize, U: serde::de::DeserializeOwned + Serialize>(
+pub(crate) fn copy_admitted<T: Serialize, U: serde::de::DeserializeOwned + Serialize>(
     source: &T,
     pool: &ResidentBudget,
     compare_wire: bool,
     check: &dyn Fn() -> Result<()>,
 ) -> Result<Admitted<U>> {
+    project_admitted(source, pool, compare_wire, check, |value, owner| {
+        Admitted::from_parts(Arc::new(value), owner)
+    })
+}
+pub(crate) fn project_admitted<T: Serialize, U: serde::de::DeserializeOwned + Serialize, R>(
+    source: &T,
+    pool: &ResidentBudget,
+    compare_wire: bool,
+    check: &dyn Fn() -> Result<()>,
+    build: impl FnOnce(U, Arc<MetadataCharge>) -> R,
+) -> Result<R> {
+    let (encoded, owner) = encode_metadata(source, pool, check)?;
+    let metadata: U = serde_json::from_slice(&encoded).map_err(|e| e.to_string())?;
+    struct Same<'a> {
+        expected: &'a [u8],
+        at: usize,
+    }
+    impl Write for Same<'_> {
+        fn write(&mut self, part: &[u8]) -> std::io::Result<usize> {
+            let end = self
+                .at
+                .checked_add(part.len())
+                .filter(|n| *n <= self.expected.len())
+                .ok_or_else(|| std::io::Error::other("Native copied metadata differs"))?;
+            if self.expected[self.at..end] != *part {
+                return Err(std::io::Error::other("Native copied metadata differs"));
+            }
+            self.at = end;
+            Ok(part.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut same = Same {
+        expected: &encoded,
+        at: 0,
+    };
+    if compare_wire {
+        serde_json::to_writer(&mut same, &metadata).map_err(|e| e.to_string())?;
+    }
+    if compare_wire && same.at != encoded.len() {
+        return Err("Native copied metadata length differs".into());
+    }
+    check()?;
+    Ok(build(metadata, owner))
+}
+pub(crate) fn metadata_working_charge<T: Serialize>(
+    source: &T,
+    pool: &ResidentBudget,
+    check: &dyn Fn() -> Result<()>,
+) -> Result<Arc<MetadataCharge>> {
+    let (encoded, owner) = encode_metadata(source, pool, check)?;
+    drop(encoded);
+    Ok(owner)
+}
+fn encode_metadata<T: Serialize>(
+    source: &T,
+    pool: &ResidentBudget,
+    check: &dyn Fn() -> Result<()>,
+) -> Result<(ScratchBytes, Arc<MetadataCharge>)> {
     struct Count<'a> {
         bytes: usize,
         check: &'a dyn Fn() -> Result<()>,
@@ -986,40 +1255,7 @@ pub(super) fn copy_admitted<T: Serialize, U: serde::de::DeserializeOwned + Seria
     drop(preflight);
     let owner = MetadataCharge::reserve(pool, stats.tree_upper_bytes()?, check)?;
     check()?;
-    let metadata: U = serde_json::from_slice(&encoded).map_err(|e| e.to_string())?;
-    struct Same<'a> {
-        expected: &'a [u8],
-        at: usize,
-    }
-    impl Write for Same<'_> {
-        fn write(&mut self, part: &[u8]) -> std::io::Result<usize> {
-            let end = self
-                .at
-                .checked_add(part.len())
-                .filter(|n| *n <= self.expected.len())
-                .ok_or_else(|| std::io::Error::other("Native copied metadata differs"))?;
-            if self.expected[self.at..end] != *part {
-                return Err(std::io::Error::other("Native copied metadata differs"));
-            }
-            self.at = end;
-            Ok(part.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut same = Same {
-        expected: &encoded,
-        at: 0,
-    };
-    if compare_wire {
-        serde_json::to_writer(&mut same, &metadata).map_err(|e| e.to_string())?;
-    }
-    if compare_wire && same.at != encoded.len() {
-        return Err("Native copied metadata length differs".into());
-    }
-    check()?;
-    Ok(Admitted::from_parts(Arc::new(metadata), owner))
+    Ok((encoded, owner))
 }
 
 #[cfg(test)]
@@ -1099,6 +1335,123 @@ mod tests {
         )
         .unwrap();
         NativeDocument::from_pending(pending).unwrap()
+    }
+    #[test]
+    fn selection_outlines_share_only_admitted_active_geometry_and_release_on_refusal() {
+        let pool = ResidentBudget::new(8 * 1024 * 1024).unwrap();
+        let owner = MetadataCharge::reserve(&pool, 64 * 1024, &|| Ok(())).unwrap();
+        let mut source = Document::new_depth(8, 8, 16).unwrap();
+        source.selection = Some([1, 2, 7, 8]);
+        source.selection_polygon = Some(vec![[1., 2.], [7., 2.], [7., 8.]]);
+        source.selection_coverage = Some(crate::selection::Coverage {
+            mask: crate::raster::Raster::new(6, 6),
+            bounds: [1, 2, 7, 8],
+            origin: [1, 2],
+            contours: vec![vec![[1., 2.], [7., 2.], [7., 8.]]],
+        });
+        let mut collector = Collector { rasters: vec![] };
+        let mut wire = Document36::capture(&source, &mut collector).unwrap();
+        let baseline = pool.used();
+        let copied = Metadata(&wire, key())
+            .selection_outline(&pool, &|| Ok(()))
+            .unwrap();
+        assert_eq!(copied.bounds(), source.selection);
+        assert_eq!(copied.polygon(), source.selection_polygon.as_deref());
+        assert_eq!(
+            copied.contours(),
+            Some(
+                source
+                    .selection_coverage
+                    .as_ref()
+                    .unwrap()
+                    .contours
+                    .as_slice()
+            )
+        );
+        assert!(!std::ptr::eq(
+            copied.polygon().unwrap(),
+            wire.selection_polygon.as_deref().unwrap().as_slice()
+        ));
+        assert!(copied.polygon.as_ref().unwrap().uses_budget(&pool));
+        assert!(copied.contours.as_ref().unwrap().uses_budget(&pool));
+        drop(copied);
+        assert_eq!(pool.used(), baseline);
+        for bounds in [None, Some([2, 2, 7, 8])] {
+            wire.selection = bounds;
+            let outline = Metadata(&wire, key())
+                .selection_outline(&pool, &|| Ok(()))
+                .unwrap();
+            assert_eq!(outline.bounds(), bounds);
+            assert!(outline.contours().is_none());
+            if bounds.is_none() {
+                assert!(outline.polygon().is_none());
+            }
+        }
+        wire.selection = source.selection;
+        let pending = PendingScene::new(
+            Admitted::from_parts(Arc::new(wire), owner),
+            RasterRoster::new(collector.rasters).unwrap(),
+            pool.clone(),
+            DiskBudget::new(1024 * 1024, 8).unwrap(),
+        )
+        .unwrap();
+        let native = NativeDocument::from_pending(pending).unwrap();
+        let baseline = pool.used();
+        let calls = std::cell::Cell::new(0);
+        assert!(native
+            .metadata()
+            .selection_outline(&pool, &|| {
+                calls.set(calls.get() + 1);
+                if calls.get() == 5 {
+                    Err("Cancelled during outline capture".into())
+                } else {
+                    Ok(())
+                }
+            })
+            .is_err());
+        assert_eq!(pool.used(), baseline);
+        let other = ResidentBudget::new(pool.limit()).unwrap();
+        assert!(native
+            .metadata()
+            .selection_outline(&other, &|| Ok(()))
+            .is_err());
+        assert_eq!(other.used(), 0);
+        let full = MetadataCharge::reserve(&pool, pool.limit() - pool.used(), &|| Ok(())).unwrap();
+        assert!(native
+            .metadata()
+            .selection_outline(&pool, &|| Ok(()))
+            .is_err());
+        drop(full);
+        assert_eq!(pool.used(), baseline);
+        let outline = native
+            .metadata()
+            .selection_outline(&pool, &|| Ok(()))
+            .unwrap();
+        assert!(outline
+            .polygon
+            .as_ref()
+            .unwrap()
+            .same_allocation(native.core.metadata.selection_polygon.as_ref().unwrap()));
+        assert!(outline.contours.as_ref().unwrap().same_allocation(
+            &native
+                .core
+                .metadata
+                .selection_coverage
+                .as_ref()
+                .unwrap()
+                .contours
+        ));
+        assert_eq!(
+            pool.used(),
+            baseline + std::mem::size_of::<SelectionOutline>() + 128
+        );
+        let weak = Arc::downgrade(native.core.owner());
+        drop(native);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(outline.bounds(), source.selection);
+        assert!(pool.used() > 0);
+        drop(outline);
+        assert_eq!(pool.used(), 0);
     }
     #[test]
     fn immutable_clones_share_sources_and_header_charge_until_last_owner() {

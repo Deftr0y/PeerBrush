@@ -50,11 +50,11 @@ fn installed_fixture_font() -> peerbrush::fonts::TextFont {
 }
 fn fixture(depth: u16) -> Engine {
     let mut e = Engine::new();
-    e.doc = Document::new_depth(240, 180, depth).unwrap();
+    e.resident_state_mut().expect("resident fixture").document = Document::new_depth(240, 180, depth).unwrap();
     e
 }
 fn edit(e: &mut Engine, c: Value) {
-    e.edit("human", &[c], Some(e.doc.revision), None, "Source")
+    e.edit("human", &[c], Some(e.resident_state().expect("resident fixture").document.revision), None, "Source")
         .unwrap();
 }
 #[test]
@@ -62,18 +62,18 @@ fn native_text_shape_projection_preview_psd_and_single_undo_preserve_source() {
     for depth in [8, 16] {
         for source in [text(), shape()] {
             let mut e = fixture(depth);
-            let before = e.doc.export_png().unwrap();
+            let before = e.resident_state().expect("resident fixture").document.export_png().unwrap();
             let command = json!({"op":"source.add","source":source,"x":21,"y":19});
-            let preview = Engine::preview_edits(e.doc.clone(), &[command.clone()]).unwrap();
+            let preview = Engine::preview_edits(e.resident_state().expect("resident fixture").document.clone(), &[command.clone()]).unwrap();
             edit(&mut e, command);
-            assert_eq!(e.undo.len(), 1);
-            assert_eq!(e.doc.export_png().unwrap(), preview.export_png().unwrap());
-            assert_eq!(e.doc.layers[0].source, Some(source.clone().into()));
-            assert!(e.doc.layers[0].pixels.bytes() > 0);
-            assert_eq!(e.state()["layers"][0]["source"], json!(source));
+            assert_eq!(e.resident_state().expect("resident fixture").undo.len(), 1);
+            assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), preview.export_png().unwrap());
+            assert_eq!(e.resident_state().expect("resident fixture").document.layers[0].source, Some(source.clone().into()));
+            assert!(e.resident_state().expect("resident fixture").document.layers[0].pixels.bytes() > 0);
+            assert_eq!(e.capture_state().unwrap().project().unwrap()["layers"][0]["source"], json!(source));
             if let Content::Shape { .. } = source.content {
                 assert_eq!(
-                    e.doc.layers[0].pixels.get16(30, 30),
+                    e.resident_state().expect("resident fixture").document.layers[0].pixels.get16(30, 30),
                     if depth == 16 {
                         [12345, 23457, 34569, 65535]
                     } else {
@@ -81,15 +81,15 @@ fn native_text_shape_projection_preview_psd_and_single_undo_preserve_source() {
                     }
                 );
             }
-            let bytes = psd::encode(&e.doc).unwrap();
+            let bytes = psd::encode(&e.resident_state().expect("resident fixture").document).unwrap();
             let decoded = psd::decode(&bytes).unwrap();
             assert!(!decoded.read_only);
-            assert_eq!(decoded.layers[0].source, e.doc.layers[0].source);
-            assert_eq!(decoded.export_png().unwrap(), e.doc.export_png().unwrap());
+            assert_eq!(decoded.layers[0].source, e.resident_state().expect("resident fixture").document.layers[0].source);
+            assert_eq!(decoded.export_png().unwrap(), e.resident_state().expect("resident fixture").document.export_png().unwrap());
             e.undo("human").unwrap();
-            assert_eq!(e.doc.export_png().unwrap(), before);
+            assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), before);
             e.redo("human").unwrap();
-            assert_eq!(e.doc.layers[0].source, Some(source.into()));
+            assert_eq!(e.resident_state().expect("resident fixture").document.layers[0].source, Some(source.into()));
         }
     }
 }
@@ -97,7 +97,7 @@ fn native_text_shape_projection_preview_psd_and_single_undo_preserve_source() {
 fn editable_source_masks_effects_native_clipboard_and_updates_stay_coherent() {
     let mut e = fixture(16);
     edit(&mut e, json!({"op":"source.add","source":shape()}));
-    let id = e.doc.layers[0].id.clone();
+    let id = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
     edit(&mut e, json!({"op":"mask.add","layer":id,"value":255}));
     edit(
         &mut e,
@@ -107,27 +107,27 @@ fn editable_source_masks_effects_native_clipboard_and_updates_stay_coherent() {
         &mut e,
         json!({"op":"effect.add","layer":id,"kind":"hsl","settings":{"hue":20.,"saturation":0.,"lightness":0.}}),
     );
-    let original = e.doc.export_png().unwrap();
-    let original_source = e.doc.layers[0].source.clone();
+    let original = e.resident_state().expect("resident fixture").document.export_png().unwrap();
+    let original_source = e.resident_state().expect("resident fixture").document.layers[0].source.clone();
     let mut updated = original_source.as_deref().cloned().unwrap();
     if let Content::Shape { fill, .. } = &mut updated.content {
         *fill = [51001, 16003, 8007, 65535];
     }
     let command = json!({"op":"source.update","layer":id,"source":updated});
-    let preview = Engine::preview_edits(e.doc.clone(), &[command.clone()]).unwrap();
+    let preview = Engine::preview_edits(e.resident_state().expect("resident fixture").document.clone(), &[command.clone()]).unwrap();
     edit(&mut e, command);
-    assert_eq!(preview.export_png().unwrap(), e.doc.export_png().unwrap());
-    assert_ne!(original, e.doc.export_png().unwrap());
-    assert!(e.doc.layers[0].mask.is_some());
-    assert_eq!(e.doc.layers[0].effects.len(), 1);
+    assert_eq!(preview.export_png().unwrap(), e.resident_state().expect("resident fixture").document.export_png().unwrap());
+    assert_ne!(original, e.resident_state().expect("resident fixture").document.export_png().unwrap());
+    assert!(e.resident_state().expect("resident fixture").document.layers[0].mask.is_some());
+    assert_eq!(e.resident_state().expect("resident fixture").document.layers[0].effects.len(), 1);
     e.undo("human").unwrap();
-    assert_eq!(original, e.doc.export_png().unwrap());
-    assert_eq!(original_source, e.doc.layers[0].source);
-    let snapshot = layer_clipboard::copy(&e.doc, &[id]).unwrap();
+    assert_eq!(original, e.resident_state().expect("resident fixture").document.export_png().unwrap());
+    assert_eq!(original_source, e.resident_state().expect("resident fixture").document.layers[0].source);
+    let snapshot = layer_clipboard::copy(&e.resident_state().expect("resident fixture").document, &[id]).unwrap();
     let mut target = Document::new_depth(240, 180, 16).unwrap();
     layer_clipboard::paste(&mut target, &snapshot, "").unwrap();
     assert!(target.layers.iter().any(|l| l.source == original_source));
-    let decoded = psd::decode(&psd::encode(&e.doc).unwrap()).unwrap();
+    let decoded = psd::decode(&psd::encode(&e.resident_state().expect("resident fixture").document).unwrap()).unwrap();
     assert_eq!(decoded.export_png().unwrap(), original);
     assert_eq!(decoded.layers[0].source, original_source);
 }
@@ -138,14 +138,14 @@ fn transforms_and_geometry_keep_editable_sources_and_native_precision() {
         &mut e,
         json!({"op":"source.add","source":shape(),"x":21,"y":19}),
     );
-    let id = e.doc.layers[0].id.clone();
-    let before = e.doc.export_png().unwrap();
-    let original = e.doc.layers[0].source.clone();
+    let id = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
+    let before = e.resident_state().expect("resident fixture").document.export_png().unwrap();
+    let original = e.resident_state().expect("resident fixture").document.layers[0].source.clone();
     edit(
         &mut e,
         json!({"op":"transform","layer":id,"angle":90.,"selection_only":false}),
     );
-    let rotated = e.doc.layers[0].clone();
+    let rotated = e.resident_state().expect("resident fixture").document.layers[0].clone();
     assert_eq!(
         rotated.source.as_ref().unwrap().content,
         original.as_ref().unwrap().content
@@ -160,39 +160,39 @@ fn transforms_and_geometry_keep_editable_sources_and_native_precision() {
         json!({"op":"source.update","layer":id,"source":source}),
     );
     assert_eq!(
-        e.doc.layers[0].pixels.get16(20, 20),
+        e.resident_state().expect("resident fixture").document.layers[0].pixels.get16(20, 20),
         [11111, 22223, 33337, 65535]
     );
     e.undo("human").unwrap();
     e.undo("human").unwrap();
-    assert_eq!(before, e.doc.export_png().unwrap());
+    assert_eq!(before, e.resident_state().expect("resident fixture").document.export_png().unwrap());
     edit(&mut e, json!({"op":"crop","rect":[10,10,230,170]}));
-    assert_eq!(e.doc.layers[0].source, original);
-    assert_eq!((e.doc.layers[0].x, e.doc.layers[0].y), (11, 9));
+    assert_eq!(e.resident_state().expect("resident fixture").document.layers[0].source, original);
+    assert_eq!((e.resident_state().expect("resident fixture").document.layers[0].x, e.resident_state().expect("resident fixture").document.layers[0].y), (11, 9));
     edit(
         &mut e,
         json!({"op":"image.resize","width":440,"height":320}),
     );
-    assert_eq!(e.doc.layers[0].source.as_ref().unwrap().width, 80);
+    assert_eq!(e.resident_state().expect("resident fixture").document.layers[0].source.as_ref().unwrap().width, 80);
     assert_eq!(
-        e.doc.layers[0].source.as_ref().unwrap().matrix,
+        e.resident_state().expect("resident fixture").document.layers[0].source.as_ref().unwrap().matrix,
         [2., 0., 0., 2., 0., 0.]
     );
     assert_eq!(
-        e.doc.layers[0].pixels.get16(40, 40),
+        e.resident_state().expect("resident fixture").document.layers[0].pixels.get16(40, 40),
         [12345, 23457, 34569, 65535]
     );
-    let doc = psd::decode(&psd::encode(&e.doc).unwrap()).unwrap();
-    assert_eq!(doc.layers[0].source, e.doc.layers[0].source);
-    assert_eq!(doc.export_png().unwrap(), e.doc.export_png().unwrap());
+    let doc = psd::decode(&psd::encode(&e.resident_state().expect("resident fixture").document).unwrap()).unwrap();
+    assert_eq!(doc.layers[0].source, e.resident_state().expect("resident fixture").document.layers[0].source);
+    assert_eq!(doc.export_png().unwrap(), e.resident_state().expect("resident fixture").document.export_png().unwrap());
 }
 #[test]
 fn invalid_sources_locked_reserved_stale_and_pixel_edits_are_atomic() {
     let mut e = fixture(16);
     edit(&mut e, json!({"op":"source.add","source":shape()}));
-    let id = e.doc.layers[0].id.clone();
-    let original = serde_json::to_value(&e.doc).unwrap();
-    let revision = e.doc.revision;
+    let id = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
+    let original = serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap();
+    let revision = e.resident_state().expect("resident fixture").document.revision;
     let mut invalid = shape();
     invalid.matrix = [0.; 6];
     for command in [
@@ -206,7 +206,7 @@ fn invalid_sources_locked_reserved_stale_and_pixel_edits_are_atomic() {
         assert!(e
             .edit("human", &[command], Some(revision), None, "Invalid")
             .is_err());
-        assert_eq!(serde_json::to_value(&e.doc).unwrap(), original);
+        assert_eq!(serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap(), original);
     }
     let mut unsupported = text();
     if let Content::Text { text, .. } = &mut unsupported.content {
@@ -230,7 +230,7 @@ fn invalid_sources_locked_reserved_stale_and_pixel_edits_are_atomic() {
         )
         .is_err());
     e.leases.clear();
-    e.doc.layers[0].locked = true;
+    e.resident_state_mut().expect("resident fixture").document.layers[0].locked = true;
     assert!(e
         .edit(
             "human",
@@ -240,13 +240,13 @@ fn invalid_sources_locked_reserved_stale_and_pixel_edits_are_atomic() {
             "Locked"
         )
         .is_err());
-    e.doc.layers[0].locked = false;
-    let png = e.doc.export_png().unwrap();
+    e.resident_state_mut().expect("resident fixture").document.layers[0].locked = false;
+    let png = e.resident_state().expect("resident fixture").document.export_png().unwrap();
     edit(&mut e, json!({"op":"source.rasterize","layer":id}));
-    assert!(e.doc.layers[0].source.is_none());
-    assert_eq!(png, e.doc.export_png().unwrap());
+    assert!(e.resident_state().expect("resident fixture").document.layers[0].source.is_none());
+    assert_eq!(png, e.resident_state().expect("resident fixture").document.export_png().unwrap());
     e.undo("human").unwrap();
-    assert!(e.doc.layers[0].source.is_some());
+    assert!(e.resident_state().expect("resident fixture").document.layers[0].source.is_some());
 }
 #[test]
 fn ellipse_paths_fill_stroke_and_text_font_alignment_are_editable() {
@@ -285,7 +285,7 @@ fn standard_psd_rasters_match_current_source_without_private_definitions() {
                 &mut e,
                 json!({"op":"source.add","source":source,"x":21,"y":19}),
             );
-            let bytes = psd::encode(&e.doc).unwrap();
+            let bytes = psd::encode(&e.resident_state().expect("resident fixture").document).unwrap();
             let start = bytes.windows(4).position(|w| w == b"PBR1").unwrap() + 4;
             let mut json = Vec::new();
             ZlibDecoder::new(&bytes[start..])
@@ -303,9 +303,9 @@ fn standard_psd_rasters_match_current_source_without_private_definitions() {
             assert!(decoded.layers.iter().all(|l| l.source.is_none()));
             assert_eq!(
                 decoded.layers[0].pixels.rgba16(),
-                e.doc.layers[0].pixels.rgba16()
+                e.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16()
             );
-            assert_eq!(decoded.export_png().unwrap(), e.doc.export_png().unwrap());
+            assert_eq!(decoded.export_png().unwrap(), e.resident_state().expect("resident fixture").document.export_png().unwrap());
         }
     }
 }
@@ -433,7 +433,7 @@ fn text_field_resize_preserves_affine_placement_native_masks_effect_controls_and
                 &mut e,
                 json!({"op":"source.add","source":text(),"x":30,"y":40}),
             );
-            let id = e.doc.layers[0].id.clone();
+            let id = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
             edit(
                 &mut e,
                 json!({"op":"transform","layer":id,"angle":90.,"mirror_x":mirrored,"selection_only":false}),
@@ -443,7 +443,7 @@ fn text_field_resize_preserves_affine_placement_native_masks_effect_controls_and
                 &mut e,
                 json!({"op":"mask.link","layer":id,"linked":!mirrored}),
             );
-            let layer = &mut e.doc.layers[0];
+            let layer = &mut e.resident_state_mut().expect("resident fixture").document.layers[0];
             let mut pixels = peerbrush::raster::Raster::new_depth(
                 layer.pixels.width,
                 layer.pixels.height,
@@ -486,7 +486,7 @@ fn text_field_resize_preserves_affine_placement_native_masks_effect_controls_and
                 &mut e,
                 json!({"op":"effect.add","layer":id,"kind":"hsl","settings":{"hue":12.,"saturation":0.,"lightness":0.}}),
             );
-            let before = e.doc.clone();
+            let before = e.resident_state().expect("resident fixture").document.clone();
             let original = before.layers[0].clone();
             let mut source = original.source.as_deref().cloned().unwrap();
             source.width = 220;
@@ -495,18 +495,18 @@ fn text_field_resize_preserves_affine_placement_native_masks_effect_controls_and
                 *letter_spacing = 3.5;
             }
             let command = json!({"op":"source.update","layer":id,"source":source,"document_id":before.id,"source_revision":before.revision});
-            let history = e.undo.len();
+            let history = e.resident_state().expect("resident fixture").undo.len();
             let preview = Engine::preview_edits(before.clone(), &[command.clone()]).unwrap();
-            assert_eq!(artwork(&e.doc), artwork(&before));
-            assert_eq!(e.undo.len(), history);
+            assert_eq!(artwork(&e.resident_state().expect("resident fixture").document), artwork(&before));
+            assert_eq!(e.resident_state().expect("resident fixture").undo.len(), history);
             edit(&mut e, command);
-            assert_eq!(e.undo.len(), history + 1);
-            assert_eq!(e.doc.export_png().unwrap(), preview.export_png().unwrap());
+            assert_eq!(e.resident_state().expect("resident fixture").undo.len(), history + 1);
+            assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), preview.export_png().unwrap());
             assert_eq!(
-                e.doc.layers[0].pixels.rgba16(),
+                e.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(),
                 preview.layers[0].pixels.rgba16()
             );
-            let resized = &e.doc.layers[0];
+            let resized = &e.resident_state().expect("resident fixture").document.layers[0];
             assert!(
                 resized.x < original.x,
                 "rotation grows into negative projection X"
@@ -609,12 +609,12 @@ fn text_field_resize_preserves_affine_placement_native_masks_effect_controls_and
                 shifted.value(12 + original.x - resized.x, 10 + original.y - resized.y)
             );
             assert_eq!(coverage.mask.rgba(), shifted.mask.rgba());
-            let grown = e.doc.clone();
+            let grown = e.resident_state().expect("resident fixture").document.clone();
             e.undo("human").unwrap();
-            assert_eq!(artwork(&e.doc), artwork(&before));
+            assert_eq!(artwork(&e.resident_state().expect("resident fixture").document), artwork(&before));
             e.redo("human").unwrap();
-            assert_eq!(artwork(&e.doc), artwork(&grown));
-            let mut smaller = e.doc.layers[0].source.as_deref().cloned().unwrap();
+            assert_eq!(artwork(&e.resident_state().expect("resident fixture").document), artwork(&grown));
+            let mut smaller = e.resident_state().expect("resident fixture").document.layers[0].source.as_deref().cloned().unwrap();
             smaller.width = 96;
             smaller.height = 70;
             edit(
@@ -623,10 +623,10 @@ fn text_field_resize_preserves_affine_placement_native_masks_effect_controls_and
             );
             assert_eq!(
                 (
-                    e.doc.layers[0].x,
-                    e.doc.layers[0].y,
-                    e.doc.layers[0].pixels.width,
-                    e.doc.layers[0].pixels.height
+                    e.resident_state().expect("resident fixture").document.layers[0].x,
+                    e.resident_state().expect("resident fixture").document.layers[0].y,
+                    e.resident_state().expect("resident fixture").document.layers[0].pixels.width,
+                    e.resident_state().expect("resident fixture").document.layers[0].pixels.height
                 ),
                 (
                     grown.layers[0].x,
@@ -635,11 +635,11 @@ fn text_field_resize_preserves_affine_placement_native_masks_effect_controls_and
                     grown.layers[0].pixels.height
                 )
             );
-            assert_eq!(json!(e.doc.layers[0].mask), json!(grown.layers[0].mask));
-            let decoded = psd::decode(&psd::encode(&e.doc).unwrap()).unwrap();
+            assert_eq!(json!(e.resident_state().expect("resident fixture").document.layers[0].mask), json!(grown.layers[0].mask));
+            let decoded = psd::decode(&psd::encode(&e.resident_state().expect("resident fixture").document).unwrap()).unwrap();
             assert!(!decoded.read_only);
-            assert_eq!(artwork(&decoded), artwork(&e.doc));
-            assert_eq!(decoded.export_png().unwrap(), e.doc.export_png().unwrap());
+            assert_eq!(artwork(&decoded), artwork(&e.resident_state().expect("resident fixture").document));
+            assert_eq!(decoded.export_png().unwrap(), e.resident_state().expect("resident fixture").document.export_png().unwrap());
         }
     }
 }
@@ -712,17 +712,17 @@ fn unavailable_installed_definitions_survive_group_clipboard_and_task_compensati
     for depth in [8, 16] {
         let mut engine = fixture(depth);
         edit(&mut engine, json!({"op":"source.add","source":text()}));
-        let id = engine.doc.layers[0].id.clone();
-        let other = engine.doc.layers[1].id.clone();
+        let id = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
+        let other = engine.resident_state().expect("resident fixture").document.layers[1].id.clone();
         // A saved fixture's font identity is absent here; its existing projection
         // comes from the real bundled font rather than an invented raster.
         if let Content::Text { font, .. } =
-            &mut std::sync::Arc::make_mut(engine.doc.layers[0].source.as_mut().unwrap()).content
+            &mut std::sync::Arc::make_mut(engine.resident_state_mut().expect("resident fixture").document.layers[0].source.as_mut().unwrap()).content
         {
             *font = installed_fixture_font();
         }
-        let definition = engine.doc.layers[0].source.clone();
-        let native = engine.doc.layers[0].pixels.rgba16();
+        let definition = engine.resident_state().expect("resident fixture").document.layers[0].source.clone();
+        let native = engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16();
         let task = engine
             .reserve("agent", "Text layer effect", vec![])
             .unwrap()
@@ -731,7 +731,7 @@ fn unavailable_installed_definitions_survive_group_clipboard_and_task_compensati
             .edit(
                 "agent",
                 &[json!({"op":"effect.add","layer":id,"kind":"invert","settings":{}})],
-                Some(engine.doc.revision),
+                Some(engine.resident_state().expect("resident fixture").document.revision),
                 Some(&task),
                 "Agent effect",
             )
@@ -744,27 +744,27 @@ fn unavailable_installed_definitions_survive_group_clipboard_and_task_compensati
             &mut engine,
             json!({"op":"layer.update","layer":id,"name":"Human retained title"}),
         );
-        let human = engine.doc.layers[1].pixels.rgba16();
+        let human = engine.resident_state().expect("resident fixture").document.layers[1].pixels.rgba16();
         engine.undo_task("human", "agent", &task).unwrap();
-        assert!(engine.doc.layers[0].effects.is_empty());
-        assert_eq!(engine.doc.layers[0].name, "Human retained title");
-        assert_eq!(engine.doc.layers[0].source, definition);
-        assert_eq!(engine.doc.layers[0].pixels.rgba16(), native);
-        assert_eq!(engine.doc.layers[1].pixels.rgba16(), human);
+        assert!(engine.resident_state().expect("resident fixture").document.layers[0].effects.is_empty());
+        assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].name, "Human retained title");
+        assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].source, definition);
+        assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(), native);
+        assert_eq!(engine.resident_state().expect("resident fixture").document.layers[1].pixels.rgba16(), human);
         edit(
             &mut engine,
             json!({"op":"group.create_selected","layers":[id]}),
         );
-        let folder = engine.doc.layers[0].id.clone();
+        let folder = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
         let layer = engine
-            .doc
+            .resident_state().expect("resident fixture").document
             .layers
             .iter()
             .find(|layer| layer.id == id)
             .unwrap();
         assert_eq!(layer.parent.as_deref(), Some(folder.as_str()));
         assert_eq!(layer.source, definition);
-        let clipboard = layer_clipboard::copy(&engine.doc, &[folder]).unwrap();
+        let clipboard = layer_clipboard::copy(&engine.resident_state().expect("resident fixture").document, &[folder]).unwrap();
         let mut target = Document::new_depth(240, 180, depth).unwrap();
         layer_clipboard::paste(&mut target, &clipboard, "").unwrap();
         let pasted = target
@@ -775,8 +775,8 @@ fn unavailable_installed_definitions_survive_group_clipboard_and_task_compensati
         assert_eq!(pasted.source, definition);
         assert_eq!(pasted.pixels.rgba16(), native);
         for bytes in [
-            psd::encode(&engine.doc).unwrap(),
-            psd::encode_psb(&engine.doc).unwrap(),
+            psd::encode(&engine.resident_state().expect("resident fixture").document).unwrap(),
+            psd::encode_psb(&engine.resident_state().expect("resident fixture").document).unwrap(),
         ] {
             let reopened = psd::decode(&bytes).unwrap();
             assert!(!reopened.read_only);
@@ -786,13 +786,13 @@ fn unavailable_installed_definitions_survive_group_clipboard_and_task_compensati
             assert_eq!(layer.pixels.rgba16(), native);
             assert_eq!(
                 reopened.export_png().unwrap(),
-                engine.doc.export_png().unwrap()
+                engine.resident_state().expect("resident fixture").document.export_png().unwrap()
             );
         }
         engine.undo("human").unwrap();
-        assert_eq!(engine.doc.layers[0].source, definition);
-        assert_eq!(engine.doc.layers[0].pixels.rgba16(), native);
-        assert_eq!(engine.doc.layers[1].pixels.rgba16(), human);
+        assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].source, definition);
+        assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(), native);
+        assert_eq!(engine.resident_state().expect("resident fixture").document.layers[1].pixels.rgba16(), human);
     }
 }
 
@@ -801,7 +801,7 @@ fn text_field_resize_and_tracking_failures_preserve_shared_state_and_nontext_fra
     for depth in [8, 16] {
         let mut e = fixture(depth);
         edit(&mut e, json!({"op":"source.add","source":text()}));
-        let id = e.doc.layers[0].id.clone();
+        let id = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
         let mut grown = text();
         grown.width = 220;
         if let Content::Text { letter_spacing, .. } = &mut grown.content {
@@ -811,32 +811,32 @@ fn text_field_resize_and_tracking_failures_preserve_shared_state_and_nontext_fra
         for guard in ["locked", "reserved", "stale", "document", "read_only"] {
             let mut command = good.clone();
             match guard {
-                "locked" => e.doc.layers[0].locked = true,
+                "locked" => e.resident_state_mut().expect("resident fixture").document.layers[0].locked = true,
                 "reserved" => {
                     e.reserve("agent", "Reserved text", vec![Scope::layer(&id)])
                         .unwrap();
                 }
-                "stale" => command["source_revision"] = json!(e.doc.revision - 1),
+                "stale" => command["source_revision"] = json!(e.resident_state().expect("resident fixture").document.revision - 1),
                 "document" => command["document_id"] = json!("another-document"),
-                _ => e.doc.read_only = true,
+                _ => e.resident_state_mut().expect("resident fixture").document.read_only = true,
             }
-            let before = json!(e.doc);
-            let history = (e.undo.len(), e.redo.len());
+            let before = json!(e.resident_state().expect("resident fixture").document);
+            let history = (e.resident_state().expect("resident fixture").undo.len(), e.resident_state().expect("resident fixture").redo.len());
             assert!(
                 e.edit(
                     "human",
                     &[command],
-                    Some(e.doc.revision),
+                    Some(e.resident_state().expect("resident fixture").document.revision),
                     None,
                     "Refused text edit"
                 )
                 .is_err(),
                 "{guard}"
             );
-            assert_eq!(json!(e.doc), before);
-            assert_eq!((e.undo.len(), e.redo.len()), history);
-            e.doc.layers[0].locked = false;
-            e.doc.read_only = false;
+            assert_eq!(json!(e.resident_state().expect("resident fixture").document), before);
+            assert_eq!((e.resident_state().expect("resident fixture").undo.len(), e.resident_state().expect("resident fixture").redo.len()), history);
+            e.resident_state_mut().expect("resident fixture").document.layers[0].locked = false;
+            e.resident_state_mut().expect("resident fixture").document.read_only = false;
             e.leases.clear();
         }
         for spacing in [f32::NAN, f32::INFINITY, -1024.5, 1024.5] {
@@ -856,7 +856,7 @@ fn text_field_resize_and_tracking_failures_preserve_shared_state_and_nontext_fra
             invalid.width = width;
             invalid.height = height;
             invalid.matrix = matrix;
-            let before = json!(e.doc);
+            let before = json!(e.resident_state().expect("resident fixture").document);
             assert!(e
                 .edit(
                     "human",
@@ -866,11 +866,11 @@ fn text_field_resize_and_tracking_failures_preserve_shared_state_and_nontext_fra
                     "Invalid frame"
                 )
                 .is_err());
-            assert_eq!(json!(e.doc), before);
+            assert_eq!(json!(e.resident_state().expect("resident fixture").document), before);
         }
         edit(&mut e, json!({"op":"mask.add","layer":id,"value":255}));
-        let step = e.doc.layers[0].mask.as_ref().unwrap().steps[0].clone();
-        e.doc.layers[0].mask.as_mut().unwrap().steps = (0..32)
+        let step = e.resident_state().expect("resident fixture").document.layers[0].mask.as_ref().unwrap().steps[0].clone();
+        e.resident_state_mut().expect("resident fixture").document.layers[0].mask.as_mut().unwrap().steps = (0..32)
             .map(|i| {
                 let mut s = step.clone();
                 s.id = format!("fill-{i}");
@@ -880,15 +880,15 @@ fn text_field_resize_and_tracking_failures_preserve_shared_state_and_nontext_fra
         let mut excessive = grown.clone();
         excessive.width = 2000;
         excessive.height = 2000;
-        let before = json!(e.doc.layers[0]);
+        let before = json!(e.resident_state().expect("resident fixture").document.layers[0]);
         assert!(
-            peerbrush::source::update(&mut e.doc.layers[0], &json!({"source":excessive}))
+            peerbrush::source::update(&mut e.resident_state_mut().expect("resident fixture").document.layers[0], &json!({"source":excessive}))
                 .unwrap_err()
                 .contains("128-million")
         );
-        assert_eq!(json!(e.doc.layers[0]), before);
+        assert_eq!(json!(e.resident_state().expect("resident fixture").document.layers[0]), before);
 
-        let mut layer = e.doc.layers[0].clone();
+        let mut layer = e.resident_state().expect("resident fixture").document.layers[0].clone();
         layer.mask = None;
         layer.x = -99999;
         let mut mirrored = text();
@@ -903,7 +903,7 @@ fn text_field_resize_and_tracking_failures_preserve_shared_state_and_nontext_fra
         );
         assert_eq!(json!(layer), before);
 
-        let mut layer = e.doc.layers[0].clone();
+        let mut layer = e.resident_state().expect("resident fixture").document.layers[0].clone();
         layer.mask.as_mut().unwrap().steps.truncate(2);
         let mut mirrored = text();
         mirrored.matrix = [-1., 0., 0., 1., 180., 0.];

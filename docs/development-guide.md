@@ -1,11 +1,11 @@
 # PeerBrush development guide
 
-PeerBrush is a GPL v3 native image editor built with Rust, egui/eframe and wgpu. Document editing, codecs and transports share one engine. Read [AGENTS.md](../AGENTS.md), the [backlog](../FOLLOWUPS.MD) and the relevant version queue before changing behavior. Version 0.26.0 Mac/Linux downloads and the website are published; Windows Store 0.26 remains pending. The active [v0.3 milestone](development-0.3.md) proposes the remaining backlog and installation/release foundations, with PB-108 first. Its approved application version is 0.30.0; development packages are unreleased.
+PeerBrush is a GPL v3 native image editor built with Rust, egui/eframe and wgpu. Document editing, codecs and transports share one engine. Read [AGENTS.md](../AGENTS.md), the [backlog](../FOLLOWUPS.MD) and the [development queue](development-0.3.md) before changing behavior. The latest published version is [0.30.1](https://github.com/Deftr0y/PeerBrush/releases/tag/v0.30.1). The next version carries forward the remaining backlog, with PB-108 first.
 
 ## Direct version development and release promotion
 
-Develop directly on the appropriate version branch. The active milestone is
-`version/0.3`, with application version 0.30.0; development builds remain
+Develop directly on the appropriate version branch. The active branch is
+`version/0.4`, with 0.4.0 as the working version. Development builds remain
 unreleased. Production source is `main`. `dev` and existing feature/fix branches
 retain historical and explicitly unqualified WIP checkpoints. Do not delete,
 rewrite or automatically integrate those checkpoints.
@@ -16,12 +16,12 @@ candidate, not authorization to publish. Never force-push shared history. Websit
 maintenance remains separate: `maintenance/site-*` → `site-content`.
 
 ```sh
-git fetch origin
-git switch version/0.3
-git pull --ff-only origin version/0.3
-# Make the requested change and commit it directly on this version branch.
-git push origin version/0.3
+git switch version/0.4
 ```
+
+Once the branch has an upstream, synchronize it with `git pull --ff-only` before editing. Commit the requested change directly on the version branch.
+
+The 0.4 series follows the published 0.30 series in PeerBrush release ordering. The app and release assets use 0.4.0. The 0.4.0 MSIX identity version is 2.4.0.0, the Debian package version is `1:0.4.0-1`, and the macOS bundle build version is 1.4.0. Each native package version sorts above its 0.30.1 predecessor. Once 0.4.0 is published, users of older portable builds can use the official download for a one-time manual upgrade. Those builds compare release tags numerically. Native package acceptance remains required.
 
 ## Essential release verification
 
@@ -46,9 +46,8 @@ validates the selection without executing application tests.
 Actual artifact identity, signatures, Store/notarization requirements, package
 installation, native feature acceptance and publication protections still apply.
 Release/signing producers build and validate their exact artifacts without
-repeating the broad code suite. Qualify 0.30.0 at the current canvas limits.
-The 16000 × 16000 editor (PB-068) is scheduled for the next version.
-Known failures affecting 0.30.0 still require a fix and a targeted recheck.
+repeating the broad code suite. The 16000 × 16000 editor (PB-068) is in scope
+for the next version and requires acceptance at those limits before release.
 
 Use Rust 1.92.0 and the [native JPEG XL prerequisites](jpeg-xl-build.md). For an
 explicit build use `python scripts/jxl_build.py -- build --locked --bin peerbrush`.
@@ -67,7 +66,11 @@ Development follows [Ponytail's compact project rules](../AGENTS.md#ponytail-dev
 
 Editing logic belongs in the engine; native UI, MCP and CLI must share commands, document/revision guards and reservations. Render gestures through the shared preview engine, committing history when the gesture finishes. AI blue feedback and animations belong to presentation and derived caches. Save current standard PSD raster/mask channels and the merged composite alongside retained editable sources. Keep model selection outside PeerBrush.
 
+For Rust embedding, `server::RecoveryVersions` is now opaque worker state that retains admitted native checkpoint bookkeeping as well as PSD deduplication state. Replace the former raw `HashMap` alias with `RecoveryVersions::new()` or `Default::default()`, retain that state across ticks and pass it to `server::checkpoint_projects`. Native source I/O and retirement still run outside Engine and workspace locks.
+
 Use the Ember palette, compact unboxed controls and the connected Color/Mask selector. Preserve native16 samples, unsupported Photoshop protection and unrelated human edits. See [implementation notes](development.md), [Photoshop fidelity](photoshop-fidelity.md), [MCP](mcp.md), [packaging](packaging.md) and the [0.26 queue](development-0.26.md).
+
+Use controls suited to each setting in new and existing menus. Use an interactive color picker for colors and recognizable icons for visual choices such as text alignment. Give icon controls accessible labels and tooltips. Keep precise entry available where the setting needs it.
 
 Use only an approved human Git identity from `.github/human-contributors.json`. Never add an AI author, committer, co-author or contributor badge. Keep the README's AI-development disclosure. Do not commit credentials, runtime state, recovery files, local tools, QA captures or build output. Required bundled artwork, fonts and licenses belong in source and packages. Review the actual diff and package contents through the [privacy/security gate](release-maintenance.md#privacy-and-security-publication-gate).
 

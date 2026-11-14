@@ -49,9 +49,9 @@ fn fixture(depth: u16) -> Document {
 fn mcp_exports_returns_pixels_and_coordinates_and_rejects_stale_or_mistyped_inputs() {
     use peerbrush::server;
     let mut engine = Engine::new();
-    engine.doc = fixture(16);
+    engine.resident_state_mut().expect("resident fixture").document = fixture(16);
     let shared = std::sync::Arc::new(std::sync::Mutex::new(engine));
-    let doc = shared.lock().unwrap().doc.clone();
+    let doc = shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
     let before = serde_json::to_value(&doc).unwrap();
     let request = json!({"action":"preview","document_id":doc.id,"expected_revision":doc.revision,"targets":[doc.layers[0].id],"settings":Settings {crop:Crop::Alpha,padding:2,..Default::default()}});
     let result = server::mcp(
@@ -87,10 +87,10 @@ fn mcp_exports_returns_pixels_and_coordinates_and_rejects_stale_or_mistyped_inpu
         );
     }
     assert_eq!(
-        serde_json::to_value(&shared.lock().unwrap().doc).unwrap(),
+        serde_json::to_value(&shared.lock().unwrap().resident_state().expect("resident fixture").document).unwrap(),
         before
     );
-    assert!(shared.lock().unwrap().undo.is_empty());
+    assert!(shared.lock().unwrap().resident_state().expect("resident fixture").undo.is_empty());
 }
 #[test]
 fn native_composite_presets_match_current_png_filters_depth_and_icc_without_editing() {
@@ -189,7 +189,7 @@ fn selected_folder_batches_render_masks_effects_and_clipping_from_the_shared_eng
         )
         .unwrap();
         let mut reference = Engine::new();
-        reference.doc = doc.clone();
+        reference.resident_state_mut().expect("resident fixture").document = doc.clone();
         reference
             .edit(
                 "human",
@@ -202,7 +202,7 @@ fn selected_folder_batches_render_masks_effects_and_clipping_from_the_shared_eng
                 "Isolate reference artwork",
             )
             .unwrap();
-        assert_eq!(bytes, reference.doc.export_png().unwrap());
+        assert_eq!(bytes, reference.resident_state().expect("resident fixture").document.export_png().unwrap());
         assert_ne!(bytes, doc.export_png().unwrap());
         let (_, _, words) = decoded(&bytes, depth);
         assert_eq!(&words[..4], &[0; 4]);
@@ -461,11 +461,11 @@ fn protocol_presets_preview_and_repeated_batches_keep_native_files_profiles_and_
         std::fs::create_dir_all(&first).unwrap();
         std::fs::create_dir_all(&second).unwrap();
         let mut engine = Engine::new();
-        engine.doc = fixture(depth);
-        engine.doc.layers[0].name = "Art:Base".into();
+        engine.resident_state_mut().expect("resident fixture").document = fixture(depth);
+        engine.resident_state_mut().expect("resident fixture").document.layers[0].name = "Art:Base".into();
         let shared = Arc::new(Mutex::new(engine));
         workspace::attach(&shared);
-        let doc = shared.lock().unwrap().doc.clone();
+        let doc = shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
         let before = serde_json::to_value(&doc).unwrap();
         let project = shared.lock().unwrap().project_id.clone();
         let settings = Settings {
@@ -533,10 +533,10 @@ fn protocol_presets_preview_and_repeated_batches_keep_native_files_profiles_and_
             );
         }
         assert_eq!(
-            serde_json::to_value(&shared.lock().unwrap().doc).unwrap(),
+            serde_json::to_value(&shared.lock().unwrap().resident_state().expect("resident fixture").document).unwrap(),
             before
         );
-        assert!(shared.lock().unwrap().undo.is_empty());
+        assert!(shared.lock().unwrap().resident_state().expect("resident fixture").undo.is_empty());
         assert!(shared.lock().unwrap().path.is_none());
         drop(shared);
         std::fs::remove_dir_all(root).unwrap();
@@ -552,9 +552,9 @@ fn batch_existing_file_policies_report_written_skipped_failed_and_unattempted_ou
     ));
     std::fs::create_dir_all(&root).unwrap();
     let mut engine = Engine::new();
-    engine.doc = fixture(16);
+    engine.resident_state_mut().expect("resident fixture").document = fixture(16);
     let shared = Arc::new(Mutex::new(engine));
-    let doc = shared.lock().unwrap().doc.clone();
+    let doc = shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
     let settings = Settings {
         variants: vec![
             Variant {
@@ -823,11 +823,11 @@ fn webp_shared_protocol_preview_batch_and_reopening_keep_the_original_project() 
             std::env::temp_dir().join(format!("pb-webp-protocol-{}", peerbrush::engine::id()));
         std::fs::create_dir(&root).unwrap();
         let mut engine = Engine::new();
-        engine.doc = fixture(depth);
-        engine.doc.layers[0]
+        engine.resident_state_mut().expect("resident fixture").document = fixture(depth);
+        engine.resident_state_mut().expect("resident fixture").document.layers[0]
             .pixels
             .set16(3, 4, [12347, 23459, 34571, 32781]);
-        let doc = engine.doc.clone();
+        let doc = engine.resident_state().expect("resident fixture").document.clone();
         let shared = Arc::new(Mutex::new(engine));
         let before = serde_json::to_value(&doc).unwrap();
         let settings = Settings {
@@ -864,9 +864,9 @@ fn webp_shared_protocol_preview_batch_and_reopening_keep_the_original_project() 
         let expected = image::load_from_memory(&bytes).unwrap().into_rgba8();
         let reopened = Arc::new(Mutex::new(Engine::new()));
         server::open(&reopened, &path).unwrap();
-        assert_eq!(reopened.lock().unwrap().doc.bit_depth, 8);
+        assert_eq!(reopened.lock().unwrap().resident_state().expect("resident fixture").document.bit_depth, 8);
         assert_eq!(
-            reopened.lock().unwrap().doc.layers[0].pixels.rgba(),
+            reopened.lock().unwrap().resident_state().expect("resident fixture").document.layers[0].pixels.rgba(),
             expected.as_raw().clone()
         );
         assert_eq!(
@@ -923,10 +923,10 @@ fn webp_shared_protocol_preview_batch_and_reopening_keep_the_original_project() 
             .iter()
             .any(|item| item["type"] == "image" && item["mimeType"] == "image/png"));
         assert_eq!(
-            serde_json::to_value(&shared.lock().unwrap().doc).unwrap(),
+            serde_json::to_value(&shared.lock().unwrap().resident_state().expect("resident fixture").document).unwrap(),
             before
         );
-        assert!(shared.lock().unwrap().undo.is_empty());
+        assert!(shared.lock().unwrap().resident_state().expect("resident fixture").undo.is_empty());
         drop(reopened);
         drop(shared);
         std::fs::remove_dir_all(root).unwrap();

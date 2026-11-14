@@ -1,6 +1,7 @@
 //! Release discovery and disabled signed update integrations.
 #[cfg(any(windows, test, feature = "windows-setup"))]
 pub(crate) mod windows;
+pub(crate) mod ownership;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -19,6 +20,9 @@ pub enum Owner {
     WindowsAppInstaller,
     WindowsPackage,
     LinuxPackage,
+    NixPackage,
+    ScoopPackage,
+    HomebrewPackage,
     Direct,
     Unknown,
 }
@@ -28,7 +32,10 @@ impl Owner {
         {
             use ::windows::ApplicationModel::Package;
             match crate::packaged::package_family() {
-                Ok(None) => Self::Direct,
+                Ok(None) => {
+                    let executable = std::env::current_exe();
+                    crate::packaged::scoop::owner(executable.as_deref().ok())
+                }
                 Ok(Some(_)) => match Package::Current() {
                     Ok(package) => windows_package_owner(package.SignatureKind(), || {
                         // Association only; never read/expose its potentially private URI.
@@ -42,23 +49,16 @@ impl Owner {
         }
         #[cfg(target_os = "linux")]
         {
-            // Conservatively leave system-installed binaries with their package
-            // manager. This does not claim a configured automatic-update repository.
-            if Path::new("/.flatpak-info").is_file()
-                || std::env::current_exe().is_ok_and(|p| {
-                    p == Path::new("/usr/bin/peerbrush")
-                        || p.starts_with("/usr/lib/peerbrush")
-                        || p.starts_with("/opt/peerbrush")
-                })
-            {
-                Self::LinuxPackage
-            } else {
-                Self::Direct
-            }
+            let executable = std::env::current_exe();
+            ownership::linux(
+                executable.as_deref().ok(),
+                Path::new("/.flatpak-info").is_file(),
+            )
         }
         #[cfg(target_os = "macos")]
         {
-            Self::Direct
+            let executable = std::env::current_exe();
+            crate::packaged::homebrew::owner(executable.as_deref().ok())
         }
         #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
         {
@@ -71,6 +71,9 @@ impl Owner {
             Self::WindowsAppInstaller => "Windows App Installer is associated with this installation. Its update settings and availability have not been verified.",
             Self::WindowsPackage => "Windows package installation; Store origin is not established. Use its installation provider for updates.",
             Self::LinuxPackage => "System/package-managed installation. Use its package manager; an automatic-update repository may not be configured.",
+            Self::NixPackage => "Nix manages this installation's updates and rollbacks. Use Nix to change the installed version.",
+            Self::ScoopPackage => "Scoop manages this installation's versions. Use Scoop for updates; bucket availability and publisher trust have not been verified.",
+            Self::HomebrewPackage => "Homebrew manages this installation's versions. Use Homebrew for updates; tap availability and publisher trust have not been verified.",
             Self::Direct => "Direct distribution or local build. Automatic installation is not configured.",
             Self::Unknown => "Installation owner could not be verified. Automatic installation is unavailable.",
         }
@@ -378,6 +381,17 @@ struct Asset {
 fn canonical_url(actual: &str, expected: &str) -> bool {
     url::Url::parse(actual).is_ok_and(|u| u.as_str() == expected && actual == expected)
 }
+pub(crate) fn release_version_cmp(left: &Version, right: &Version) -> std::cmp::Ordering {
+    // PeerBrush 0.4 follows the published 0.30 release line.
+    let series = |version: &Version| match (version.major, version.minor) {
+        (0, 4) => (0, 30, 1),
+        (major, minor) => (major, minor, 0),
+    };
+    series(left)
+        .cmp(&series(right))
+        .then_with(|| left.cmp_precedence(right))
+}
+
 pub fn parse_releases(
     bytes: &[u8],
     current: &str,
@@ -414,11 +428,11 @@ pub fn parse_releases(
         if channel == Channel::Stable && (release.prerelease || !version.pre.is_empty()) {
             continue;
         }
-        if version.cmp_precedence(&current_version).is_gt() {
+        if release_version_cmp(&version, &current_version).is_gt() {
             candidates.push((version, release));
         }
     }
-    candidates.sort_by(|a, b| b.0.cmp_precedence(&a.0));
+    candidates.sort_by(|a, b| release_version_cmp(&b.0, &a.0));
     let mut report = Report {
         current_version: current.into(),
         channel,

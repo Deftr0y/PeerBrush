@@ -8,8 +8,8 @@ use peerbrush::{
 use serde_json::{json, Value};
 fn fixture(depth: u16, origin: [i32; 2], mask: bool, selected: bool) -> Engine {
     let mut e = Engine::new();
-    e.doc = Document::new_depth(64, 48, depth).unwrap();
-    let l = &mut e.doc.layers[0];
+    e.resident_state_mut().expect("resident fixture").document = Document::new_depth(64, 48, depth).unwrap();
+    let l = &mut e.resident_state_mut().expect("resident fixture").document.layers[0];
     l.x = origin[0];
     l.y = origin[1];
     l.pixels = Raster::new_depth((64 - origin[0]) as u32, (48 - origin[1]) as u32, depth);
@@ -36,11 +36,11 @@ fn fixture(depth: u16, origin: [i32; 2], mask: bool, selected: bool) -> Engine {
         )
         .unwrap();
     }
-    e.undo.clear();
+    e.resident_state_mut().expect("resident fixture").undo.clear();
     e
 }
 fn command(e: &Engine, op: &str, tip: &str, mask: bool) -> Value {
-    let mut c = json!({"op":op,"layer":e.doc.layers[0].id,"points":[[16.25,20.5],[28.25,25.5],[44.25,26.5]],"pressures":[0.8,0.6,0.9],"radius":7.,"hardness":0.6,"opacity":0.7,"flow":0.8,"spacing":0.2,"tip":tip,"density":0.42,"grain":2.75,"seed":71,"angle":35.,"color":[180,40,90,255],"mask":mask});
+    let mut c = json!({"op":op,"layer":e.resident_state().expect("resident fixture").document.layers[0].id,"points":[[16.25,20.5],[28.25,25.5],[44.25,26.5]],"pressures":[0.8,0.6,0.9],"radius":7.,"hardness":0.6,"opacity":0.7,"flow":0.8,"spacing":0.2,"tip":tip,"density":0.42,"grain":2.75,"seed":71,"angle":35.,"color":[180,40,90,255],"mask":mask});
     if op == "clone" || op == "heal" {
         // Keep the healing neighborhood inside content common to both frames;
         // padded masks legitimately have different data beyond the canvas edge.
@@ -61,9 +61,9 @@ fn textures_match_equivalent_document_strokes_in_shifted_storage_at_native_depth
                         reference
                             .edit("human", &[c], None, None, "Reference stroke")
                             .unwrap();
-                        let expected = reference.doc.export_png().unwrap();
+                        let expected = reference.resident_state().expect("resident fixture").document.export_png().unwrap();
                         let mut shifted = fixture(depth, [-13, -11], mask, selected);
-                        let before = shifted.doc.clone();
+                        let before = shifted.resident_state().expect("resident fixture").document.clone();
                         let c = command(&shifted, op, tip, mask);
                         let preview = Engine::preview_edits(before.clone(), &[c.clone()]).unwrap();
                         assert!(
@@ -73,14 +73,14 @@ fn textures_match_equivalent_document_strokes_in_shifted_storage_at_native_depth
                         shifted
                             .edit("human", &[c], Some(before.revision), None, "Shifted stroke")
                             .unwrap();
-                        assert_eq!(shifted.undo.len(), 1);
-                        assert_eq!(shifted.doc.export_png().unwrap(), expected);
-                        let saved = psd::decode(&psd::encode(&shifted.doc).unwrap()).unwrap();
+                        assert_eq!(shifted.resident_state().expect("resident fixture").undo.len(), 1);
+                        assert_eq!(shifted.resident_state().expect("resident fixture").document.export_png().unwrap(), expected);
+                        let saved = psd::decode(&psd::encode(&shifted.resident_state().expect("resident fixture").document).unwrap()).unwrap();
                         assert_eq!(saved.bit_depth, depth);
                         assert_eq!(saved.export_png().unwrap(), expected);
                         shifted.undo("human").unwrap();
                         assert_eq!(
-                            shifted.doc.export_png().unwrap(),
+                            shifted.resident_state().expect("resident fixture").document.export_png().unwrap(),
                             before.export_png().unwrap()
                         );
                     }
@@ -103,9 +103,9 @@ fn incremental_texture_previews_follow_the_document_grid_at_shifted_origins() {
                     c["points"] = json!(&points[..count]);
                     c["pressures"] = json!(&pressures[..count]);
                     let cached = cache
-                        .edit(e.doc.clone(), &[c.clone()], "texture gesture")
+                        .edit(e.resident_state().expect("resident fixture").document.clone(), &[c.clone()], "texture gesture")
                         .unwrap();
-                    let full = Engine::preview_edits(e.doc.clone(), &[c.clone()]).unwrap();
+                    let full = Engine::preview_edits(e.resident_state().expect("resident fixture").document.clone(), &[c.clone()]).unwrap();
                     assert_eq!(cached.export_png().unwrap(), full.export_png().unwrap());
                     for edge in [32, 64, 96] {
                         let shown = cache
@@ -118,7 +118,7 @@ fn incremental_texture_previews_follow_the_document_grid_at_shifted_origins() {
                         );
                     }
                 }
-                assert!(e.undo.is_empty());
+                assert!(e.resident_state().expect("resident fixture").undo.is_empty());
             }
         }
     }

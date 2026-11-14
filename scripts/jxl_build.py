@@ -27,7 +27,9 @@ def tool(name, kind, allowed, environment, selected=None):
     if not found:
         raise ValueError('Missing native JPEG XL build tool: ' + name)
     try:
-        path = Path(found).resolve(strict=True)
+        # Driver aliases can select C++ mode or wrapper behavior through argv[0].
+        # Stat follows links, but invoke/export the selected absolute launcher.
+        path = Path(found).absolute()
         if not path.is_file():
             raise OSError('not a file')
         result = subprocess.run([str(path), '--version'], env=environment, capture_output=True,

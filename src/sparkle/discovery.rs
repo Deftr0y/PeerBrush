@@ -72,7 +72,17 @@ fn read(bytes: &[u8], key: &str, installed: &str) -> Result<Option<Offer>, Strin
         return Err(INVALID.into());
     }
     let item = child(child(root, None, "channel")?, None, "item")?;
-    let version = child(item, Some(NS), "version")?.text().ok_or(INVALID)?;
+    let build = child(item, Some(NS), "version")?.text().ok_or(INVALID)?;
+    let mut short_versions = item
+        .children()
+        .filter(|n| n.has_tag_name((NS, "shortVersionString")));
+    let version = match short_versions.next() {
+        Some(short) => short.text().ok_or(INVALID)?,
+        None => build,
+    };
+    if short_versions.next().is_some() || super::bundle_version(version) != build {
+        return Err(INVALID.into());
+    }
     let next = semver::Version::parse(version).map_err(|_| INVALID)?;
     let enclosure = child(item, None, "enclosure")?;
     let prefix = format!("https://github.com/Deftr0y/PeerBrush/releases/download/v{version}/PeerBrush-{version}-macOS-arm64-apple-signed-r");
@@ -112,10 +122,12 @@ fn read(bytes: &[u8], key: &str, installed: &str) -> Result<Option<Offer>, Strin
     {
         return Err(INVALID.into());
     }
-    Ok(
-        (next > semver::Version::parse(installed).map_err(|_| INVALID)?)
-            .then(|| (version.to_owned(), notes.to_owned())),
-    )
+    let installed_version = semver::Version::parse(installed).map_err(|_| INVALID)?;
+    let installed_build = semver::Version::parse(&super::bundle_version(installed))
+        .map_err(|_| INVALID)?;
+    let newer_build = semver::Version::parse(build).map_err(|_| INVALID)? > installed_build;
+    Ok((newer_build && crate::updates::release_version_cmp(&next, &installed_version).is_gt())
+        .then(|| (version.to_owned(), notes.to_owned())))
 }
 
 #[cfg(test)]
@@ -129,11 +141,14 @@ mod tests {
             r#"<rss xmlns:s="{NS}"><channel><item><s:version>0.30.1</s:version><s:minimumSystemVersion>12.0.0</s:minimumSystemVersion><s:hardwareRequirements>arm64</s:hardwareRequirements><description s:format="plain-text">Brush &amp; pen</description><enclosure url="https://github.com/Deftr0y/PeerBrush/releases/download/v0.30.1/PeerBrush-0.30.1-macOS-arm64-apple-signed-r1-dmg-signed-r2.dmg" length="300" type="application/octet-stream" s:edSignature="{}"/></item></channel></rss>"#,
             STANDARD.encode([7; 64])
         );
-        let signed = format!(
-            "{xml}<!-- sparkle-signatures:\nedSignature: {}\nlength: {}\n-->\n",
-            STANDARD.encode(pair.sign(xml.as_bytes())),
-            xml.len()
-        );
+        let sign = |xml: &str| {
+            format!(
+                "{xml}<!-- sparkle-signatures:\nedSignature: {}\nlength: {}\n-->\n",
+                STANDARD.encode(pair.sign(xml.as_bytes())),
+                xml.len()
+            )
+        };
+        let signed = sign(&xml);
         let key = STANDARD.encode(pair.public_key());
         assert_eq!(
             read(signed.as_bytes(), &key, "0.30.0").unwrap(),
@@ -147,5 +162,16 @@ mod tests {
         )
         .is_err());
         assert!(read(xml.as_bytes(), &key, "0.30.1").is_err());
+        assert_eq!(read(signed.as_bytes(), &key, "0.4.0").unwrap(), None);
+        let transition = xml.replace("0.30.1", "0.4.0").replace(
+            "<s:version>0.4.0</s:version>",
+            "<s:version>1.4.0</s:version><s:shortVersionString>0.4.0</s:shortVersionString>",
+        );
+        assert_eq!(
+            read(sign(&transition).as_bytes(), &key, "0.30.1").unwrap(),
+            Some(("0.4.0".into(), "Brush & pen".into()))
+        );
+        let mismatched_build = transition.replace("<s:version>1.4.0", "<s:version>1.4.1");
+        assert!(read(sign(&mismatched_build).as_bytes(), &key, "0.30.1").is_err());
     }
 }

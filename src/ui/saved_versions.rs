@@ -37,26 +37,26 @@ mod tests {
             let path = dir.join("Artwork.psd");
             {
                 let mut e = app.shared.lock().unwrap();
-                e.doc = Document::new_depth(9, 7, depth).unwrap();
-                e.doc.layers[0]
+                e.resident_state_mut().expect("resident fixture").document = Document::new_depth(9, 7, depth).unwrap();
+                e.resident_state_mut().expect("resident fixture").document.layers[0]
                     .pixels
                     .set16(2, 3, [10001, 20003, 40007, 65535]);
-                app.selected = e.doc.layers[0].id.clone();
+                app.selected = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
             }
-            let prior = app.shared.lock().unwrap().doc.export_png().unwrap();
+            let prior = app.shared.lock().unwrap().resident_state().expect("resident fixture").document.export_png().unwrap();
             server::save(&app.shared, &path).unwrap();
             {
                 let mut e = app.shared.lock().unwrap();
-                e.doc.layers[0]
+                e.resident_state_mut().expect("resident fixture").document.layers[0]
                     .pixels
                     .set16(2, 3, [54321, 23459, 45671, 65535]);
-                e.doc.revision += 1;
+                e.resident_state_mut().expect("resident fixture").document.revision += 1;
             }
             server::save(&app.shared, &path).unwrap();
             let saved = std::fs::read(&path).unwrap();
             frame(&mut app, &ctx, vec![]);
             let current = app.shared.clone();
-            let png = current.lock().unwrap().doc.export_png().unwrap();
+            let png = current.lock().unwrap().resident_state().expect("resident fixture").document.export_png().unwrap();
             let project = app.project_id.clone();
             app.recover_previous_save();
             assert_eq!(app.saved_versions.as_ref().unwrap().entries.len(), 1);
@@ -72,7 +72,7 @@ mod tests {
                     }
                 });
             }
-            assert_eq!(current.lock().unwrap().doc.export_png().unwrap(), png);
+            assert_eq!(current.lock().unwrap().resident_state().expect("resident fixture").document.export_png().unwrap(), png);
             assert_eq!(app.project_id, project);
             let pos = position.expect("visible Open copy button");
             for pressed in [true, false] {
@@ -100,12 +100,12 @@ mod tests {
             assert_ne!(app.project_id, project);
             let e = app.shared.lock().unwrap();
             assert!(e.path.is_none() && e.file_version.is_none());
-            assert_ne!(e.doc.revision, e.saved_revision);
-            assert_eq!(e.doc.bit_depth, depth);
-            assert_eq!(e.doc.export_png().unwrap(), prior);
-            assert!(e.doc.name.contains("Artwork.psd"));
+            assert_ne!(e.resident_state().expect("resident fixture").document.revision, e.saved_revision);
+            assert_eq!(e.resident_state().expect("resident fixture").document.bit_depth, depth);
+            assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), prior);
+            assert!(e.resident_state().expect("resident fixture").document.name.contains("Artwork.psd"));
             drop(e);
-            assert_eq!(current.lock().unwrap().doc.export_png().unwrap(), png);
+            assert_eq!(current.lock().unwrap().resident_state().expect("resident fixture").document.export_png().unwrap(), png);
             assert_eq!(std::fs::read(&path).unwrap(), saved);
             // Release native test caches before removing this test's private files.
             drop(app);

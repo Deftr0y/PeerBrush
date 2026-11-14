@@ -1,12 +1,16 @@
 //! Opt-in horizontal shaping. Historical character layout remains a separate path.
-use super::{outline_work, spacing, Content, Source};
+use super::{outline_work, spacing, text_position::{Cluster, TextCarets}, Content, Source, TextLayout};
 use ab_glyph::{point, Font, FontArc, Glyph, GlyphId, PxScale, ScaleFont};
 use harfrust::{BufferFlags, Direction, ShapeOptions, ShaperData, UnicodeBuffer};
 use std::ops::Range;
+use unicode_bidi::Level;
 use unicode_script::{Script, UnicodeScript};
+use unicode_segmentation::UnicodeSegmentation;
 
 const GLYPHS: usize = 16384;
 const COORDINATE: f64 = 100000.;
+const WRAP_PROBE_BYTES: usize = 256 * 1024;
+pub(super) const MAX_ROWS: usize = 96;
 
 #[derive(Debug, PartialEq)]
 struct Run {
@@ -15,8 +19,8 @@ struct Run {
     rtl: bool,
 }
 
-fn runs(text: &str) -> Vec<Run> {
-    let bidi = unicode_bidi::BidiInfo::new(text, None);
+fn runs(text: &str, level: Option<Level>) -> Vec<Run> {
+    let bidi = unicode_bidi::BidiInfo::new(text, level);
     let Some(paragraph) = bidi.paragraphs.first() else {
         return vec![];
     };
@@ -118,83 +122,46 @@ struct Positioned {
     blank: bool,
 }
 
-pub(super) fn layout(source: &Source, font: &FontArc) -> Result<Vec<Glyph>, String> {
-    let Content::Text {
-        text,
-        font: reference,
-        size,
-        line_height,
-        letter_spacing,
-        align,
-        ..
-    } = &source.content
-    else {
-        return Err("Shaped layout requires a text source".into());
-    };
-    layout_parts(
-        source.width,
-        text,
-        reference,
-        *size,
-        *line_height,
-        *letter_spacing,
-        align,
-        font,
-        &mut |_| Ok(()),
-    )
+
+#[derive(Default)]
+struct ShapeWork {
+    glyphs: usize,
+    runs: usize,
 }
 
-pub(super) fn layout_parts(
-    width: u32,
-    text: &str,
-    reference: &crate::fonts::TextFont,
-    size: f32,
-    line_height: f32,
+struct ShapedLine {
+    advance: f64,
+    positioned: Vec<Positioned>,
+    clusters: Vec<Cluster>,
+}
+
+struct LineShaper<'a, F> {
+    font: &'a F,
+    shaper: harfrust::Shaper<'a>,
+    scale: f64,
     letter_spacing: f32,
-    align: &str,
-    font: &impl Font,
-    preflight: &mut dyn FnMut(GlyphId) -> Result<(), String>,
-) -> Result<Vec<Glyph>, String> {
-    let (size, line_height, letter_spacing) = (&size, &line_height, &letter_spacing);
-    variation_sequences(text)?;
-    let index = match reference {
-        crate::fonts::TextFont::Bundled(_) => 0,
-        crate::fonts::TextFont::Installed(font) => font.index,
-    };
-    let face = harfrust::FontRef::from_index(font.font_data(), index)
-        .map_err(|_| "The selected font cannot be shaped")?;
-    let height = f64::from(font.height_unscaled());
-    if !height.is_finite()
-        || height <= 0.
-        || !font.ascent_unscaled().is_finite()
-        || !font.descent_unscaled().is_finite()
-        || font
-            .units_per_em()
-            .is_none_or(|units| !units.is_finite() || units <= 0.)
-    {
-        return Err("The selected font has unsupported text metrics".into());
-    }
-    let scale = f64::from(*size) / height;
-    let scaled = font.as_scaled(PxScale::from(*size));
-    let data = ShaperData::new(&face);
-    let shaper = data.shaper(&face).build();
-    let mut glyph_positions = Vec::new();
-    let mut glyphs = 0usize;
-    let mut run_count = 0usize;
-    let mut work = 0u64;
-    for (row, line) in text.split('\n').enumerate() {
-        let baseline = f64::from(scaled.ascent())
-            + row as f64 * f64::from(scaled.height()) * f64::from(*line_height);
-        coordinate(baseline)?;
+}
+
+impl<F: Font> LineShaper<'_, F> {
+    fn line(
+        &self,
+        line: &str,
+        level: Option<Level>,
+        baseline: f64,
+        work: &mut ShapeWork,
+        collect_glyphs: bool,
+        collect_carets: bool,
+    ) -> Result<ShapedLine, String> {
         let mut positioned = Vec::new();
+        let mut caret_clusters: Vec<Cluster> = Vec::new();
         let mut advance = 0f64;
         let mut have_cluster = false;
-        for run in runs(line) {
-            run_count += 1;
-            if run_count > 4096 {
+        for run in runs(line, level) {
+            work.runs += 1;
+            if work.runs > 4096 {
                 return Err("Shaped text exceeds the run budget".into());
             }
-            if *letter_spacing != 0. && !tracking_supported(run.script) {
+            if self.letter_spacing != 0. && !tracking_supported(run.script) {
                 return Err("Set letter spacing to zero for joining or complex scripts".into());
             }
             let part = &line[run.range.clone()];
@@ -226,10 +193,10 @@ pub(super) fn layout_parts(
             }
             buffer.set_flags(flags);
             let output = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                shaper.shape(buffer, ShapeOptions::new())
+                self.shaper.shape(buffer, ShapeOptions::new())
             }))
             .map_err(|_| "The selected font could not shape this text")?;
-            glyphs = glyphs
+            work.glyphs = work.glyphs
                 .checked_add(output.len())
                 .filter(|count| *count <= GLYPHS)
                 .ok_or("Shaped text exceeds the glyph budget")?;
@@ -250,7 +217,7 @@ pub(super) fn layout_parts(
             let mut previous = None;
             let mut vertical = 0f64;
             for (info, position) in infos.iter().zip(positions) {
-                let id = checked_glyph(font, info.glyph_id)?;
+                let id = checked_glyph(self.font, info.glyph_id)?;
                 if previous.is_some_and(|last| {
                     if run.rtl {
                         info.cluster > last
@@ -262,7 +229,7 @@ pub(super) fn layout_parts(
                 }
                 if previous != Some(info.cluster) {
                     if have_cluster {
-                        advance += f64::from(*letter_spacing);
+                        advance += f64::from(self.letter_spacing);
                     }
                     have_cluster = true;
                 }
@@ -271,34 +238,221 @@ pub(super) fn layout_parts(
                     .binary_search(&cluster)
                     .map_err(|_| "Invalid shaped text cluster")?;
                 let end = clusters.get(at + 1).copied().unwrap_or(part.len());
-                positioned.push(Positioned {
-                    id,
-                    x: advance + f64::from(position.x_offset) * scale,
-                    y: baseline - vertical - f64::from(position.y_offset) * scale,
-                    blank: part[cluster..end]
-                        .chars()
-                        .all(|ch| spacing(ch) || matches!(ch, '\u{200c}' | '\u{200d}'))
-                        || part[cluster..end]
+                if collect_carets && previous != Some(info.cluster) {
+                    caret_clusters.push(Cluster {
+                        bytes: (run.range.start + cluster)..(run.range.start + end),
+                        advance: [advance; 2],
+                        rtl: run.rtl,
+                    });
+                }
+                if collect_glyphs {
+                    positioned.push(Positioned {
+                        id,
+                        x: advance + f64::from(position.x_offset) * self.scale,
+                        y: baseline - vertical - f64::from(position.y_offset) * self.scale,
+                        blank: part[cluster..end]
                             .chars()
-                            .any(|ch| spacing(ch) && font.glyph_id(ch) == id),
-                });
-                advance += f64::from(position.x_advance) * scale;
-                vertical += f64::from(position.y_advance) * scale;
+                            .all(|ch| spacing(ch) || matches!(ch, '\u{200c}' | '\u{200d}'))
+                            || part[cluster..end]
+                                .chars()
+                                .any(|ch| spacing(ch) && self.font.glyph_id(ch) == id),
+                    });
+                }
+                advance += f64::from(position.x_advance) * self.scale;
+                if let Some(cluster) = caret_clusters.last_mut() {
+                    cluster.advance[1] = advance;
+                }
+                vertical += f64::from(position.y_advance) * self.scale;
                 coordinate(advance)?;
                 coordinate(vertical)?;
                 previous = Some(info.cluster);
             }
         }
+        Ok(ShapedLine { advance, positioned, clusters: caret_clusters })
+    }
+}
+
+struct TextRow<'a> {
+    text: &'a str,
+    level: Option<Level>,
+    soft_end: bool,
+}
+
+fn paragraph_rows(
+    text: &str,
+    width: f64,
+    mut measure: impl FnMut(&str, Option<Level>) -> Result<f64, String>,
+) -> Result<Vec<TextRow<'_>>, String> {
+    let mut rows = Vec::new();
+    let mut probed = 0usize;
+    for paragraph in text.split('\n') {
+        let level = unicode_bidi::BidiInfo::new(paragraph, None)
+            .paragraphs.first().map(|paragraph| paragraph.level);
+        let boundaries: Vec<_> = paragraph.grapheme_indices(true).map(|(offset, grapheme)| {
+            let preferred = grapheme.chars().last().is_some_and(|ch| {
+                (spacing(ch) && !matches!(ch, '\u{00a0}' | '\u{2007}' | '\u{202f}'))
+                    || matches!(ch, '-' | '\u{2010}' | '\u{200b}')
+            });
+            (offset + grapheme.len(), preferred)
+        }).collect();
+        let mut first = 0;
+        let mut start = 0;
+        loop {
+            if rows.len() == MAX_ROWS {
+                return Err("Wrapped text exceeds the 96-row layout limit".into());
+            }
+            let remaining = &boundaries[first..];
+            let mut fits = |count: usize| {
+                let end = remaining[count - 1].0;
+                probed += end - start;
+                if probed > WRAP_PROBE_BYTES {
+                    return Err("Wrapped text exceeds the line measurement budget".into());
+                }
+                measure(&paragraph[start..end], level).map(|advance| advance <= width)
+            };
+            let count = if remaining.is_empty() {
+                0
+            } else {
+                // Bracket the first overflow before narrowing the measured prefix.
+                let mut fitting = 0;
+                let mut probe = 1;
+                while fits(probe)? {
+                    fitting = probe;
+                    if fitting == remaining.len() { break; }
+                    probe = (probe * 2).min(remaining.len());
+                }
+                if fitting == remaining.len() {
+                    fitting
+                } else if fitting == 0 {
+                    1 // A single grapheme may be wider than the frame.
+                } else {
+                    while probe - fitting > 1 {
+                        let mid = fitting + (probe - fitting) / 2;
+                        if fits(mid)? { fitting = mid; } else { probe = mid; }
+                    }
+                    remaining[..fitting].iter().rposition(|(_, preferred)| *preferred)
+                        .map_or(fitting, |index| index + 1)
+                }
+            };
+            let end = if count == 0 { start } else { remaining[count - 1].0 };
+            let soft_end = end < paragraph.len();
+            rows.push(TextRow { text: &paragraph[start..end], level, soft_end });
+            if !soft_end { break; }
+            first += count;
+            start = end;
+        }
+    }
+    Ok(rows)
+}
+
+pub(super) fn layout(source: &Source, font: &FontArc) -> Result<Vec<Glyph>, String> {
+    layout_with_carets(source, font, None)
+}
+
+pub(super) fn layout_with_carets(
+    source: &Source,
+    font: &FontArc,
+    carets: Option<&mut TextCarets>,
+) -> Result<Vec<Glyph>, String> {
+    let Content::Text {
+        text,
+        layout,
+        font: reference,
+        size,
+        line_height,
+        letter_spacing,
+        align,
+        ..
+    } = &source.content
+    else {
+        return Err("Shaped layout requires a text source".into());
+    };
+    layout_parts(
+        *layout,
+        source.width,
+        text,
+        reference,
+        *size,
+        *line_height,
+        *letter_spacing,
+        align,
+        font,
+        &mut |_| Ok(()),
+        carets,
+    )
+}
+
+pub(super) fn layout_parts(
+    layout: TextLayout,
+    width: u32,
+    text: &str,
+    reference: &crate::fonts::TextFont,
+    size: f32,
+    line_height: f32,
+    letter_spacing: f32,
+    align: &str,
+    font: &impl Font,
+    check: &mut dyn FnMut(Option<GlyphId>) -> Result<(), String>,
+    mut carets: Option<&mut TextCarets>,
+) -> Result<Vec<Glyph>, String> {
+    variation_sequences(text)?;
+    let index = match reference {
+        crate::fonts::TextFont::Bundled(_) => 0,
+        crate::fonts::TextFont::Installed(font) => font.index,
+    };
+    let face = harfrust::FontRef::from_index(font.font_data(), index)
+        .map_err(|_| "The selected font cannot be shaped")?;
+    let height = f64::from(font.height_unscaled());
+    if !height.is_finite()
+        || height <= 0.
+        || !font.ascent_unscaled().is_finite()
+        || !font.descent_unscaled().is_finite()
+        || font
+            .units_per_em()
+            .is_none_or(|units| !units.is_finite() || units <= 0.)
+    {
+        return Err("The selected font has unsupported text metrics".into());
+    }
+    let scale = f64::from(size) / height;
+    let scaled = font.as_scaled(PxScale::from(size));
+    let data = ShaperData::new(&face);
+    let shaper = LineShaper { font, shaper: data.shaper(&face).build(), scale, letter_spacing };
+    let rows = if layout == TextLayout::Paragraph {
+        paragraph_rows(text, f64::from(width), |line, level| {
+            check(None)?;
+            Ok(shaper.line(line, level, 0., &mut ShapeWork::default(), false, false)?.advance)
+        })?
+    } else {
+        text.split('\n').map(|text| TextRow { text, level: None, soft_end: false }).collect()
+    };
+    let mut glyph_positions = Vec::new();
+    let mut shape_work = ShapeWork::default();
+    let mut work = 0u64;
+    for (row, TextRow { text: line, level, soft_end }) in rows.into_iter().enumerate() {
+        check(None)?;
+        let baseline = f64::from(scaled.ascent())
+            + row as f64 * f64::from(scaled.height()) * f64::from(line_height);
+        coordinate(baseline)?;
+        let ShapedLine { advance, positioned, mut clusters } = shaper.line(
+            line, level, baseline, &mut shape_work, true, carets.is_some(),
+        )?;
         let start = match align {
             "center" => (f64::from(width) - advance) * 0.5,
             "right" => f64::from(width) - advance,
             _ => 0.,
         };
         coordinate(start)?;
+        if let Some(carets) = carets.as_deref_mut() {
+            let vertical = [
+                (baseline - f64::from(scaled.ascent())) as f32,
+                (baseline - f64::from(scaled.descent())) as f32,
+            ];
+            carets.shaped_row(line, start, vertical, &mut clusters, soft_end);
+        }
         for glyph in positioned {
             let glyph_position = point(coordinate(start + glyph.x)?, coordinate(glyph.y)?);
-            let positioned = glyph.id.with_scale_and_position(*size, glyph_position);
-            preflight(positioned.id)?;
+            let positioned = glyph.id.with_scale_and_position(size, glyph_position);
+            check(Some(positioned.id))?;
             match font.outline_glyph(positioned.clone()) {
                 Some(outline) => {
                     let bounds = outline.px_bounds();
@@ -399,7 +553,7 @@ mod tests {
     #[test]
     fn bidi_script_itemization_keeps_clusters_and_reverses_rtl_script_order() {
         let text = "ab\u{0301} \u{05d0}\u{05d1} cd";
-        let actual = runs(text);
+        let actual = runs(text, None);
         assert_eq!(
             actual
                 .iter()
@@ -413,7 +567,7 @@ mod tests {
         );
         let same_direction = "A\u{0915}\u{093f}B";
         assert_eq!(
-            runs(same_direction)
+            runs(same_direction, None)
                 .iter()
                 .map(|run| (&same_direction[run.range.clone()], run.script))
                 .collect::<Vec<_>>(),
@@ -424,7 +578,7 @@ mod tests {
             ]
         );
         let common = "(\u{05d0}\u{0301})";
-        let actual = runs(common);
+        let actual = runs(common, None);
         assert!(actual
             .iter()
             .all(|run| run.script == Script::Hebrew && run.rtl));
@@ -433,6 +587,61 @@ mod tests {
             common.len()
         );
     }
+    #[test]
+    fn shaped_carets_share_the_ligature_layout_and_skip_combining_interiors() {
+        let font = fonts::snapshot(&"regular".into()).unwrap();
+        let text = "ffi a\u{0301}";
+        let source = source(text);
+        let mut map = TextCarets::new(text, TextLayout::Shaped).unwrap();
+        let shaped = layout_with_carets(&source, &font, Some(&mut map)).unwrap();
+        assert_eq!(shaped, layout(&source, &font).unwrap());
+        let at = |index| map.at(super::super::text_position::Caret { index, trailing: false }).unwrap();
+        assert!(at(0).0 < at(1).0 && at(1).0 < at(2).0 && at(2).0 < at(3).0);
+        let (x, [top, bottom]) = at(5);
+        assert_eq!(map.nearest([x, (top + bottom) * 0.5]).index, 6);
+    }
+    #[test]
+    fn paragraph_breaks_prefer_spaces_and_keep_whole_graphemes() {
+        let measure = |line: &str, _| Ok(line.chars().count() as f64);
+        let rows = paragraph_rows("ab cd ef", 5., measure).unwrap();
+        assert_eq!(rows.iter().map(|row| (row.text, row.soft_end)).collect::<Vec<_>>(),
+            [("ab ", true), ("cd ef", false)]);
+        let rows = paragraph_rows("a\u{0301}b\n", 1., measure).unwrap();
+        assert_eq!(rows.iter().map(|row| (row.text, row.soft_end)).collect::<Vec<_>>(),
+            [("a\u{0301}", true), ("b", false), ("", false)]);
+    }
+
+    #[test]
+    fn paragraph_pixels_and_carets_follow_the_same_wrapped_rows() {
+        use super::super::text_position::Caret;
+        let font = fonts::snapshot(&"regular".into()).unwrap();
+        let text = "aaaa aaaa\nb";
+        let mut wrapped = source(text);
+        let scaled = font.as_scaled(PxScale::from(32.));
+        wrapped.width = (4. * scaled.h_advance(scaled.glyph_id('a'))
+            + scaled.h_advance(scaled.glyph_id(' ')) + 3.).ceil() as u32;
+        wrapped.height = 160;
+        if let Content::Text { layout, .. } = &mut wrapped.content {
+            *layout = TextLayout::Paragraph;
+        }
+        let mut map = TextCarets::new(text, TextLayout::Paragraph).unwrap();
+        layout_with_carets(&wrapped, &font, Some(&mut map)).unwrap();
+        let (x, first) = map.at(Caret { index: 5, trailing: true }).unwrap();
+        let (_, second) = map.at(Caret { index: 5, trailing: false }).unwrap();
+        let (_, third) = map.at(Caret { index: 10, trailing: false }).unwrap();
+        assert!(first[0] < second[0] && second[0] < third[0]);
+        let hit = map.nearest([x, (first[0] + first[1]) * 0.5]);
+        assert_eq!((hit.index, hit.trailing), (5, true));
+        assert_eq!(map.highlights(4..6).count(), 2);
+        let mut hard_breaks = source("aaaa \naaaa\nb");
+        hard_breaks.width = wrapped.width;
+        hard_breaks.height = wrapped.height;
+        for depth in [8, 16] {
+            assert_eq!(wrapped.render(wrapped.width, wrapped.height, depth).unwrap(),
+                hard_breaks.render(wrapped.width, wrapped.height, depth).unwrap());
+        }
+    }
+
     #[test]
     fn combining_ligatures_whitespace_alignment_and_baselines_use_native_font_metrics() {
         let font = fonts::snapshot(&"regular".into()).unwrap();
@@ -581,12 +790,12 @@ mod tests {
             for depth in [8, 16] {
                 let guard = fonts::test_fonts(vec![(reference.clone(), Ok(font.clone()))]);
                 let mut engine = crate::engine::Engine::new();
-                engine.doc = crate::engine::Document::new_depth(280, 120, depth).unwrap();
-                let before = engine.doc.export_png().unwrap();
+                engine.resident_state_mut().expect("resident fixture").document = crate::engine::Document::new_depth(280, 120, depth).unwrap();
+                let before = engine.resident_state().expect("resident fixture").document.export_png().unwrap();
                 let command =
                     serde_json::json!({"op":"source.add","source":definition,"x":7,"y":9});
                 let preview =
-                    crate::engine::Engine::preview_edits(engine.doc.clone(), &[command.clone()])
+                    crate::engine::Engine::preview_edits(engine.resident_state().expect("resident fixture").document.clone(), &[command.clone()])
                         .unwrap();
                 assert_eq!(guard.requests(), 1);
                 let shared = std::sync::Arc::new(std::sync::Mutex::new(engine));
@@ -619,28 +828,28 @@ mod tests {
                 );
                 let mut engine = shared.lock().unwrap();
                 assert_eq!(guard.requests(), 2, "Apply takes one new exact snapshot");
-                assert_eq!(engine.undo.len(), 1);
-                assert_eq!(engine.doc.layers[0].source, Some(definition.clone().into()));
-                assert_eq!(engine.doc.layers[0].pixels.depth, depth);
+                assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), 1);
+                assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].source, Some(definition.clone().into()));
+                assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].pixels.depth, depth);
                 assert_eq!(
-                    engine.doc.export_png().unwrap(),
+                    engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
                     preview.export_png().unwrap()
                 );
-                assert!(engine.doc.layers[0]
+                assert!(engine.resident_state().expect("resident fixture").document.layers[0]
                     .pixels
                     .rgba16()
                     .chunks_exact(4)
                     .any(|pixel| pixel[3] > 0));
                 if depth == 16 {
-                    assert!(engine.doc.layers[0]
+                    assert!(engine.resident_state().expect("resident fixture").document.layers[0]
                         .pixels
                         .rgba16()
                         .iter()
                         .any(|word| word % 257 != 0));
                 }
                 for bytes in [
-                    crate::psd::encode(&engine.doc).unwrap(),
-                    crate::psd::encode_psb(&engine.doc).unwrap(),
+                    crate::psd::encode(&engine.resident_state().expect("resident fixture").document).unwrap(),
+                    crate::psd::encode_psb(&engine.resident_state().expect("resident fixture").document).unwrap(),
                 ] {
                     let reopened = crate::psd::decode(&bytes).unwrap();
                     assert!(!reopened.read_only);
@@ -677,8 +886,8 @@ mod tests {
                     2,
                     "Saving never re-shapes baked native channels"
                 );
-                let id = engine.doc.layers[0].id.clone();
-                let before_reserved = serde_json::json!({"doc":engine.doc,"png":engine.doc.export_png().unwrap(),"undo":engine.undo.len(),"redo":engine.redo.len()});
+                let id = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
+                let before_reserved = serde_json::json!({"doc":engine.resident_state().expect("resident fixture").document,"png":engine.resident_state().expect("resident fixture").document.export_png().unwrap(),"undo":engine.resident_state().expect("resident fixture").undo.len(),"redo":engine.resident_state().expect("resident fixture").redo.len()});
                 engine
                     .reserve(
                         "other",
@@ -696,13 +905,13 @@ mod tests {
                     )
                     .is_err());
                 assert_eq!(
-                    serde_json::json!({"doc":engine.doc,"png":engine.doc.export_png().unwrap(),"undo":engine.undo.len(),"redo":engine.redo.len()}),
+                    serde_json::json!({"doc":engine.resident_state().expect("resident fixture").document,"png":engine.resident_state().expect("resident fixture").document.export_png().unwrap(),"undo":engine.resident_state().expect("resident fixture").undo.len(),"redo":engine.resident_state().expect("resident fixture").redo.len()}),
                     before_reserved
                 );
                 engine.leases.clear();
                 // expected_revision permits disjoint edits; sampled source definitions
                 // also require the exact source guard used by the native text editor.
-                let document_id = engine.doc.id.clone();
+                let document_id = engine.resident_state().expect("resident fixture").document.id.clone();
                 assert!(engine
                     .edit(
                         "human",
@@ -714,17 +923,17 @@ mod tests {
                     .unwrap_err()
                     .contains("The source project changed."));
                 assert_eq!(
-                    serde_json::json!({"doc":engine.doc,"png":engine.doc.export_png().unwrap(),"undo":engine.undo.len(),"redo":engine.redo.len()}),
+                    serde_json::json!({"doc":engine.resident_state().expect("resident fixture").document,"png":engine.resident_state().expect("resident fixture").document.export_png().unwrap(),"undo":engine.resident_state().expect("resident fixture").undo.len(),"redo":engine.resident_state().expect("resident fixture").redo.len()}),
                     before_reserved
                 );
                 engine.undo("human").unwrap();
-                assert_eq!(engine.doc.export_png().unwrap(), before);
+                assert_eq!(engine.resident_state().expect("resident fixture").document.export_png().unwrap(), before);
                 engine.redo("human").unwrap();
                 assert_eq!(
-                    engine.doc.export_png().unwrap(),
+                    engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
                     preview.export_png().unwrap()
                 );
-                let saved = engine.doc.clone();
+                let saved = engine.resident_state().expect("resident fixture").document.clone();
                 drop(engine);
                 drop(guard);
                 let missing = fonts::test_fonts(vec![(reference.clone(), Err(FontError::Missing))]);
@@ -830,9 +1039,9 @@ mod tests {
                 result
             };
             let mut engine = crate::engine::Engine::new();
-            engine.doc = crate::engine::Document::new_depth(256, 96, depth).unwrap();
-            engine.doc.layers[0].pixels = baked;
-            engine.doc.layers[0].source = Some(installed.clone().into());
+            engine.resident_state_mut().expect("resident fixture").document = crate::engine::Document::new_depth(256, 96, depth).unwrap();
+            engine.resident_state_mut().expect("resident fixture").document.layers[0].pixels = baked;
+            engine.resident_state_mut().expect("resident fixture").document.layers[0].source = Some(installed.clone().into());
             for error in [
                 FontError::Missing,
                 FontError::Changed,
@@ -846,8 +1055,8 @@ mod tests {
                 );
                 assert_eq!(guard.requests(), 1);
                 for bytes in [
-                    crate::psd::encode(&engine.doc).unwrap(),
-                    crate::psd::encode_psb(&engine.doc).unwrap(),
+                    crate::psd::encode(&engine.resident_state().expect("resident fixture").document).unwrap(),
+                    crate::psd::encode_psb(&engine.resident_state().expect("resident fixture").document).unwrap(),
                 ] {
                     let reopened = crate::psd::decode(&bytes).unwrap();
                     assert!(!reopened.read_only);
@@ -855,7 +1064,7 @@ mod tests {
                     assert_eq!(reopened.layers[0].pixels.rgba16(), expected.rgba16());
                     assert_eq!(
                         reopened.export_png().unwrap(),
-                        engine.doc.export_png().unwrap()
+                        engine.resident_state().expect("resident fixture").document.export_png().unwrap()
                     );
                 }
                 assert_eq!(guard.requests(), 1, "storage never resolves a missing font");

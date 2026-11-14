@@ -463,7 +463,7 @@ impl Inverse {
             return;
         }
         macro_rules! field {($($f:ident),*)=>{$(self.field(&before.$f,&after.$f,&mut current.$f,None,stringify!($f));)*};}
-        field!(id, name, width, height, bit_depth, read_only, warnings);
+        field!(id, name, width, height, bit_depth, read_only, warnings, psd_global_angle);
         let mut filters = serde_json::to_value(&current.filters).unwrap();
         self.value(
             &serde_json::to_value(&before.filters).unwrap(),
@@ -662,7 +662,9 @@ fn layer_equal(a: &Layer, b: &Layer) -> bool {
     layer_meta(a) == layer_meta(b) && a.pixels == b.pixels && mask_equal(&a.mask, &b.mask)
 }
 fn document_equal(a: &Document, b: &Document) -> bool {
-    if serde_json::to_value(&a.filters).unwrap() != serde_json::to_value(&b.filters).unwrap() {
+    if a.psd_global_angle != b.psd_global_angle
+        || serde_json::to_value(&a.filters).unwrap() != serde_json::to_value(&b.filters).unwrap()
+    {
         return false;
     }
     (
@@ -698,45 +700,29 @@ fn document_equal(a: &Document, b: &Document) -> bool {
 
 impl Engine {
     pub(crate) fn trim_history(&mut self) {
-        if self.undo.len() > 40 {
-            let old = self.undo.remove(0);
+        let crate::engine::authority::DocumentAuthority::Resident(state) = &mut self.authority else {
+            return;
+        };
+        if state.undo.len() > 40 {
+            let old = state.undo.remove(0);
             if let Some(task) = old.task {
-                if !self
-                    .undo
-                    .iter()
-                    .any(|h| h.reverted.contains(&old.after.revision))
-                {
-                    self.truncated_tasks.insert((old.actor, task));
+                if !state.undo.iter().any(|h| h.reverted.contains(&old.after.revision)) {
+                    state.truncated_tasks.insert((old.actor, task));
                 }
             }
         }
     }
     pub fn task_history(&self) -> Value {
-        let reverted: BTreeSet<_> = self
-            .undo
-            .iter()
-            .flat_map(|h| h.reverted.iter().copied())
-            .collect();
+        let reverted: BTreeSet<_> = self.history_entries().flat_map(|entry| entry.reverted_batches().iter().copied()).collect();
         let mut tasks = Vec::<Value>::new();
-        for h in &self.undo {
-            if let Some(task) = &h.task {
-                if h.actor == "human" {
-                    continue;
-                }
-                if !tasks
-                    .iter()
-                    .any(|v| v["actor"] == h.actor && v["task"] == *task)
-                {
-                    let active = self
-                        .undo
-                        .iter()
-                        .filter(|e| {
-                            e.actor == h.actor
-                                && e.task.as_ref() == Some(task)
-                                && !reverted.contains(&e.after.revision)
-                        })
-                        .count();
-                    tasks.push(json!({"actor":h.actor,"task":task,"label":h.label,"active_batches":active,"complete":!self.truncated_tasks.contains(&(h.actor.clone(),task.clone()))}));
+        for entry in self.history_entries() {
+            if let Some(task) = entry.task() {
+                if entry.actor() == "human" { continue; }
+                if !tasks.iter().any(|value| value["actor"] == entry.actor() && value["task"] == task) {
+                    let active = self.history_entries().filter(|other| {
+                        other.actor() == entry.actor() && other.task() == Some(task) && !reverted.contains(&other.revision())
+                    }).count();
+                    tasks.push(json!({"actor":entry.actor(),"task":task,"label":entry.label(),"active_batches":active,"complete":self.history_task_complete(entry.actor(),task)}));
                 }
             }
         }
@@ -756,18 +742,18 @@ impl Engine {
         if actor != "human" && actor != owner {
             return Err("An agent can undo only its own tasks".into());
         }
-        if self.truncated_tasks.contains(&(owner.into(), task.into())) {
+        if self.authority.resident_state()?.truncated_tasks.contains(&(owner.into(), task.into())) {
             return Err(
                 "Task exceeds the retained 40-step history; refusing a partial task undo".into(),
             );
         }
         let reverted: BTreeSet<_> = self
-            .undo
+            .authority.resident_state()?.undo
             .iter()
             .flat_map(|h| h.reverted.iter().copied())
             .collect();
         let entries: Vec<_> = self
-            .undo
+            .authority.resident_state()?.undo
             .iter()
             .filter(|h| {
                 h.actor == owner
@@ -778,10 +764,18 @@ impl Engine {
         if entries.is_empty() {
             return Err("No active batches for this task in the retained 40-step history".into());
         }
-        let mut doc = self.doc.clone();
+        let current = &self.authority.resident_state()?.document;
+        let mut doc = current.clone();
         let mut inverse = Inverse::default();
         for h in entries.iter().rev() {
             inverse.document(&h.before, &h.after, &mut doc);
+        }
+        let linked = |doc: &Document| {
+            doc.layers.iter().flat_map(|layer| &layer.effects).chain(&doc.filters)
+                .all(|effect| crate::effects::styles::global_light_matches(&effect.settings, doc.psd_global_angle))
+        };
+        if linked(current) && !linked(&doc) {
+            inverse.conflict(None, "document.global_light", None, "Global Light links changed after this task");
         }
         if let Err(error) = crate::psd::validate(&doc) {
             inverse.conflict(None, "document", None, &error);
@@ -799,18 +793,18 @@ impl Engine {
         task: &str,
     ) -> Result<Value, String> {
         let (_, mut inverse, revisions) = self.task_inverse(actor, owner, task)?;
-        if self.doc.read_only {
+        if self.authority.resident_state()?.document.read_only {
             inverse.conflict(None, "document", None, "Document is read-only");
         }
         if let Err(error) = self.check(actor, &inverse.scopes) {
             inverse.conflict(None, "reservation", None, &error);
         }
         Ok(
-            json!({"revision":self.doc.revision,"actor":owner,"task":task,"can_undo":inverse.conflicts.is_empty()&&!self.doc.read_only,"batches":revisions,"scopes":inverse.scopes,"conflicts":inverse.conflicts}),
+            json!({"revision":self.authority.resident_state()?.document.revision,"actor":owner,"task":task,"can_undo":inverse.conflicts.is_empty()&&!self.authority.resident_state()?.document.read_only,"batches":revisions,"scopes":inverse.scopes,"conflicts":inverse.conflicts}),
         )
     }
     pub fn undo_task(&mut self, actor: &str, owner: &str, task: &str) -> Result<Value, String> {
-        if self.doc.read_only {
+        if self.authority.resident_state()?.document.read_only {
             return Err("Document is read-only".into());
         }
         let (mut doc, inverse, reverted) = self.task_inverse(actor, owner, task)?;
@@ -821,7 +815,7 @@ impl Engine {
             ));
         }
         self.check(actor, &inverse.scopes)?;
-        let before = self.doc.clone();
+        let before = self.authority.resident_state()?.document.clone();
         doc.revision = before.revision + 1;
         // Invalidate ancestors as well as directly changed sources; caches are derived only.
         for layer in &mut doc.layers {
@@ -832,10 +826,11 @@ impl Engine {
         }
         let label = format!("Undo task: {task}");
         let revision = doc.revision;
-        self.doc = doc;
-        self.undo.push(History {
+        self.authority.resident_state_mut()?.document = doc;
+        let after = self.authority.resident_state()?.document.clone();
+        self.authority.resident_state_mut()?.undo.push(History {
             before,
-            after: self.doc.clone(),
+            after,
             actor: actor.into(),
             label: label.clone(),
             task: None,
@@ -844,7 +839,7 @@ impl Engine {
             reverted: reverted.clone(),
         });
         self.trim_history();
-        self.redo.clear();
+        self.authority.resident_state_mut()?.redo.clear();
         self.changes.push((revision, inverse.scopes.clone()));
         if self.changes.len() > 200 {
             self.changes.remove(0);

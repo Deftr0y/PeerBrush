@@ -2,7 +2,10 @@
 use super::backed::{CoverageSource, PreparedCoverageRegion};
 use crate::{
     large_document::{Error, ResidentBudget, Result},
-    raster::backed::Region,
+    raster::{
+        backed::{Region, MAX_REGION_PIXELS},
+        TILE,
+    },
 };
 use std::sync::Arc;
 
@@ -17,6 +20,17 @@ pub enum SelectionSource {
 }
 
 impl SelectionSource {
+    pub(super) fn may_cover(&self, [left, top, right, bottom]: [i32; 4]) -> bool {
+        match self {
+            Self::All => true,
+            Self::Geometry { bounds: [l, t, r, b], .. } => left < *r && right > *l && top < *b && bottom > *t,
+            Self::Coverage(coverage) => {
+                let [x, y] = coverage.origin();
+                coverage.mask().has_physical_tiles([left - x, top - y, right - x, bottom - y])
+            }
+        }
+    }
+
     /// Match the existing priority: matching coverage, otherwise no restriction
     /// or the rectangle and its matching polygon. Stale geometry cannot clip it.
     pub fn from_metadata(
@@ -105,16 +119,86 @@ impl PreparedSelection {
         Ok(self.value(x, y)? > 0.)
     }
     pub fn copy_row(&self, y: i32, output: &mut [u8]) -> Result<()> {
+        if let PreparedKind::Coverage(coverage) = &self.kind {
+            return coverage.copy_row(y, output);
+        }
         let [left, top, right, bottom] = self.region.bounds();
         if y < top || y >= bottom || output.len() != (right - left) as usize {
             return Err(Error::Invalid(
                 "Selection row differs from its prepared footprint",
             ));
         }
+        if let PreparedKind::All = self.kind {
+            output.fill(255);
+            return Ok(());
+        }
+        if let PreparedKind::Geometry { bounds: [l, t, r, b], polygon: None } = &self.kind {
+            output.fill(0);
+            let start = left.max(*l);
+            let end = right.min(*r);
+            if (*t..*b).contains(&y) && start < end {
+                output[(start - left) as usize..(end - left) as usize].fill(255);
+            }
+            return Ok(());
+        }
         for (x, value) in (left..right).zip(output) {
             *value = (self.value(x, y)? * 255.).round() as u8;
         }
         Ok(())
+    }
+}
+
+pub(super) struct PriorRows<'a> {
+    prior: Option<&'a SelectionSource>,
+    height: u32,
+    pinned: Option<PreparedSelection>,
+}
+
+impl<'a> PriorRows<'a> {
+    pub(super) fn new(prior: Option<&'a SelectionSource>, height: u32) -> Self {
+        Self {
+            // With no previous selection, Add, Subtract and Intersect start at zero coverage.
+            prior: prior.filter(|prior| !matches!(prior, SelectionSource::All)),
+            height,
+            pinned: None,
+        }
+    }
+
+    pub(super) fn copy_row(
+        &mut self,
+        y: u32,
+        output: &mut [u8],
+        pool: &ResidentBudget,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<()> {
+        if y >= self.height || !(1..=16000).contains(&output.len()) {
+            return Err(Error::Invalid("Previous selection row exceeds its canvas"));
+        }
+        let Some(prior) = self.prior else {
+            output.fill(0);
+            return Ok(());
+        };
+        let y = y as i32;
+        if self.pinned.as_ref().is_none_or(|view| {
+            let [_, top, right, bottom] = view.region().bounds();
+            right as usize != output.len() || !(top..bottom).contains(&y)
+        }) {
+            drop(self.pinned.take());
+            let origin = match prior {
+                SelectionSource::Coverage(coverage) => coverage.origin()[1],
+                _ => 0,
+            };
+            // Align to the underlying coverage tile row even when the surface is cropped.
+            let max_rows = (MAX_REGION_PIXELS / output.len()).min(TILE as usize);
+            let rows = 1_i32 << max_rows.ilog2();
+            let top = y - (y - origin).rem_euclid(rows);
+            let region = Region::new([
+                0, top.max(0), output.len() as i32, (top + rows).min(self.height as i32),
+            ])?;
+            self.pinned = Some(prior.prepare_region(region, pool, &mut || check())?);
+        }
+        self.pinned.as_ref().ok_or(Error::Invalid("Previous selection band missing"))?
+            .copy_row(y, output)
     }
 }
 

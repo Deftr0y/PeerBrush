@@ -202,9 +202,9 @@ fn opaque_three_channel_sixteen_bit_images_are_readonly_and_cannot_overwrite_the
     assert_eq!(doc.layers[0].pixels.get(0, 0), [0, 128, 255, 255]);
     assert!(psd::encode(&doc).is_err());
     let mut e = Engine::new();
-    e.doc = doc;
-    let id = e.doc.layers[0].id.clone();
-    let before = e.doc.export_png().unwrap();
+    e.resident_state_mut().expect("resident fixture").document = doc;
+    let id = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
+    let before = e.resident_state().expect("resident fixture").document.export_png().unwrap();
     assert!(e
         .edit(
             "human",
@@ -214,8 +214,8 @@ fn opaque_three_channel_sixteen_bit_images_are_readonly_and_cannot_overwrite_the
             "must stay protected"
         )
         .is_err());
-    assert_eq!(e.doc.export_png().unwrap(), before);
-    assert!(e.undo.is_empty());
+    assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), before);
+    assert!(e.resident_state().expect("resident fixture").undo.is_empty());
 }
 
 #[test]

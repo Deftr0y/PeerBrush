@@ -28,15 +28,15 @@ impl Drop for WatchSave {
 
 fn native_save_fixture(depth: u16, name: &str) -> Shared {
     let mut e = Engine::new();
-    e.doc = engine::Document::new_depth(4, 3, depth).unwrap();
-    e.doc.name = name.into();
-    e.doc.layers[0].pixels.set16(0, 0, [12347, 23459, 34571, 0]);
-    e.doc.layers[0]
+    e.resident_state_mut().expect("resident fixture").document = engine::Document::new_depth(4, 3, depth).unwrap();
+    e.resident_state_mut().expect("resident fixture").document.name = name.into();
+    e.resident_state_mut().expect("resident fixture").document.layers[0].pixels.set16(0, 0, [12347, 23459, 34571, 0]);
+    e.resident_state_mut().expect("resident fixture").document.layers[0]
         .pixels
         .set16(2, 1, [50001, 30003, 10001, 32769]);
     let mut mask = raster::Raster::new_depth(4, 3, depth);
     mask.set16(2, 1, [45673, 45673, 45673, 65535]);
-    e.doc.layers[0].mask = Some(engine::Mask {
+    e.resident_state_mut().expect("resident fixture").document.layers[0].mask = Some(engine::Mask {
         linked: true,
         enabled: false,
         cache_key: engine::id(),
@@ -50,7 +50,7 @@ fn native_save_fixture(depth: u16, name: &str) -> Shared {
             settings: json!(null),
         }],
     });
-    let layer = e.doc.layers[0].id.clone();
+    let layer = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
     e.edit(
         "human",
         &[json!({"op":"fill","layer":layer,"rect":[3,2,4,3],"color":[41,83,127,173]})],
@@ -77,9 +77,9 @@ fn multistrip_working_save_preserves_destination_history_and_foreign_scratch() {
                 fs::create_dir(&dir).unwrap();
                 let path = dir.join(format!("art.{extension}"));
                 let mut engine = Engine::new();
-                engine.doc = engine::Document::new_depth(257, 515, depth).unwrap();
-                engine.doc.name = format!("art.{extension}");
-                let layer = engine.doc.layers[0].id.clone();
+                engine.resident_state_mut().expect("resident fixture").document = engine::Document::new_depth(257, 515, depth).unwrap();
+                engine.resident_state_mut().expect("resident fixture").document.name = format!("art.{extension}");
+                let layer = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
                 engine.edit("human", &[json!({"op":"fill","layer":layer,"rect":[0,0,257,515],"color":[37,73,151,193]})], None, None, "Dense native artwork").unwrap();
                 let shared = Arc::new(Mutex::new(engine));
                 save(&shared, &path).unwrap();
@@ -88,8 +88,8 @@ fn multistrip_working_save_preserves_destination_history_and_foreign_scratch() {
                     let mut engine = shared.lock().unwrap();
                     engine.edit("human", &[json!({"op":"fill","layer":layer,"rect":[0,514,257,515],"color":[17,83,139,211]})], None, None, "Last strip artwork").unwrap();
                 }
-                let before = serde_json::to_value(&shared.lock().unwrap().doc).unwrap();
-                let history = shared.lock().unwrap().undo.len();
+                let before = serde_json::to_value(&shared.lock().unwrap().resident_state().expect("resident fixture").document).unwrap();
+                let history = shared.lock().unwrap().resident_state().expect("resident fixture").undo.len();
                 let saved = shared.lock().unwrap().saved_revision;
                 let control = crate::saving::Control::default();
                 let observed_control = control.clone();
@@ -110,7 +110,7 @@ fn multistrip_working_save_preserves_destination_history_and_foreign_scratch() {
                             assert!(observed_control.cancel());
                         } else {
                             let mut engine = observed_shared.lock().unwrap();
-                            let layer = engine.doc.layers[0].id.clone();
+                            let layer = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
                             engine.edit("human", &[json!({"op":"fill","layer":layer,"rect":[1,1,2,2],"color":[1,3,5,255]})], None, None, "Later human artwork").unwrap();
                         }
                     }
@@ -128,7 +128,7 @@ fn multistrip_working_save_preserves_destination_history_and_foreign_scratch() {
                 let result = save_controlled(&shared, &path, &json!({}), &control, || {});
                 drop(watch);
                 let engine = shared.lock().unwrap();
-                assert_eq!(engine.undo.len(), history + usize::from(fault == "stale"));
+                assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), history + usize::from(fault == "stale"));
                 if fault == "none" {
                     result.unwrap();
                     assert_eq!(
@@ -136,7 +136,7 @@ fn multistrip_working_save_preserves_destination_history_and_foreign_scratch() {
                             .unwrap(),
                         before
                     );
-                    assert_eq!(engine.saved_revision, engine.doc.revision);
+                    assert_eq!(engine.saved_revision, engine.resident_state().expect("resident fixture").document.revision);
                     assert!(crate::file_safety::previous_versions(&path)
                         .unwrap()
                         .iter()
@@ -147,7 +147,7 @@ fn multistrip_working_save_preserves_destination_history_and_foreign_scratch() {
                     assert_eq!(engine.saved_revision, saved);
                 }
                 if fault != "stale" {
-                    assert_eq!(serde_json::to_value(&engine.doc).unwrap(), before);
+                    assert_eq!(serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap(), before);
                 }
                 if let Some(path) = &*foreign_name.lock().unwrap() {
                     assert_eq!(fs::read(path).unwrap(), b"foreign scratch bytes");
@@ -168,8 +168,8 @@ fn streamed_working_save_keeps_native_sources_history_ownership_and_previous_byt
             fs::create_dir(&dir).unwrap();
             let path = dir.join(format!("art.{extension}"));
             let shared = native_save_fixture(depth, path.file_name().unwrap().to_str().unwrap());
-            let before = serde_json::to_value(&shared.lock().unwrap().doc).unwrap();
-            let history = shared.lock().unwrap().undo.len();
+            let before = serde_json::to_value(&shared.lock().unwrap().resident_state().expect("resident fixture").document).unwrap();
+            let history = shared.lock().unwrap().resident_state().expect("resident fixture").undo.len();
             save(&shared, &path).unwrap();
             let original = fs::read(&path).unwrap();
             let loaded = psd::decode(&original).unwrap();
@@ -191,9 +191,9 @@ fn streamed_working_save_keeps_native_sources_history_ownership_and_previous_byt
             }
             {
                 let e = shared.lock().unwrap();
-                assert_eq!(serde_json::to_value(&e.doc).unwrap(), before);
-                assert_eq!(e.undo.len(), history);
-                assert_eq!(e.saved_revision, e.doc.revision);
+                assert_eq!(serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap(), before);
+                assert_eq!(e.resident_state().expect("resident fixture").undo.len(), history);
+                assert_eq!(e.saved_revision, e.resident_state().expect("resident fixture").document.revision);
                 assert_eq!(
                     e.file_version,
                     Some(crate::file_safety::version(&path).unwrap())
@@ -203,7 +203,7 @@ fn streamed_working_save_keeps_native_sources_history_ownership_and_previous_byt
             }
             {
                 let mut e = shared.lock().unwrap();
-                let layer = e.doc.layers[0].id.clone();
+                let layer = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
                 e.edit(
                     "human",
                     &[json!({"op":"fill","layer":layer,"rect":[1,0,2,1],"color":[13,29,53,97]})],
@@ -219,13 +219,13 @@ fn streamed_working_save_keeps_native_sources_history_ownership_and_previous_byt
                 .iter()
                 .any(|version| fs::read(&version.path).unwrap() == original));
             let e = shared.lock().unwrap();
-            assert_eq!(e.undo.len(), history + 1);
-            assert_eq!(e.saved_revision, e.doc.revision);
+            assert_eq!(e.resident_state().expect("resident fixture").undo.len(), history + 1);
+            assert_eq!(e.saved_revision, e.resident_state().expect("resident fixture").document.revision);
             assert_eq!(
                 psd::decode(&fs::read(&path).unwrap()).unwrap().layers[0]
                     .pixels
                     .rgba16(),
-                e.doc.layers[0].pixels.rgba16()
+                e.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16()
             );
             assert!(!fs::read_dir(&dir).unwrap().any(|entry| matches!(
                 entry.unwrap().path().extension().and_then(|s| s.to_str()),
@@ -259,13 +259,13 @@ fn streamed_save_faults_preserve_dirty_work_original_and_foreign_temporary_files
                 let original = fs::read(&path).unwrap();
                 {
                     let mut e = shared.lock().unwrap();
-                    let layer = e.doc.layers[0].id.clone();
+                    let layer = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
                     e.edit("human", &[json!({"op":"fill","layer":layer,"rect":[1,0,2,1],"color":[13,29,53,97]})], None, None, "Pending artwork").unwrap();
                 }
-                let before = serde_json::to_value(&shared.lock().unwrap().doc).unwrap();
+                let before = serde_json::to_value(&shared.lock().unwrap().resident_state().expect("resident fixture").document).unwrap();
                 let saved = shared.lock().unwrap().saved_revision;
                 let version = shared.lock().unwrap().file_version;
-                let history = shared.lock().unwrap().undo.len();
+                let history = shared.lock().unwrap().resident_state().expect("resident fixture").undo.len();
                 let foreign = dir.join("foreign-replacement.tmp");
                 let relocated = dir.join("relocated-original.tmp");
                 let (foreign_observed, relocated_observed) = (foreign.clone(), relocated.clone());
@@ -307,10 +307,10 @@ fn streamed_save_faults_preserve_dirty_work_original_and_foreign_temporary_files
                 drop(watch);
                 assert!(!error.is_empty());
                 let e = shared.lock().unwrap();
-                assert_eq!(serde_json::to_value(&e.doc).unwrap(), before);
+                assert_eq!(serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap(), before);
                 assert_eq!(e.saved_revision, saved);
                 assert_eq!(e.file_version, version);
-                assert_eq!(e.undo.len(), history);
+                assert_eq!(e.resident_state().expect("resident fixture").undo.len(), history);
                 assert!(e.file_ownership.is_some());
                 if fault == "published" {
                     assert_ne!(fs::read(&path).unwrap(), original);
@@ -352,7 +352,9 @@ fn streamed_save_rejects_same_held_inode_symlinks_and_never_deletes_the_foreign_
                     native_save_fixture(depth, path.file_name().unwrap().to_str().unwrap());
                 save(&shared, &path).unwrap();
                 let original = fs::read(&path).unwrap();
-                let before = serde_json::to_value(&shared.lock().unwrap().doc).unwrap();
+                let before = serde_json::to_value(
+                    &shared.lock().unwrap().resident_state().unwrap().document,
+                ).unwrap();
                 let observed = Arc::new(Mutex::new(None));
                 let record = observed.clone();
                 let relocated = dir.join("held-native-bytes");
@@ -371,7 +373,9 @@ fn streamed_save_rejects_same_held_inode_symlinks_and_never_deletes_the_foreign_
                 assert!(error.contains("regular file"));
                 assert_eq!(fs::read(&path).unwrap(), original);
                 assert_eq!(
-                    serde_json::to_value(&shared.lock().unwrap().doc).unwrap(),
+                    serde_json::to_value(
+                        &shared.lock().unwrap().resident_state().unwrap().document,
+                    ).unwrap(),
                     before
                 );
                 let alias = observed.lock().unwrap().clone().unwrap();
@@ -393,7 +397,7 @@ fn update_restart_is_blocked_during_unlocked_save_and_export_preparation() {
     let directory = std::env::temp_dir().join(format!("pb-update-save-{}", engine::id()));
     fs::create_dir(&directory).unwrap();
     let mut engine = Engine::new();
-    engine.doc = crate::engine::Document::new(8, 8).unwrap();
+    engine.resident_state_mut().expect("resident fixture").document = crate::engine::Document::new(8, 8).unwrap();
     let root = Arc::new(Mutex::new(engine));
     let workspace = crate::workspace::attach(&root);
     let reviewed = update_readiness(&workspace).unwrap();
@@ -475,8 +479,8 @@ fn pending_save_rejects_changed_document_path_and_destination_at_publication() {
     for scenario in 0..7 {
         let path = dir.join(format!("source-{scenario}.psd"));
         let mut e = Engine::new();
-        e.doc = engine::Document::new_depth(8, 8, 16).unwrap();
-        e.doc.layers[0]
+        e.resident_state_mut().expect("resident fixture").document = engine::Document::new_depth(8, 8, 16).unwrap();
+        e.resident_state_mut().expect("resident fixture").document.layers[0]
             .pixels
             .set16(2, 3, [10001, 20003, 40007, 65535]);
         let shared = Arc::new(Mutex::new(e));
@@ -491,10 +495,10 @@ fn pending_save_rejects_changed_document_path_and_destination_at_publication() {
         let result = save_prepared(&shared, &target, &json!({}), || match scenario {
             0 => {
                 let mut e = shared.lock().unwrap();
-                e.doc.layers[0]
+                e.resident_state_mut().expect("resident fixture").document.layers[0]
                     .pixels
                     .set16(2, 3, [54321, 23459, 45671, 65535]);
-                e.doc.revision += 1;
+                e.resident_state_mut().expect("resident fixture").document.revision += 1;
             }
             1 => shared.lock().unwrap().path = Some(dir.join("other.psd")),
             2 => {
@@ -505,7 +509,7 @@ fn pending_save_rejects_changed_document_path_and_destination_at_publication() {
                 expected = b"new destination appeared".to_vec();
                 atomic_write(&target, &expected).unwrap();
             }
-            4 => shared.lock().unwrap().doc.id = engine::id(),
+            4 => shared.lock().unwrap().resident_state_mut().expect("resident fixture").document.id = engine::id(),
             5 => shared.lock().unwrap().file_version = None,
             6 => {
                 let mut e = shared.lock().unwrap();
@@ -524,13 +528,114 @@ fn pending_save_rejects_changed_document_path_and_destination_at_publication() {
         assert!(!e.closed);
         if scenario == 0 {
             assert_eq!(
-                e.doc.layers[0].pixels.get16(2, 3),
+                e.resident_state().expect("resident fixture").document.layers[0].pixels.get16(2, 3),
                 [54321, 23459, 45671, 65535]
             );
-            assert_ne!(e.saved_revision, e.doc.revision);
+            assert_ne!(e.saved_revision, e.resident_state().expect("resident fixture").document.revision);
         }
     }
     fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn first_save_and_export_refuse_a_destination_created_at_the_final_move() {
+    let dir = std::env::temp_dir().join(format!("pb-first-publication-{}", engine::id()));
+    fs::create_dir(&dir).unwrap();
+    for depth in [8, 16] {
+        for extension in ["psd", "psb", "png"] {
+            let shared = native_save_fixture(depth, "Unsaved artwork");
+            let path = dir.join(format!("work-{depth}.{extension}"));
+            let foreign = b"another application created this destination";
+            let (saved_revision, history, document) = {
+                let e = shared.lock().unwrap();
+                (e.saved_revision, e.history_lengths(), e.resident().unwrap().clone())
+            };
+            let target = path.clone();
+            let watch = WatchSave::new(move |phase, destination, staging| {
+                if phase == "before-new-publication" {
+                    assert_eq!(destination, crate::file_safety::canonical_destination(&target).unwrap());
+                    assert!(staging.is_file());
+                    let mut external = fs::OpenOptions::new().write(true).create_new(true)
+                        .open(destination).unwrap();
+                    external.write_all(foreign).unwrap();
+                }
+                Ok(())
+            });
+            let result = if extension == "png" { export(&shared, &path) } else { save(&shared, &path) };
+            drop(watch);
+            assert!(result.unwrap_err().contains("without replacement"));
+            assert_eq!(fs::read(&path).unwrap(), foreign);
+            let e = shared.lock().unwrap();
+            assert!(e.path.is_none() && e.file_version.is_none());
+            assert_eq!(e.saved_revision, saved_revision);
+            assert_eq!(e.history_lengths(), history);
+            assert_eq!(e.resident().unwrap().revision, document.revision);
+            assert_eq!(e.resident().unwrap().layers[0].pixels, document.layers[0].pixels);
+            assert!(!e.closed);
+        }
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn immutable_recovery_publication_leaves_late_destinations_untouched() {
+    let dir = std::env::temp_dir().join(format!("pb-recovery-publication-{}", engine::id()));
+    fs::create_dir(&dir).unwrap();
+    for extension in ["psd", "json"] {
+        let path = dir.join(format!("recovery-{}-{}.{extension}", engine::id(), engine::id()));
+        let target = path.clone();
+        let watch = WatchSave::new(move |phase, destination, staging| {
+            if phase == "before-new-publication" {
+                assert_eq!(destination, target);
+                assert_eq!(fs::read(staging).unwrap(), b"autosave candidate");
+                let mut competing = fs::OpenOptions::new().write(true).create_new(true)
+                    .open(destination).unwrap();
+                competing.write_all(b"existing recovery bytes").unwrap();
+            }
+            Ok(())
+        });
+        let error = atomic_create(&path, b"autosave candidate", |_| Ok(())).unwrap_err();
+        drop(watch);
+        assert!(error.contains("without replacement"));
+        assert_eq!(fs::read(&path).unwrap(), b"existing recovery bytes");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        fs::remove_file(&path).unwrap();
+    }
+    fs::remove_dir(dir).unwrap();
+}
+
+#[test]
+fn first_preference_save_preserves_a_late_file_and_can_retry_after_reloading() {
+    let fixture = crate::engine::native::worker::tests::Fixture::new();
+    let path = fixture.path().join("preview.json");
+    let expected = path.clone();
+    let external = br#"{"version":1,"reduced_resolution":false}"#;
+    let proposed = br#"{"version":1,"reduced_resolution":true}"#;
+    let watch = WatchSave::new(move |phase, destination, staging| {
+        if phase == "before-new-publication" {
+            assert_eq!(destination, expected);
+            assert_eq!(fs::read(staging).unwrap(), proposed);
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(destination)
+                .unwrap();
+            file.write_all(external).unwrap();
+        }
+        Ok(())
+    });
+    let changed = "Preview preferences changed on disk; restart before saving";
+    let error = crate::tool_settings::write_owned(&path, proposed, None, changed).unwrap_err();
+    drop(watch);
+    assert!(error.contains("without replacement"));
+    let reloaded = crate::tool_settings::read_owned(&path).unwrap().unwrap();
+    assert_eq!(reloaded, external);
+    assert_eq!(
+        crate::tool_settings::write_owned(&path, proposed, None, changed).unwrap_err(),
+        changed
+    );
+    crate::tool_settings::write_owned(&path, proposed, Some(&reloaded), changed).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), proposed);
 }
 
 #[test]
@@ -569,7 +674,7 @@ fn synthetic_save_phase_diagnostic() {
         let shared = Arc::new(Mutex::new(Engine::new()));
         {
             let mut e = shared.lock().unwrap();
-            e.doc = engine::Document::new_depth(2048, 2048, depth).unwrap();
+            e.resident_state_mut().expect("resident fixture").document = engine::Document::new_depth(2048, 2048, depth).unwrap();
             for y in 0..2048i32 {
                 for x in 0..2048i32 {
                     let (x, y) = (x as u16, y as u16);
@@ -580,7 +685,7 @@ fn synthetic_save_phase_diagnostic() {
                             .wrapping_add(x.wrapping_mul(31))
                             .wrapping_add(y.wrapping_mul(47))
                     };
-                    e.doc.layers[0].pixels.set16(
+                    e.resident_state_mut().expect("resident fixture").document.layers[0].pixels.set16(
                         i32::from(x),
                         i32::from(y),
                         [
@@ -605,7 +710,7 @@ fn synthetic_save_phase_diagnostic() {
                 open(&shared, &source).unwrap();
                 {
                     let mut engine = shared.lock().unwrap();
-                    let layer = engine.doc.layers[0].id.clone();
+                    let layer = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
                     engine
                         .reserve(
                             "human",
@@ -614,7 +719,7 @@ fn synthetic_save_phase_diagnostic() {
                         )
                         .unwrap();
                 }
-                let before = shared.lock().unwrap().doc.clone();
+                let before = shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
                 let full_history = |engine: &Engine| {
                     let entries = |items: &[engine::History]| {
                         items.iter().map(|entry| json!({
@@ -622,12 +727,12 @@ fn synthetic_save_phase_diagnostic() {
                         "task":entry.task,"scopes":entry.scopes,"gesture":entry.gesture,"reverted":entry.reverted
                     })).collect::<Vec<_>>()
                     };
-                    json!({"undo":entries(&engine.undo),"redo":entries(&engine.redo),"leases":engine.leases})
+                    json!({"undo":entries(&engine.resident_state().expect("resident fixture").undo),"redo":entries(&engine.resident_state().expect("resident fixture").redo),"leases":engine.leases})
                 };
                 let previous_history = full_history(&shared.lock().unwrap());
                 assert!(!shared.lock().unwrap().leases.is_empty());
                 assert_eq!(shared.lock().unwrap().saved_revision, before.revision);
-                let history = shared.lock().unwrap().undo.len();
+                let history = shared.lock().unwrap().resident_state().expect("resident fixture").undo.len();
                 #[derive(serde::Serialize)]
                 struct ObservedStage {
                     stage: String,
@@ -789,15 +894,15 @@ fn synthetic_save_phase_diagnostic() {
                 {
                     let e = shared.lock().unwrap();
                     assert_eq!(
-                        (e.doc.id.as_str(), e.doc.revision, e.doc.bit_depth),
+                        (e.resident_state().expect("resident fixture").document.id.as_str(), e.resident_state().expect("resident fixture").document.revision, e.resident_state().expect("resident fixture").document.bit_depth),
                         (before.id.as_str(), before.revision, depth)
                     );
-                    assert_eq!(e.undo.len(), history);
+                    assert_eq!(e.resident_state().expect("resident fixture").undo.len(), history);
                     assert_eq!(full_history(&e), previous_history);
                     let mut expected = before.clone();
                     expected.name = output.file_name().unwrap().to_string_lossy().into();
                     assert_eq!(
-                        serde_json::to_value(&e.doc).unwrap(),
+                        serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap(),
                         serde_json::to_value(&expected).unwrap()
                     );
                     assert_eq!(e.path.as_deref(), Some(output.as_path()));
@@ -812,7 +917,7 @@ fn synthetic_save_phase_diagnostic() {
                         Some(crate::file_safety::version(&output).unwrap())
                     );
                     assert_eq!(
-                        e.doc.layers[0].pixels.rgba16(),
+                        e.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(),
                         before.layers[0].pixels.rgba16()
                     );
                     assert_eq!(e.saved_revision, before.revision);
@@ -1069,23 +1174,23 @@ fn controlled_save_cancellation_and_writer_errors_preserve_native_work_and_origi
                 // the small editable layer/mask and its native hidden samples stay intact.
                 {
                     let mut e = shared.lock().unwrap();
-                    e.doc.width = 257;
-                    e.doc.height = 257;
+                    e.resident_state_mut().expect("resident fixture").document.width = 257;
+                    e.resident_state_mut().expect("resident fixture").document.height = 257;
                 }
                 save(&shared, &path).unwrap();
                 let original = fs::read(&path).unwrap();
                 {
                     let mut e = shared.lock().unwrap();
-                    let layer = e.doc.layers[0].id.clone();
+                    let layer = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
                     e.edit("human", &[json!({"op":"fill","layer":layer,"rect":[1,0,2,1],"color":[13,29,53,97]})], None, None, "Unsaved native work").unwrap();
                 }
                 let (document, saved, version, history) = {
                     let e = shared.lock().unwrap();
                     (
-                        serde_json::to_value(&e.doc).unwrap(),
+                        serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap(),
                         e.saved_revision,
                         e.file_version,
-                        e.undo.len(),
+                        e.resident_state().expect("resident fixture").undo.len(),
                     )
                 };
                 let control = crate::saving::Control::default();
@@ -1141,10 +1246,10 @@ fn controlled_save_cancellation_and_writer_errors_preserve_native_work_and_origi
                 );
                 assert_eq!(fs::read(&path).unwrap(), original);
                 let e = shared.lock().unwrap();
-                assert_eq!(serde_json::to_value(&e.doc).unwrap(), document);
+                assert_eq!(serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap(), document);
                 assert_eq!(e.saved_revision, saved);
                 assert_eq!(e.file_version, version);
-                assert_eq!(e.undo.len(), history);
+                assert_eq!(e.resident_state().expect("resident fixture").undo.len(), history);
                 assert!(e.file_ownership.is_some());
                 assert_eq!(e.file_operations.load(Ordering::Acquire), 0);
                 assert!(control.status().finished && control.status().error.is_some());
@@ -1180,15 +1285,15 @@ fn controlled_save_last_cancel_is_atomic_and_late_cancel_cannot_hide_publication
                 let original = fs::read(&path).unwrap();
                 {
                     let mut e = shared.lock().unwrap();
-                    let layer = e.doc.layers[0].id.clone();
+                    let layer = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
                     e.edit("human", &[json!({"op":"fill","layer":layer,"rect":[1,0,2,1],"color":[13,29,53,97]})], None, None, "Pending work").unwrap();
                 }
                 let (document, saved, history) = {
                     let e = shared.lock().unwrap();
                     (
-                        serde_json::to_value(&e.doc).unwrap(),
+                        serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap(),
                         e.saved_revision,
-                        e.undo.len(),
+                        e.resident_state().expect("resident fixture").undo.len(),
                     )
                 };
                 let control = crate::saving::Control::default();
@@ -1213,16 +1318,16 @@ fn controlled_save_last_cancel_is_atomic_and_late_cancel_cannot_hide_publication
                 assert_eq!(result.is_ok(), late);
                 assert_eq!(published.get(), late);
                 let e = shared.lock().unwrap();
-                assert_eq!(serde_json::to_value(&e.doc).unwrap(), document);
-                assert_eq!(e.undo.len(), history);
-                assert_eq!(e.saved_revision, if late { e.doc.revision } else { saved });
+                assert_eq!(serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap(), document);
+                assert_eq!(e.resident_state().expect("resident fixture").undo.len(), history);
+                assert_eq!(e.saved_revision, if late { e.resident_state().expect("resident fixture").document.revision } else { saved });
                 assert_eq!(fs::read(&path).unwrap() == original, !late);
                 if late {
                     let decoded = psd::decode(&fs::read(&path).unwrap()).unwrap();
                     assert!(!decoded.read_only);
                     assert_eq!(
                         decoded.layers[0].pixels.rgba16(),
-                        e.doc.layers[0].pixels.rgba16()
+                        e.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16()
                     );
                     assert!(crate::file_safety::previous_versions(&path)
                         .unwrap()
@@ -1247,11 +1352,11 @@ fn save_run_binding_duplicate_registration_and_failed_spawn_keep_operations_owne
     let shared = native_save_fixture(16, "art.psd");
     let (document, revision) = {
         let e = shared.lock().unwrap();
-        (e.doc.id.clone(), e.doc.revision)
+        (e.resident_state().expect("resident fixture").document.id.clone(), e.resident_state().expect("resident fixture").document.revision)
     };
     let request = json!({"document_id":document,"expected_revision":revision});
-    let source = serde_json::to_value(&shared.lock().unwrap().doc).unwrap();
-    assert!(save_async(&shared, path.clone(), &json!({})).is_err());
+    let source = serde_json::to_value(&shared.lock().unwrap().resident_state().expect("resident fixture").document).unwrap();
+    assert!(save_async(&shared, path.clone(), &json!({}), || Ok(())).is_err());
     assert!(SaveOperation::begin(
         &shared,
         &json!({"document_id":"stale"}),
@@ -1274,7 +1379,7 @@ fn save_run_binding_duplicate_registration_and_failed_spawn_keep_operations_owne
             .load(Ordering::Acquire),
         1
     );
-    assert!(save_async(&shared, path.clone(), &request)
+    assert!(save_async(&shared, path.clone(), &request, || Ok(()))
         .unwrap_err()
         .contains("already active"));
     assert!(dispatch(
@@ -1301,13 +1406,18 @@ fn save_run_binding_duplicate_registration_and_failed_spawn_keep_operations_owne
             Ok(())
         }
     });
-    assert!(save_async(&shared, path.clone(), &request)
+    let reply_error = "Injected async Save reply admission failure";
+    assert_eq!(
+        save_async(&shared, path.clone(), &request, || Err::<(), _>(reply_error.into())).unwrap_err(),
+        reply_error,
+    );
+    assert!(save_async(&shared, path.clone(), &request, || Ok(()))
         .unwrap_err()
         .contains("creation failure"));
     drop(watch);
     let e = shared.lock().unwrap();
     assert_eq!(e.file_operations.load(Ordering::Acquire), 0);
-    assert_eq!(serde_json::to_value(&e.doc).unwrap(), source);
+    assert_eq!(serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap(), source);
     assert!(e.saving.as_ref().unwrap().status().finished);
     assert!(e
         .saving
@@ -1333,11 +1443,11 @@ fn later_human_edit_fails_controlled_save_without_marking_it_saved_or_canceled()
     save(&shared, &path).unwrap();
     let original = fs::read(&path).unwrap();
     let saved = shared.lock().unwrap().saved_revision;
-    let history = shared.lock().unwrap().undo.len();
+    let history = shared.lock().unwrap().resident_state().expect("resident fixture").undo.len();
     let control = crate::saving::Control::default();
     let error = save_controlled(&shared, &path, &json!({}), &control, || {
         let mut e = shared.lock().unwrap();
-        let layer = e.doc.layers[0].id.clone();
+        let layer = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
         e.edit(
             "human",
             &[json!({"op":"fill","layer":layer,"rect":[1,0,2,1],"color":[13,29,53,97]})],
@@ -1351,11 +1461,11 @@ fn later_human_edit_fails_controlled_save_without_marking_it_saved_or_canceled()
     assert!(error.contains("source changed"));
     assert_eq!(fs::read(&path).unwrap(), original);
     let e = shared.lock().unwrap();
-    assert_eq!(e.undo.len(), history + 1);
+    assert_eq!(e.resident_state().expect("resident fixture").undo.len(), history + 1);
     assert_eq!(e.saved_revision, saved);
-    assert_ne!(e.saved_revision, e.doc.revision);
+    assert_ne!(e.saved_revision, e.resident_state().expect("resident fixture").document.revision);
     assert_eq!(
-        e.doc.layers[0].pixels.get16(1, 0),
+        e.resident_state().expect("resident fixture").document.layers[0].pixels.get16(1, 0),
         [13 * 257, 29 * 257, 53 * 257, 97 * 257]
     );
     assert!(control.status().finished && control.status().error.is_some());
@@ -1379,7 +1489,7 @@ fn queued_save_rejects_early_cancel_or_newer_human_source_before_serialization()
                 assert!(control.cancel());
             } else {
                 let mut e = shared.lock().unwrap();
-                let layer = e.doc.layers[0].id.clone();
+                let layer = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
                 e.edit(
                     "human",
                     &[json!({"op":"fill","layer":layer,"rect":[1,0,2,1],"color":[13,29,53,97]})],
@@ -1392,9 +1502,9 @@ fn queued_save_rejects_early_cancel_or_newer_human_source_before_serialization()
             let (before, saved, history) = {
                 let e = shared.lock().unwrap();
                 (
-                    serde_json::to_value(&e.doc).unwrap(),
+                    serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap(),
                     e.saved_revision,
-                    e.undo.len(),
+                    e.resident_state().expect("resident fixture").undo.len(),
                 )
             };
             let result = save_prepared_inner(&shared, &path, &json!({}), &control, || {
@@ -1408,12 +1518,12 @@ fn queued_save_rejects_early_cancel_or_newer_human_source_before_serialization()
             operation.complete(&result);
             drop(operation);
             let e = shared.lock().unwrap();
-            assert_eq!(serde_json::to_value(&e.doc).unwrap(), before);
+            assert_eq!(serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap(), before);
             assert_eq!(e.saved_revision, saved);
-            assert_eq!(e.undo.len(), history);
+            assert_eq!(e.resident_state().expect("resident fixture").undo.len(), history);
             assert_eq!(e.file_operations.load(Ordering::Acquire), 0);
             assert!(!e.closed);
-            assert_ne!(e.doc.revision, e.saved_revision);
+            assert_ne!(e.resident_state().expect("resident fixture").document.revision, e.saved_revision);
             assert!(control.status().finished && control.status().error.is_some());
             assert_eq!(control.status().cancel_requested, cancel);
             assert!(!path.exists());
@@ -1470,7 +1580,7 @@ fn source_compression_and_replay_refuse_newer_human_work_without_publication() {
                             })
                             .collect::<Vec<_>>()
                     };
-                    json!({"undo":entries(&e.undo),"redo":entries(&e.redo),"leases":e.leases})
+                    json!({"undo":entries(&e.resident_state().expect("resident fixture").undo),"redo":entries(&e.resident_state().expect("resident fixture").redo),"leases":e.leases})
                 };
                 let mut source_start = None;
                 let watch = WatchSave::new(move |phase, output, spool| {
@@ -1488,8 +1598,8 @@ fn source_compression_and_replay_refuse_newer_human_work_without_publication() {
                     if started {
                         reached.set(true);
                         let mut e = actual.lock().unwrap();
-                        let layer = e.doc.layers[0].id.clone();
-                        let revision = e.doc.revision;
+                        let layer = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
+                        let revision = e.resident_state().expect("resident fixture").document.revision;
                         e.edit(
                             "human",
                             &[json!({"op":"layer.update","layer":layer,"opacity":0.5})],
@@ -1499,7 +1609,7 @@ fn source_compression_and_replay_refuse_newer_human_work_without_publication() {
                         )
                         .unwrap();
                         *expected.borrow_mut() =
-                            Some((serde_json::to_value(&e.doc).unwrap(), history(&e)));
+                            Some((serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap(), history(&e)));
                     }
                     Ok(())
                 });
@@ -1515,11 +1625,11 @@ fn source_compression_and_replay_refuse_newer_human_work_without_publication() {
                 let e = shared.lock().unwrap();
                 let expected = retained.borrow();
                 let (document, histories) = expected.as_ref().unwrap();
-                assert_eq!(&serde_json::to_value(&e.doc).unwrap(), document);
+                assert_eq!(&serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap(), document);
                 assert_eq!(&history(&e), histories);
                 assert_eq!(e.saved_revision, saved);
                 assert_eq!(e.file_version, version);
-                assert_ne!(e.saved_revision, e.doc.revision);
+                assert_ne!(e.saved_revision, e.resident_state().expect("resident fixture").document.revision);
                 assert!(e.file_ownership.is_some());
                 assert!(crate::file_ownership::Ownership::open(&path, "other project").is_err());
                 assert_eq!(e.file_operations.load(Ordering::Acquire), 0);
@@ -1551,7 +1661,7 @@ fn buffered_source_flush_failure_and_cancel_keep_actual_native_save_and_history(
                 let original = fs::read(&path).unwrap();
                 {
                     let mut e = shared.lock().unwrap();
-                    let layer = e.doc.layers[0].id.clone();
+                    let layer = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
                     for color in [[13, 29, 53, 97], [19, 31, 61, 113]] {
                         e.edit(
                             "human",
@@ -1563,7 +1673,7 @@ fn buffered_source_flush_failure_and_cancel_keep_actual_native_save_and_history(
                         .unwrap();
                     }
                     e.undo("human").unwrap();
-                    assert!(!e.undo.is_empty() && !e.redo.is_empty());
+                    assert!(!e.resident_state().expect("resident fixture").undo.is_empty() && !e.resident_state().expect("resident fixture").redo.is_empty());
                 }
                 let history = |e: &Engine| {
                     let entries = |items: &[engine::History]| {
@@ -1576,12 +1686,12 @@ fn buffered_source_flush_failure_and_cancel_keep_actual_native_save_and_history(
                             })
                             .collect::<Vec<_>>()
                     };
-                    json!({"undo":entries(&e.undo),"redo":entries(&e.redo),"leases":e.leases})
+                    json!({"undo":entries(&e.resident_state().expect("resident fixture").undo),"redo":entries(&e.resident_state().expect("resident fixture").redo),"leases":e.leases})
                 };
                 let (document, histories, saved, version) = {
                     let e = shared.lock().unwrap();
                     (
-                        serde_json::to_value(&e.doc).unwrap(),
+                        serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap(),
                         history(&e),
                         e.saved_revision,
                         e.file_version,
@@ -1622,7 +1732,7 @@ fn buffered_source_flush_failure_and_cancel_keep_actual_native_save_and_history(
                 );
                 assert_eq!(fs::read(&path).unwrap(), original);
                 let e = shared.lock().unwrap();
-                assert_eq!(serde_json::to_value(&e.doc).unwrap(), document);
+                assert_eq!(serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap(), document);
                 assert_eq!(history(&e), histories);
                 assert_eq!(e.saved_revision, saved);
                 assert_eq!(e.file_version, version);
@@ -1661,7 +1771,7 @@ fn save_temporary_io_component_diagnostic() {
             "task":entry.task,"scopes":entry.scopes,"gesture":entry.gesture,"reverted":entry.reverted
         })).collect::<Vec<_>>()
         };
-        json!({"doc":engine.doc,"undo":entries(&engine.undo),"redo":entries(&engine.redo),
+        json!({"doc":engine.resident_state().expect("resident fixture").document,"undo":entries(&engine.resident_state().expect("resident fixture").undo),"redo":entries(&engine.resident_state().expect("resident fixture").redo),
             "leases":engine.leases,"path":engine.path,"saved_revision":engine.saved_revision})
     };
     let build: Value = serde_json::from_str(crate::build_info::json()).unwrap();
@@ -1677,7 +1787,7 @@ fn save_temporary_io_component_diagnostic() {
     for depth in [8, 16] {
         let shared = native_save_fixture(depth, "Native IO component fixture");
         let before = state(&shared.lock().unwrap());
-        let document = shared.lock().unwrap().doc.clone();
+        let document = shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
         let encoded = psd::encode(&document).unwrap();
         assert!(!encoded.is_empty() && encoded.len() <= CHUNK * OPERATIONS);
         assert_eq!(

@@ -320,6 +320,24 @@ class InstalledGuiContracts(unittest.TestCase):
             self.assertNotIn('shell', options)
             authenticate.assert_called_once_with()
 
+    def test_profile_desktop_launch_uses_only_its_selected_entry_and_display_environment(self):
+        with tempfile.TemporaryDirectory(prefix='peerbrush-profile-desktop-') as temporary:
+            work = Path(temporary)
+            desktop = work / 'profile.desktop'
+            desktop.write_bytes(b'[Desktop Entry]\nExec=/nix/store/fixture/bin/peerbrush -- %F\n')
+            path = work / 'Artwork 作品.psb'
+            env = dict(DISPLAY=':92', TMPDIR=str(work))
+            window = gui.Window(dict(desktop=desktop.read_text()), work, desktop=desktop, env=env)
+            window.pid = 2468
+            with mock.patch.object(window, 'authenticate'), mock.patch.object(gui.subprocess, 'run') as launch:
+                window.launch([path])
+                self.assertEqual(launch.call_args.args[0], ['gio', 'launch', str(desktop), str(path)])
+                self.assertEqual(launch.call_args.kwargs['env'], env)
+                desktop.write_bytes(b'[Desktop Entry]\nExec=/usr/bin/other -- %F\n')
+                with self.assertRaisesRegex(ValueError, 'desktop entry changed'):
+                    window.launch([path])
+                launch.assert_called_once()
+
     def test_actual_process_consumer_rejects_changed_uid_media_route_or_parent(self):
         with tempfile.TemporaryDirectory(prefix='peerbrush-gui-owner-') as temporary:
             work = Path(temporary).resolve(strict=True)

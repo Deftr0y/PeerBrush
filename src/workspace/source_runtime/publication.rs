@@ -5,6 +5,7 @@ use crate::{
     large_document::{ExternalFact, PublicationTicket, ScratchBytes},
     psd::{
         memory36::{Admitted, MetadataCharge},
+        mib_progress,
         save36::CompletedSave36,
     },
 };
@@ -26,6 +27,8 @@ mod creation;
 mod creation_frame;
 #[path = "publication/frame.rs"]
 mod frame;
+#[path = "publication/members.rs"]
+mod members;
 #[path = "publication/settlement.rs"]
 mod settlement;
 pub(crate) use creation::RegisteredCreation;
@@ -57,6 +60,31 @@ impl Registry {
     ) -> Result<(), String> {
         use closed_frame::Place;
         for entry in &self.entries {
+            if entry.closed.is_none()
+                && entry
+                    .frame
+                    .expected
+                    .is_some_and(|old| Some(old.identity) == identity)
+                && (entry.frame.parent != parent
+                    || entry
+                        .frame
+                        .target
+                        .file_name()
+                        .is_none_or(|target| !same_native_name(target, name)))
+            {
+                return Err(
+                    "Pending native original identity is not another user destination".into(),
+                );
+            }
+            if entry.frame.backups_identity == parent
+                && entry
+                    .frame
+                    .retained_original_name()
+                    .as_deref()
+                    .is_some_and(|reserved| same_native_name(reserved, name))
+            {
+                return Err("Retained native original is not a user destination".into());
+            }
             let retained = entry.closed.as_ref().is_some_and(|closed| {
                 closed
                     .frame
@@ -88,7 +116,9 @@ impl Registry {
                         closed.frame.bindings.iter().any(|binding| {
                             matches!(
                                 binding.place,
-                                Place::BackupOrdinal(_) | Place::CreatedBackup
+                                Place::BackupOrdinal(_)
+                                    | Place::CreatedBackup
+                                    | Place::RetainedOriginal
                             ) && binding.fact.identity == id
                         })
                     })
@@ -166,6 +196,34 @@ pub(crate) struct ArmedPublication<'a> {
     intent: PublicationIntent<'a>,
     prepared: crate::saving::PreparedCommit,
     closing: settlement::Closing,
+}
+#[must_use = "Close the refused publication with its actual abort receipt, or retain its debt"]
+pub(crate) struct RefusedPublication<'a> {
+    intent: PublicationIntent<'a>,
+    closing: settlement::Closing,
+    reason: &'static str,
+}
+impl std::fmt::Debug for RefusedPublication<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("RefusedPublication")
+            .field(&self.reason)
+            .finish()
+    }
+}
+impl RefusedPublication<'_> {
+    pub(crate) fn reason(&self) -> &'static str {
+        self.reason
+    }
+    pub(crate) fn abort(
+        self,
+        proof: &dyn crate::file_safety::ExternalOutcomeProof,
+        check: &dyn Fn() -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.closing.finish(&self.intent, proof, &|| {
+            check()?;
+            self.intent.check()
+        })
+    }
 }
 pub(crate) struct CommittedPublication<'a> {
     intent: PublicationIntent<'a>,
@@ -325,7 +383,13 @@ impl<'a> PublicationIntent<'a> {
         check()?;
         self.check()?;
         candidate.check_session(self.session)?;
-        candidate.recheck(check)?;
+        let report = |stage: &str, completed, total| control.progress(stage, completed, total);
+        let mut progress = mib_progress(
+            &report,
+            "Rechecking Photoshop file before publication",
+            candidate.bytes(),
+        );
+        candidate.recheck_with_progress(check, &mut progress)?;
         if candidate.bytes() != self.frame.candidate_bytes
             || candidate.sha256() != self.frame.candidate_sha256
             || candidate.provenance() != self.frame.provenance
@@ -384,16 +448,31 @@ impl<'a> ArmedPublication<'a> {
     pub(crate) fn commit(
         self,
         control: &crate::saving::Control,
-    ) -> Result<CommittedPublication<'a>, &'static str> {
-        let permit = self.intent.session.operation.commit_finalization(
-            self.intent.sha256,
-            control,
-            self.prepared,
-        )?;
+    ) -> Result<CommittedPublication<'a>, RefusedPublication<'a>> {
+        let Self {
+            intent,
+            prepared,
+            closing,
+        } = self;
+        let permit =
+            match intent
+                .session
+                .operation
+                .commit_finalization(intent.sha256, control, prepared)
+            {
+                Ok(permit) => permit,
+                Err(reason) => {
+                    return Err(RefusedPublication {
+                        intent,
+                        closing,
+                        reason,
+                    })
+                }
+            };
         Ok(CommittedPublication {
-            intent: self.intent,
+            intent,
             permit,
-            closing: Some(self.closing),
+            closing: Some(closing),
         })
     }
 }
@@ -492,6 +571,9 @@ impl PublicationPlan {
     pub(crate) fn expected_version(&self) -> Option<crate::file_safety::Version> {
         self.expected
     }
+    pub(crate) fn retained_original_name(&self) -> Option<std::ffi::OsString> {
+        self.frame.retained_original_name()
+    }
     pub(crate) fn candidate_bytes(&self) -> u64 {
         self.frame.candidate_bytes
     }
@@ -516,6 +598,7 @@ impl SourceSession {
         candidate: &CompletedSave36<'_>,
         observed: &NativeExternalSnapshot<'_>,
         check: &dyn Fn() -> Result<(), String>,
+        progress: &mut dyn FnMut(u64) -> Result<(), String>,
     ) -> Result<PublicationIntent<'a>, String> {
         check()?;
         self.check()?;
@@ -524,7 +607,7 @@ impl SourceSession {
         if !observed.uses_budget(&self.resident()) {
             return Err("External observation uses another resident pool".into());
         }
-        candidate.recheck(check)?;
+        candidate.recheck_with_progress(check, progress)?;
         observed.revalidate(check)?;
         let owner = {
             let state = self

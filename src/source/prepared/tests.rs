@@ -129,14 +129,17 @@ fn analytic_shape_and_cubic_regions_keep_original_native_grid_and_affine_sampler
 }
 #[test]
 fn native_text_keeps_global_alignment_glyph_phase_and_per_glyph_depth_projection() {
-    for layout in [TextLayout::Legacy, TextLayout::Shaped] {
+    for layout in [TextLayout::Legacy, TextLayout::Shaped, TextLayout::Paragraph] {
         for matrix in [
             [1., 0., 0., 1., 0., 0.],
             [1., 0., 0., 1., 3.25, -2.75],
             [0.9375, 0.125, -0.0625, 1.125, 7.25, 0.625],
             [0., 1., -1., 0., 80., -5.],
         ] {
-            let s = text(layout);
+            let mut s = text(layout);
+            if layout == TextLayout::Paragraph {
+                s.width = 54;
+            }
             compare(&s, matrix, [111, 83]);
             assert_eq!(s.matrix, [1., 0., 0., 1., 0., 0.]);
         }

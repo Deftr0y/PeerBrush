@@ -175,12 +175,12 @@ fn classic_lut_xyz_conversion_and_explicit_psd_copy_preserve_native_depth_and_al
                 let shared = shared(source.clone());
                 server::compatible_copy_with_color(&shared, "qa", Some(0), true).unwrap();
                 let e = shared.lock().unwrap();
-                assert!(!e.doc.read_only);
-                assert_eq!(e.doc.bit_depth, depth);
-                assert_eq!(e.doc.preview(None, 4, None, false).unwrap().2, display);
+                assert!(!e.resident_state().expect("resident fixture").document.read_only);
+                assert_eq!(e.resident_state().expect("resident fixture").document.bit_depth, depth);
+                assert_eq!(e.resident_state().expect("resident fixture").document.preview(None, 4, None, false).unwrap().2, display);
                 assert_eq!(source.export_png().unwrap(), original);
-                let saved = psd::decode(&psd::encode(&e.doc).unwrap()).unwrap();
-                assert_eq!(saved.export_png().unwrap(), e.doc.export_png().unwrap());
+                let saved = psd::decode(&psd::encode(&e.resident_state().expect("resident fixture").document).unwrap()).unwrap();
+                assert_eq!(saved.export_png().unwrap(), e.resident_state().expect("resident fixture").document.export_png().unwrap());
             }
         }
     }
@@ -406,9 +406,40 @@ fn profiled_psd_loading_canvas_and_export_have_separate_color_boundaries() {
         }
         assert_ne!(bytes, display);
         assert!(psd::encode(&doc).is_err());
-        let state = shared(doc).lock().unwrap().state();
+        let state = shared(doc).lock().unwrap().capture_state().unwrap().project().unwrap();
         assert_eq!(state["document"]["color_profile"]["preview"], "sRGB");
         assert!(!state.to_string().contains("icc_profile"));
+    }
+}
+
+#[test]
+fn resident_rgb16_profiled_preview_bands_match_the_whole_frame_conversion() {
+    let (width, height) = (1027, 171);
+    let mut doc = Document::new_depth(width, height, 16).unwrap();
+    for y in 0..height {
+        for x in 0..width {
+            let words = [
+                (x * 4903 + y * 3929) as u16,
+                (x * 829 + y * 2179 + 63) as u16,
+                (x * 3023 + y * 431 + 127) as u16,
+                [0, 127, 129, 19457, 65535][((x + y * 3) % 5) as usize],
+            ];
+            doc.layers[0].pixels.set16(x as i32, y as i32, words);
+        }
+    }
+    let original = doc.layers[0].pixels.clone();
+    let layer = doc.layers[0].id.clone();
+    for profile in [linear_profile(), lut_profile(false, true, true, 4)] {
+        doc.icc_profile = Some(Arc::new(profile.clone()));
+        for (rect, edge, target) in [(None, 8192, None), (Some([3, 1, 1025, 170]), 997, Some(layer.as_str()))] {
+            let (w, h, mut words, grid) = peerbrush::depth16::preview16(&doc, rect, edge, target, false).unwrap();
+            color_profile::convert16(&profile, &mut words).unwrap();
+            let expected: Vec<_> = words.chunks_exact(4)
+                .flat_map(|pixel| peerbrush::depth16::display_pixel(pixel.try_into().unwrap())).collect();
+            assert_eq!(doc.preview(rect, edge, target, false).unwrap(), (w, h, expected, grid));
+        }
+        assert_eq!(doc.layers[0].pixels, original);
+        assert_eq!(doc.icc_profile.as_deref(), Some(&profile));
     }
 }
 
@@ -446,23 +477,23 @@ fn explicit_protocol_copy_converts_original_precision_and_preserves_source_and_g
         shared.lock().unwrap().leases.retain(|l| l.id != lease.id);
         server::dispatch(&shared, "document", &explicit).unwrap();
         let e = shared.lock().unwrap();
-        assert_ne!(e.doc.id, source_id);
-        assert!(!e.doc.read_only);
-        assert_eq!(e.doc.bit_depth, depth);
-        assert!(e.doc.icc_profile.is_none());
-        assert!(e.doc.srgb_tagged);
+        assert_ne!(e.resident_state().expect("resident fixture").document.id, source_id);
+        assert!(!e.resident_state().expect("resident fixture").document.read_only);
+        assert_eq!(e.resident_state().expect("resident fixture").document.bit_depth, depth);
+        assert!(e.resident_state().expect("resident fixture").document.icc_profile.is_none());
+        assert!(e.resident_state().expect("resident fixture").document.srgb_tagged);
         assert!(e.path.is_none());
-        assert_eq!(e.doc.revision, 1);
+        assert_eq!(e.resident_state().expect("resident fixture").document.revision, 1);
         assert_eq!(e.saved_revision, 0);
-        assert!(e.undo.is_empty());
-        assert_eq!(e.doc.preview(None, 4, None, false).unwrap().2, display);
+        assert!(e.resident_state().expect("resident fixture").undo.is_empty());
+        assert_eq!(e.resident_state().expect("resident fixture").document.preview(None, 4, None, false).unwrap().2, display);
         if depth == 16 {
-            assert!(e.doc.layers[0].pixels.rgba16().iter().any(|v| v % 257 != 0));
+            assert!(e.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16().iter().any(|v| v % 257 != 0));
         }
-        let standard = psd::decode(&psd::encode(&e.doc).unwrap()).unwrap();
+        let standard = psd::decode(&psd::encode(&e.resident_state().expect("resident fixture").document).unwrap()).unwrap();
         assert!(!standard.read_only);
         assert!(standard.srgb_tagged);
-        assert_eq!(standard.export_png().unwrap(), e.doc.export_png().unwrap());
+        assert_eq!(standard.export_png().unwrap(), e.resident_state().expect("resident fixture").document.export_png().unwrap());
         assert_eq!(source.export_png().unwrap(), source_png);
         assert!(source.read_only);
         assert_eq!(source.icc_profile.as_deref().unwrap().as_slice(), profile);
@@ -475,7 +506,7 @@ fn converted_standard_psd_and_png_keep_an_explicit_working_profile_without_priva
         let source = psd::decode(&fixture(&linear_profile(), depth)).unwrap();
         let shared = shared(source);
         server::compatible_copy_with_color(&shared, "qa", Some(0), true).unwrap();
-        let doc = shared.lock().unwrap().doc.clone();
+        let doc = shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
         let bytes = psd::encode(&doc).unwrap();
         let size = u32::from_be_bytes(bytes[30..34].try_into().unwrap()) as usize;
         let resources = resource(color_profile::srgb_profile());
@@ -569,9 +600,9 @@ fn unsupported_malformed_ambiguous_and_oversized_profiles_never_become_editable(
         let summary = color_profile::summary(Some(&invalid));
         assert_eq!(summary["preview"], "unmanaged");
         let shared = shared(doc);
-        let before = shared.lock().unwrap().doc.id.clone();
+        let before = shared.lock().unwrap().resident_state().expect("resident fixture").document.id.clone();
         assert!(server::compatible_copy_with_color(&shared, "qa", Some(0), true).is_err());
-        assert_eq!(shared.lock().unwrap().doc.id, before);
+        assert_eq!(shared.lock().unwrap().resident_state().expect("resident fixture").document.id, before);
     }
     let oversized = vec![0; color_profile::MAX_PROFILE_BYTES + 1];
     assert!(psd::decode(&fixture(&oversized, 8))
@@ -654,10 +685,10 @@ fn webp_preserves_original_icc_samples_and_reopens_through_existing_color_manage
         let reopened = Arc::new(Mutex::new(Engine::new()));
         server::open(&reopened, &path).unwrap();
         let engine = reopened.lock().unwrap();
-        assert_eq!(engine.doc.bit_depth, 8);
-        assert!(engine.doc.srgb_tagged);
-        assert!(engine.doc.icc_profile.is_none());
-        let managed = engine.doc.layers[0].pixels.rgba();
+        assert_eq!(engine.resident_state().expect("resident fixture").document.bit_depth, 8);
+        assert!(engine.resident_state().expect("resident fixture").document.srgb_tagged);
+        assert!(engine.resident_state().expect("resident fixture").document.icc_profile.is_none());
+        let managed = engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba();
         for (source, actual) in expected.chunks_exact(4).zip(managed.chunks_exact(4)) {
             assert_eq!(actual[3], source[3]);
             for channel in 0..3 {

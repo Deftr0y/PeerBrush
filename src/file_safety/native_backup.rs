@@ -111,6 +111,7 @@ impl NativeInventory<'_> {
         }
         self.validate(check)?;
         let mut output = options.open(&path).map_err(|e| e.to_string())?;
+        super::super::owned_rename::hold_write_stamp(&output)?;
         let output_id = identity(&output)?;
         let named = || -> Result<(), String> {
             regular_directory(&self.directory)?;
@@ -124,7 +125,13 @@ impl NativeInventory<'_> {
             Ok(())
         };
         named()?;
-        super::super::native_access::preserve(&source, &output, &self.budget, check)?;
+        super::super::native_access::preserve(
+            &source,
+            &output,
+            super::super::native_access::Destination::Backup,
+            &self.budget,
+            check,
+        )?;
         let mut left = expected.bytes;
         let mut digest = Context::new(&SHA256);
         while left != 0 {
@@ -145,6 +152,7 @@ impl NativeInventory<'_> {
         {
             return Err("Native previous file bytes changed; backup debt retained".into());
         }
+        super::super::owned_rename::finish_write_stamp(&output)?;
         output.sync_all().map_err(|e| e.to_string())?;
         let sealed = owned_rename::Sealed::verify(
             &output,

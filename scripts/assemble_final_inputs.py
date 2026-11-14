@@ -17,7 +17,7 @@ import zipfile
 
 import acquire_macos_qualification_inputs as transport
 import final_release as final
-from package_deb import deb_version
+from package_deb import deb_filename
 from package_macos_dmg import bounded_file, private_inspection_directory
 import prepare_final_inputs as inputs
 
@@ -76,7 +76,7 @@ def selections(value):
     portable = f'PeerBrush-{version}-Windows-x64.zip'
     candidate = artifacts['candidate']['files']
     expected = {portable, f'PeerBrush-{version}-macOS-arm64.zip', f'PeerBrush-{version}-Linux-x64.zip',
-                f'PeerBrush-{version}-source.zip', f'peerbrush_{deb_version(version)}_amd64.deb',
+                f'PeerBrush-{version}-source.zip', deb_filename(version),
                 'release-inventory.json', 'SHA256SUMS', 'production-readiness.json'}
     if set(candidate) != expected:
         raise ValueError('Select the exact ordinary five-record candidate artifact.')

@@ -4,18 +4,24 @@
 //! raster getters into implicit disk reads. Callers must pin a bounded region
 //! successfully before sampling it, and retain dirty source bytes until put succeeds.
 mod access;
+pub(crate) use access::{
+    Access as SourceAccess, Exclusive as SourceExclusive, OwnedRead as SourceRead,
+};
 mod budget;
 mod bytes;
 mod disk;
 mod index;
 mod linear;
+pub(crate) use linear::unlink_owned_at;
 mod planar;
 pub(crate) mod root;
 mod scalar;
 pub(crate) mod segments;
 mod store;
 
+pub(crate) use budget::DerivedCache;
 pub use budget::{Reservation, ResidentBudget};
+pub(crate) use bytes::{verified_transfer_buffer, BufferedWrite, VERIFIED_BATCH_BYTES};
 pub use bytes::{
     AppendWriter, ByteRole, BytesCursor, CompletedBytes, LargeSourceTemporary, MAX_SOURCE_PAYLOAD,
 };
@@ -25,10 +31,12 @@ pub(crate) use disk::{
 pub use disk::{DiskBudget, DiskReservation};
 pub use planar::{CompletedPlanar, PlanarRole, PlanarScratch, PlanarSpec};
 pub use scalar::{CompletedScalar, ScalarScratch, ScalarSpec};
-pub(crate) use store::WeakStore;
 pub use store::{
     BlockRef, CommitRef, FreshFragment, Limits, PinnedBytes, PinnedTile, ScratchBytes, Snapshot,
     Store, TileSpec,
+};
+pub(crate) use store::{
+    ParkedSource, RefusedRetirement as RefusedFragmentRetirement, RetiredSource, WeakStore,
 };
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -1,6 +1,71 @@
 //! One source-bound transform preview; the shared engine owns every pixel and guard.
 use super::*;
 
+fn mode_choice(ui: &mut egui::Ui, menu: bool, icon: Icon, label: &str, selected: bool) -> bool {
+    let min_width = if menu { ui.available_width() } else { 0. };
+    let clicked = icons::labeled_choice(ui, icon, label, Some(selected), min_width).clicked();
+    if clicked && menu {
+        ui.close_menu();
+    }
+    clicked
+}
+
+fn rotation_handle([top_left, top_right, _, bottom_left]: [Pos2; 4], middle: Pos2) -> Pos2 {
+    let top = top_right - top_left;
+    let mut outward = Vec2::new(top.y, -top.x).normalized();
+    if outward.dot(bottom_left - top_left) > 0. {
+        outward = -outward;
+    }
+    middle + outward * 26.
+}
+
+fn near_transform_edge(point: Pos2, corners: [Pos2; 4]) -> bool {
+    (0..4).any(|i| {
+        let start = corners[i];
+        let edge = corners[(i + 1) % 4] - start;
+        let length_sq = edge.length_sq();
+        let along = if length_sq > 0. {
+            ((point - start).dot(edge) / length_sq).clamp(0., 1.)
+        } else {
+            0.
+        };
+        point.distance_sq(start + edge * along) < 22. * 22.
+    })
+}
+
+fn paint_warp_grid(painter: &egui::Painter, nodes: [Pos2; 9], stroke: Stroke) {
+    for line in [[0, 1, 2], [3, 4, 5], [6, 7, 8], [0, 3, 6], [1, 4, 7], [2, 5, 8]] {
+        painter.add(egui::Shape::line(line.map(|i| nodes[i]).to_vec(), stroke));
+    }
+}
+
+fn warp_preset_button(ui: &mut egui::Ui, name: &str, label: &str, selected: bool, amount: f64) -> egui::Response {
+    let response = ui
+        .add_sized([65., 56.], egui::Button::new("").frame(false).selected(selected))
+        .on_hover_text(label);
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::RadioButton, response.enabled(), selected, label)
+    });
+    let visuals = ui.style().interact_selectable(&response, selected);
+    if selected || response.hovered() {
+        ui.painter().rect_filled(response.rect, 3., visuals.weak_bg_fill);
+    }
+    let color = visuals.text_color();
+    let top = response.rect.center_top();
+    if let Ok(grid) = crate::warp::Grid::preset([0., 0., 1., 1.], name, amount) {
+        let nodes = grid.points.map(|[x, y]| {
+            top + Vec2::new((x as f32 - 0.5) * 30., 9. + y as f32 * 20.)
+        });
+        paint_warp_grid(ui.painter(), nodes, Stroke::new(1., color));
+    }
+    ui.painter().text(
+        top + Vec2::new(0., 43.), egui::Align2::CENTER_CENTER, label,
+        egui::TextStyle::Button.resolve(ui.style()), color,
+    );
+    icons::paint_focus(ui, &response);
+    response
+}
+
 #[derive(Clone, PartialEq)]
 struct Quad {
     rect: [f64; 4],
@@ -34,20 +99,46 @@ impl Default for Parameters {
         }
     }
 }
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, serde::Serialize)]
 enum Handle {
     Move,
     Rotate,
     Scale(bool, bool),
     Skew(usize),
+    SkewShortcut(usize),
     Projective(usize, bool),
+    DistortEdge(usize),
+    PerspectiveShortcut(usize),
     Warp(usize),
     Pivot,
 }
+
+fn transform_modifier(modifiers: egui::Modifiers) -> bool {
+    if cfg!(target_os = "macos") {
+        modifiers.mac_cmd
+    } else {
+        modifiers.ctrl
+    }
+}
+
+fn modifier_handle(index: usize, modifiers: egui::Modifiers, affine_only: bool) -> Option<Handle> {
+    if !transform_modifier(modifiers) {
+        return None;
+    }
+    match (index < 4, modifiers.alt, modifiers.shift) {
+        (true, true, true) if !affine_only => Some(Handle::PerspectiveShortcut(index)),
+        (false, false, true) => Some(Handle::SkewShortcut(index % 2)),
+        (true, false, false) if !affine_only => Some(Handle::Projective(index, false)),
+        (false, false, false) if !affine_only => Some(Handle::DistortEdge(index - 4)),
+        _ => None,
+    }
+}
+
 struct Drag {
     origin: [f64; 2],
     start: Parameters,
     handle: Handle,
+    warp_preset: Option<&'static str>,
 }
 struct Reference {
     point: [f64; 2],
@@ -61,6 +152,8 @@ struct Reference {
 pub(super) struct Editor {
     pub document: String,
     pub revision: u64,
+    native_source: Option<crate::engine::native::DocumentKey>,
+    draft: Option<source::TransformDraft>,
     roots: Vec<String>,
     mask: bool,
     step: Option<String>,
@@ -86,8 +179,12 @@ pub(super) struct Editor {
     snap: bool,
     prior_tool: Tool,
     gesture: String,
+    pending: bool,
+    canvas_apply: bool,
+    geometry_pending: bool,
     drag: Option<Drag>,
     pub error: Option<String>,
+    apply_error: Option<String>,
     pub rendered: Option<String>,
     #[cfg(test)]
     inputs: [Option<Rect>; 9],
@@ -103,10 +200,44 @@ pub(super) struct Editor {
     scroll_offset: Vec2,
 }
 impl Editor {
+    pub(super) fn is_dragging(&self) -> bool {
+        self.drag.is_some()
+    }
+
+    pub(super) fn observes(&self, doc: DocumentView<'_>) -> bool {
+        self.document == doc.id()
+            && self.revision == doc.revision()
+            && self.native_source == doc.native().map(|native| native.key())
+    }
+    pub(super) fn edits_text_draft(&self) -> bool {
+        self.draft.is_some()
+    }
+
+    pub(super) fn pointer_preview_key(&self) -> Option<impl serde::Serialize + '_> {
+        let drag = self.drag.as_ref()?;
+        (!self.pending && !self.geometry_pending && !matches!(drag.handle, Handle::Pivot)).then_some((
+            &self.gesture,
+            drag.origin,
+            drag.handle,
+            &self.roots,
+            self.mask,
+            &self.step,
+            self.whole,
+        ))
+    }
+
     pub(super) fn mode(&self) -> Option<Tool> {
         (!self.skew_mode && self.projective_mode.is_none() && !self.warp_mode).then_some(self.mode)
     }
+
+    fn scale_handles(&self) -> bool {
+        matches!(self.mode(), Some(Tool::Move | Tool::Scale))
+    }
+
     pub(super) fn set_mode(&mut self, mode: Tool) {
+        if self.pending || self.geometry_pending {
+            return;
+        }
         self.mode = mode;
         self.skew_mode = false;
         self.projective_mode = None;
@@ -179,54 +310,14 @@ impl Editor {
         self.context_frame = block_canvas;
         let mut context = std::mem::take(&mut self.context);
         context.show(&response, |ui| {
-            for (mode, label) in [
-                (Tool::Move, "Move"),
-                (Tool::Scale, "Scale"),
-                (Tool::Rotate, "Rotate"),
-            ] {
-                if ui
-                    .selectable_label(self.mode() == Some(mode), label)
-                    .clicked()
-                {
-                    self.set_mode(mode);
-                    ui.close_menu();
-                }
-            }
-            if ui.selectable_label(self.skew_mode, "Skew").clicked() {
-                self.skew_mode = true;
-                self.projective_mode = None;
-                self.warp_mode = false;
-                self.drag = None;
-                ui.close_menu();
-            }
-            for (mode, label) in [
-                (ProjectiveMode::Distort, "Distort"),
-                (ProjectiveMode::Perspective, "Perspective"),
-            ] {
-                if ui
-                    .selectable_label(self.projective_mode == Some(mode), label)
-                    .clicked()
-                {
-                    self.projective_mode = Some(mode);
-                    self.skew_mode = false;
-                    self.warp_mode = false;
-                    self.drag = None;
-                    ui.close_menu();
-                }
-            }
-            if ui.selectable_label(self.warp_mode, "Grid Warp").clicked() {
-                self.warp_mode = true;
-                self.skew_mode = false;
-                self.projective_mode = None;
-                self.drag = None;
-                ui.close_menu();
-            }
+            self.affine_modes(ui, true);
+            self.nonlinear_modes(ui, true);
             ui.separator();
-            for (axis, label) in [(0, "Flip Horizontal"), (1, "Flip Vertical")] {
-                if ui
-                    .selectable_label(self.values.mirror[axis], label)
-                    .clicked()
-                {
+            for (axis, icon, label) in [
+                (0, Icon::MirrorHorizontal, "Flip Horizontal"),
+                (1, Icon::MirrorVertical, "Flip Vertical"),
+            ] {
+                if icons::menu_choice(ui, icon, label, Some(self.values.mirror[axis])).clicked() {
                     self.values.mirror[axis] = !self.values.mirror[axis];
                     self.drag = None;
                     ui.close_menu();
@@ -239,6 +330,56 @@ impl Editor {
         }
         block_canvas
     }
+
+    fn affine_modes(&mut self, ui: &mut egui::Ui, menu: bool) {
+        for (mode, icon, label) in [
+            (Tool::Move, Icon::Move, "Move"),
+            (Tool::Rotate, Icon::Rotate, "Rotate"),
+            (Tool::Scale, Icon::Scale, "Scale"),
+        ] {
+            if mode_choice(ui, menu, icon, label, self.mode() == Some(mode)) {
+                self.set_mode(mode);
+            }
+        }
+        if mode_choice(ui, menu, Icon::Skew, "Skew", self.skew_mode) {
+            self.skew_mode = true;
+            self.projective_mode = None;
+            self.warp_mode = false;
+            self.drag = None;
+        }
+    }
+
+    fn nonlinear_modes(&mut self, ui: &mut egui::Ui, menu: bool) {
+        if self.draft.is_some() {
+            return;
+        }
+        for (mode, icon, label) in [
+            (ProjectiveMode::Distort, Icon::Distort, "Distort"),
+            (ProjectiveMode::Perspective, Icon::Perspective, "Perspective"),
+        ] {
+            if mode_choice(ui, menu, icon, label, self.projective_mode == Some(mode)) {
+                self.projective_mode = Some(mode);
+                self.skew_mode = false;
+                self.warp_mode = false;
+                self.drag = None;
+            }
+        }
+        let (icon, label) = if self.warp_mode && !menu {
+            (Icon::Scale, "Back to Transform")
+        } else {
+            (Icon::GridWarp, "Grid Warp")
+        };
+        if mode_choice(ui, menu, icon, label, self.warp_mode && menu) {
+            if self.warp_mode && !menu {
+                self.set_mode(self.mode);
+            } else {
+                self.warp_mode = true;
+                self.skew_mode = false;
+                self.projective_mode = None;
+                self.drag = None;
+            }
+        }
+    }
     fn affine(&self) -> bool {
         self.values.scale != [1.; 2]
             || self.values.angle.rem_euclid(360.) != 0.
@@ -248,13 +389,19 @@ impl Editor {
             || self.values.warp.is_some()
     }
     fn raw(&self, id: &str, snap: bool) -> Value {
-        json!({"op":if self.affine() {"transform"}else{"move"},"layer":id,
+        let fractional = self.edits_text_draft()
+            && self.values.offset.iter().any(|offset| offset.fract() != 0.);
+        let mut command = json!({"op":if self.affine() || fractional {"transform"}else{"move"},"layer":id,
             "dx":self.values.offset[0],"dy":self.values.offset[1],
             "angle":self.values.angle,"scale_x":self.values.scale[0],"scale_y":self.values.scale[1],
             "skew_x":self.values.skew[0],"skew_y":self.values.skew[1],
             "mirror_x":self.values.mirror[0],"mirror_y":self.values.mirror[1],"pivot":self.pivot,
             "snap":snap,"mask":self.mask,"step":if self.roots.len()==1 {self.step.clone()}else{None},
-            "selection_only":self.selected&&!self.whole,"document_id":self.document,"source_revision":self.revision})
+            "selection_only":self.selected&&!self.whole,"document_id":self.document,"source_revision":self.revision});
+        if fractional {
+            command["fractional_translation"] = json!(true);
+        }
+        command
     }
     fn matrix(command: &Value) -> Result<[f64; 6], String> {
         let [dx, dy] = crate::transform::translation(command)?;
@@ -373,6 +520,15 @@ impl Editor {
         }
         Ok(points)
     }
+    fn nearest_warp_node(points: &[Pos2; 9], pointer: Pos2) -> Option<usize> {
+        points
+            .iter()
+            .enumerate()
+            .map(|(index, &point)| (index, point.distance_sq(pointer)))
+            .filter(|&(_, distance)| distance < 9. * 9.)
+            .min_by(|(_, a), (_, b)| a.total_cmp(b))
+            .map(|(index, _)| index)
+    }
     fn outline(&self) -> Vec<[f64; 2]> {
         if self.values.warp.is_some() && self.projective_mode.is_none() {
             let points = Self::rectangle(self.target_bounds()).map(|p| p.map(|v| v as f32));
@@ -459,6 +615,14 @@ impl Editor {
             [self.pivot[0] + offset[0], self.pivot[1] + offset[1]]
         }
     }
+    fn reference_anchors(&self) -> [[f64; 2]; 9] {
+        let [a, b, c, d] = self.corners();
+        let between = |a: [f64; 2], b: [f64; 2]| [(a[0] + b[0]) / 2., (a[1] + b[1]) / 2.];
+        let top = between(a, b);
+        let bottom = between(d, c);
+        [a, top, b, between(a, d), between(top, bottom), between(b, c), d, bottom, c]
+    }
+
     fn set_reference(&mut self, point: [f64; 2]) -> Result<(), String> {
         if point
             .iter()
@@ -489,6 +653,9 @@ impl Editor {
         Ok(())
     }
     pub(super) fn commands(&self) -> Result<Vec<Value>, String> {
+        if self.geometry_pending {
+            return Err("Preparing transform geometry".into());
+        }
         let command = self.command("", self.snap)?;
         if command["op"] == "move" && crate::transform::translation(&command)? == [0.; 2] {
             return Ok(vec![]);
@@ -499,6 +666,9 @@ impl Editor {
             .collect()
     }
     pub(super) fn key(&self) -> Result<String, String> {
+        if self.draft.is_some() {
+            return self.command("", self.snap).map(|command| command.to_string());
+        }
         self.commands()
             .map(|commands| serde_json::to_string(&commands).unwrap())
     }
@@ -517,24 +687,14 @@ impl Editor {
                 .and_then(|map| map.point(p))
                 .unwrap_or(p);
         }
-        let (sx, sy) = crate::transform::scales(&c).unwrap_or((1., 1.));
-        let (sin, cos) = c["angle"].as_f64().unwrap_or(0.).to_radians().sin_cos();
-        let [a, b, cc, d] = crate::transform::skewed([cos * sx, sin * sx, -sin * sy, cos * sy], &c)
-            .unwrap_or([1., 0., 0., 1.]);
-        let [dx, dy] = if c["op"] == "move" {
-            [
-                c["dx"].as_f64().unwrap_or(0.).round(),
-                c["dy"].as_f64().unwrap_or(0.).round(),
-            ]
-        } else {
-            crate::transform::translation(&c).unwrap_or([0.; 2])
-        };
-        [
-            self.pivot[0] + a * (p[0] - self.pivot[0]) + cc * (p[1] - self.pivot[1]) + dx,
-            self.pivot[1] + b * (p[0] - self.pivot[0]) + d * (p[1] - self.pivot[1]) + dy,
-        ]
+        Self::matrix(&c).map_or(p, |[a, b, c, d, tx, ty]| {
+            [a * p[0] + c * p[1] + tx, b * p[0] + d * p[1] + ty]
+        })
     }
     fn corners(&self) -> [[f64; 2]; 4] {
+        if let Some(draft) = &self.draft {
+            return draft.corners.map(|point| self.point(point));
+        }
         if self.values.warp.is_some() {
             if self.projective_mode.is_some() {
                 // P controls are the A(quad) reference plane, not warped subject corners.
@@ -584,9 +744,28 @@ impl Editor {
         };
         [[l, t], [r, t], [r, b], [l, b]].map(|p| self.point(p))
     }
+    fn projective_handles(&self) -> Result<[[f64; 2]; 4], String> {
+        let map = crate::projective::affine(&self.affine_command("", self.snap)?, self.pivot)?;
+        let mut points = self.quad()?.corners;
+        for point in &mut points {
+            *point = map.point(*point)?;
+        }
+        Ok(points)
+    }
+
     fn changed(&mut self) {
         self.error = None;
+        self.apply_error = None;
         self.rendered = None;
+    }
+    fn ready_to_apply(&self, pending_preview: bool, busy: bool, context_frame: bool) -> bool {
+        self.key().ok().as_ref().is_some_and(|key| self.rendered.as_ref() == Some(key))
+            && self.error.is_none()
+            && self.context.is_none()
+            && !context_frame
+            && !pending_preview
+            && self.drag.is_none()
+            && !busy
     }
     fn drag_corner(
         &mut self,
@@ -633,6 +812,22 @@ impl Editor {
         self.set_quad(quad);
         Ok(())
     }
+    fn drag_projective_edge(&mut self, index: usize, origin: [f64; 2], p: [f64; 2]) -> Result<(), String> {
+        if p == origin {
+            return Ok(());
+        }
+        let inverse = crate::projective::affine(&self.affine_command("", self.snap)?, self.pivot)?.inverse()?;
+        let a = inverse.point(origin)?;
+        let b = inverse.point(if self.snap { p.map(f64::round) } else { p })?;
+        let mut quad = self.quad()?;
+        for corner in [index, (index + 1) % 4] {
+            for axis in 0..2 {
+                quad.corners[corner][axis] += b[axis] - a[axis];
+            }
+        }
+        self.set_quad(quad);
+        Ok(())
+    }
     fn projective_controls(&mut self, ui: &mut egui::Ui) {
         if self.projective_mode.is_none() {
             return;
@@ -667,13 +862,17 @@ impl Editor {
                     ui.add_sized([82., 20.], egui::Label::new(label));
                     let mut edited = false;
                     for (axis, value) in point.iter_mut().enumerate() {
-                        let response = controls::numeric(ui, value, -100000. ..=100000.);
+                        let direction = ["X", "Y"][axis];
+                        let response = controls::numeric(ui, value, -100000. ..=100000.)
+                            .on_hover_text(format!("{label} {direction} in document pixels"));
+                        response.widget_info(|| egui::WidgetInfo {
+                            label: Some(format!("{label} {direction}")),
+                            ..egui::WidgetInfo::drag_value(response.enabled(), *value)
+                        });
                         #[cfg(test)]
                         {
                             self.projective_inputs[index * 2 + axis] = Some(response.rect);
                         }
-                        #[cfg(not(test))]
-                        let _ = axis;
                         edited |= response.changed();
                     }
                     edited
@@ -697,26 +896,27 @@ impl Editor {
         &mut self,
         index: usize,
         origin: [f64; 2],
-        mut point: [f64; 2],
+        point: [f64; 2],
         shift: bool,
     ) -> Result<(), String> {
         if point == origin {
             return Ok(());
         }
+        let map = self.post_map()?;
+        let mut grid = self.grid()?;
+        let anchor = map.point(grid.points[index])?;
+        // Apply the pointer displacement at the node in displayed coordinates.
+        // A projective inverse does not preserve displacement away from it.
+        let delta = [point[0] - origin[0], point[1] - origin[1]];
+        let mut target = [anchor[0] + delta[0], anchor[1] + delta[1]];
         if self.snap {
-            point = point.map(f64::round);
+            target = target.map(f64::round);
         }
         if shift {
-            let axis = usize::from((point[0] - origin[0]).abs() >= (point[1] - origin[1]).abs());
-            point[axis] = origin[axis];
+            let axis = usize::from(delta[0].abs() >= delta[1].abs());
+            target[axis] = anchor[axis];
         }
-        let inverse = self.post_map()?.inverse()?;
-        let a = inverse.point(origin)?;
-        let b = inverse.point(point)?;
-        let mut grid = self.grid()?;
-        for axis in 0..2 {
-            grid.points[index][axis] += b[axis] - a[axis];
-        }
+        grid.points[index] = map.inverse()?.point(target)?;
         self.set_grid(grid);
         self.warp_preset = None;
         Ok(())
@@ -725,30 +925,25 @@ impl Editor {
         if !self.warp_mode {
             return;
         }
-        ui.label("3 by 3 grid with straight segments between points.");
-        ui.label("Drag nodes; Shift constrains document X/Y. Presets use this grid.");
         let mut preset_changed = false;
         ui.horizontal(|ui| {
             for (name, label) in [("arc", "Arc"), ("bulge", "Bulge"), ("flag", "Flag")] {
-                if ui
-                    .selectable_label(self.warp_preset == Some(name), label)
+                if warp_preset_button(ui, name, label, self.warp_preset == Some(name), self.warp_amount)
                     .clicked()
                 {
                     self.warp_preset = Some(name);
                     preset_changed = true;
                 }
             }
-            if self.warp_preset.is_none() {
-                ui.label("Custom");
-            }
         });
         ui.horizontal(|ui| {
-            ui.add_sized([82., 20.], egui::Label::new("Amount"));
+            let amount = ui.add_sized([82., 20.], egui::Label::new("Amount"));
             let response = ui
                 .add_enabled_ui(self.warp_preset.is_some(), |ui| {
                     controls::numeric(ui, &mut self.warp_amount, -0.25..=0.25)
                 })
-                .inner;
+                .inner.labelled_by(amount.id)
+                .on_hover_text("Warp amount relative to the grid. A negative value reverses the preset.");
             #[cfg(test)]
             {
                 self.warp_amount_input = Some(response.rect);
@@ -770,13 +965,13 @@ impl Editor {
                 }
             }
         }
-        if ui.button("Reset Warp").clicked() {
+        if ui.button("Reset Warp")
+            .on_hover_text("Fit a fresh grid to this target and keep the other transform settings")
+            .clicked()
+        {
             self.values.warp = None;
             self.warp_preset = None;
         }
-        ui.label(
-            "Reset Warp fits a fresh grid to this target and keeps the other transform settings.",
-        );
         let state = self.grid().and_then(|grid| {
             self.post_map()
                 .and_then(|map| map.inverse().map(|inverse| (grid, map, inverse)))
@@ -803,18 +998,23 @@ impl Editor {
                     return;
                 }
             };
+            let label = format!("Node {}", index + 1);
             let edited = ui
                 .horizontal(|ui| {
-                    ui.add_sized([82., 20.], egui::Label::new(format!("Node {}", index + 1)));
+                    ui.add_sized([82., 20.], egui::Label::new(&label));
                     let mut edited = false;
                     for (axis, value) in displayed.iter_mut().enumerate() {
-                        let response = controls::numeric(ui, value, -100000. ..=100000.);
+                        let direction = ["X", "Y"][axis];
+                        let response = controls::numeric(ui, value, -100000. ..=100000.)
+                            .on_hover_text(format!("{label} {direction} in document pixels"));
+                        response.widget_info(|| egui::WidgetInfo {
+                            label: Some(format!("{label} {direction}")),
+                            ..egui::WidgetInfo::drag_value(response.enabled(), *value)
+                        });
                         #[cfg(test)]
                         {
                             self.warp_inputs[index * 2 + axis] = Some(response.rect);
                         }
-                        #[cfg(not(test))]
-                        let _ = axis;
                         edited |= response.changed();
                     }
                     edited
@@ -842,9 +1042,11 @@ impl Editor {
         let start = drag.start.clone();
         let origin = drag.origin;
         let handle = drag.handle;
+        let warp_preset = drag.warp_preset;
         self.values = start.clone();
         match handle {
             Handle::Warp(index) => {
+                self.warp_preset = warp_preset;
                 if let Err(error) = self.drag_node(index, origin, p, shift) {
                     self.error = Some(error);
                 }
@@ -852,6 +1054,18 @@ impl Editor {
             }
             Handle::Projective(index, perspective) => {
                 if let Err(error) = self.drag_corner(index, origin, p, perspective, shift) {
+                    self.error = Some(error);
+                }
+                return;
+            }
+            Handle::DistortEdge(index) => {
+                if let Err(error) = self.drag_projective_edge(index, origin, p) {
+                    self.error = Some(error);
+                }
+                return;
+            }
+            Handle::PerspectiveShortcut(index) => {
+                if let Err(error) = self.drag_corner(index, origin, p, true, false) {
                     self.error = Some(error);
                 }
                 return;
@@ -896,7 +1110,7 @@ impl Editor {
                 };
                 let mut factors = [if x { ratio(0) } else { 1. }, if y { ratio(1) } else { 1. }];
                 let reflected = factors.map(|factor| factor < 0.);
-                if shift || (self.proportional && x && y) {
+                if (self.proportional && x && y) ^ shift {
                     let factor = if !x {
                         factors[1]
                     } else if !y || (factors[0].abs() - 1.).abs() > (factors[1].abs() - 1.).abs() {
@@ -911,8 +1125,9 @@ impl Editor {
                     self.values.mirror[i] = start.mirror[i] ^ reflected[i];
                 }
             }
-            Handle::Skew(axis) => {
-                if p == origin && !shift {
+            Handle::Skew(axis) | Handle::SkewShortcut(axis) => {
+                let snap_with_shift = shift && matches!(handle, Handle::Skew(_));
+                if p == origin && !snap_with_shift {
                     return;
                 }
                 let Ok(command) = self.command("", self.snap) else {
@@ -955,7 +1170,9 @@ impl Editor {
             }
         }
         if !matches!(handle, Handle::Pivot) {
-            if let Ok(c) = crate::transform::resolve_command(&self.raw("", self.snap || shift)) {
+            let snap = self.snap
+                || (shift && !matches!(handle, Handle::Scale(..) | Handle::SkewShortcut(_)));
+            if let Ok(c) = crate::transform::resolve_command(&self.raw("", snap)) {
                 self.values.offset = [
                     c["dx"].as_f64().unwrap_or(0.),
                     c["dy"].as_f64().unwrap_or(0.),
@@ -966,7 +1183,7 @@ impl Editor {
                         c["scale_y"].as_f64().unwrap(),
                     ];
                     self.values.angle = c["angle"].as_f64().unwrap();
-                    if matches!(handle, Handle::Skew(_)) {
+                    if matches!(handle, Handle::Skew(_) | Handle::SkewShortcut(_)) {
                         self.values.skew =
                             [c["skew_x"].as_f64().unwrap(), c["skew_y"].as_f64().unwrap()];
                     }
@@ -988,6 +1205,9 @@ impl PeerBrush {
         let Some(editor) = &mut self.free_transform else {
             return false;
         };
+        if editor.pending {
+            return true;
+        }
         for (i, key) in ["mirror_x", "mirror_y"].iter().enumerate() {
             if parameters[*key] == true {
                 editor.values.mirror[i] = !editor.values.mirror[i];
@@ -1002,81 +1222,126 @@ impl PeerBrush {
     fn free_transform_stale<'a>(&self, doc: impl Into<DocumentView<'a>>) -> bool {
         let doc = doc.into();
         self.free_transform.as_ref().is_some_and(|editor| {
-            editor.document != doc.id()
-                || editor.revision != doc.revision()
-                || editor.roots != crate::tree::roots_view(doc, &self.selection_layers)
-                || editor.mask != self.mask
-                || editor.step != self.mask_step
+            !editor.observes(doc)
+                || match &editor.draft {
+                    Some(draft) => !self.source_editor.as_ref().is_some_and(|source| {
+                        source.token() == draft.token
+                    }),
+                    None => editor.roots != crate::tree::roots_view(doc, &self.selection_layers)
+                        || editor.mask != self.mask
+                        || editor.step != self.mask_step,
+                }
         })
     }
-    pub(super) fn open_free_transform(&mut self, ctx: &egui::Context, doc: &Document) {
+    pub(super) fn open_free_transform<'a>(
+        &mut self,
+        ctx: &egui::Context,
+        doc: impl Into<DocumentView<'a>>,
+    ) {
+        self.open_free_transform_from(ctx, doc.into(), false);
+    }
+    pub(super) fn open_free_transform_from<'a>(
+        &mut self,
+        ctx: &egui::Context,
+        doc: DocumentView<'a>,
+        text_toolbar: bool,
+    ) {
         if self.free_transform.is_some() {
             return;
         }
-        if self.update_interaction_active()
-            || doc.read_only
+        let mut draft = self.source_editor.as_ref().and_then(|source| source.transform_draft(doc));
+        let canvas_text_focus = draft.is_some() && self.source_editor.as_ref().is_some_and(|source| {
+            source.has_canvas_focus(ctx) || source.has_field_handle_focus(ctx)
+        });
+        if self.interaction_active(self.source_editor.is_some() && draft.is_none())
+            || doc.read_only()
             || self.lifecycle_frame
             || self.pen.in_gesture()
             || self.drag_start.is_some()
             || self.size_drag.is_some()
             || self.shortcuts.open
-            || ctx.wants_keyboard_input()
+            || (ctx.wants_keyboard_input() && !canvas_text_focus && !text_toolbar)
             || ctx.input(|i| i.pointer.any_down())
         {
             self.message =
                 "Finish or cancel the current tool or text edit before Free Transform.".into();
             return;
         }
-        let roots = crate::tree::roots(doc, &self.selection_layers.iter().cloned().collect());
-        if roots.is_empty() {
+        let roots = if draft.is_some() {
+            Vec::new()
+        } else {
+            crate::tree::roots_view(doc, &self.selection_layers)
+        };
+        if draft.is_none() && roots.is_empty() {
             self.message = "Select a layer or folder to transform.".into();
             return;
         }
-        let tree = crate::transform::tree_ids(doc, &roots);
+        let tree = crate::transform::tree_ids_view(doc, &roots);
         if doc
-            .layers
-            .iter()
-            .any(|layer| tree.contains(&layer.id) && layer.locked)
+            .layers()
+            .any(|layer| tree.iter().any(|id| id == layer.id()) && layer.locked())
         {
             self.message = "Unlock the selected content before Free Transform.".into();
             return;
         }
-        let whole_bounds = crate::transform::tree_bounds(doc, &roots)
-            .unwrap_or([0, 0, doc.width as i32, doc.height as i32])
-            .map(f64::from);
-        let b = doc
-            .selection
-            .map(|bounds| bounds.map(f64::from))
-            .unwrap_or(whole_bounds);
-        let warp_domains = [false, true].map(|whole| {
-            let commands = roots
-                .iter()
-                .map(|id| {
-                    json!({"op":"transform","layer":id,
-                "mask":self.mask,"step":if roots.len()==1 {self.mask_step.clone()}else{None},
-                "selection_only":doc.selection.is_some()&&!whole})
-                })
-                .collect::<Vec<_>>();
-            crate::warp::domain(doc, &commands)
-        });
         let prior_tool = self.tool;
-        self.select_tool(Tool::Move);
+        if let Some(draft) = &mut draft {
+            draft.resume_focus = canvas_text_focus || text_toolbar;
+        }
+        if canvas_text_focus || text_toolbar {
+            if let Some(focus) = ctx.memory(|memory| memory.focused()) {
+                ctx.memory_mut(|memory| memory.surrender_focus(focus));
+            }
+        }
+        let whole_pixel_copy = self.transform_entire_pixel_copy(doc);
+        self.select_tool(prior_tool);
         self.close_proposal();
         self.isolate = false;
+        let (geometry, preparation_error) = if draft.is_some() {
+            (None, None)
+        } else {
+            match self.transform_geometry(ctx, doc, &roots) {
+                Ok(geometry) => (geometry, None),
+                Err(error) => (None, Some(error)),
+            }
+        };
+        let geometry_pending = draft.is_none() && geometry.is_none();
+        let whole_bounds = draft.as_ref().map_or_else(
+            || geometry.as_ref().map_or([0, 0, doc.width() as i32, doc.height() as i32], |g| g.bounds).map(f64::from),
+            |draft| draft.bounds,
+        );
+        let selection = doc.selection().filter(|_| draft.is_none());
+        let whole = selection.is_none() || whole_pixel_copy
+            || (prior_tool == Tool::Text && roots.len() == 1 && !self.mask
+                && doc.find_layer(&roots[0]).is_some_and(|layer| layer.source_kind() == Some("text")));
+        let bounds = selection.map_or(whole_bounds, |bounds| bounds.map(f64::from));
+        let b = if whole { whole_bounds } else { bounds };
+        let mode = if draft.is_some() { Tool::Scale } else { Tool::Move };
+        let warp_domains = geometry.map_or_else(
+            || {
+                [
+                    Err("Preparing transform geometry".into()),
+                    Err("Preparing transform geometry".into()),
+                ]
+            },
+            |g| g.warp_domains,
+        );
         self.free_transform = Some(Editor {
-            document: doc.id.clone(),
-            revision: doc.revision,
+            document: doc.id().to_owned(),
+            revision: doc.revision(),
+            native_source: doc.native().map(|native| native.key()),
+            draft,
             roots,
             mask: self.mask,
             step: self.mask_step.clone(),
-            selected: doc.selection.is_some(),
-            whole: doc.selection.is_none(),
-            bounds: b,
+            selected: selection.is_some(),
+            whole,
+            bounds,
             whole_bounds,
             pivot: [(b[0] + b[2]) * 0.5, (b[1] + b[3]) * 0.5],
             reference: None,
             values: Parameters::default(),
-            mode: Tool::Move,
+            mode,
             skew_mode: false,
             projective_mode: None,
             warp_mode: false,
@@ -1091,8 +1356,12 @@ impl PeerBrush {
             snap: false,
             prior_tool,
             gesture: crate::engine::id(),
+            pending: false,
+            canvas_apply: false,
+            geometry_pending,
             drag: None,
-            error: None,
+            error: preparation_error,
+            apply_error: None,
             rendered: None,
             #[cfg(test)]
             inputs: [None; 9],
@@ -1111,14 +1380,135 @@ impl PeerBrush {
         self.last_preview = None;
         ctx.request_repaint();
     }
+    fn transform_geometry(
+        &mut self,
+        ctx: &egui::Context,
+        doc: DocumentView<'_>,
+        roots: &[String],
+    ) -> Result<Option<transform_bounds::Geometry>, String> {
+        match doc {
+            DocumentView::Native(native) => self.transform_bounds.get(
+                &self.shared,
+                &self.project_id,
+                native,
+                roots,
+                self.mask,
+                self.mask_step.as_deref(),
+                ctx,
+            ),
+            DocumentView::Resident(resident) => {
+                let bounds = crate::transform::tree_bounds(resident, roots).unwrap_or([
+                    0,
+                    0,
+                    doc.width() as i32,
+                    doc.height() as i32,
+                ]);
+                let warp_domains = [false, true].map(|whole| {
+                    let commands = roots.iter().map(|id| json!({"op":"transform","layer":id,"mask":self.mask,
+                        "step":if roots.len()==1 {self.mask_step.clone()}else{None}, "selection_only":doc.selection().is_some()&&!whole})).collect::<Vec<_>>();
+                    crate::warp::domain(doc, &commands, &|| Ok(()))
+                });
+                Ok(Some(transform_bounds::Geometry {
+                    bounds,
+                    warp_domains,
+                }))
+            }
+        }
+    }
+    fn preparing_free_transform(&self) -> bool {
+        self.free_transform
+            .as_ref()
+            .is_some_and(|editor| editor.geometry_pending)
+    }
+    pub(super) fn free_transform_pending(&self) -> bool {
+        self.free_transform
+            .as_ref()
+            .is_some_and(|editor| editor.pending)
+    }
+    fn apply_free_transform(&mut self) {
+        if self.preparing_free_transform() {
+            return;
+        }
+        if self.edit_worker.pending() {
+            self.message = "An edit is still being applied; wait for its result".into();
+            return;
+        }
+        let Some(editor) = self.free_transform.as_mut() else {
+            return;
+        };
+        if editor.draft.is_some() {
+            self.finish_free_transform(true);
+            self.message = "Free Transform applied to the text draft.".into();
+            return;
+        }
+        let commands = match editor.commands() {
+            Ok(commands) => commands,
+            Err(error) => {
+                editor.error = Some(error.clone());
+                self.message = error.into();
+                return;
+            }
+        };
+        if commands.is_empty() {
+            self.cancel_free_transform();
+            self.message = "Free Transform unchanged.".into();
+            return;
+        }
+        let document = editor.document.clone();
+        let revision = editor.revision;
+        let source = editor.native_source;
+        let token = egui::Id::new(&editor.gesture);
+        editor.apply_error = None;
+        editor.pending = true;
+        self.apply_action(
+            commands,
+            "Free Transform",
+            Some((&document, revision)),
+            edit_job::Origin::FreeTransform(token, source),
+        );
+    }
+    pub(super) fn free_transform_finished(&mut self, token: egui::Id, result: Result<(), String>) {
+        let Some(editor) = self
+            .free_transform
+            .as_mut()
+            .filter(|editor| editor.pending && egui::Id::new(&editor.gesture) == token)
+        else {
+            return;
+        };
+        editor.pending = false;
+        match result {
+            Ok(()) => self.cancel_free_transform(),
+            Err(error) => editor.apply_error = Some(error),
+        }
+    }
     pub(super) fn cancel_free_transform(&mut self) {
+        self.finish_free_transform(false);
+    }
+    fn finish_free_transform(&mut self, keep_text_transform: bool) {
+        if self.free_transform_pending() {
+            self.cancel_pending_edit();
+            return;
+        }
         if let Some(editor) = self.free_transform.take() {
+            if let Some(draft) = editor.draft {
+                if let Some(source) = self.source_editor.as_mut().filter(|source| source.token() == draft.token) {
+                    if !keep_text_transform {
+                        source.restore_transform(&draft);
+                    }
+                    if draft.resume_focus {
+                        source.resume_canvas_focus();
+                    }
+                }
+            }
+            self.transform_bounds.clear();
             self.select_tool(editor.prior_tool);
             self.free_transform_frame = true;
-            self.free_transform_cancelled_pointer = true;
+            self.free_transform_cancelled_pointer = self.edit_context.input(|input| input.pointer.primary_down());
             self.transient.clear();
+            self.native_source_preview = None;
             self.canvas_selection = None;
             self.last_preview = None;
+            self.edit_context.request_repaint();
         }
     }
     pub(super) fn sync_free_transform<'a>(
@@ -1127,6 +1517,12 @@ impl PeerBrush {
         doc: impl Into<DocumentView<'a>>,
     ) {
         let doc = doc.into();
+        if self.free_transform_pending() {
+            if self.free_transform.as_ref().is_some_and(|editor| !editor.observes(doc)) {
+                self.transient.clear();
+            }
+            return;
+        }
         let lost = ctx.input(|i| {
             !i.focused
                 || i.events
@@ -1136,7 +1532,8 @@ impl PeerBrush {
         let other = self.lifecycle.is_some()
             || self.lifecycle_frame
             || self.geometry.is_some()
-            || self.source_editor.is_some()
+            || (self.source_editor.is_some()
+                && !self.free_transform.as_ref().is_some_and(Editor::edits_text_draft))
             || self.filter_editor.is_some()
             || self.refinement.is_some()
             || self.show_new
@@ -1146,9 +1543,37 @@ impl PeerBrush {
             || self.load_control.is_some()
             || self.pending_import.is_some()
             || self.pending_image_open.is_some();
-        if self.free_transform.is_some() && (lost || other || self.free_transform_stale(doc)) {
+        let cancelled_contact = self.free_transform.as_ref().is_some_and(|editor| editor.drag.is_some())
+            && Self::pointer_contact_cancelled(ctx);
+        if self.free_transform.is_some() && (lost || other || cancelled_contact || self.free_transform_stale(doc)) {
             self.cancel_free_transform();
-            self.message="Free Transform cancelled after focus, target or source changed; current work is preserved.".into();
+            self.message = if cancelled_contact {
+                "Free Transform cancelled after contact ended · current work preserved"
+            } else {
+                "Free Transform cancelled after focus, target or source changed; current work is preserved."
+            }.into();
+        }
+        if self.preparing_free_transform() {
+            let roots = self.free_transform.as_ref().unwrap().roots.clone();
+            let result = self.transform_geometry(ctx, doc, &roots);
+            let editor = self.free_transform.as_mut().unwrap();
+            match result {
+                Ok(Some(geometry)) => {
+                    editor.whole_bounds = geometry.bounds.map(f64::from);
+                    editor.bounds = doc
+                        .selection()
+                        .map(|b| b.map(f64::from))
+                        .unwrap_or(editor.whole_bounds);
+                    let b = editor.target_bounds();
+                    editor.pivot = [(b[0] + b[2]) * 0.5, (b[1] + b[3]) * 0.5];
+                    editor.warp_domains = geometry.warp_domains;
+                    editor.geometry_pending = false;
+                    editor.error = None;
+                    self.last_preview = None;
+                }
+                Ok(None) => {}
+                Err(error) => editor.error = Some(error),
+            }
         }
     }
     pub(super) fn free_transform_keys<'a>(
@@ -1181,6 +1606,9 @@ impl PeerBrush {
                 }
             }
         });
+        if self.free_transform_pending() {
+            return;
+        }
         if self
             .free_transform
             .as_ref()
@@ -1216,13 +1644,16 @@ impl PeerBrush {
             self.message = "Free Transform cancelled.".into();
             return;
         }
+        if self.preparing_free_transform() {
+            return;
+        }
         if let Some(editor) = &mut self.free_transform {
             for (action, tool) in [
                 ("Move", Tool::Move),
                 ("Rotate artwork", Tool::Rotate),
                 ("Scale artwork", Tool::Scale),
             ] {
-                if ctx.input(|input| self.shortcuts.pressed(action, input)) {
+                if ctx.input(|input| self.shortcuts.pressed_once(action, input)) {
                     editor.set_mode(tool);
                 }
             }
@@ -1236,7 +1667,17 @@ impl PeerBrush {
         scale: f32,
         available: Rect,
     ) {
+        let doc = doc.into();
         self.sync_free_transform(ui.ctx(), doc);
+        if Self::pointer_contact_cancelled(ui.ctx()) {
+            return;
+        }
+        if self.preparing_free_transform() {
+            return;
+        }
+        if self.free_transform_pending() {
+            return;
+        }
         let Some(mut editor) = self.free_transform.take() else {
             return;
         };
@@ -1246,20 +1687,48 @@ impl PeerBrush {
         let view = self.view;
         let screen = |p: [f64; 2]| view.point(p.map(|v| v as f32), rect, scale);
         let corners = editor.corners().map(screen);
+        let actions = if editor.edits_text_draft() && editor.drag.is_none() && !context_frame {
+            source::text_actions_rect(available, Rect::from_points(&corners))
+        } else {
+            Rect::NOTHING
+        };
         let edges = editor.edge_points().map(screen);
         let middle = edges[0];
         let center = screen(editor.reference_point());
-        let rotation = middle + (middle - center).normalized() * 26.;
+        let rotation = rotation_handle(corners, middle);
         let points = [
             corners[0], corners[1], corners[2], corners[3], edges[0], edges[1], edges[2], edges[3],
         ];
-        let navigating = ui.input(|i| {
-            context_frame
-                || i.modifiers.alt
+        let (press, release, modifiers, navigating) = ui.input(|i| {
+            let mut buttons = primary_button_samples(i);
+            let press = if editor.drag.is_none() {
+                buttons.find(|sample| sample.0).map(|(_, point, modifiers)| (point, modifiers))
+            } else {
+                None
+            };
+            let release = buttons.find(|sample| !sample.0).map(|(_, point, modifiers)| (point, modifiers));
+            let modifiers = press.map_or(i.modifiers, |(_, modifiers)| modifiers);
+            let navigating = context_frame
+                || (modifiers.alt && !transform_modifier(modifiers) && editor.drag.is_none())
                 || i.key_down(egui::Key::Space)
                 || i.pointer.middle_down()
-                || i.pointer.secondary_down()
+                || i.pointer.secondary_down();
+            (press, release, modifiers, navigating)
         });
+        let modifier_active = transform_modifier(modifiers) && !editor.warp_mode;
+        let skew_shortcut = modifier_active && modifiers.shift && !modifiers.alt;
+        let projective_shortcut = modifier_active
+            && !editor.edits_text_draft()
+            && modifiers.alt == modifiers.shift;
+        let shortcut_active = skew_shortcut || projective_shortcut;
+        let projective_points = |editor: &Editor| {
+            let [a, b, c, d] = editor.projective_handles().ok()?.map(screen);
+            Some([
+                a, b, c, d,
+                a.lerp(b, 0.5), b.lerp(c, 0.5), c.lerp(d, 0.5), d.lerp(a, 0.5),
+            ])
+        };
+        let projective = projective_shortcut.then(|| projective_points(&editor)).flatten();
         if navigating {
             editor.drag = None;
         }
@@ -1269,12 +1738,12 @@ impl PeerBrush {
             .ok()
             .flatten()
             .map(|points| points.map(screen));
-        let outline = editor.outline().into_iter().map(screen).collect::<Vec<_>>();
         let pointer = ui.input(|i| i.pointer.hover_pos());
-        let hit = pointer
+        let hit = press.map(|(point, _)| point).or(pointer)
             .filter(|p| {
                 !navigating
                     && available.contains(*p)
+                    && !actions.contains(*p)
                     && ui.ctx().layer_id_at(*p) == Some(ui.layer_id())
             })
             .and_then(|p| {
@@ -1282,9 +1751,26 @@ impl PeerBrush {
                 if editor.warp_mode {
                     if let Some(index) = grid_points
                         .as_ref()
-                        .and_then(|points| points.iter().position(|node| p.distance(*node) < 9.))
+                        .and_then(|points| Editor::nearest_warp_node(points, p))
                     {
                         return Some(Handle::Warp(index));
+                    }
+                }
+                if shortcut_active {
+                    if let Some((_, handle)) = (0..8)
+                        .filter_map(|index| {
+                            let handle = modifier_handle(index, modifiers, editor.edits_text_draft())?;
+                            let point = if matches!(handle, Handle::SkewShortcut(_)) {
+                                points[index]
+                            } else {
+                                projective?[index]
+                            };
+                            let distance = p.distance_sq(point);
+                            (distance < 9. * 9.).then_some((distance, handle))
+                        })
+                        .min_by(|(a, _), (b, _)| a.total_cmp(b))
+                    {
+                        return Some(handle);
                     }
                 }
                 if p.distance(center) < 9. {
@@ -1293,7 +1779,7 @@ impl PeerBrush {
                 if p.distance(rotation) < 10. {
                     return Some(Handle::Rotate);
                 }
-                if let Some(mode) = editor.projective_mode {
+                if let Some(mode) = editor.projective_mode.filter(|_| !shortcut_active) {
                     if let Some(index) = corners.iter().position(|point| p.distance(*point) < 9.) {
                         return Some(Handle::Projective(
                             index,
@@ -1301,56 +1787,71 @@ impl PeerBrush {
                         ));
                     }
                 }
-                if editor.skew_mode {
-                    return points[4..]
-                        .iter()
-                        .position(|point| p.distance(*point) < 9.)
-                        .map(|index| Handle::Skew(index % 2));
+                if editor.skew_mode && !shortcut_active {
+                    if let Some(index) = points[4..].iter().position(|point| p.distance(*point) < 9.) {
+                        return Some(Handle::Skew(index % 2));
+                    }
                 }
-                if !editor.warp_mode
-                    && editor.projective_mode.is_none()
-                    && editor.mode == Tool::Scale
+                if editor.scale_handles() && !shortcut_active {
+                    if let Some((index, _)) = points
+                        .iter()
+                        .enumerate()
+                        .map(|(index, point)| (index, p.distance_sq(*point)))
+                        .filter(|&(_, distance)| distance < 9. * 9.)
+                        .min_by(|(_, a), (_, b)| a.total_cmp(b))
+                    {
+                        return Some(Handle::Scale(
+                            index < 4 || index % 2 == 1, index < 4 || index % 2 == 0,
+                        ));
+                    }
+                }
+                if !shortcut_active
+                    && editor.mode() == Some(Tool::Rotate)
+                    && points.iter().any(|point| p.distance(*point) < 10.)
                 {
-                    return points
-                        .iter()
-                        .position(|point| p.distance(*point) < 9.)
-                        .map(|index| {
-                            Handle::Scale(index < 4 || index % 2 == 1, index < 4 || index % 2 == 0)
-                        });
+                    return Some(Handle::Rotate);
                 }
-                if !editor.warp_mode
-                    && editor.projective_mode.is_none()
-                    && editor.mode == Tool::Rotate
+                let [x, y] = view.document(p, rect, scale);
+                let inside = if editor.values.warp.is_some() && editor.projective_mode.is_none() {
+                    let outline: Vec<_> = editor.outline().into_iter()
+                        .map(|point| point.map(|v| v as f32)).collect();
+                    crate::selection::contains(&outline, x, y)
+                } else {
+                    let polygon = corners.map(|point| [point.x, point.y]);
+                    crate::selection::contains(&polygon, p.x, p.y)
+                };
+                if inside {
+                    Some(Handle::Move)
+                } else if !shortcut_active && editor.mode().is_some()
+                    && editor.values.warp.is_none() && near_transform_edge(p, corners)
                 {
-                    return points
-                        .iter()
-                        .any(|point| p.distance(*point) < 10.)
-                        .then_some(Handle::Rotate);
+                    Some(Handle::Rotate)
+                } else {
+                    None
                 }
-                Rect::from_points(&outline)
-                    .contains(p)
-                    .then_some(Handle::Move)
             });
-        if hit.is_some() {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+        if let (Some(handle), Some((p, _))) = (hit, press) {
+            editor.drag = Some(Drag {
+                origin: view.document(p, rect, scale).map(f64::from),
+                start: editor.values.clone(),
+                handle,
+                warp_preset: editor.warp_preset,
+            });
         }
-        if let (Some(handle), Some(p)) = (hit, pointer) {
-            if ui.input(|i| i.pointer.primary_pressed()) {
-                editor.drag = Some(Drag {
-                    origin: view.document(p, rect, scale).map(f64::from),
-                    start: editor.values.clone(),
-                    handle,
-                });
-            }
-        }
-        if let Some(p) = pointer.filter(|_| editor.drag.is_some()) {
+        let sample = release.or_else(|| pointer.map(|pos| (pos, ui.input(|i| i.modifiers))));
+        if let Some((p, modifiers)) = sample.filter(|_| editor.drag.is_some()) {
             editor.drag_to(
                 view.document(p, rect, scale).map(f64::from),
-                ui.input(|i| i.modifiers.shift),
+                modifiers.shift,
             );
         }
-        if ui.input(|i| i.pointer.primary_released()) {
+        if release.is_some() {
             editor.drag = None;
+        }
+        if editor.drag.is_some() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        } else if hit.is_some() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
         }
         if before != editor.values {
             editor.changed();
@@ -1364,26 +1865,29 @@ impl PeerBrush {
         let edges = editor.edge_points().map(screen);
         let middle = edges[0];
         let center = screen(editor.reference_point());
-        let rotation = middle + (middle - center).normalized() * 26.;
+        let rotation = rotation_handle(corners, middle);
         painter.add(egui::Shape::closed_line(
             editor.outline().into_iter().map(screen).collect(),
             Stroke::new(1.25, ACCENT),
         ));
-        let mut handles = if editor.skew_mode || editor.warp_mode {
+        let mut handles = if projective_shortcut {
+            projective_points(&editor).map_or_else(Vec::new, |points| {
+                points.into_iter().enumerate()
+                    .filter_map(|(index, point)| modifier_handle(index, modifiers, false).map(|_| point))
+                    .collect()
+            })
+        } else if editor.skew_mode || editor.warp_mode || skew_shortcut {
             vec![]
         } else {
             corners.to_vec()
         };
-        if (!editor.warp_mode && editor.projective_mode.is_none() && editor.mode == Tool::Scale)
-            || editor.skew_mode
-        {
-            for i in 0..4 {
-                handles.push(edges[i]);
-            }
+        let show_skew_handles = skew_shortcut || (!shortcut_active && editor.skew_mode);
+        if show_skew_handles || (!shortcut_active && editor.scale_handles()) {
+            handles.extend(edges);
         }
         for (index, p) in handles.into_iter().enumerate() {
             painter.rect_filled(Rect::from_center_size(p, Vec2::splat(7.)), 1., ACCENT);
-            if editor.skew_mode {
+            if show_skew_handles {
                 painter.text(
                     p + Vec2::new(8., -5.),
                     egui::Align2::LEFT_BOTTOM,
@@ -1396,19 +1900,7 @@ impl PeerBrush {
         if editor.warp_mode || editor.values.warp.is_some() {
             if let Ok(nodes) = editor.grid_points() {
                 let nodes = nodes.map(screen);
-                for line in [
-                    [0, 1, 2],
-                    [3, 4, 5],
-                    [6, 7, 8],
-                    [0, 3, 6],
-                    [1, 4, 7],
-                    [2, 5, 8],
-                ] {
-                    painter.add(egui::Shape::line(
-                        line.map(|i| nodes[i]).to_vec(),
-                        Stroke::new(1., ACCENT),
-                    ));
-                }
+                paint_warp_grid(&painter, nodes, Stroke::new(1., ACCENT));
                 if editor.warp_mode {
                     for node in nodes {
                         painter.rect_filled(
@@ -1423,10 +1915,64 @@ impl PeerBrush {
         painter.circle_stroke(rotation, 5., Stroke::new(1.5, ACCENT));
         painter.line_segment([middle, rotation], Stroke::new(1., ACCENT));
         painter.circle_stroke(center, 5., Stroke::new(1., Color32::WHITE));
-        if let Ok(commands) = editor.commands() {
+        if let Some(draft) = &editor.draft {
+            if let Err(error) = self.preview_text_transform(&editor, draft, doc) {
+                editor.error = Some(error);
+                editor.rendered = None;
+            }
+            let actions = if actions.is_positive() && before == editor.values {
+                actions
+            } else {
+                Rect::NOTHING
+            };
+            let ready = editor.ready_to_apply(self.pending, self.busy, context_frame)
+                && (doc.native().is_none() || !self.native_canvas_offscreen());
+            let (apply, cancel) = source::text_canvas_actions(
+                ui, &painter, actions, egui::Id::new((&editor.gesture, "text transform actions")), ready,
+                [
+                    ("Apply text transform on canvas", "Keep the transform and return to the text draft"),
+                    ("Cancel text transform on canvas", "Restore the starting text field · Escape"),
+                ],
+            );
+            editor.canvas_apply = apply;
+            if cancel {
+                self.free_transform = Some(editor);
+                self.cancel_free_transform();
+                return;
+            }
+        } else if let Ok(commands) = editor.commands() {
             self.transient = commands;
         }
         self.free_transform = Some(editor);
+    }
+    fn preview_text_transform(
+        &mut self,
+        editor: &Editor,
+        draft: &source::TransformDraft,
+        doc: DocumentView<'_>,
+    ) -> Result<(), String> {
+        self.transient.clear();
+        self.native_source_preview = None;
+        self.native_source_preview_at = 0;
+        let source = self.source_editor.as_mut()
+            .filter(|source| source.token() == draft.token)
+            .ok_or("Text draft changed during Free Transform")?;
+        let matrix = Editor::matrix(&editor.command("", editor.snap)?)?;
+        source.project_transform(draft, matrix)?;
+        match source.edit_command(doc)? {
+            source::EditCommand::Resident(command) => {
+                if let Some(error) = &source.error {
+                    return Err(error.clone());
+                }
+                self.transient.push(command);
+            }
+            source::EditCommand::Native(_) => {
+                self.native_source_preview = Some(source.owned_command().ok_or_else(|| {
+                    source.error.clone().unwrap_or_else(|| "Text draft preview is unavailable".into())
+                })?);
+            }
+        }
+        Ok(())
     }
     pub(super) fn free_transform_window<'a>(
         &mut self,
@@ -1434,7 +1980,48 @@ impl PeerBrush {
         doc: impl Into<DocumentView<'a>>,
         drawn_generation: u64,
     ) {
+        let doc = doc.into();
         self.sync_free_transform(ctx, doc);
+        if self.preparing_free_transform() {
+            egui::Window::new("Free Transform")
+                .id(egui::Id::new("free transform"))
+                .resizable(false)
+                .collapsible(false)
+                .show(ctx, |ui| {
+                    if let Some(error) = self
+                        .free_transform
+                        .as_ref()
+                        .and_then(|editor| editor.error.as_ref())
+                    {
+                        ui.label(error);
+                        if ui.button("Retry").clicked() {
+                            self.transform_bounds.clear();
+                            self.free_transform.as_mut().unwrap().error = None;
+                            ctx.request_repaint();
+                        }
+                    } else {
+                        ui.spinner();
+                        ui.label("Preparing transform geometry…");
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.cancel_free_transform();
+                    }
+                });
+            return;
+        }
+        if self.free_transform_pending() {
+            egui::Window::new("Free Transform")
+                .id(egui::Id::new("free transform"))
+                .resizable(false)
+                .collapsible(false)
+                .show(ctx, |ui| {
+                    ui.label("Applying Free Transform…");
+                    if ui.button("Cancel apply").clicked() {
+                        self.cancel_pending_edit();
+                    }
+                });
+            return;
+        }
         let Some(mut editor) = self.free_transform.take() else {
             return;
         };
@@ -1445,6 +2032,7 @@ impl PeerBrush {
         let typing = ctx.wants_keyboard_input()
             || ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Ime(_))));
         let before = editor.key();
+        let canvas_apply = std::mem::take(&mut editor.canvas_apply);
         let mut open = true;
         let (mut apply, mut cancel) = (false, false);
         egui::Window::new("Free Transform")
@@ -1460,39 +2048,14 @@ impl PeerBrush {
                     .auto_shrink([true, true])
                     .drag_to_scroll(false)
                     .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    for (mode, label) in [
-                        (Tool::Move, "Move"),
-                        (Tool::Rotate, "Rotate"),
-                        (Tool::Scale, "Scale"),
-                    ] {
-                        if ui.selectable_label(editor.mode() == Some(mode), label).clicked() {
-                            editor.set_mode(mode);
-                        }
-                    }
-                    if ui.selectable_label(editor.skew_mode, "Skew").clicked() {
-                        editor.skew_mode = true;
-                        editor.projective_mode = None;
-                        editor.warp_mode = false;
-                        editor.drag = None;
-                    }
-                });
-                ui.horizontal(|ui| {
-                    for (mode, label) in [(ProjectiveMode::Distort, "Distort"),
-                                           (ProjectiveMode::Perspective, "Perspective")] {
-                        if ui.selectable_label(editor.projective_mode == Some(mode), label).clicked() {
-                            editor.projective_mode = Some(mode);
-                            editor.warp_mode = false;
-                            editor.skew_mode = false;
-                            editor.drag = None;
-                        }
-                    }
-                    if ui.selectable_label(editor.warp_mode,"Grid Warp").clicked() {
-                        editor.warp_mode=true;editor.skew_mode=false;editor.projective_mode=None;editor.drag=None;
-                    }
-                });
+                ui.horizontal_wrapped(|ui| editor.affine_modes(ui, false));
+                if editor.edits_text_draft() {
+                    ui.weak("Distort, Perspective, and Grid Warp require a rasterized layer.");
+                } else {
+                    ui.horizontal_wrapped(|ui| editor.nonlinear_modes(ui, false));
+                }
                 if editor.warp_mode {
-                    ui.label("Drag a grid point or choose a preset.");
+                    ui.label("Drag a grid point or choose a preset. Shift constrains the drag to one axis.");
                 } else if let Some(mode) = editor.projective_mode {
                     ui.label(if mode == ProjectiveMode::Distort {
                         "Drag a corner freely. Shift constrains its axis."
@@ -1503,21 +2066,46 @@ impl PeerBrush {
                 } else if editor.skew_mode {
                     ui.label("Top/bottom: X · Left/right: Y · Shift: 15° snap.")
                         .on_hover_text("Drag an edge handle to shear the actual artwork. An edge on the reference axis stays fixed; drag the opposite edge or move the reference point. Release keeps the preview pending.");
+                } else if editor.scale_handles() {
+                    let (key, alt) = if cfg!(target_os = "macos") {
+                        ("Cmd", "Option")
+                    } else {
+                        ("Ctrl", "Alt")
+                    };
+                    let mut help = format!("Shift toggles proportional scaling. {key}+Shift on a side handle skews the target.");
+                    if !editor.edits_text_draft() {
+                        help.push_str(&format!(" {key}-drag on a handle distorts, and {key}+{alt}+Shift on a corner adjusts perspective."));
+                    }
+                    ui.label("Drag inside to move, a square to scale, or just outside the outline to rotate.")
+                        .on_hover_text(help);
                 } else {
-                    ui.label("Drag handles or enter values. Release keeps the preview pending.");
+                    ui.label("Drag inside to move. Drag a handle or just outside the outline to rotate.");
                 }
                 #[cfg(test)]
                 let mut input_index = 0;
                 #[cfg(test)]
                 let mut inputs = [None; 9];
+                const ANGLE_LABEL: &str = "Angle";
                 let number = |ui: &mut egui::Ui,
                               label: &str,
                               value: &mut f64,
                               range: std::ops::RangeInclusive<f64>| {
                     let response = ui
                         .horizontal(|ui| {
-                            ui.add_sized([82., 20.], egui::Label::new(label));
-                            controls::numeric(ui, value, range)
+                            let name = ui.add_sized([82., 20.], egui::Label::new(label));
+                            if label == ANGLE_LABEL {
+                                controls::angle_with_limits(
+                                    ui,
+                                    ("free transform rotation", &editor.gesture),
+                                    value,
+                                    true,
+                                    "Rotation angle",
+                                    "Positive angles rotate clockwise around the transform reference point.",
+                                    Some(range),
+                                )
+                            } else {
+                                controls::numeric(ui, value, range).labelled_by(name.id)
+                            }
                         })
                         .inner;
                     #[cfg(test)]
@@ -1555,7 +2143,7 @@ impl PeerBrush {
                     editor.values.scale[0] =
                         (old[0] * editor.values.scale[1] / old[1]).clamp(0.05, 20.);
                 }
-                number(ui, "Angle", &mut editor.values.angle, -100000. ..=100000.);
+                number(ui, ANGLE_LABEL, &mut editor.values.angle, -100000. ..=100000.);
                 number(
                     ui,
                     "Skew X",
@@ -1569,23 +2157,66 @@ impl PeerBrush {
                     -crate::transform::SKEW_LIMIT..=crate::transform::SKEW_LIMIT,
                 );
                 ui.horizontal(|ui| {
-                    ui.checkbox(&mut editor.proportional, "Proportional");
-                    ui.checkbox(&mut editor.snap, "Snap");
+                    icons::toggle(
+                        ui,
+                        Icon::Connect,
+                        &mut editor.proportional,
+                        "Keep horizontal and vertical scale proportional",
+                    );
+                    icons::toggle(ui, Icon::Snap, &mut editor.snap, "Snap transform")
+                        .on_hover_text(format!(
+                            "Snap movement to {} px, rotation and skew to {}°, and scale to {}% steps. Distort and Perspective handles and Grid Warp nodes use whole-pixel drag positions.",
+                            crate::transform::MOVE_SNAP, crate::transform::ANGLE_SNAP,
+                            crate::transform::SCALE_SNAP * 100.,
+                        ));
                 });
                 ui.horizontal(|ui| {
-                    ui.checkbox(&mut editor.values.mirror[0], "Flip H");
-                    ui.checkbox(&mut editor.values.mirror[1], "Flip V");
+                    icons::toggle(
+                        ui,
+                        Icon::MirrorHorizontal,
+                        &mut editor.values.mirror[0],
+                        "Flip horizontally",
+                    );
+                    icons::toggle(
+                        ui,
+                        Icon::MirrorVertical,
+                        &mut editor.values.mirror[1],
+                        "Flip vertically",
+                    );
                 });
                 if editor.selected {
-                    ui.checkbox(&mut editor.whole, "Whole target (keep selection)");
+                    ui.horizontal_wrapped(|ui| {
+                        for (whole, icon, label, help) in [
+                            (false, Icon::Selection, "Selected pixels", "Transform the selected pixels and move the selection with them."),
+                            (true, Icon::CanvasBounds, "Whole target", "Transform the full target and leave the selection in place."),
+                        ] {
+                            if icons::labeled_choice(ui, icon, label, Some(editor.whole == whole), 0.)
+                                .on_hover_text(help).clicked()
+                            {
+                                editor.whole = whole;
+                            }
+                        }
+                    });
                 }
                 let mut reference = editor.reference_point();
                 let old_reference = reference;
+                let anchors = editor.reference_anchors();
+                let selected = anchors.iter().position(|point| {
+                    (point[0] - reference[0]).abs() < 1e-6 && (point[1] - reference[1]).abs() < 1e-6
+                });
+                let reference_choice = ui.horizontal(|ui| {
+                    ui.label("Reference point")
+                        .on_hover_text("Choose a reference from the transform bounds or drag it on the canvas.");
+                    controls::anchor_grid(ui, "transform reference", selected, "Reference: ")
+                }).inner;
                 number(ui, "Reference X", &mut reference[0], -100000. ..=100000.);
                 number(ui, "Reference Y", &mut reference[1], -100000. ..=100000.);
                 #[cfg(test)]
                 {
                     editor.inputs = inputs;
+                }
+                if let Some(index) = reference_choice {
+                    reference = anchors[index];
                 }
                 if reference != old_reference {
                     if let Err(error) = editor.set_reference(reference) {
@@ -1593,8 +2224,10 @@ impl PeerBrush {
                     }
                     ctx.request_repaint();
                 }
-                editor.projective_controls(ui);
-                editor.warp_controls(ui);
+                if editor.draft.is_none() {
+                    editor.projective_controls(ui);
+                    editor.warp_controls(ui);
+                }
                 if ui.button("Reset transform").clicked() {
                     if editor.reference.is_some() {
                         editor.pivot = editor.reference_point();
@@ -1609,25 +2242,25 @@ impl PeerBrush {
                     editor.changed();
                 }
                 let commands = editor.commands();
-                if let Some(error) = commands.as_ref().err().or(editor.error.as_ref()) {
+                if let Some(error) = commands.as_ref().err().or(editor.error.as_ref()).or(editor.apply_error.as_ref()) {
                     ui.colored_label(ACCENT, error);
                 }
-                let rendered = editor
+                let offscreen = doc.native().is_some() && self.native_canvas_offscreen();
+                let rendered = !offscreen && editor
                     .key()
                     .ok()
                     .is_some_and(|key| editor.rendered.as_ref() == Some(&key));
-                if !rendered {
-                    ui.label("Rendering shared-engine preview...");
+                if offscreen {
+                    ui.label("Bring the canvas into view to preview and apply");
+                } else if !rendered && editor.error.is_none() && commands.is_ok() {
+                    ui.label("Waiting for the full-detail preview");
                 }
                 ui.horizontal(|ui| {
-                    let ready = commands.is_ok()
-                        && editor.context.is_none()
-                        && !context_frame
-                        && rendered
-                        && editor.drag.is_none()
-                        && !self.busy
+                    let ready = commands.is_ok() && rendered
+                        && editor.ready_to_apply(self.pending, self.busy, context_frame)
                         && drawn_generation == self.canvas_generation;
                     apply = ui.add_enabled(ready, dialogs::primary("Apply")).clicked()
+                        || (ready && canvas_apply)
                         || (ready
                             && !typing
                             && !ctx.wants_keyboard_input()
@@ -1652,38 +2285,12 @@ impl PeerBrush {
             self.cancel_free_transform();
             self.message = "Free Transform cancelled.".into();
         } else if apply {
-            let commands = editor.commands().unwrap();
-            let unchanged = commands.is_empty();
-            let result = if unchanged {
-                Ok(json!({}))
-            } else {
-                self.shared.lock().unwrap().edit(
-                    "human",
-                    &commands,
-                    Some(editor.revision),
-                    None,
-                    "Free Transform",
-                )
-            };
-            match result {
-                Ok(_) => {
-                    self.free_transform = Some(editor);
-                    self.cancel_free_transform();
-                    self.message = if unchanged {
-                        "Free Transform unchanged."
-                    } else {
-                        "Free Transform applied; one Undo restores the starting artwork."
-                    }
-                    .into();
-                }
-                Err(error) => {
-                    editor.error = Some(error.clone());
-                    self.message = error.into();
-                    self.free_transform = Some(editor);
-                }
-            }
+            self.free_transform = Some(editor);
+            self.apply_free_transform();
         } else {
-            self.transient = editor.commands().unwrap_or_default();
+            if editor.draft.is_none() {
+                self.transient = editor.commands().unwrap_or_default();
+            }
             if editor.key() != before {
                 self.last_preview = None;
                 ctx.request_repaint();

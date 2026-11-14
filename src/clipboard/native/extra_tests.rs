@@ -7,6 +7,54 @@ use crate::{
 use std::cell::Cell;
 
 #[test]
+fn shared_paste_never_materializes_native_clipboard_into_resident_authority() {
+    let fixture = Fixture::new(doc(16, 3));
+    let original = fixture.source_hash();
+    let baseline = fixture.disk.used().unwrap();
+    let snapshot = crate::clipboard::LayerSnapshot::Native(
+        layers::LayerCopyPlan::capture(
+            &fixture.document,
+            &[fixture.legacy.layers[0].id.clone()],
+            &mut Work::new(1_000_000).unwrap(),
+            &|| Ok(()),
+        )
+        .unwrap(),
+    );
+    let mut engine = crate::engine::Engine::new();
+    engine.resident_state_mut().expect("resident fixture").document = Document::new(8, 8).unwrap();
+    let before = serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap();
+    let document = engine.resident_state().expect("resident fixture").document.id.clone();
+    let target = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
+    let shared = Arc::new(std::sync::Mutex::new(engine));
+    let error = crate::server::paste_layers_shared(
+        &shared,
+        "human",
+        &snapshot,
+        &target,
+        Some(0),
+        None,
+        Some(&document),
+        None,
+    )
+    .err()
+    .unwrap();
+    assert!(error.contains("cannot be pasted into a resident document"));
+    let engine = shared.lock().unwrap();
+    assert_eq!(serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap(), before);
+    assert_eq!(engine.history_lengths(), [0, 0]);
+    assert_eq!(
+        engine
+            .file_operations
+            .load(std::sync::atomic::Ordering::Acquire),
+        0
+    );
+    assert_eq!(fixture.disk.used().unwrap(), baseline);
+    assert_eq!(fixture.source_hash(), original);
+    drop(snapshot);
+    fixture.finish();
+}
+
+#[test]
 fn copy_cancel_work_and_foreign_source_or_pool_never_return_partial_pixels() {
     let fixture = Fixture::new(doc(16, 3));
     let original = fixture.source_hash();
@@ -113,7 +161,7 @@ fn copy_cancel_work_and_foreign_source_or_pool_never_return_partial_pixels() {
 }
 
 #[test]
-fn unsupported_derived_and_raw_mask_copy_refuses_before_creating_sources() {
+fn raw_mask_copy_keeps_disabled_samples_and_applies_enabled_masks_to_color() {
     for depth in [8, 16] {
         for enabled in [false, true] {
             let mut legacy = doc(depth, 0);
@@ -149,17 +197,12 @@ fn unsupported_derived_and_raw_mask_copy_refuses_before_creating_sources() {
                     &mut Work::new(1_000_000).unwrap(),
                     &|| Ok(()),
                 );
-                if !enabled && !mask {
-                    let copy = result.unwrap();
-                    let expected =
-                        crate::clipboard::Image::copy(&fixture.legacy, request.target, mask, false)
-                            .unwrap();
-                    super::assert_copy(&copy, &expected, &fixture.pool);
-                    copy.abort(&session).unwrap();
-                } else {
-                    assert!(result.is_err());
-                    assert_eq!(session.created.get(), 0);
-                }
+                let copy = result.unwrap();
+                let expected =
+                    crate::clipboard::Image::copy(&fixture.legacy, request.target, mask, false)
+                        .unwrap();
+                super::assert_copy(&copy, &expected, &fixture.pool);
+                copy.abort(&session).unwrap();
                 assert_eq!(fixture.disk.used().unwrap(), baseline);
                 drop(session);
             }

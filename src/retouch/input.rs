@@ -1,9 +1,9 @@
-//! Clone/heal over an explicit captured paint plane or raw paint mask step.
-//! Merged artwork and composed masks require their separate prepared provider.
+//! Clone/heal from a captured raw plane, composed mask or merged artwork.
+use super::source::{self, Source};
 use crate::{
     brush::{input::LocalStroke, Settings},
     edit_bounds::{
-        input::{restrict_frame_tile, restrict_tile, InputFrame, RasterInput},
+        input::{restrict_frame_tile, restrict_tile, InputFrame, RasterInput, RetouchInput},
         output::{stage_frame_with, BuiltTiles, TileOutput},
     },
     workspace::source_runtime::SourceSession,
@@ -23,7 +23,7 @@ pub(crate) fn stage_raster<'d, 's>(
 ) -> Result<BuiltTiles<'d, 's>, String> {
     stage_impl(
         input,
-        source,
+        &Source::Raster(source),
         stroke,
         settings,
         offset,
@@ -36,7 +36,6 @@ pub(crate) fn stage_raster<'d, 's>(
 }
 pub(crate) fn stage_guarded<'d, 's>(
     input: &RasterInput<'d>,
-    source: &RasterInput<'d>,
     stroke: &LocalStroke,
     frame: Option<&InputFrame>,
     guard: &crate::edit_bounds::input::WriteGuard<'_>,
@@ -46,10 +45,7 @@ pub(crate) fn stage_guarded<'d, 's>(
     guard.validate(input, frame, &["clone", "heal"])?;
     stroke.validate_command(guard.token())?;
     let parameters = guard.parameters();
-    match input.retouch_source(parameters)? {
-        crate::edit_bounds::input::RetouchInput::Raster(expected) if expected.binding()==source.binding()=>{},
-        _=>return Err("Retouch source requires its exact prepared raw plane, composed mask or merged artwork provider".into()),
-    }
+    let source = input.retouch_source(parameters)?;
     let settings = Settings::from_command(parameters)?;
     let anchor = parameters["source"]
         .as_array()
@@ -79,22 +75,52 @@ pub(crate) fn stage_guarded<'d, 's>(
         check()?;
         guard.check_active()
     };
-    stage_impl(
-        input,
-        source,
-        stroke,
-        settings,
-        offset,
-        (parameters["op"] == "heal").then_some(radius),
-        frame,
-        Some(guard),
-        session,
-        &mut checked,
-    )
+    let needs_frame = match &source {
+        RetouchInput::Merged(_) => true,
+        RetouchInput::ComposedMask { layer, .. } => layer.id() == input.layer_metadata().id(),
+        RetouchInput::Raster(_) => false,
+    };
+    let snapshot = frame
+        .filter(|_| needs_frame)
+        .map(|frame| {
+            // The snapshot consumes no history and shares the original command's
+            // admission/cancellation. It is retired before the actual draw seals.
+            let checkpoint = std::cell::RefCell::new(&mut checked);
+            crate::engine::native::worker::retouch_frame(input, frame, guard, session, &|| {
+                checkpoint.borrow_mut()()
+            })
+        })
+        .transpose()?;
+    let result = (|| {
+        let source = if let Some(snapshot) = &snapshot {
+            RasterInput::from_parameters(snapshot.preview(), parameters)?
+                .retouch_source(parameters)?
+        } else {
+            source
+        };
+        source::with_source(&source, session, &mut checked, |source, check| {
+            stage_impl(
+                input,
+                source,
+                stroke,
+                settings,
+                offset,
+                (parameters["op"] == "heal").then_some(radius),
+                frame,
+                Some(guard),
+                session,
+                check,
+            )
+        })
+    })();
+    let cleanup = snapshot.map_or(Ok(()), |snapshot| {
+        snapshot.abort(session, &|| session.cleanup_check())
+    });
+    source::finish(result, cleanup)
 }
 fn stage_impl<'d, 's>(
     input: &RasterInput<'d>,
-    source: &RasterInput<'d>,
+    source: &Source<'_, '_>,
     stroke: &LocalStroke,
     settings: Settings,
     offset: [f32; 2],
@@ -107,23 +133,23 @@ fn stage_impl<'d, 's>(
     session.check()?;
     check()?;
     stroke.validate_frame(input, frame)?;
-    if input.binding().generation() != source.binding().generation()
-        || !input.pool().same_pool(source.pool())
-        || input.document().metadata().read_only()
-        || input.layer_metadata().locked()
-    {
+    if input.document().metadata().read_only() || input.layer_metadata().locked() {
         return Err(
             "Native retouch requires the same captured scene and an editable unlocked target"
                 .into(),
         );
     }
-    if (!input.is_mask() && input.layer_metadata().kind() != "paint")
-        || (!source.is_mask() && source.layer_metadata().kind() != "paint")
-        || input.is_mask() != source.is_mask()
-    {
-        return Err(
-            "Retouch paint layers together or prepare explicit raw paint mask steps".into(),
-        );
+    if !input.is_mask() && input.layer_metadata().kind() != "paint" {
+        return Err("Retouch a paint layer or a paint mask step".into());
+    }
+    if let Source::Raster(source) = source {
+        if input.binding().generation() != source.binding().generation()
+            || !input.pool().same_pool(source.pool())
+            || (!source.is_mask() && source.layer_metadata().kind() != "paint")
+            || input.is_mask() != source.is_mask()
+        {
+            return Err("Retouch source requires its captured raw paint plane".into());
+        }
     }
     let mut guarded = || {
         session.check()?;
@@ -150,12 +176,18 @@ fn stage_impl<'d, 's>(
                 )
             })
             .transpose()?;
-        let samples = source.prepare_samples(reads.source_queries, check)?;
+        let samples = source.prepare(input, frame, reads.source_queries, check)?;
         let mut after = plan.render_tile(
             key,
             before,
             check,
             |x, y| {
+                if frame.is_some_and(|frame| {
+                    let shape = frame.geometry().new_shape();
+                    x < 0 || y < 0 || x >= shape[0] as i32 || y >= shape[1] as i32
+                }) {
+                    return Ok([0; 4]);
+                }
                 destination
                     .as_ref()
                     .ok_or("Native healing destination halo is not prepared")?
@@ -180,17 +212,14 @@ fn stage_impl<'d, 's>(
         Ok(after)
     };
     if let Some(frame) = frame {
-        return stage_frame_with(input, frame, session, &mut guarded, |key, before, check| {
-            if plan
-                .tiles()
-                .binary_search_by_key(&(key.1, key.0), |&(x, y)| (y, x))
-                .is_err()
-            {
-                Ok(before.clone())
-            } else {
-                render(key, before, check)
-            }
-        })
+        return stage_frame_with(
+            input,
+            frame,
+            session,
+            &mut guarded,
+            Some(plan.tiles()),
+            render,
+        )
         .map(BuiltTiles::Draft);
     }
     let mut output = TileOutput::new(input, session)?;

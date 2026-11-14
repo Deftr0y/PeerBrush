@@ -24,18 +24,18 @@ fn source() -> Source {
     }
 }
 fn snapshot(engine: &Engine) -> Value {
-    json!({"doc":engine.doc,"png":engine.doc.export_png().unwrap(),"undo":engine.undo.len(),"redo":engine.redo.len(),"saved":engine.saved_revision})
+    json!({"doc":engine.resident_state().expect("resident fixture").document,"png":engine.resident_state().expect("resident fixture").document.export_png().unwrap(),"undo":engine.resident_state().expect("resident fixture").undo.len(),"redo":engine.resident_state().expect("resident fixture").redo.len(),"saved":engine.saved_revision})
 }
 #[test]
 fn shaped_source_protocol_preview_native_clipboard_and_guards_share_one_history_path() {
     use base64::Engine as _;
     for depth in [8, 16] {
         let mut engine = Engine::new();
-        engine.doc = Document::new_depth(220, 120, depth).unwrap();
-        let original_png = engine.doc.export_png().unwrap();
+        engine.resident_state_mut().expect("resident fixture").document = Document::new_depth(220, 120, depth).unwrap();
+        let original_png = engine.resident_state().expect("resident fixture").document.export_png().unwrap();
         let original = snapshot(&engine);
         let command = json!({"op":"source.add","source":source(),"x":9,"y":13});
-        let expected = Engine::preview_edits(engine.doc.clone(), &[command.clone()]).unwrap();
+        let expected = Engine::preview_edits(engine.resident_state().expect("resident fixture").document.clone(), &[command.clone()]).unwrap();
         assert_eq!(snapshot(&engine), original);
         let shared = Arc::new(Mutex::new(engine));
         let reply = peerbrush::server::dispatch(&shared,"edit",&json!({"actor":"human","commands":[command],"expected_revision":0,"feedback":"always","max_edge":220})).unwrap();
@@ -63,13 +63,13 @@ fn shaped_source_protocol_preview_native_clipboard_and_guards_share_one_history_
         assert_eq!(reply["revision"], json!(1));
         let mut engine = shared.lock().unwrap();
         assert_eq!(
-            engine.doc.export_png().unwrap(),
+            engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
             expected.export_png().unwrap()
         );
-        assert_eq!(engine.undo.len(), 1);
-        assert_eq!(engine.doc.layers[0].pixels.depth, depth);
-        let id = engine.doc.layers[0].id.clone();
-        let clip = layer_clipboard::copy(&engine.doc, &[id.clone()]).unwrap();
+        assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), 1);
+        assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].pixels.depth, depth);
+        let id = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
+        let clip = layer_clipboard::copy(&engine.resident_state().expect("resident fixture").document, &[id.clone()]).unwrap();
         let mut destination = Document::new_depth(220, 120, depth).unwrap();
         let mut original_destination = destination.layers[0].clone();
         let pasted = layer_clipboard::paste(&mut destination, &clip, "").unwrap();
@@ -83,9 +83,9 @@ fn shaped_source_protocol_preview_native_clipboard_and_guards_share_one_history_
         assert_eq!(copied.pixels.depth, depth);
         assert_eq!(
             (copied.x, copied.y),
-            (engine.doc.layers[0].x, engine.doc.layers[0].y)
+            (engine.resident_state().expect("resident fixture").document.layers[0].x, engine.resident_state().expect("resident fixture").document.layers[0].y)
         );
-        assert_eq!(copied.pixels.rgba16(), engine.doc.layers[0].pixels.rgba16());
+        assert_eq!(copied.pixels.rgba16(), engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16());
         // Paste wraps the original top-level paint destination; returned IDs
         // identify copied roots, independently of their position in the stack.
         let parent = copied.parent.as_ref().expect("Paste destination wrapper");
@@ -120,20 +120,20 @@ fn shaped_source_protocol_preview_native_clipboard_and_guards_share_one_history_
         // Snapshot-derived properties use exact source guards in addition to
         // expected_revision's optimistic, disjoint-edit conflict handling.
         let mut stale = update.clone();
-        stale["document_id"] = json!(engine.doc.id);
+        stale["document_id"] = json!(engine.resident_state().expect("resident fixture").document.id);
         stale["source_revision"] = json!(0);
         assert!(engine
             .edit("human", &[stale], Some(0), None, "Stale")
             .unwrap_err()
             .contains("The source project changed."));
         assert_eq!(snapshot(&engine), before);
-        engine.doc.layers[0].locked = true;
+        engine.resident_state_mut().expect("resident fixture").document.layers[0].locked = true;
         let locked = snapshot(&engine);
         assert!(engine
             .edit("human", &[update.clone()], Some(1), None, "Locked")
             .is_err());
         assert_eq!(snapshot(&engine), locked);
-        engine.doc.layers[0].locked = false;
+        engine.resident_state_mut().expect("resident fixture").document.layers[0].locked = false;
         for invalid_text in [
             "\u{10ffff}",
             "A\u{fe0f}",
@@ -162,15 +162,15 @@ fn shaped_source_protocol_preview_native_clipboard_and_guards_share_one_history_
         engine
             .edit("human", &[update], Some(1), None, "Shaped update")
             .unwrap();
-        assert_eq!(engine.undo.len(), 2);
+        assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), 2);
         engine.undo("human").unwrap();
-        assert_eq!(engine.doc.layers[0].source, Some(source().into()));
+        assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].source, Some(source().into()));
         assert_eq!(
-            engine.doc.export_png().unwrap(),
+            engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
             expected.export_png().unwrap()
         );
         engine.undo("human").unwrap();
-        assert_eq!(engine.doc.export_png().unwrap(), original_png);
+        assert_eq!(engine.resident_state().expect("resident fixture").document.export_png().unwrap(), original_png);
     }
 }
 
@@ -207,7 +207,7 @@ fn omitted_or_explicit_legacy_serialization_pixels_and_script_rejection_stay_ide
 fn shaped_updates_affine_placement_masks_effects_and_explicit_rasterize_keep_native_sources() {
     for depth in [8, 16] {
         let mut engine = Engine::new();
-        engine.doc = Document::new_depth(240, 160, depth).unwrap();
+        engine.resident_state_mut().expect("resident fixture").document = Document::new_depth(240, 160, depth).unwrap();
         engine
             .edit(
                 "human",
@@ -217,11 +217,11 @@ fn shaped_updates_affine_placement_masks_effects_and_explicit_rasterize_keep_nat
                 "Text",
             )
             .unwrap();
-        let id = engine.doc.layers[0].id.clone();
+        let id = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
         engine.edit("human",&[json!({"op":"mask.add","layer":id}),json!({"op":"effect.add","layer":id,"kind":"hsl","settings":{"hue":12.,"saturation":0.,"lightness":0.}})],None,None,"Editable mask/effect").unwrap();
         let mut mask = peerbrush::raster::Raster::new_depth(160, 72, depth);
         mask.set16(7, 9, [45003, 45003, 45003, 65535]);
-        engine.doc.layers[0]
+        engine.resident_state_mut().expect("resident fixture").document.layers[0]
             .mask
             .as_mut()
             .unwrap()
@@ -235,34 +235,34 @@ fn shaped_updates_affine_placement_masks_effects_and_explicit_rasterize_keep_nat
                 pixels: mask,
                 settings: Value::Null,
             });
-        let original = engine.doc.clone();
+        let original = engine.resident_state().expect("resident fixture").document.clone();
         let mut changed = source();
         if let Content::Text { text, .. } = &mut changed.content {
             *text = "a\u{0301} office".into();
         }
         let command = json!({"op":"source.update","layer":id,"source":changed});
         let preview = Engine::preview_edits(original.clone(), &[command.clone()]).unwrap();
-        let count = engine.undo.len();
+        let count = engine.resident_state().expect("resident fixture").undo.len();
         engine
             .edit("human", &[command], None, None, "Shaped content")
             .unwrap();
-        assert_eq!(engine.undo.len(), count + 1);
+        assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), count + 1);
         assert_eq!(
-            engine.doc.export_png().unwrap(),
+            engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
             preview.export_png().unwrap()
         );
         assert_eq!(
-            json!(engine.doc.layers[0].mask),
+            json!(engine.resident_state().expect("resident fixture").document.layers[0].mask),
             json!(original.layers[0].mask)
         );
         assert_eq!(
-            json!(engine.doc.layers[0].effects),
+            json!(engine.resident_state().expect("resident fixture").document.layers[0].effects),
             json!(original.layers[0].effects)
         );
         engine.undo("human").unwrap();
-        assert_eq!(json!(engine.doc.layers), json!(original.layers));
+        assert_eq!(json!(engine.resident_state().expect("resident fixture").document.layers), json!(original.layers));
         engine.redo("human").unwrap();
-        let contents = engine.doc.layers[0]
+        let contents = engine.resident_state().expect("resident fixture").document.layers[0]
             .source
             .as_ref()
             .unwrap()
@@ -278,11 +278,11 @@ fn shaped_updates_affine_placement_masks_effects_and_explicit_rasterize_keep_nat
             )
             .unwrap();
         assert_eq!(
-            engine.doc.layers[0].source.as_ref().unwrap().content,
+            engine.resident_state().expect("resident fixture").document.layers[0].source.as_ref().unwrap().content,
             contents
         );
-        assert_eq!(engine.doc.layers[0].pixels.depth, depth);
-        let before = engine.doc.clone();
+        assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].pixels.depth, depth);
+        let before = engine.resident_state().expect("resident fixture").document.clone();
         for encoded in [
             peerbrush::psd::encode(&before).unwrap(),
             peerbrush::psd::encode_psb(&before).unwrap(),
@@ -306,16 +306,16 @@ fn shaped_updates_affine_placement_masks_effects_and_explicit_rasterize_keep_nat
                 "Explicit rasterize",
             )
             .unwrap();
-        assert!(engine.doc.layers[0].source.is_none());
+        assert!(engine.resident_state().expect("resident fixture").document.layers[0].source.is_none());
         assert_eq!(
-            engine.doc.layers[0].pixels.rgba16(),
+            engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(),
             before.layers[0].pixels.rgba16()
         );
         assert_eq!(
-            engine.doc.export_png().unwrap(),
+            engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
             before.export_png().unwrap()
         );
         engine.undo("human").unwrap();
-        assert_eq!(json!(engine.doc.layers), json!(before.layers));
+        assert_eq!(json!(engine.resident_state().expect("resident fixture").document.layers), json!(before.layers));
     }
 }

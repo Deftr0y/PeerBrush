@@ -4,7 +4,7 @@ use crate::{
     large_document::ResidentBudget,
     source::TextLayout,
 };
-pub(super) fn matrix(m: [f32; 6]) -> Result<(), String> {
+pub(crate) fn matrix(m: [f32; 6]) -> Result<(), String> {
     if m.iter().any(|v| !v.is_finite() || v.abs() > 100000.)
         || (m[0] * m[3] - m[1] * m[2]).abs() < 0.000001
     {
@@ -13,6 +13,23 @@ pub(super) fn matrix(m: [f32; 6]) -> Result<(), String> {
         Ok(())
     }
 }
+
+pub(crate) fn bezier(
+    nodes: &[crate::path::Anchor],
+    closed: bool,
+    stroke_width: f32,
+    pool: &ResidentBudget,
+) -> Result<(), String> {
+    if !stroke_width.is_finite() || !(0. ..=256.).contains(&stroke_width) {
+        return Err("Invalid path stroke width".into());
+    }
+    let _work = pool
+        .reserve_bytes(256 * 1024, 256 * 1024)
+        .map_err(|e| e.to_string())?;
+    crate::path::flatten(nodes, closed)?;
+    Ok(())
+}
+
 pub(crate) fn validate_definition(
     source: &Source36,
     pool: &ResidentBudget,
@@ -30,15 +47,7 @@ pub(crate) fn validate_definition(
             stroke_width,
             ..
         } => {
-            if !stroke_width.is_finite() || !(0. ..=256.).contains(stroke_width) {
-                return Err("Invalid path stroke width".into());
-            }
-            let _work = pool
-                .reserve_bytes(256 * 1024, 256 * 1024)
-                .map_err(|e| e.to_string())?;
-            let points = crate::path::flatten(nodes, *closed)?;
-            check()?;
-            drop(points);
+            bezier(nodes, *closed, *stroke_width, pool)?;
         }
         Content36::Shape {
             shape,
@@ -76,7 +85,7 @@ pub(crate) fn validate_definition(
             if text.len() > 16384
                 || text.chars().count() > 4096
                 || text.lines().count() > 96
-                || (*layout == TextLayout::Shaped && text.split('\n').count() > 96)
+                || (layout.uses_shaping() && text.split('\n').count() > 96)
                 || !size.is_finite()
                 || !(1. ..=1024.).contains(size)
                 || !line_height.is_finite()
@@ -91,7 +100,7 @@ pub(crate) fn validate_definition(
             for ch in text.chars().filter(|c| *c != '\n') {
                 if ch.is_control()
                     || matches!(ch as u32,0x200e..=0x200f|0x202a..=0x202e|0x2066..=0x2069)
-                    || (*layout == TextLayout::Shaped
+                    || (layout.uses_shaping()
                         && matches!(ch, '\u{061c}' | '\u{2028}' | '\u{2029}'))
                     || (*layout == TextLayout::Legacy
                         && (matches!(ch as u32, 0x200c..=0x200d)

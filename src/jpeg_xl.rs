@@ -4,11 +4,14 @@
 mod native;
 mod pipe;
 mod process_limits;
+pub(crate) mod rows_parent;
+mod spans;
 mod stream_chunks;
 mod stream_native;
 pub(crate) mod stream_parent;
 pub(crate) mod stream_protocol;
 pub use native::{Decoded, Info, Options, Pixels, PixelsRef, ENCODED_LIMIT};
+use crate::raster::CanvasLimits;
 use serde::{Deserialize, Serialize};
 use std::{
     ffi::OsStr,
@@ -26,6 +29,8 @@ use std::{
 const MAGIC: &[u8; 8] = b"PBJXL001";
 const HEADER_LIMIT: usize = 4096;
 const RAW_LIMIT: usize = 256 * 1024 * 1024;
+pub(crate) const NATIVE_BUFFER_LIMIT: usize = 64 * 1024 * 1024;
+pub(crate) const NATIVE_ENCODED_LIMIT: u64 = 3 * 1024 * 1024 * 1024;
 const DEADLINE: Duration = Duration::from_secs(120);
 const FAILED: &str = "JPEG XL worker failed; current work was preserved";
 const PROTOCOL: &str = "JPEG XL worker response was invalid; current work was preserved";
@@ -44,6 +49,11 @@ struct ChildResources {
     charges: Vec<crate::large_document::Reservation>,
     _headers: crate::large_document::Reservation,
     _original_chunks: Option<Arc<Mutex<stream_chunks::OriginalChunks>>>,
+}
+struct OperationOwnership {
+    source: crate::workspace::source_runtime::SessionRetention,
+    resources: ChildResources,
+    may_retire: Arc<AtomicBool>,
 }
 static RETAINED: Mutex<Option<RetainedWorker>> = Mutex::new(None);
 static RETAINED_WAKE: Condvar = Condvar::new();
@@ -115,7 +125,34 @@ fn ensure_reaper() -> Result<(), String> {
 enum Operation {
     Inspect,
     Decode,
+    DecodePatch,
     Encode,
+    InspectNative,
+    DecodeNative,
+    DecodeSpans,
+}
+impl Operation {
+    fn streams_input(self) -> bool {
+        matches!(self, Self::InspectNative | Self::DecodeNative | Self::DecodeSpans)
+    }
+    fn limits(self) -> CanvasLimits {
+        match self {
+            Self::InspectNative | Self::DecodeNative | Self::DecodeSpans => CanvasLimits::Native,
+            _ => CanvasLimits::Resident,
+        }
+    }
+    fn pixel_limit(self) -> usize {
+        match self {
+            Self::InspectNative | Self::DecodeSpans => usize::MAX,
+            Self::DecodeNative => NATIVE_BUFFER_LIMIT,
+            Self::DecodePatch => 128 * 1024 * 1024,
+            _ => RAW_LIMIT,
+        }
+    }
+    fn raw_size(self, info: Info) -> Result<usize, String> {
+        let bytes = image_bytes(info, self.limits())?;
+        (bytes <= self.pixel_limit()).then_some(bytes).ok_or_else(|| PROTOCOL.into())
+    }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -177,13 +214,19 @@ impl Request {
             return Err(PROTOCOL.into());
         }
         match self.operation {
-            Operation::Inspect | Operation::Decode => {
-                if self.info.is_some()
+            Operation::Inspect | Operation::Decode | Operation::DecodePatch | Operation::InspectNative | Operation::DecodeNative | Operation::DecodeSpans => {
+                let requires_shape = matches!(self.operation, Operation::DecodePatch | Operation::DecodeNative | Operation::DecodeSpans);
+                let encoded_limit = if self.operation.streams_input() { NATIVE_ENCODED_LIMIT } else { ENCODED_LIMIT as u64 };
+                if (matches!(self.operation, Operation::Inspect | Operation::InspectNative) && self.info.is_some())
+                    || (requires_shape && self.info.is_none())
                     || self.options.is_some()
                     || self.profile_bytes != 0
-                    || !(2..=ENCODED_LIMIT as u64).contains(&self.payload_bytes)
+                    || !(2..=encoded_limit).contains(&self.payload_bytes)
                 {
                     return Err(PROTOCOL.into());
+                }
+                if let Some(info) = self.info {
+                    self.operation.raw_size(info)?;
                 }
             }
             Operation::Encode => {
@@ -231,16 +274,21 @@ impl Response {
             return Ok(());
         }
         let info = self.info.ok_or(PROTOCOL)?;
-        let count = raw_size(info)?;
+        let count = self.operation.raw_size(info)?;
         match self.operation {
-            Operation::Inspect => {
+            Operation::Inspect | Operation::InspectNative => {
                 if self.profile_bytes != 0 || self.payload_bytes != 0 {
                     return Err(PROTOCOL.into());
                 }
             }
-            Operation::Decode => {
-                if !(1..=crate::color_profile::MAX_PROFILE_BYTES as u32)
-                    .contains(&self.profile_bytes)
+            Operation::Decode | Operation::DecodePatch | Operation::DecodeNative | Operation::DecodeSpans => {
+                let differs = request.info.is_some_and(|expected| {
+                    let transposed = Info { width: expected.height, height: expected.width, ..expected };
+                    expected != info && !(self.operation == Operation::DecodePatch && transposed == info)
+                });
+                if differs
+                    || !(1..=crate::color_profile::MAX_PROFILE_BYTES as u32)
+                        .contains(&self.profile_bytes)
                     || self.payload_bytes != count as u64
                 {
                     return Err(PROTOCOL.into());
@@ -273,7 +321,10 @@ fn build() -> Result<String, String> {
     Ok(value.into())
 }
 fn raw_size(info: Info) -> Result<usize, String> {
-    crate::raster::check_size(info.width, info.height)?;
+    Operation::Decode.raw_size(info)
+}
+fn image_bytes(info: Info, limits: CanvasLimits) -> Result<usize, String> {
+    limits.check(info.width, info.height)?;
     if !matches!(info.bit_depth, 8 | 16) {
         return Err(PROTOCOL.into());
     }
@@ -281,7 +332,6 @@ fn raw_size(info: Info) -> Result<usize, String> {
         .checked_mul(info.height as usize)
         .and_then(|n| n.checked_mul(4))
         .and_then(|n| n.checked_mul(usize::from(info.bit_depth / 8)))
-        .filter(|n| *n <= RAW_LIMIT)
         .ok_or_else(|| PROTOCOL.into())
 }
 fn header<T: Serialize>(output: &mut impl Write, value: &T) -> Result<(), String> {
@@ -478,7 +528,7 @@ fn read_output(
     }
     let info = result.info.ok_or(PROTOCOL)?;
     let profile = read_bytes(input, result.profile_bytes as usize)?;
-    if request.operation == Operation::Decode {
+    if matches!(request.operation, Operation::Decode | Operation::DecodePatch) {
         crate::color_profile::supported(&profile)
             .map_err(|_| ErrorCode::UnsupportedProfile.message())?;
     }
@@ -486,7 +536,7 @@ fn read_output(
     if let Some(started) = started {
         started.store(true, std::sync::atomic::Ordering::SeqCst);
     }
-    let pixels = if request.operation == Operation::Decode {
+    let pixels = if matches!(request.operation, Operation::Decode | Operation::DecodePatch) {
         read_pixels(input, info)?
     } else {
         Pixels::Eight(Vec::new())
@@ -514,6 +564,7 @@ struct ChildGuard {
     _limits: Option<process_limits::Parent>,
     _source: Option<crate::workspace::source_runtime::SessionRetention>,
     _resources: Option<ChildResources>,
+    may_retire: Option<Arc<AtomicBool>>,
     #[cfg(test)]
     primary_kill_failed: bool,
     #[cfg(test)]
@@ -600,6 +651,9 @@ impl ChildGuard {
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         let _ = self.stop();
+        if let Some(may_retire) = &self.may_retire {
+            may_retire.store(self.done, Ordering::SeqCst);
+        }
     }
 }
 struct Runtime {
@@ -643,9 +697,9 @@ impl Default for Runtime {
         }
     }
 }
-enum Event {
+enum Event<T> {
     Ready,
-    Result(Result<Output, String>),
+    Result(Result<T, String>),
 }
 fn cleanup_failed() -> bool {
     if !FAILED_STOP.load(Ordering::SeqCst) {
@@ -671,8 +725,45 @@ fn invoke(
     request: Request,
     body: Input<'_>,
     check: &dyn Fn() -> Result<(), String>,
-    mut runtime: Runtime,
+    runtime: Runtime,
 ) -> Result<Output, String> {
+    #[cfg(test)]
+    let mut runtime = runtime;
+    #[cfg(test)]
+    let response_started = runtime.response_started.take();
+    invoke_with(
+        request,
+        move |output, _| body.write(output),
+        move |input, request, _| {
+            read_output(
+                input,
+                request,
+                #[cfg(test)]
+                response_started.as_deref(),
+            )
+        },
+        check,
+        runtime,
+        None,
+    )
+}
+
+// One supervisor owns process identity, protection, cancellation, pumps and
+// uncertain-exit retention for both resident buffers and admitted row streams.
+fn invoke_with<T: Send>(
+    request: Request,
+    body: impl FnOnce(&mut pipe::Pipe<std::process::ChildStdin>, Arc<AtomicBool>) -> Result<(), String>
+        + Send,
+    read_result: impl FnOnce(
+            &mut pipe::Pipe<std::process::ChildStdout>,
+            &Request,
+            Arc<AtomicBool>,
+        ) -> Result<T, String>
+        + Send,
+    check: &dyn Fn() -> Result<(), String>,
+    mut runtime: Runtime,
+    ownership: Option<OperationOwnership>,
+) -> Result<T, String> {
     check()?;
     ensure_reaper()?;
     request.validate()?;
@@ -728,8 +819,18 @@ fn invoke(
         command.creation_flags(0x08000000);
     }
     let child = command.spawn().map_err(|_| FAILED)?;
+    if let Some(ownership) = &ownership {
+        ownership.may_retire.store(false, Ordering::SeqCst);
+    }
     // The guard is inside the scope: it stops pumps and attempts child cleanup
     // before scoped threads join on every return/unwind, including kill error.
+    let (source, resources, may_retire) = ownership.map_or((None, None, None), |owner| {
+        (
+            Some(owner.source),
+            Some(owner.resources),
+            Some(owner.may_retire),
+        )
+    });
     thread::scope(|scope| {
         let stop = Arc::new(AtomicBool::new(false));
         let mut guard = ChildGuard {
@@ -737,8 +838,9 @@ fn invoke(
             done: false,
             stop: stop.clone(),
             _limits: None,
-            _source: None,
-            _resources: None,
+            _source: source,
+            _resources: resources,
+            may_retire,
             #[cfg(test)]
             primary_kill_failed: runtime.primary_kill_failed,
             #[cfg(test)]
@@ -776,8 +878,7 @@ fn invoke(
         }
         let (tx, rx) = mpsc::sync_channel(2);
         let selected = request.clone();
-        #[cfg(test)]
-        let response_started = runtime.response_started.take();
+        let reader_stop = guard.stop.clone();
         let reader = scope.spawn(move || {
             let result = (|| {
                 #[cfg(test)]
@@ -793,12 +894,7 @@ fn invoke(
                     return Err(PROTOCOL.into());
                 }
                 tx.send(Event::Ready).map_err(|_| FAILED)?;
-                read_output(
-                    &mut output,
-                    &selected,
-                    #[cfg(test)]
-                    response_started.as_deref(),
-                )
+                read_result(&mut output, &selected, reader_stop)
             })();
             let _ = tx.send(Event::Result(result));
         });
@@ -823,7 +919,6 @@ fn invoke(
                         check()?;
                         let mut input = input.take().ok_or(PROTOCOL)?;
                         let body = body.take().ok_or(PROTOCOL)?;
-                        #[cfg(test)]
                         let writer_stop = guard.stop.clone();
                         writer = Some(scope.spawn(move || {
                             #[cfg(test)]
@@ -833,7 +928,7 @@ fn invoke(
                                 }
                                 return Err(FAILED.into());
                             }
-                            body.write(&mut input)
+                            body(&mut input, writer_stop)
                         }));
                     }
                     Event::Result(output) => {
@@ -934,9 +1029,45 @@ pub fn inspect(bytes: &[u8], check: &dyn Fn() -> Result<(), String>) -> Result<I
     )
     .map(|result| result.info)
 }
+
+pub(crate) fn inspect_native_file(mut file: std::fs::File) -> Result<Info, String> {
+    let length = file.metadata().map_err(|e| e.to_string())?.len();
+    if !(2..=NATIVE_ENCODED_LIMIT).contains(&length) {
+        return Err("JPEG XL metadata requires a file of at most 3 GiB".into());
+    }
+    invoke_with(
+        request(Operation::InspectNative, None, None, 0, length as usize)?,
+        move |pipe, stop| {
+            let mut bytes = [0; 16 * 1024];
+            let mut remaining = length;
+            while remaining != 0 {
+                if stop.load(Ordering::SeqCst) {
+                    return Err(FAILED.into());
+                }
+                let count = remaining.min(bytes.len() as u64) as usize;
+                read(&mut file, &mut bytes[..count])?;
+                write(pipe, &bytes[..count])?;
+                remaining -= count as u64;
+            }
+            eof(&mut file)
+        },
+        |pipe, request, _| read_output(pipe, request, #[cfg(test)] None).map(|out| out.info),
+        &|| Ok(()),
+        Runtime::default(),
+        None,
+    )
+}
 pub fn decode(bytes: &[u8], check: &dyn Fn() -> Result<(), String>) -> Result<Decoded, String> {
+    decode_image(bytes, Operation::Decode, None, check)
+}
+
+pub(crate) fn decode_patch(bytes: &[u8], info: Info) -> Result<Decoded, String> {
+    decode_image(bytes, Operation::DecodePatch, Some(info), &|| Ok(()))
+}
+
+fn decode_image(bytes: &[u8], operation: Operation, info: Option<Info>, check: &dyn Fn() -> Result<(), String>) -> Result<Decoded, String> {
     let result = invoke(
-        request(Operation::Decode, None, None, 0, bytes.len())?,
+        request(operation, info, None, 0, bytes.len())?,
         Input::Encoded(bytes),
         check,
         Runtime::default(),
@@ -1006,31 +1137,49 @@ fn worker() -> Result<(), String> {
     }
     let profile = read_bytes(&mut input, request.profile_bytes as usize)?;
     let mut pixels = None;
-    let encoded = if request.operation == Operation::Encode {
+    let mut stream = None;
+    let bytes = if request.operation.streams_input() {
+        stream = Some(native::StreamInput::new(&mut input, request.payload_bytes)?);
+        Vec::new()
+    } else if request.operation == Operation::Encode {
         crate::color_profile::supported(&profile)?;
         pixels = Some(read_pixels(&mut input, request.info.ok_or(PROTOCOL)?)?);
+        eof(&mut input)?;
         Vec::new()
     } else {
-        read_bytes(&mut input, request.payload_bytes as usize)?
+        let bytes = read_bytes(&mut input, request.payload_bytes as usize)?;
+        eof(&mut input)?;
+        bytes
     };
-    eof(&mut input)?;
+    let mut encoded = stream.as_mut().map_or(native::EncodedInput::Slice(&bytes), native::EncodedInput::Stream);
     #[cfg(test)]
-    if test_fault(&request, &mut output)? {
-        return Ok(());
+    if tests::has_body_fault() {
+        encoded.finish()?;
+        if test_fault(&request, &mut output)? {
+            return Ok(());
+        }
+        return Err(FAILED.into());
+    }
+    if request.operation == Operation::DecodeSpans {
+        return spans::write_decoded(&request, &mut encoded, &mut output);
     }
     let mut result = request.response(Kind::Result);
     let mut returned = None;
     let mut image = None;
     let operation = match request.operation {
-        Operation::Inspect => {
-            native::inspect(&encoded, &|| Ok(())).map(|info| result.info = Some(info))
+        Operation::Inspect | Operation::InspectNative => {
+            native::inspect(&mut encoded, request.operation, &|| Ok(())).map(|info| result.info = Some(info))
         }
-        Operation::Decode => native::decode(&encoded, &|| Ok(())).map(|decoded| {
-            result.info = Some(decoded.info);
-            result.profile_bytes = decoded.icc_profile.len() as u32;
-            result.payload_bytes = raw_size(decoded.info).unwrap_or(0) as u64;
-            image = Some(decoded);
-        }),
+        Operation::Decode | Operation::DecodePatch | Operation::DecodeNative => {
+            native::decode_expected(&mut encoded, request.operation, request.info, &|| Ok(())).and_then(|decoded| {
+                result.info = Some(decoded.info);
+                result.profile_bytes = decoded.icc_profile.len() as u32;
+                result.payload_bytes = request.operation.raw_size(decoded.info)? as u64;
+                image = Some(decoded);
+                Ok(())
+            })
+        }
+        Operation::DecodeSpans => unreachable!("Span decoding owns its response stream"),
         Operation::Encode => {
             let info = request.info.ok_or(PROTOCOL)?;
             let pixels = match pixels.as_ref().ok_or(PROTOCOL)? {
@@ -1052,6 +1201,7 @@ fn worker() -> Result<(), String> {
             })
         }
     };
+    encoded.finish()?;
     if let Err(error) = operation {
         result.info = None;
         result.profile_bytes = 0;
@@ -1081,6 +1231,12 @@ fn worker() -> Result<(), String> {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(crate) fn test_process_guard() -> std::sync::MutexGuard<'static, ()> {
+    tests::PROCESS_FIXTURES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
 #[cfg(test)]
 use tests::{read_test_ready, test_fault};
 
@@ -1155,6 +1311,7 @@ pub(crate) fn park_retained_test_child(
         _limits: None,
         _source: Some(source),
         _resources: None,
+        may_retire: None,
         primary_kill_failed: false,
         kill_calls: 0,
     };

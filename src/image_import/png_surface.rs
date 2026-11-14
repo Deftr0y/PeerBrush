@@ -198,13 +198,14 @@ impl PassWriter {
         header: Header,
         event: PassRow,
         row: &[u8],
+        active: &mut dyn FnMut() -> Result<(), String>,
         check: &mut dyn FnMut() -> Result<(), String>,
     ) -> Result<(), String> {
         if self.poisoned {
             return Err("PNG provisional writer is poisoned".into());
         }
         self.poisoned = true;
-        self.push_checked(header, event, row, check)?;
+        self.push_checked(header, event, row, active, check)?;
         self.poisoned = false;
         Ok(())
     }
@@ -213,9 +214,10 @@ impl PassWriter {
         header: Header,
         event: PassRow,
         row: &[u8],
+        active: &mut dyn FnMut() -> Result<(), String>,
         check: &mut dyn FnMut() -> Result<(), String>,
     ) -> Result<(), String> {
-        check()?;
+        active()?;
         if !matches(self.header, header) {
             return Err("PNG source header changed during pass staging".into());
         }
@@ -263,34 +265,38 @@ impl PassWriter {
         }
         self.next_line += 1;
         if self.next_line - self.band_top == rows {
-            self.flush(check)?;
+            self.flush(active, check)?;
         }
-        check()
+        active()
     }
-    fn flush(&mut self, check: &mut dyn FnMut() -> Result<(), String>) -> Result<(), String> {
+    fn flush(
+        &mut self,
+        active: &mut dyn FnMut() -> Result<(), String>,
+        check: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<(), String> {
         let band = self.band.take().ok_or("PNG pass band is missing")?;
         let g = self.geometry;
         let bytes_per_pixel = if self.header.depth == 16 { 8 } else { 4 };
         let rows = self.next_line - self.band_top;
         let ty = self.band_top / TILE;
         for tx in 0..g.width.div_ceil(TILE) {
-            check()?;
+            active()?;
             let key = (tx, ty);
             let spec = g.spec(key, self.header.depth, self.plain)?;
             let mut output = ScratchBytes::new(&self.pool, spec.bytes(), spec.bytes())
                 .map_err(|e| e.to_string())?;
             let columns = (g.width - tx * TILE).min(TILE) as usize;
             for y in 0..rows as usize {
-                check()?;
+                active()?;
                 let source = (y * g.width as usize + tx as usize * TILE as usize) * bytes_per_pixel;
                 let target = y * spec.width() as usize * bytes_per_pixel;
                 output[target..target + columns * bytes_per_pixel]
                     .copy_from_slice(&band[source..source + columns * bytes_per_pixel]);
             }
-            if nonzero(&output, check)? {
+            if nonzero(&output, active)? {
                 let reference = self
                     .store
-                    .put(spec, &output, &mut || storage_check(check))
+                    .put_guarded(spec, &output, &mut || storage_check(active), &mut || storage_check(check))
                     .map_err(|e| e.to_string())?;
                 if self.maps[g.pass as usize].insert(key, reference).is_some() {
                     return Err("PNG pass tile was staged twice".into());
@@ -618,7 +624,7 @@ mod tests {
                         ColorPolicy::RawSelection,
                     )?);
                 }
-                writer.as_mut().unwrap().push(h, event, row, &mut || Ok(()))
+                writer.as_mut().unwrap().push(h, event, row, &mut || Ok(()), &mut || Ok(()))
             },
         )?;
         writer
@@ -727,8 +733,8 @@ mod tests {
                     PassWriter::new(h, event, store.get(), &encoded, ColorPolicy::RawSelection)?;
                 let mut bad = event;
                 bad.samples += 1;
-                assert!(candidate.push(h, bad, row, &mut || Ok(())).is_err());
-                assert!(candidate.push(h, event, row, &mut || Ok(())).is_err());
+                assert!(candidate.push(h, bad, row, &mut || Ok(()), &mut || Ok(())).is_err());
+                assert!(candidate.push(h, event, row, &mut || Ok(()), &mut || Ok(())).is_err());
                 writer = Some(candidate);
                 Err("Stop poisoned fixture".into())
             }
@@ -800,7 +806,7 @@ mod tests {
                             ColorPolicy::RawSelection,
                         )?);
                     }
-                    writer.as_mut().unwrap().push(h, event, row, &mut || Ok(()))
+                    writer.as_mut().unwrap().push(h, event, row, &mut || Ok(()), &mut || Ok(()))
                 },
             )
             .unwrap();

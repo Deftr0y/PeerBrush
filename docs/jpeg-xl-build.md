@@ -38,7 +38,7 @@ qualification on every platform rechecks the complete exported CC/CXX, CMAKE
 and CMAKE_MAKE_PROGRAM tuple, including separate C and C++ compiler paths on
 Linux and macOS. Without a complete tuple, all tools are selected afresh through
 PATH; partial inherited values are never mixed with discovered selections.
-No version fallback is added.
+No version fallback is added. Tool selection validates the selected file and preserves its absolute launch path when invoking/exporting it, including symbolic compiler-driver aliases. Resolving a C++ driver alias to its shared underlying binary can change driver mode or wrapper behavior; canonical target names do not replace the selected launch name. POSIX alias regression source is prepared, with native execution still pending.
 `python scripts/jxl_build.py` reports whether the installed tool versions are
 the reviewed versions. `python scripts/jxl_build.py -- run --locked -- --state-dir .runtime` selects them for a child
 Cargo command without changing the calling shell; use test/check/build/clippy
@@ -107,3 +107,13 @@ establish compilation and codec/application acceptance. No tool is downloaded.
 The macOS 15 Apple Silicon upgrade test uses Apple Clang 17.0.0, CMake 4.4.4
 and Ninja 1.13.2 from its [hosted image](https://github.com/actions/runner-images/blob/macos-15-arm64/20261028.0489/images/macos/macos-15-arm64-Readme.md).
 The macOS 26 release producer still requires Clang 21.0.0.
+
+## Native import row transport (unreleased)
+
+Native import uses the existing worker executable, process protection and PBJXL001 handshake, with an optional inspected `Info` on Decode requests. Inspect still forbids supplied dimensions; legacy Decode requests retain their existing behavior. A supplied Decode shape is checked in the child at BASIC_INFO before output storage is allocated, and again in the parent's response validator. No in-process file-data decode fallback is introduced.
+
+The supervisor now accepts bounded source writers and row receivers as well as legacy resident buffers. Native callers hold authenticated SessionBytes throughout both inspect and decode. A row receiver writes private canonical native tiles and does not gain document publication authority. Eight-bit samples expand exactly; sixteen-bit little-endian transport words retain all bits when written to canonical big-endian rows.
+
+Child callback allocation (512 MiB), reviewed non-callback/CMS allowance (96 MiB), encoded input, decoded output and profile storage are reserved separately. Parent parsing/transport reservations and row buffers are also separate. Source input and child output are each capped at 64 MiB in this path until incremental decoding is audited. OS process limits remain unchanged, including the documented macOS limitation.
+
+The original stop/reaper path owns both source-session retention and child reservations. Cleanup is allowed only after known exit, including early setup failure cleanup; an uncertain stop leaves registered input and row generations inventoried for verified recovery. Existing supervisor lifecycle tests and new native row/precision/command regression source must run at the authorized release gate. Compile checks do not qualify native acceptance or a release artifact.

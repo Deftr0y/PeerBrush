@@ -163,6 +163,18 @@ pub fn status(requested_state: Option<&Path>) -> Result<Status, String> {
     Ok(status_at(&native_paths()?, requested_state))
 }
 
+/// Explicit CLI registration for a workspace that can already answer authenticated requests.
+pub fn connect_running(state_dir: &Path) -> Result<Report, String> {
+    if !state_dir.is_absolute() || !crate::packaged::external_config_is_visible(state_dir)? {
+        return Err("Choose an absolute workspace visible to external MCP clients".into());
+    }
+    let connection = crate::server::probe_connection(state_dir);
+    if connection.category != crate::server::ConnectionCategory::Ready {
+        return Err(connection.message.into());
+    }
+    connect(&crate::packaged::mcp_command()?, state_dir)
+}
+
 /// Inject destinations so acceptance never reads or modifies real client settings.
 pub fn status_at(paths: &DiscoveryPaths, requested_state: Option<&Path>) -> Status {
     let mut report = Status {
@@ -422,9 +434,12 @@ fn owned(command: Option<&str>, args: Option<&Value>) -> bool {
         .rsplit(['/', '\\'])
         .next()
         .unwrap_or("");
+    let nix_wrapped = base == ".peerbrush-wrapped"
+        && command.is_some_and(|command| crate::updates::ownership::nix_store(Path::new(command)));
     (base.eq_ignore_ascii_case("peerbrush")
         || base.eq_ignore_ascii_case("peerbrush.exe")
-        || base.eq_ignore_ascii_case(crate::packaged::MCP_ALIAS))
+        || base.eq_ignore_ascii_case(crate::packaged::MCP_ALIAS)
+        || nix_wrapped)
         && args
             .and_then(Value::as_array)
             .is_some_and(|a| a.iter().any(|v| v.as_str() == Some("mcp")))

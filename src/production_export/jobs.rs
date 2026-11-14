@@ -1,5 +1,5 @@
 //! Cancellable per-output publication. Completed exports are receipts; originals stay editable.
-use super::{Control, Output, Settings};
+use super::{Capture, Control, Output, Settings};
 use crate::server::Shared;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -65,6 +65,7 @@ pub fn state(library: &Arc<Mutex<super::library::Library>>, id: &str) -> Result<
     let state = job.state.lock().unwrap().clone();
     Ok(state)
 }
+
 pub fn cancel(
     library: &Arc<Mutex<super::library::Library>>,
     id: &str,
@@ -84,9 +85,63 @@ pub fn cancel(
     job.control.cancel();
     state(library, id)
 }
+
+fn launch<F: FnOnce() + Send + 'static>(
+    library: &Arc<Mutex<super::library::Library>>,
+    job: Job,
+    worker: F,
+    spawn: impl FnOnce(F) -> std::io::Result<std::thread::JoinHandle<()>>,
+) -> Result<(), String> {
+    let mut library = library.lock().unwrap();
+    if library
+        .jobs
+        .iter()
+        .any(|j| j.state.lock().unwrap().status == "running")
+    {
+        return Err("Finish or cancel the current export batch first".into());
+    }
+    // Keep the slot exclusive while launching. A refused launch must not
+    // publish a running job or evict a completed receipt.
+    drop(spawn(worker).map_err(|error| format!("Could not start export batch: {error}"))?);
+    while library.jobs.len() >= 8 {
+        library.jobs.remove(0);
+    }
+    library.jobs.push(job);
+    Ok(())
+}
+
 pub fn start(
     shared: &Shared,
     request: &Value,
+    settings: Settings,
+    targets: Vec<String>,
+    directory: PathBuf,
+    existing: Existing,
+    actor: &str,
+) -> Result<State, String> {
+    start_guarded(
+        shared,
+        |engine| {
+            crate::workspace::validate_target(engine, request)?;
+            let document = request["document_id"]
+                .as_str()
+                .ok_or("Export requires the observed document_id")?;
+            let revision = request["expected_revision"]
+                .as_u64()
+                .ok_or("Export requires the observed expected_revision")?;
+            crate::workspace::guard(engine, document, revision)
+        },
+        settings,
+        targets,
+        directory,
+        existing,
+        actor,
+    )
+}
+
+pub(super) fn start_guarded(
+    shared: &Shared,
+    validate_source: impl FnOnce(&crate::engine::Engine) -> Result<(), String>,
     settings: Settings,
     targets: Vec<String>,
     directory: PathBuf,
@@ -103,30 +158,24 @@ pub fn start(
     if !directory.is_dir() {
         return Err("Choose an existing export directory".into());
     }
-    let (doc, project, library) = {
+    let (capture, project, library) = {
         let engine = shared.lock().unwrap();
-        crate::workspace::validate_target(&engine, request)?;
-        let document = request["document_id"]
-            .as_str()
-            .ok_or("Export requires the observed document_id")?;
-        let revision = request["expected_revision"]
-            .as_u64()
-            .ok_or("Export requires the observed expected_revision")?;
-        crate::workspace::guard(&engine, document, revision)?;
+        validate_source(&engine)?;
         (
-            engine.doc.clone(),
+            Capture::new(&engine)?,
             engine.project_id.clone(),
             engine.export_library.clone(),
         )
     };
     let control = Control::default();
     let id = format!("export-{}", crate::engine::id());
+    let doc = capture.view();
     let state = State {
         run: id.clone(),
         actor: actor.into(),
         project_id: project,
-        document_id: doc.id.clone(),
-        revision: doc.revision,
+        document_id: doc.id().to_owned(),
+        revision: doc.revision(),
         status: "running".into(),
         stage: "Planning native output".into(),
         outputs: vec![],
@@ -138,25 +187,13 @@ pub fn start(
         control: control.clone(),
         state: Arc::new(Mutex::new(state.clone())),
     };
-    {
-        let mut library = library.lock().unwrap();
-        if library
-            .jobs
-            .iter()
-            .any(|j| j.state.lock().unwrap().status == "running")
-        {
-            return Err("Finish or cancel the current export batch first".into());
-        }
-        while library.jobs.len() >= 8 {
-            library.jobs.remove(0);
-        }
-        library.jobs.push(job.clone());
-    }
+    let registered = job.clone();
     let shared = shared.clone();
-    std::thread::spawn(move || {
+    let worker = move || {
         let _operation = operation;
         let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||->Result<(),String> {
-            let plan=super::plan(&doc,&targets,&settings,&control)?;
+            let plan=capture.plan(&shared,&targets,&settings,&control)?;
+            capture.validate(&shared.lock().unwrap())?;
             {
                 let mut state=job.state.lock().unwrap();
                 state.outputs=plan.outputs.iter().map(|output|Receipt {output:output.clone(),path:directory.join(&output.filename),status:"not_written".into(),bytes:None,message:None}).collect();
@@ -165,9 +202,10 @@ pub fn start(
                 control.check()?;
                 job.state.lock().unwrap().stage=format!("Rendering {} ({}/{})",output.filename,index+1,plan.outputs.len());
                 let path=directory.join(&output.filename);
-                let published=crate::server::export_derived_to_guarded(&shared,&path,&json!({"document_id":doc.id,"expected_revision":doc.revision,"overwrite":existing==Existing::Replace,"skip_existing":existing==Existing::Skip}),&control, |source,writer| {
-                    super::render_to(source,output,&settings,&control,writer)
-                });
+                let published=crate::server::export_planned_to_guarded(
+                    &shared,&path,&json!({"document_id":plan.document_id,"expected_revision":plan.revision,"overwrite":existing==Existing::Replace,"skip_existing":existing==Existing::Skip}),
+                    &control,output,&settings,capture.seed(),
+                );
                 let published=match published {
                     Ok(published)=>published,
                     Err(error)=>{let mut state=job.state.lock().unwrap();state.outputs[index].status="failed".into();state.outputs[index].message=Some(error.clone());return Err(error);}
@@ -200,6 +238,71 @@ pub fn start(
                 }
             }
         }
-    });
+    };
+    launch(&library, registered, worker, |worker| {
+        std::thread::Builder::new()
+            .name("peerbrush-export-batch".into())
+            .spawn(worker)
+    })?;
     Ok(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn job(id: String, status: &str) -> Job {
+        Job {
+            id: id.clone(),
+            actor: "human".into(),
+            control: Control::default(),
+            state: Arc::new(Mutex::new(State {
+                run: id,
+                actor: "human".into(),
+                project_id: "project".into(),
+                document_id: "document".into(),
+                revision: 0,
+                status: status.into(),
+                stage: String::new(),
+                outputs: vec![],
+                error: None,
+            })),
+        }
+    }
+
+    #[test]
+    fn refused_worker_keeps_receipts_and_releases_the_batch_slot_and_file_operation() {
+        let library = Arc::new(Mutex::new(super::super::library::Library::default()));
+        library.lock().unwrap().jobs = (0..8)
+            .map(|index| job(index.to_string(), "completed"))
+            .collect();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let operation = crate::server::FileOperation::track(counter.clone());
+        let refused = launch(
+            &library,
+            job("refused".into(), "running"),
+            move || drop(operation),
+            |_| Err(std::io::Error::other("Worker creation refused")),
+        );
+        assert!(refused.unwrap_err().contains("Worker creation refused"));
+        assert_eq!(counter.load(Ordering::Acquire), 0);
+        let runs = || {
+            states(&library)
+                .into_iter()
+                .map(|state| state.run)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(runs(), (0..8).map(|index| index.to_string()).collect::<Vec<_>>());
+
+        launch(&library, job("retry".into(), "running"), || {}, |worker| {
+            std::thread::Builder::new().spawn(worker)
+        })
+        .unwrap();
+        assert_eq!(runs(), ["1", "2", "3", "4", "5", "6", "7", "retry"]);
+        let overlapping = launch(&library, job("overlap".into(), "running"), || {}, |_| {
+            panic!("A competing batch must not start a worker");
+        });
+        assert!(overlapping.unwrap_err().contains("current export batch"));
+    }
 }

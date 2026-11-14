@@ -9,6 +9,7 @@ use crate::{engine::Document, raster::check_size};
 pub use compositor::Plan16;
 pub use mask::Gray16;
 use std::{
+    borrow::Cow,
     collections::{HashMap, VecDeque},
     sync::{Arc, Mutex, OnceLock},
 };
@@ -93,8 +94,14 @@ pub fn validate_budget(doc: &Document) -> Result<(), String> {
     Ok(())
 }
 pub fn prepare_masks(doc: &Document) -> Result<Vec<Option<Arc<Gray16>>>, String> {
+    prepare_masks_checked(doc, &|| Ok(()))
+}
+pub(crate) fn prepare_masks_checked(
+    doc: &Document,
+    check: &crate::render::Check<'_>,
+) -> Result<Vec<Option<Arc<Gray16>>>, String> {
     validate_budget(doc)?;
-    doc.layers.iter().map(mask::prepare).collect()
+    doc.layers.iter().map(|layer| mask::prepare_checked(layer, check)).collect()
 }
 pub fn mask_value_prepared(
     layer: &crate::engine::Layer,
@@ -124,10 +131,19 @@ pub(crate) fn prepare_with_masks(
     doc: &Document,
     masks: &[Option<Arc<Gray16>>],
 ) -> Result<Vec<Option<Arc<Image16>>>, String> {
+    prepare_with_masks_checked(doc, masks, &|| Ok(()))
+}
+pub(crate) fn prepare_with_masks_checked(
+    doc: &Document,
+    masks: &[Option<Arc<Gray16>>],
+    check: &crate::render::Check<'_>,
+) -> Result<Vec<Option<Arc<Image16>>>, String> {
+    check()?;
     validate_budget(doc)?;
     let mut out = vec![None; doc.layers.len()];
     let cache = COLORS.get_or_init(|| Mutex::new(ColorCache::default()));
     for index in crate::compositor::effect_order(doc) {
+        check()?;
         let layer = &doc.layers[index];
         if !crate::effects::active(layer) {
             continue;
@@ -153,6 +169,7 @@ pub(crate) fn prepare_with_masks(
             }
         }
         if let Some(bytes) = crate::disk_cache::read(&key, width, height, 16) {
+            check()?;
             let words = bytes
                 .chunks_exact(2)
                 .map(|v| u16::from_ne_bytes([v[0], v[1]]))
@@ -176,8 +193,12 @@ pub(crate) fn prepare_with_masks(
         let mut image = match layer.kind.as_str() {
             "fill" => {
                 let mut image = Image16::new(base_width, base_height)?;
-                for pixel in image.words.chunks_exact_mut(4) {
-                    pixel.copy_from_slice(&layer.color.map(|v| u16::from(v) * 257));
+                let color = layer.color.map(|v| u16::from(v) * 257);
+                for row in image.words.chunks_mut((base_width as usize * 4).max(1)) {
+                    check()?;
+                    for pixel in row.chunks_exact_mut(4) {
+                        pixel.copy_from_slice(&color);
+                    }
                 }
                 image
             }
@@ -188,13 +209,13 @@ pub(crate) fn prepare_with_masks(
                 Image16 {
                     width,
                     height,
-                    words: crate::render::rgba16(width, height, |x, y| {
+                    words: crate::render::rgba(width, height, check, |x, y| {
                         if layer.kind == "group" {
                             plan.sample(group, x as i32, y as i32)
                         } else {
                             plan.adjustment_input(index, x as i32, y as i32)
                         }
-                    }),
+                    })?,
                 }
             }
             _ => Image16 {
@@ -205,10 +226,11 @@ pub(crate) fn prepare_with_masks(
         };
         let mut expanded = base_frame;
         for effect in layer.effects.iter().filter(|e| e.enabled && e.weight > 0.0) {
+            check()?;
             if crate::effects::styles::contains(&effect.kind) && !expanded {
-                let words = crate::render::rgba16(width, height, |x, y| {
+                let words = crate::render::rgba(width, height, check, |x, y| {
                     image.get(x as i32 - layer.x, y as i32 - layer.y)
-                });
+                })?;
                 image = Image16 {
                     width,
                     height,
@@ -218,6 +240,7 @@ pub(crate) fn prepare_with_masks(
             }
             color::apply_effect(&mut image, effect, None)?;
         }
+        check()?;
         let image = Arc::new(image);
         let mut cache = cache.lock().map_err(|_| "16-bit color cache unavailable")?;
         if let Some(existing) = cache.items.get(&key) {
@@ -227,6 +250,7 @@ pub(crate) fn prepare_with_masks(
         insert_color(&mut cache, key, image.clone());
         out[index] = Some(image);
     }
+    check()?;
     Ok(out)
 }
 fn insert_color(cache: &mut ColorCache, key: String, image: Arc<Image16>) {
@@ -258,28 +282,36 @@ fn insert_color(cache: &mut ColorCache, key: String, image: Arc<Image16>) {
     cache.items.insert(key, image.clone());
 }
 pub fn render_crop(doc: &Document, rect: [i32; 4]) -> Result<Image16, String> {
+    render_crop_checked(doc, rect, &|| Ok(()))
+}
+pub(crate) fn render_crop_checked(
+    doc: &Document,
+    rect: [i32; 4],
+    check: &crate::render::Check<'_>,
+) -> Result<Image16, String> {
+    check()?;
     let width = u32::try_from(i64::from(rect[2]) - i64::from(rect[0]))
         .map_err(|_| "Invalid16-bit render rectangle")?;
     let height = u32::try_from(i64::from(rect[3]) - i64::from(rect[1]))
         .map_err(|_| "Invalid16-bit render rectangle")?;
     check_size(width, height)?;
     if crate::filters::active(doc) {
-        let image = crate::filters::prepare16(doc)?;
+        let image = crate::filters::prepare16_checked(doc, check)?;
         return Ok(Image16 {
             width,
             height,
-            words: crate::render::rgba16(width, height, |x, y| {
+            words: crate::render::rgba(width, height, check, |x, y| {
                 image.get(rect[0] + x as i32, rect[1] + y as i32)
-            }),
+            })?,
         });
     }
-    let plan = Plan16::new(doc)?;
+    let plan = Plan16::new_checked(doc, check)?;
     Ok(Image16 {
         width,
         height,
-        words: crate::render::rgba16(width, height, |x, y| {
+        words: crate::render::rgba(width, height, check, |x, y| {
             plan.pixel(rect[0] + x as i32, rect[1] + y as i32)
-        }),
+        })?,
     })
 }
 pub fn render(doc: &Document) -> Result<Image16, String> {
@@ -308,16 +340,38 @@ pub fn preview16(
     target: Option<&str>,
     mask: bool,
 ) -> Result<(u32, u32, Vec<u16>, [i32; 4]), String> {
-    preview_impl(doc, rect, edge, target, mask, false)
+    let check = || Ok(());
+    let (width, height, pixels, rect) = preview_impl(doc, rect, edge, target, mask, false,
+        |width, height, sample| crate::render::rgba(width, height, &check, sample), &check)?;
+    Ok((width, height, pixels.into_words(), rect))
 }
-fn preview_impl(
+
+enum PreviewPixels<T> {
+    Cpu(Vec<T>),
+    Gpu(Vec<u16>),
+}
+
+impl PreviewPixels<u16> {
+    fn into_words(self) -> Vec<u16> {
+        match self {
+            Self::Cpu(words) | Self::Gpu(words) => words,
+        }
+    }
+}
+
+type PreviewSample<'a> = dyn Fn(u32, u32) -> Pixel16 + Sync + 'a;
+
+fn preview_impl<T>(
     doc: &Document,
     rect: Option<[i32; 4]>,
     edge: u32,
     target: Option<&str>,
     mask: bool,
     gpu: bool,
-) -> Result<(u32, u32, Vec<u16>, [i32; 4]), String> {
+    render: impl Fn(u32, u32, &PreviewSample<'_>) -> Result<Vec<T>, String>,
+    check: &crate::render::Check<'_>,
+) -> Result<(u32, u32, PreviewPixels<T>, [i32; 4]), String> {
+    check()?;
     validate_budget(doc)?;
     let mut rect = rect.unwrap_or([0, 0, doc.width as i32, doc.height as i32]);
     rect[0] = rect[0].clamp(0, doc.width as i32 - 1);
@@ -338,17 +392,30 @@ fn preview_impl(
         })
         .transpose()?;
     if index.is_none() && !mask && crate::filters::active(doc) {
-        let image = crate::filters::prepare16(doc)?;
-        let words = crate::render::rgba16(width, height, |x, y| {
+        let image = crate::filters::prepare16_checked(doc, check)?;
+        let pixels = render(width, height, &|x, y| {
             image.get(
                 rect[0] + (x as f64 / scale) as i32,
                 rect[1] + (y as f64 / scale) as i32,
             )
-        });
-        return Ok((width, height, words, rect));
+        })?;
+        return Ok((width, height, PreviewPixels::Cpu(pixels), rect));
     }
-    let masks = prepare_masks(doc)?;
-    let colors = prepare_with_masks(doc, &masks)?;
+    if let Some(index) = index.filter(|_| mask) {
+        let layer = &doc.layers[index];
+        let prepared = mask::prepare_checked(layer, check)?;
+        check_size(width, height)?;
+        let pixels = render(width, height, &|x, y| {
+            let sx = rect[0] + (x as f64 / scale) as i32;
+            let sy = rect[1] + (y as f64 / scale) as i32;
+            let gray = mask::raw_word(layer, sx - layer.x, sy - layer.y, prepared.as_deref());
+            [gray, gray, gray, 65535]
+        })?;
+        return Ok((width, height, PreviewPixels::Cpu(pixels), rect));
+    }
+    let masks = prepare_masks_checked(doc, check)?;
+    let colors = prepare_with_masks_checked(doc, &masks, check)?;
+    check()?;
     if gpu && index.is_none() && !mask && scale < 1.0 {
         let xs: Vec<_> = (0..width)
             .map(|x| rect[0] + (x as f64 / scale) as i32)
@@ -357,27 +424,22 @@ fn preview_impl(
             .map(|y| rect[1] + (y as f64 / scale) as i32)
             .collect();
         if let Some(words) = crate::gpu::composite::try_render16(doc, &colors, &xs, &ys) {
-            return Ok((width, height, words, rect));
+            check()?;
+            return Ok((width, height, PreviewPixels::Gpu(words), rect));
         }
     }
     let plan = Plan16::with_prepared(doc, &masks, &colors);
     check_size(width, height)?;
-    let words = crate::render::rgba16(width, height, |x, y| {
+    let pixels = render(width, height, &|x, y| {
         let sx = rect[0] + (x as f64 / scale) as i32;
         let sy = rect[1] + (y as f64 / scale) as i32;
-        let pixel = if let Some(index) = index {
-            if mask {
-                let v = (plan.mask(index, sx, sy, true) * 65535.0).round() as u16;
-                [v, v, v, 65535]
-            } else {
-                plan.layer(index, sx, sy)
-            }
+        if let Some(index) = index {
+            plan.layer(index, sx, sy)
         } else {
             plan.pixel(sx, sy)
-        };
-        pixel
-    });
-    Ok((width, height, words, rect))
+        }
+    })?;
+    Ok((width, height, PreviewPixels::Cpu(pixels), rect))
 }
 pub fn preview(
     doc: &Document,
@@ -386,17 +448,74 @@ pub fn preview(
     target: Option<&str>,
     mask: bool,
 ) -> Result<(u32, u32, Vec<u8>, [i32; 4]), String> {
-    let (width, height, mut words, rect) = preview_impl(doc, rect, edge, target, mask, true)?;
-    if !mask {
-        if let Some(profile) = doc.icc_profile.as_deref() {
-            if crate::color_profile::supported(profile).is_ok() {
-                crate::color_profile::convert16(profile, &mut words)?;
+    preview_checked(doc, rect, edge, target, mask, &|| Ok(()))
+}
+pub(crate) fn preview_checked(
+    doc: &Document,
+    rect: Option<[i32; 4]>,
+    edge: u32,
+    target: Option<&str>,
+    mask: bool,
+    check: &crate::render::Check<'_>,
+) -> Result<(u32, u32, Vec<u8>, [i32; 4]), String> {
+    check()?;
+    let profile = doc.icc_profile.as_deref().filter(|_| !mask)
+        .and_then(|bytes| crate::color_profile::transforms(bytes).ok());
+    let (width, height, pixels, rect) = preview_impl(doc, rect, edge, target, mask, true,
+        |width, height, sample| {
+            if let Some(profile) = &profile {
+                project_profiled(width, height, profile, check, |top, rows| {
+                    crate::render::rgba(width, rows, check, |x, y| sample(x, top + y)).map(Cow::Owned)
+                })
+            } else {
+                crate::render::rgba(width, height, check, |x, y| display_pixel(sample(x, y)))
             }
+        }, check)?;
+    let bytes = match (pixels, profile) {
+        (PreviewPixels::Cpu(bytes), _) => bytes,
+        (PreviewPixels::Gpu(words), Some(profile)) => {
+            let stride = width as usize * 4;
+            project_profiled(width, height, &profile, check, |top, rows| {
+                Ok(Cow::Borrowed(&words[top as usize * stride..(top + rows) as usize * stride]))
+            })?
+        }
+        (PreviewPixels::Gpu(words), None) => project_words(width, height, &words, check)?,
+    };
+    Ok((width, height, bytes, rect))
+}
+
+fn project_profiled<'a>(
+    width: u32,
+    height: u32,
+    profile: &crate::color_profile::Transforms,
+    check: &crate::render::Check<'_>,
+    read: impl Fn(u32, u32) -> Result<Cow<'a, [u16]>, String>,
+) -> Result<Vec<u8>, String> {
+    // Full bands preserve the vector grouping of the whole-frame transform.
+    // Only the final band can reach the converter's scalar tail.
+    let band_rows = 131_072u32.div_ceil(width).next_multiple_of(32);
+    let stride = width as usize * 4;
+    let mut converted = vec![0; stride * band_rows.min(height) as usize];
+    let mut bytes = vec![0; stride * height as usize];
+    for top in (0..height).step_by(band_rows as usize) {
+        check()?;
+        let rows = (height - top).min(band_rows);
+        let input = read(top, rows)?;
+        let output = &mut converted[..stride * rows as usize];
+        profile.convert16_into(&input, output)?;
+        for (input, pixel) in output.chunks_exact(4)
+            .zip(bytes[top as usize * stride..(top + rows) as usize * stride].chunks_exact_mut(4))
+        {
+            pixel.copy_from_slice(&display_pixel(input.try_into().unwrap()));
         }
     }
-    let bytes = crate::render::rgba8(width, height, |x, y| {
+    check()?;
+    Ok(bytes)
+}
+
+fn project_words(width: u32, height: u32, words: &[u16], check: &crate::render::Check<'_>) -> Result<Vec<u8>, String> {
+    crate::render::rgba(width, height, check, |x, y| {
         let at = ((y * width + x) * 4) as usize;
         display_pixel(words[at..at + 4].try_into().unwrap())
-    });
-    Ok((width, height, bytes, rect))
+    })
 }

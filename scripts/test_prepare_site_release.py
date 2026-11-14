@@ -155,7 +155,7 @@ class Published(unittest.TestCase):
             with self.subTest(date=type(value).__name__), self.assertRaises(ValueError):
                 self.published()
 
-    def test_installed_policy_blocks_portable_fallback_without_version_magic(self):
+    def installed_policy(self):
         # A source policy is part of the exact selected commit, not a cutoff in
         # the website script. This synthetic release uses installed-only formats.
         path = self.root / 'packaging/release-policy.json'
@@ -172,6 +172,10 @@ class Published(unittest.TestCase):
         self.inventory = json.loads((self.directory / 'release-inventory.json').read_bytes())
         self.assets = {p.name: p.read_bytes() for p in self.directory.iterdir() if p.name != 'release-inventory.json'}
         self.metadata()
+
+    def test_installed_policy_blocks_portable_fallback_without_version_magic(self):
+        self.installed_policy()
+        commit = self.commit
         entry, excluded = self.published()
         self.assertEqual(entry['platforms'], [])
         self.assertEqual(sum(e['reason'] == 'not-selected-by-committed-distribution-policy' for e in excluded), 3)
@@ -434,10 +438,9 @@ class Published(unittest.TestCase):
                 site.prepare(self.root, 'a' * 40, self.inventory, 'v0.2.0', self.commit, self.notes, output.with_name(output.name + '-failed'), self.get)
             self.assertFalse(output.with_name(output.name + '-failed').exists())
 
-    def final_dmg(self):
+    def sign_macos_portable(self):
         import test_sign_macos
         from verify_release import inspect_archive
-        self.final_deb()
         original = next(a for a in self.inventory['assets'] if a.get('platform') == 'macOS')
         signer = test_sign_macos.Signing(methodName='test_success_final_hashes_source_preservation_and_native_validation')
         self.addCleanup(signer.doCleanups)
@@ -450,6 +453,14 @@ class Published(unittest.TestCase):
         self.inventory['assets'] = [self.macos if a == original else a for a in self.inventory['assets']]
         self.assets.pop(original['file'])
         self.assets[signed.name] = signed.read_bytes()
+        self.assets['SHA256SUMS'] = ''.join(f"{a['sha256']}  {a['file']}\n" for a in self.inventory['assets']).encode()
+        self.metadata()
+        return signed
+
+    def final_dmg(self):
+        import test_sign_macos
+        self.final_deb()
+        signed = self.sign_macos_portable()
         self.dmg_name = signed.stem + '-dmg-signed-r2.dmg'
         image = b'SYNTHETIC_UNVERIFIED_BYTES_NOT_A_DMG'
         self.dmg_record = dict(file=self.dmg_name, bytes=len(image), sha256=site.sha(image), platform='macOS',

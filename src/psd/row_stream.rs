@@ -4,7 +4,9 @@
 //! streams, without retaining incomplete RGBA tiles for an entire canvas. These
 //! are unpredicted on-disk channel samples; composite white-matte/transparency
 //! interpretation remains the existing semantic codec's responsibility.
-use super::structural::{Compression, Encoding, Format, Span};
+use super::structural::{rle_row_length, sum_rle_table, Compression, Encoding, Span};
+#[cfg(test)]
+use super::structural::Format;
 use flate2::{Decompress, FlushDecompress, Status};
 use std::cell::{Cell, RefCell};
 use std::io::{self, Read, Seek, SeekFrom};
@@ -17,6 +19,7 @@ pub(crate) struct Source<R> {
     bytes: u64,
     window: RefCell<Option<ReadWindow>>,
     window_valid: Cell<bool>,
+    direct_raw_stripes: bool,
 }
 struct ReadWindow {
     bytes: crate::large_document::ScratchBytes,
@@ -38,6 +41,7 @@ impl<R: Read + Seek> Source<R> {
             bytes: expected_bytes,
             window: RefCell::new(None),
             window_valid: Cell::new(false),
+            direct_raw_stripes: false,
         })
     }
 
@@ -51,6 +55,17 @@ impl<R: Read + Seek> Source<R> {
     ) -> Result<Self, String> {
         if buffer.len() != TRANSFER {
             return Err("Photoshop source read window differs from its 64 KiB admission".into());
+        }
+        Self::with_window(input, expected_bytes, buffer)
+    }
+
+    fn with_window(
+        input: R,
+        expected_bytes: u64,
+        buffer: crate::large_document::ScratchBytes,
+    ) -> Result<Self, String> {
+        if !(TRANSFER..=crate::large_document::VERIFIED_BATCH_BYTES).contains(&buffer.len()) {
+            return Err("Photoshop source read window exceeds its transfer admission".into());
         }
         let source = Self::new(input, expected_bytes)?;
         *source.window.borrow_mut() = Some(ReadWindow {
@@ -68,6 +83,17 @@ impl<R: Read + Seek> Source<R> {
         span: Span,
         check: &'a dyn Fn() -> Result<(), String>,
     ) -> Result<Ranged<'a, R>, String> {
+        let mut range = self.range_with_checks(span, check, check)?;
+        range.use_shared_cached_check = false;
+        Ok(range)
+    }
+
+    pub(super) fn range_with_checks<'a>(
+        &'a self,
+        span: Span,
+        check: &'a dyn Fn() -> Result<(), String>,
+        check_cached: &'a dyn Fn() -> Result<(), String>,
+    ) -> Result<Ranged<'a, R>, String> {
         check()?;
         if span.end()? > self.bytes {
             return Err("Photoshop range exceeds indexed source".into());
@@ -77,7 +103,49 @@ impl<R: Read + Seek> Source<R> {
             span,
             position: 0,
             check,
+            check_cached,
+            window: None,
+            use_shared_cached_check: true,
         })
+    }
+
+    /// A fresh forward scan for a digest over one indexed span.
+    pub(super) fn scan(
+        &self,
+        span: Span,
+        scratch: &mut [u8],
+        check: &dyn Fn() -> Result<(), String>,
+        mut consume: impl FnMut(&[u8]) -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.window_valid.set(false);
+        check()?;
+        if scratch.is_empty() || span.end()? > self.bytes {
+            return Err("Photoshop scan exceeds indexed source or has no buffer".into());
+        }
+        // Reuse the admitted allocation, never its cached observation.
+        let mut window = self.window.try_borrow_mut()
+            .map_err(|_| "Photoshop read window is already borrowed")?;
+        let transfer = match window.as_mut() {
+            Some(window) if window.bytes.len() > scratch.len() => &mut window.bytes[..],
+            _ => scratch,
+        };
+        let mut input = self.input.try_borrow_mut()
+            .map_err(|_| "Photoshop stream is already borrowed")?;
+        if input.seek(SeekFrom::Start(span.offset)).map_err(|e| e.to_string())? != span.offset {
+            return Err("Photoshop stream seek differs".into());
+        }
+        let mut remaining = span.bytes;
+        while remaining != 0 {
+            check()?;
+            let limit = remaining.min(transfer.len() as u64) as usize;
+            let count = input.read(&mut transfer[..limit]).map_err(|e| e.to_string())?;
+            if count == 0 || count > limit {
+                return Err("Invalid or truncated Photoshop scan".into());
+            }
+            consume(&transfer[..count])?;
+            remaining -= count as u64;
+        }
+        check()
     }
 
     fn read_at(&self, position: u64, out: &mut [u8]) -> io::Result<usize> {
@@ -113,7 +181,7 @@ impl<R: Read + Seek> Source<R> {
             if input.seek(SeekFrom::Start(position))? != position {
                 return Err(io::Error::other("Photoshop stream seek differs"));
             }
-            let limit = (self.bytes - position).min(TRANSFER as u64) as usize;
+            let limit = (self.bytes - position).min(window.bytes.len() as u64) as usize;
             let count = input.read(&mut window.bytes[..limit])?;
             if count > limit {
                 return Err(io::Error::other("Invalid Photoshop read result"));
@@ -177,7 +245,18 @@ impl<R: Read + Seek> Source<R> {
         encoding: &Encoding,
         check: &'a dyn Fn() -> Result<(), String>,
     ) -> Result<Rows<'a, R>, String> {
-        check()?;
+        self.rows_with_checks(encoding, check, check)
+    }
+
+    /// The backing decoder validates ownership at file I/O and tile writes.
+    /// Decoding bytes already held in memory only needs its cancellation check.
+    pub(super) fn rows_with_checks<'a>(
+        &'a self,
+        encoding: &Encoding,
+        check_io: &'a dyn Fn() -> Result<(), String>,
+        check: &'a dyn Fn() -> Result<(), String>,
+    ) -> Result<Rows<'a, R>, String> {
+        check_io()?;
         if ![8, 16].contains(&encoding.depth)
             || encoding.row_bytes > MAX_ROW_BYTES
             || encoding.row_bytes % u64::from(encoding.depth / 8) != 0
@@ -196,7 +275,10 @@ impl<R: Read + Seek> Source<R> {
             source: self,
             span,
             position: 0,
-            check,
+            check: check_io,
+            check_cached: check,
+            window: None,
+            use_shared_cached_check: false,
         };
         let state = if encoding.compression == Compression::Empty {
             if encoding.span.bytes != 0
@@ -242,7 +324,7 @@ impl<R: Read + Seek> Source<R> {
                 }
                 Compression::Rle => {
                     let counts = encoding.counts.ok_or("Missing Photoshop row table")?;
-                    let count_bytes = if encoding.format == Format::Psb { 4 } else { 2 };
+                    let count_bytes = encoding.format.rle_count_width() as u64;
                     if counts.offset != after
                         || encoding.rows.checked_mul(count_bytes) != Some(counts.bytes)
                         || counts.end()? != encoding.payload.offset
@@ -251,7 +333,7 @@ impl<R: Read + Seek> Source<R> {
                     }
                     State::Rle {
                         input: range(encoding.payload),
-                        counts,
+                        counts: range(counts),
                         packed: Vec::new(),
                     }
                 }
@@ -273,9 +355,122 @@ impl<R: Read + Seek> Source<R> {
             next: 0,
             state,
             check,
+            check_io,
             finished: false,
             failed: false,
         })
+    }
+
+    /// Merged planes share one compression header. Validate that envelope
+    /// and require disjoint ranges to cover the complete encoded payload.
+    pub(super) fn composite_planes<'a>(
+        &'a self,
+        encoding: &Encoding,
+        height: u32,
+        channels: u16,
+        scratch: &mut [u8],
+        check_io: &'a dyn Fn() -> Result<(), String>,
+        check: &'a dyn Fn() -> Result<(), String>,
+    ) -> Result<CompositePlanes<'a, R>, String> {
+        if !matches!(encoding.compression, Compression::Raw | Compression::Rle)
+            || encoding.row_padding != 0 || encoding.row_bytes == 0
+            || !(1..=4).contains(&channels) || height == 0
+            || encoding.rows != u64::from(height) * u64::from(channels)
+        {
+            return Err("Photoshop composite plane geometry differs".into());
+        }
+        self.rows_with_checks(encoding, check_io, check)?;
+        let range = |span| self.range(span, check_io).map(|mut range| {
+            range.check_cached = check;
+            range
+        });
+        let count_width = encoding.format.rle_count_width();
+        let count_bytes = u64::from(height) * count_width as u64;
+        let mut offset = encoding.payload.offset;
+        let end = encoding.payload.end()?;
+        let mut planes = Vec::with_capacity(channels as usize);
+        for channel in 0..u64::from(channels) {
+            let counts = encoding.counts.map(|table| Span {
+                offset: table.offset + channel * count_bytes,
+                bytes: count_bytes,
+            });
+            let bytes = if let Some(counts) = counts {
+                let mut input = range(counts)?;
+                sum_rle_table(&mut input, encoding.format, u64::from(height), encoding.row_bytes, scratch, &mut || check())?
+            } else {
+                encoding.row_bytes * u64::from(height)
+            };
+            let payload = Span { offset, bytes };
+            offset = payload.end()?;
+            if offset > end { return Err("Photoshop composite plane exceeds its payload".into()); }
+            let input = range(payload)?;
+            let state = if let Some(counts) = counts {
+                State::Rle { input, counts: range(counts)?, packed: Vec::new() }
+            } else {
+                State::Raw(input)
+            };
+            // These private substreams are never exposed as completion
+            // tokens for the shared composite envelope.
+            planes.push(Rows {
+                source: self,
+                encoding: Encoding { rows: u64::from(height), counts, payload, ..encoding.clone() },
+                state,
+                next: 0,
+                check,
+                check_io,
+                finished: false,
+                failed: false,
+            });
+        }
+        if offset != end { return Err("Photoshop composite planes leave trailing data".into()); }
+        Ok(CompositePlanes(planes))
+    }
+}
+
+impl<'a> Source<crate::large_document::BytesCursor<'a>> {
+    pub(crate) fn with_sealed_buffer(
+        input: crate::large_document::BytesCursor<'a>,
+        bytes: u64,
+        buffer: crate::large_document::ScratchBytes,
+    ) -> Result<Self, String> {
+        // Save reads sequential planes from a sealed spool. Keep its verified
+        // read window across stripes instead of rereading boundary chunks.
+        Self::with_window(input, bytes, buffer)
+    }
+}
+
+impl<'a> Source<&'a mut std::fs::File> {
+    pub(super) fn with_held_buffer(
+        file: &'a mut std::fs::File,
+        version: crate::file_safety::Version,
+        buffer: crate::large_document::ScratchBytes,
+    ) -> Result<Self, String> {
+        if crate::file_safety::identity(file)? != version.identity {
+            return Err("Photoshop decoder handle differs from its admitted source".into());
+        }
+        let mut source = Self::with_window(file, version.bytes, buffer)?;
+        source.direct_raw_stripes = true;
+        Ok(source)
+    }
+}
+
+pub(super) struct CompositePlanes<'a, R>(Vec<Rows<'a, R>>);
+
+impl<R: Read + Seek> CompositePlanes<'_, R> {
+    pub(super) fn prefetch(&mut self, pool: &crate::large_document::ResidentBudget) {
+        for plane in &mut self.0 {
+            if plane.encoding.compression == Compression::Rle { plane.prefetch(pool); }
+        }
+    }
+
+    pub(super) fn read(&mut self, channel: usize, output: &mut [u8]) -> Result<(), String> {
+        let plane = self.0.get_mut(channel).ok_or("Invalid Photoshop composite plane")?;
+        plane.read_rows(output)
+    }
+
+    pub(super) fn finish(mut self) -> Result<(), String> {
+        for plane in &mut self.0 { let _ = plane.finish()?; }
+        Ok(())
     }
 }
 
@@ -284,6 +479,63 @@ pub(crate) struct Ranged<'a, R> {
     span: Span,
     position: u64,
     check: &'a dyn Fn() -> Result<(), String>,
+    check_cached: &'a dyn Fn() -> Result<(), String>,
+    window: Option<ReadWindow>,
+    use_shared_cached_check: bool,
+}
+
+impl<R> Ranged<'_, R> {
+    fn prefetch(&mut self, pool: &crate::large_document::ResidentBudget) {
+        let len = self.span.bytes.min(TRANSFER as u64) as usize;
+        self.window = crate::large_document::ScratchBytes::new(pool, len, TRANSFER)
+            .ok().map(|bytes| ReadWindow { bytes, offset: 0, used: 0 });
+    }
+}
+
+impl<R: Read + Seek> Ranged<'_, R> {
+    fn read_raw_stripe(&mut self, out: &mut [u8]) -> io::Result<()> {
+        if !self.source.direct_raw_stripes
+            || self.window.is_some()
+            || !(TRANSFER + 1..=super::bulk36::MAX_TILE_BYTES).contains(&out.len())
+        {
+            return self.read_exact(out);
+        }
+        if out.len() as u64 > self.span.bytes - self.position {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Photoshop stripe exceeds its plane",
+            ));
+        }
+        (self.check)().map_err(|_| io::Error::other("Photoshop decode interrupted"))?;
+        self.source.window_valid.set(false);
+        let mut input = self
+            .source
+            .input
+            .try_borrow_mut()
+            .map_err(|_| io::Error::other("Photoshop stream is already borrowed"))?;
+        let offset = self
+            .span
+            .offset
+            .checked_add(self.position)
+            .ok_or_else(|| io::Error::other("Photoshop range overflow"))?;
+        if input.seek(SeekFrom::Start(offset))? != offset {
+            return Err(io::Error::other("Photoshop stream seek differs"));
+        }
+        let length = out.len();
+        let mut remaining = out;
+        while !remaining.is_empty() {
+            (self.check)().map_err(|_| io::Error::other("Photoshop decode interrupted"))?;
+            match input.read(remaining) {
+                Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+                Ok(count) if count <= remaining.len() => remaining = &mut remaining[count..],
+                Ok(_) => return Err(io::Error::other("Invalid Photoshop read result")),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        self.position += length as u64;
+        Ok(())
+    }
 }
 
 impl<R: Read + Seek> Seek for Ranged<'_, R> {
@@ -307,20 +559,49 @@ impl<R: Read + Seek> Seek for Ranged<'_, R> {
 
 impl<R: Read + Seek> Read for Ranged<'_, R> {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        (self.check)().map_err(|_| io::Error::other("Photoshop decode interrupted"))?;
+        let cached = self.window.as_ref().is_some_and(|window| {
+            self.position >= window.offset && self.position - window.offset < window.used as u64
+        });
         let count = out
             .len()
             .min(TRANSFER)
             .min(usize::try_from(self.span.bytes - self.position).unwrap_or(usize::MAX));
-        if count == 0 {
-            return Ok(0);
-        }
         let position = self
             .span
             .offset
             .checked_add(self.position)
             .ok_or_else(|| io::Error::other("Photoshop range overflow"))?;
-        let n = self.source.read_at(position, &mut out[..count])?;
+        let shared_cached = self.use_shared_cached_check
+            && self.window.is_none()
+            && self.source.window_valid.get()
+            && self.source.window.try_borrow()
+                .map_err(|_| io::Error::other("Photoshop read window is already borrowed"))?
+                .as_ref()
+                .is_some_and(|window| position >= window.offset
+                    && position - window.offset < window.used as u64);
+        let check = if count != 0 && (cached || shared_cached) {
+            self.check_cached
+        } else {
+            self.check
+        };
+        check().map_err(|_| io::Error::other("Photoshop decode interrupted"))?;
+        if count == 0 {
+            return Ok(0);
+        }
+        let n = if let Some(window) = &mut self.window {
+            if !cached {
+                window.used = 0;
+                let len = (self.span.bytes - self.position).min(window.bytes.len() as u64) as usize;
+                window.used = self.source.read_at(position, &mut window.bytes[..len])?;
+                window.offset = self.position;
+            }
+            let begin = (self.position - window.offset) as usize;
+            let count = count.min(window.used - begin);
+            out[..count].copy_from_slice(&window.bytes[begin..begin + count]);
+            count
+        } else {
+            self.source.read_at(position, &mut out[..count])?
+        };
         self.position += n as u64;
         Ok(n)
     }
@@ -330,7 +611,7 @@ enum State<'a, R> {
     Raw(Ranged<'a, R>),
     Rle {
         input: Ranged<'a, R>,
-        counts: Span,
+        counts: Ranged<'a, R>,
         packed: Vec<u8>,
     },
     Zip(Inflater<'a, R>),
@@ -419,6 +700,7 @@ pub(crate) struct Rows<'a, R> {
     next: u64,
     state: State<'a, R>,
     check: &'a dyn Fn() -> Result<(), String>,
+    check_io: &'a dyn Fn() -> Result<(), String>,
     finished: bool,
     failed: bool,
 }
@@ -460,6 +742,20 @@ impl<R: Read + Seek> CompletedRows<'_, R> {
 }
 
 impl<'a, R: Read + Seek> Rows<'a, R> {
+    /// Only these interleaved streams use per-range windows. ZIP already owns
+    /// an encoded transfer buffer, and ordinary metadata ranges remain fresh.
+    pub(super) fn prefetch(&mut self, pool: &crate::large_document::ResidentBudget) {
+        if self.encoding.rows < 2 { return; }
+        match &mut self.state {
+            State::Raw(input) => input.prefetch(pool),
+            State::Rle { input, counts, .. } => {
+                input.prefetch(pool);
+                counts.prefetch(pool);
+            }
+            State::Zip(_) | State::Empty => {}
+        }
+    }
+
     /// Read exactly one unpredicted native channel row. Never converts native16 to8bit.
     pub(crate) fn read_row(&mut self, out: &mut [u8]) -> Result<bool, String> {
         if self.failed {
@@ -468,6 +764,41 @@ impl<'a, R: Read + Seek> Rows<'a, R> {
         let result = self.read_row_inner(out);
         self.failed |= result.is_err();
         result
+    }
+
+    /// Read a bounded run of whole native rows. Unpadded raw rows share one
+    /// transfer, with the range reader still guarding each underlying read.
+    pub(super) fn read_rows(&mut self, out: &mut [u8]) -> Result<(), String> {
+        let stride = self.encoding.row_bytes as usize;
+        if self.failed || self.finished || stride == 0 || out.is_empty() || out.len() % stride != 0 {
+            return Err("Invalid Photoshop row batch".into());
+        }
+        let count = (out.len() / stride) as u64;
+        if count > self.encoding.rows - self.next {
+            return Err("Photoshop row batch exceeds its plane".into());
+        }
+        if let State::Raw(input) = &mut self.state {
+            if self.encoding.row_padding == 0 {
+                let result = (|| {
+                    (self.check)()?;
+                    input.read_raw_stripe(out).map_err(|_| {
+                        (self.check)().err().or_else(|| (self.check_io)().err())
+                            .unwrap_or_else(|| "Truncated raw Photoshop row batch".into())
+                    })?;
+                    (self.check)()
+                })();
+                if result.is_ok() {
+                    self.next += count;
+                } else {
+                    self.failed = true;
+                }
+                return result;
+            }
+        }
+        for row in out.chunks_exact_mut(stride) {
+            if !self.read_row(row)? { return Err("Missing Photoshop row in batch".into()); }
+        }
+        Ok(())
     }
 
     fn read_row_inner(&mut self, out: &mut [u8]) -> Result<bool, String> {
@@ -482,7 +813,8 @@ impl<'a, R: Read + Seek> Rows<'a, R> {
             return Ok(false);
         }
         let check = self.check;
-        let failure = |message: &str| check().err().unwrap_or_else(|| message.into());
+        let check_io = self.check_io;
+        let failure = |message: &str| check().err().or_else(|| check_io().err()).unwrap_or_else(|| message.into());
         match &mut self.state {
             State::Raw(input) => {
                 input
@@ -503,27 +835,11 @@ impl<'a, R: Read + Seek> Rows<'a, R> {
                 counts,
                 packed,
             } => {
-                let count_bytes = if self.encoding.format == Format::Psb {
-                    4u64
-                } else {
-                    2
-                };
-                let offset = self
-                    .next
-                    .checked_mul(count_bytes)
-                    .and_then(|n| counts.offset.checked_add(n))
-                    .ok_or("Photoshop row table offset overflow")?;
+                let count_bytes = self.encoding.format.rle_count_width();
                 let mut value = [0; 4];
-                self.source
-                    .exact_at(offset, &mut value[..count_bytes as usize])?;
-                let length = if count_bytes == 4 {
-                    u64::from(u32::from_be_bytes(value))
-                } else {
-                    u64::from(u16::from_be_bytes(value[..2].try_into().unwrap()))
-                };
-                if length > self.encoding.row_bytes * 2 + 1024 {
-                    return Err("Packed Photoshop row exceeds transfer budget".into());
-                }
+                counts.read_exact(&mut value[..count_bytes])
+                    .map_err(|_| failure("Truncated Photoshop row table"))?;
+                let length = rle_row_length(&value[..count_bytes], self.encoding.row_bytes)?;
                 let length =
                     usize::try_from(length).map_err(|_| "Photoshop row length overflow")?;
                 packed.clear();
@@ -599,7 +915,7 @@ impl<'a, R: Read + Seek> Rows<'a, R> {
     }
 
     fn finish_inner(&mut self) -> Result<CompletedRows<'a, R>, String> {
-        (self.check)()?;
+        (self.check_io)()?;
         if self.finished || self.next != self.encoding.rows {
             return Err("Photoshop row stream was not completed exactly once".into());
         }
@@ -607,8 +923,7 @@ impl<'a, R: Read + Seek> Rows<'a, R> {
             State::Zip(input) => {
                 let mut extra = [0; 1];
                 if input.read(&mut extra).map_err(|_| {
-                    (self.check)()
-                        .err()
+                    (self.check)().err().or_else(|| (self.check_io)().err())
                         .unwrap_or_else(|| "Invalid Photoshop ZIP termination".into())
                 })? != 0
                     || !input.ended
@@ -623,6 +938,9 @@ impl<'a, R: Read + Seek> Rows<'a, R> {
                     return Err("Photoshop ZIP stream did not end exactly".into());
                 }
             }
+            State::Rle { counts, .. } if counts.position != counts.span.bytes => {
+                return Err("Photoshop row table contains trailing data".into());
+            }
             State::Raw(input) | State::Rle { input, .. } => {
                 if input.position != input.span.bytes {
                     return Err("Photoshop encoded rows contain trailing data".into());
@@ -631,7 +949,7 @@ impl<'a, R: Read + Seek> Rows<'a, R> {
             State::Empty => {}
         }
         self.source.unchanged_length()?;
-        (self.check)()?;
+        (self.check_io)()?;
         self.finished = true;
         Ok(CompletedRows {
             source: self.source,
@@ -719,6 +1037,77 @@ mod tests {
             pool,
         )
     }
+    #[test]
+    fn guarded_raw_stripe_rechecks_short_reads_and_invalidates_the_structural_window() {
+        let length = 2 * TRANSFER;
+        let (mut source, bytes, reads, _, _) =
+            buffered_fixture(vec![17; length], TRANSFER / 2);
+        source.direct_raw_stripes = true;
+        let span = Span { offset: 0, bytes: length as u64 };
+        let check = || Ok(());
+        let mut prefix = [0; 2];
+        source.range(span, &check).unwrap().read_exact(&mut prefix).unwrap();
+        assert_eq!(prefix, [17; 2]);
+        bytes.borrow_mut()[1] = 19;
+
+        let checks = Cell::new(0);
+        let counted = || {
+            checks.set(checks.get() + 1);
+            Ok(())
+        };
+        let mut stripe = source.range(span, &counted).unwrap();
+        checks.set(0);
+        let prior_reads = reads.get();
+        let mut output = vec![0; length];
+        stripe.read_raw_stripe(&mut output).unwrap();
+        assert_eq!(checks.get(), 5);
+        assert_eq!(reads.get() - prior_reads, 4);
+        assert_eq!(&output[..2], &[17, 19]);
+        assert!(output[2..].iter().all(|&byte| byte == 17));
+        source.range(span, &check).unwrap().read_exact(&mut prefix).unwrap();
+        assert_eq!(prefix, [17, 19]);
+    }
+
+    #[test]
+    fn private_range_checks_the_owner_at_refill_and_cancellation_on_buffered_reads() {
+        let (source, _, reads, _, _) =
+            buffered_fixture(vec![37; TRANSFER + 1], usize::MAX);
+        let owner = Cell::new(0);
+        let active = Cell::new(0);
+        let cancelled = Cell::new(false);
+        let check = || {
+            owner.set(owner.get() + 1);
+            Ok(())
+        };
+        let pinned = || {
+            active.set(active.get() + 1);
+            if cancelled.get() {
+                Err("Cancelled in a buffered range".into())
+            } else {
+                Ok(())
+            }
+        };
+        let mut input = source.range_with_checks(
+            Span { offset: 0, bytes: (TRANSFER + 1) as u64 },
+            &check,
+            &pinned,
+        ).unwrap();
+        let mut byte = [0];
+        input.read_exact(&mut byte).unwrap();
+        assert_eq!((owner.get(), active.get(), reads.get()), (2, 0, 1));
+        cancelled.set(true);
+        assert!(input.read_exact(&mut byte).is_err());
+        assert_eq!((owner.get(), active.get(), reads.get()), (2, 1, 1));
+        cancelled.set(false);
+        let mut rest = vec![0; TRANSFER];
+        input.read_exact(&mut rest).unwrap();
+        assert_eq!(owner.get(), 3);
+        assert_eq!(reads.get(), 2);
+        assert!(rest.iter().all(|&byte| byte == 37));
+        assert_eq!(input.read(&mut byte).unwrap(), 0);
+        assert_eq!(owner.get(), 4);
+    }
+
     #[test]
     fn admitted_source_window_batches_tiny_reads_and_releases_the_exact_charge() {
         let (source, _, reads, _, pool) = buffered_fixture(vec![17; TRANSFER + 31], usize::MAX);
@@ -848,7 +1237,49 @@ mod tests {
     }
 
     #[test]
+    fn sequential_scan_reads_fresh_bytes_after_one_seek_and_stops_on_cancellation() {
+        let (source, bytes, reads, fail_seek, _) = buffered_fixture((0..23).collect(), 7);
+        let span = Span { offset: 1, bytes: 8 };
+        let check = || Ok(());
+        let mut cached = [0];
+        source.range(span, &check).unwrap().read_exact(&mut cached).unwrap();
+        assert_eq!(cached, [1]);
+        bytes.borrow_mut()[1] = 199;
+
+        let mut fresh = Vec::new();
+        let mut lengths = Vec::new();
+        let prior_reads = reads.get();
+        source.scan(span, &mut [0; 5], &check, |chunk| {
+            // The next short read must continue from the same file position.
+            fail_seek.set(true);
+            fresh.extend_from_slice(chunk);
+            lengths.push(chunk.len());
+            Ok(())
+        }).unwrap();
+        assert_eq!(fresh, [199, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(lengths, [7, 1]);
+        assert_eq!(reads.get() - prior_reads, 2);
+        fail_seek.set(false);
+        source.range(span, &check).unwrap().read_exact(&mut cached).unwrap();
+        assert_eq!(cached, [199]);
+
+        let cancelled = Cell::new(false);
+        let check = || if cancelled.get() { Err("Cancelled scan".into()) } else { Ok(()) };
+        assert_eq!(
+            source.scan(span, &mut [0; 5], &check, |_| {
+                cancelled.set(true);
+                Ok(())
+            }).unwrap_err(),
+            "Cancelled scan",
+        );
+        cancelled.set(false);
+        bytes.borrow_mut().truncate(4);
+        assert!(source.scan(span, &mut [0; 5], &check, |_| Ok(())).is_err());
+    }
+
+    #[test]
     fn native_layer_raw_rows_accept_explicit_odd_padding_while_composite_has_none() {
+        let pool = crate::large_document::ResidentBudget::new(TRANSFER).unwrap();
         for format in [Format::Psd, Format::Psb] {
             for padded in [false, true] {
                 let bytes = super::super::structural::tests::odd_raw_fixture(format, padded);
@@ -864,6 +1295,7 @@ mod tests {
                     let encoding = channel.encoding.as_ref().unwrap();
                     assert_eq!(encoding.row_padding, u8::from(padded));
                     let mut rows = source.rows(encoding, &check).unwrap();
+                    rows.prefetch(&pool);
                     for y in 0..3u8 {
                         let mut row = [0; 3];
                         assert!(rows.read_row(&mut row).unwrap());
@@ -1022,6 +1454,55 @@ mod tests {
     }
 
     #[test]
+    fn composite_planes_share_the_header_and_validate_complete_payloads() {
+        for (format, depth) in [(Format::Psd, 8), (Format::Psb, 16)] {
+            for (channels, kind) in [(3, 0), (4, 0), (3, 1), (4, 1)] {
+                let (mut bytes, encoding, expected) = plane(format, depth, 259, 3 * u32::from(channels), kind, 1);
+                let length = bytes.len() as u64;
+                let source = Source::new(Cursor::new(&bytes), length).unwrap();
+                let check = || Ok(());
+                let io_checks = Cell::new(0);
+                let check_io = || {
+                    io_checks.set(io_checks.get() + 1);
+                    Ok(())
+                };
+                let mut scratch = [0; 7]; // Force multiple whole-count table reads.
+                let mut planes = source.composite_planes(&encoding, 3, channels, &mut scratch, &check_io, &check).unwrap();
+                let pool = crate::large_document::ResidentBudget::new(2 * TRANSFER).unwrap();
+                planes.prefetch(&pool);
+                let stride = encoding.row_bytes as usize;
+                for (first, count) in [(0, 2), (2, 1)] {
+                    let before = io_checks.get();
+                    let mut batch = vec![0; stride * count];
+                    for channel in 0..channels as usize {
+                        planes.read(channel, &mut batch).unwrap();
+                        let at = (channel * 3 + first) * stride;
+                        assert_eq!(batch, expected[at..at + batch.len()]);
+                    }
+                    if kind == 1 && first > 0 {
+                        assert_eq!(io_checks.get(), before);
+                    }
+                }
+                assert!(planes.read(0, &mut vec![0; stride]).is_err());
+                let before_finish = io_checks.get();
+                planes.finish().unwrap();
+                assert!(io_checks.get() > before_finish);
+                assert!(source.composite_planes(&encoding, 2, channels, &mut scratch, &check_io, &check).is_err());
+                assert!(source.composite_planes(&encoding, 3, channels, &mut scratch, &check_io, &check)
+                    .unwrap().finish().is_err());
+                drop(source);
+                if let Some(counts) = encoding.counts {
+                    bytes[counts.end().unwrap() as usize - 1] ^= 1;
+                } else {
+                    bytes[1] = 1;
+                }
+                let source = Source::new(Cursor::new(&bytes), length).unwrap();
+                assert!(source.composite_planes(&encoding, 3, channels, &mut scratch, &check_io, &check).is_err());
+            }
+        }
+    }
+
+    #[test]
     fn interleaves_independent_zip_predicted_rle_and_raw_cursors_on_one_source() {
         let mut bytes = Vec::new();
         let mut plans = Vec::new();
@@ -1033,25 +1514,43 @@ mod tests {
             plans.push(plan);
             expected.push(raw);
         }
-        let source = Source::new(Cursor::new(&bytes), bytes.len() as u64).unwrap();
-        let check = || Ok(());
-        let mut inputs = plans
-            .iter()
-            .map(|plan| source.rows(plan, &check).unwrap())
-            .collect::<Vec<_>>();
-        let mut rows = vec![vec![0u8; 518]; 4];
-        for y in 0..513 {
-            for channel in 0..4 {
-                assert!(inputs[channel].read_row(&mut rows[channel]).unwrap());
-                assert_eq!(rows[channel], expected[channel][y * 518..(y + 1) * 518]);
+        let length = bytes.len() as u64;
+        let bytes = Rc::new(RefCell::new(bytes));
+        let mut unbuffered_reads = 0;
+        for limit in [1, 4 * TRANSFER] {
+            let pool = crate::large_document::ResidentBudget::new(limit).unwrap();
+            let reads = Rc::new(Cell::new(0));
+            let source = Source::new(MutableInput {
+                bytes: bytes.clone(),
+                reads: reads.clone(),
+                fail_seek: Rc::new(Cell::new(false)),
+                maximum: usize::MAX,
+                position: 0,
+            }, length).unwrap();
+            let check = || Ok(());
+            let mut inputs = plans.iter().map(|plan| {
+                let mut rows = source.rows(plan, &check).unwrap();
+                rows.prefetch(&pool);
+                rows
+            }).collect::<Vec<_>>();
+            assert_eq!(pool.used(), if limit == 1 { 0 } else { 2 * TRANSFER + 513 * 4 });
+            let mut row = [0; 518];
+            for y in 0..513 {
+                for channel in 0..4 {
+                    assert!(inputs[channel].read_row(&mut row).unwrap());
+                    assert_eq!(row, expected[channel][y * 518..(y + 1) * 518]);
+                }
             }
-        }
-        for (input, plan) in inputs.iter_mut().zip(&plans) {
-            input
-                .finish()
-                .unwrap()
-                .check(&source, plan, &check)
-                .unwrap();
+            for (input, plan) in inputs.iter_mut().zip(&plans) {
+                input.finish().unwrap().check(&source, plan, &check).unwrap();
+            }
+            if limit == 1 {
+                unbuffered_reads = reads.get();
+            } else {
+                assert!(reads.get() * 8 < unbuffered_reads);
+            }
+            drop(inputs);
+            assert_eq!(pool.used(), 0);
         }
     }
 
@@ -1201,6 +1700,43 @@ mod tests {
         assert!(input.read_row(&mut row).is_err());
         assert!(input.finish().is_err());
         assert_eq!(source.input.borrow().get_ref(), &bytes);
+    }
+
+    #[test]
+    fn backed_rle_rows_check_ownership_on_file_reads_and_completion_and_cancel_cached_rows() {
+        let (bytes, plan, expected) = plane(Format::Psd, 8, 7, 3, 1, 0);
+        let source = Source::new(Cursor::new(&bytes), bytes.len() as u64).unwrap();
+        let pool = crate::large_document::ResidentBudget::new(TRANSFER * 2).unwrap();
+        let checks = Cell::new(0);
+        let canceled = Cell::new(false);
+        let check_io = || {
+            checks.set(checks.get() + 1);
+            Ok(())
+        };
+        let check = || if canceled.get() { Err("Canceled row".into()) } else { Ok(()) };
+        let mut rows = source.rows_with_checks(&plan, &check_io, &check).unwrap();
+        rows.prefetch(&pool);
+        let start = checks.get();
+        let mut output = [0; 7];
+        assert!(rows.read_row(&mut output).unwrap());
+        assert_eq!(output.as_slice(), &expected[..7]);
+        let after_io = checks.get();
+        assert!(after_io > start);
+        for expected in expected[7..].chunks_exact(7) {
+            assert!(rows.read_row(&mut output).unwrap());
+            assert_eq!(output.as_slice(), expected);
+        }
+        assert_eq!(checks.get(), after_io);
+        rows.finish().unwrap().check(&source, &plan, &check_io).unwrap();
+        assert!(checks.get() > after_io);
+
+        let mut rows = source.rows_with_checks(&plan, &check_io, &check).unwrap();
+        rows.prefetch(&pool);
+        assert!(rows.read_row(&mut output).unwrap());
+        let before_cancel = checks.get();
+        canceled.set(true);
+        assert_eq!(rows.read_row(&mut output).unwrap_err(), "Canceled row");
+        assert_eq!(checks.get(), before_cancel);
     }
 
     #[test]

@@ -11,7 +11,7 @@ fn edit(e: &mut Engine, command: Value) {
     e.edit(
         "human",
         &[command],
-        Some(e.doc.revision),
+        Some(e.resident_state().expect("resident fixture").document.revision),
         None,
         "Edit bounds",
     )
@@ -19,8 +19,8 @@ fn edit(e: &mut Engine, command: Value) {
 }
 fn fixture(depth: u16, mask: bool) -> Engine {
     let mut e = Engine::new();
-    e.doc = Document::new_depth(96, 80, depth).unwrap();
-    let l = &mut e.doc.layers[0];
+    e.resident_state_mut().expect("resident fixture").document = Document::new_depth(96, 80, depth).unwrap();
+    let l = &mut e.resident_state_mut().expect("resident fixture").document.layers[0];
     l.x = 28;
     l.y = 22;
     l.pixels = Raster::new_depth(24, 20, depth);
@@ -45,7 +45,7 @@ fn fixture(depth: u16, mask: bool) -> Engine {
         &mut e,
         json!({"op":"move","layer":id,"dx":8,"dy":5,"selection_only":false}),
     );
-    e.undo.clear();
+    e.resident_state_mut().expect("resident fixture").undo.clear();
     e
 }
 fn pixel(doc: &Document, x: i32, y: i32) -> [u16; 4] {
@@ -65,11 +65,11 @@ fn assert_old_pixels(before: &Document, after: &Document) {
 fn scaled_moved_layers_paint_across_canvas_with_exact_live_preview_undo_and_reopen() {
     for depth in [8, 16] {
         let mut e = fixture(depth, true);
-        let before = e.doc.clone();
+        let before = e.resident_state().expect("resident fixture").document.clone();
         let id = before.layers[0].id.clone();
         let command = json!({"op":"paint","layer":id,"points":[[8,8],[85,8]],"radius":3,"hardness":1,"color":[20,100,245,255]});
         let live = Engine::preview_edits(before.clone(), &[command.clone()]).unwrap();
-        assert_eq!(e.undo.len(), 0);
+        assert_eq!(e.resident_state().expect("resident fixture").undo.len(), 0);
         let mut cache = preview::Cache::default();
         let mut early = command.clone();
         early["points"] = json!([[8, 8]]);
@@ -82,18 +82,18 @@ fn scaled_moved_layers_paint_across_canvas_with_exact_live_preview_undo_and_reop
             live.export_png().unwrap()
         );
         edit(&mut e, command);
-        assert!(pixel(&e.doc, 8, 8)[3] > 0, "paint clipped at depth {depth}");
-        assert!(pixel(&e.doc, 85, 8)[3] > 0);
-        assert_old_pixels(&before, &e.doc);
-        assert_eq!(e.doc.export_png().unwrap(), live.export_png().unwrap());
-        assert_eq!(e.undo.len(), 1);
-        let decoded = psd::decode(&psd::encode(&e.doc).unwrap()).unwrap();
+        assert!(pixel(&e.resident_state().expect("resident fixture").document, 8, 8)[3] > 0, "paint clipped at depth {depth}");
+        assert!(pixel(&e.resident_state().expect("resident fixture").document, 85, 8)[3] > 0);
+        assert_old_pixels(&before, &e.resident_state().expect("resident fixture").document);
+        assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), live.export_png().unwrap());
+        assert_eq!(e.resident_state().expect("resident fixture").undo.len(), 1);
+        let decoded = psd::decode(&psd::encode(&e.resident_state().expect("resident fixture").document).unwrap()).unwrap();
         assert!(!decoded.read_only);
         assert_eq!(decoded.bit_depth, depth);
-        assert_eq!(decoded.export_png().unwrap(), e.doc.export_png().unwrap());
+        assert_eq!(decoded.export_png().unwrap(), e.resident_state().expect("resident fixture").document.export_png().unwrap());
         e.undo("human").unwrap();
         assert_eq!(
-            serde_json::to_value(&e.doc.layers).unwrap(),
+            serde_json::to_value(&e.resident_state().expect("resident fixture").document.layers).unwrap(),
             serde_json::to_value(&before.layers).unwrap()
         );
     }
@@ -102,7 +102,7 @@ fn scaled_moved_layers_paint_across_canvas_with_exact_live_preview_undo_and_reop
 #[test]
 fn mask_edits_expand_without_resampling_the_unchanged_color_original() {
     let mut e = fixture(16, true);
-    let before = e.doc.clone();
+    let before = e.resident_state().expect("resident fixture").document.clone();
     let original = before.layers[0]
         .pixels
         .retained
@@ -115,13 +115,13 @@ fn mask_edits_expand_without_resampling_the_unchanged_color_original() {
         &mut e,
         json!({"op":"paint","layer":id,"mask":true,"points":[[8,8]],"radius":3,"hardness":1,"color":[0,0,0,255]}),
     );
-    assert_old_pixels(&before, &e.doc);
-    let l = &e.doc.layers[0];
+    assert_old_pixels(&before, &e.resident_state().expect("resident fixture").document);
+    let l = &e.resident_state().expect("resident fixture").document.layers[0];
     assert_eq!(l.pixels.retained.as_ref().unwrap().pixels, original);
     let mask = l.mask.as_ref().unwrap().steps.last().unwrap();
     assert_eq!(mask.pixels.get16(8 - l.x, 8 - l.y), [0, 0, 0, 65535]);
     assert!(mask.pixels.retained.is_none());
-    let painted = e.doc.export_png().unwrap();
+    let painted = e.resident_state().expect("resident fixture").document.export_png().unwrap();
     edit(
         &mut e,
         json!({"op":"transform","layer":id,"pivot":[40,36],"angle":20,"selection_only":false}),
@@ -130,13 +130,13 @@ fn mask_edits_expand_without_resampling_the_unchanged_color_original() {
         &mut e,
         json!({"op":"transform","layer":id,"pivot":[40,36],"angle":-20,"selection_only":false}),
     );
-    assert_eq!(e.doc.export_png().unwrap(), painted);
+    assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), painted);
 }
 
 #[test]
 fn soft_selections_keep_holes_and_native_samples_outside_the_edit() {
     let mut e = fixture(16, false);
-    let id = e.doc.layers[0].id.clone();
+    let id = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
     let mut mask = Raster::new(12, 12);
     for y in 0..12 {
         for x in 0..12 {
@@ -146,17 +146,17 @@ fn soft_selections_keep_holes_and_native_samples_outside_the_edit() {
         }
     }
     let coverage = selection::from_mask(mask).unwrap().local(-4, -4);
-    e.doc.selection = Some(coverage.bounds);
-    e.doc.selection_coverage = Some(coverage);
-    let before = e.doc.clone();
+    e.resident_state_mut().expect("resident fixture").document.selection = Some(coverage.bounds);
+    e.resident_state_mut().expect("resident fixture").document.selection_coverage = Some(coverage);
+    let before = e.resident_state().expect("resident fixture").document.clone();
     edit(
         &mut e,
         json!({"op":"paint","layer":id,"points":[[8,8]],"radius":7,"hardness":1,"color":[25,120,240,255]}),
     );
-    assert!(pixel(&e.doc, 8, 8)[3] > 0 && pixel(&e.doc, 8, 8)[3] < 65535);
-    assert_eq!(pixel(&e.doc, 9, 8), [0; 4]);
-    assert_eq!(pixel(&e.doc, 2, 8), [0; 4]);
-    assert_old_pixels(&before, &e.doc);
+    assert!(pixel(&e.resident_state().expect("resident fixture").document, 8, 8)[3] > 0 && pixel(&e.resident_state().expect("resident fixture").document, 8, 8)[3] < 65535);
+    assert_eq!(pixel(&e.resident_state().expect("resident fixture").document, 9, 8), [0; 4]);
+    assert_eq!(pixel(&e.resident_state().expect("resident fixture").document, 2, 8), [0; 4]);
+    assert_old_pixels(&before, &e.resident_state().expect("resident fixture").document);
 }
 
 #[test]
@@ -164,7 +164,7 @@ fn fills_shapes_gradients_and_clone_share_document_editing_bounds() {
     for depth in [8, 16] {
         for op in ["fill", "paint.fill", "shape", "gradient", "clone"] {
             let mut e = fixture(depth, false);
-            let before = e.doc.clone();
+            let before = e.resident_state().expect("resident fixture").document.clone();
             let l = &before.layers[0];
             let command = if op == "clone" {
                 json!({"op":op,"layer":l.id,"source":[l.x+4,l.y+4],"points":[[8,8]],"radius":2,"hardness":1})
@@ -172,10 +172,10 @@ fn fills_shapes_gradients_and_clone_share_document_editing_bounds() {
                 json!({"op":op,"layer":l.id,"rect":[4,4,16,16],"color":[20,100,245,255],"color2":[240,10,50,255]})
             };
             edit(&mut e, command);
-            assert!(pixel(&e.doc, 8, 8)[3] > 0, "{op} clipped at depth {depth}");
-            assert_old_pixels(&before, &e.doc);
+            assert!(pixel(&e.resident_state().expect("resident fixture").document, 8, 8)[3] > 0, "{op} clipped at depth {depth}");
+            assert_old_pixels(&before, &e.resident_state().expect("resident fixture").document);
             e.undo("human").unwrap();
-            assert_eq!(e.doc.export_png().unwrap(), before.export_png().unwrap());
+            assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), before.export_png().unwrap());
         }
     }
 }
@@ -183,16 +183,16 @@ fn fills_shapes_gradients_and_clone_share_document_editing_bounds() {
 #[test]
 fn bounds_expansion_rejects_locked_reserved_and_invalid_edits_atomically() {
     let mut e = fixture(16, true);
-    let id = e.doc.layers[0].id.clone();
+    let id = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
     let command =
         json!({"op":"paint","layer":id,"points":[[8,8]],"radius":3,"color":[20,100,245,255]});
-    e.doc.layers[0].locked = true;
-    let before = serde_json::to_value(&e.doc).unwrap();
+    e.resident_state_mut().expect("resident fixture").document.layers[0].locked = true;
+    let before = serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap();
     assert!(e
         .edit("human", &[command.clone()], None, None, "Locked")
         .is_err());
-    assert_eq!(serde_json::to_value(&e.doc).unwrap(), before);
-    e.doc.layers[0].locked = false;
+    assert_eq!(serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap(), before);
+    e.resident_state_mut().expect("resident fixture").document.layers[0].locked = false;
     let lease = e
         .reserve(
             "agent",
@@ -203,17 +203,17 @@ fn bounds_expansion_rejects_locked_reserved_and_invalid_edits_atomically() {
             }],
         )
         .unwrap();
-    let before = serde_json::to_value(&e.doc).unwrap();
+    let before = serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap();
     assert!(e
         .edit("human", &[command.clone()], None, None, "Reserved")
         .is_err());
-    assert_eq!(serde_json::to_value(&e.doc).unwrap(), before);
+    assert_eq!(serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap(), before);
     e.leases.retain(|l| l.id != lease.id);
     let mut invalid = command;
     invalid["radius"] = json!(-1);
     assert!(e.edit("human", &[invalid], None, None, "Invalid").is_err());
-    assert_eq!(serde_json::to_value(&e.doc).unwrap(), before);
-    assert!(e.undo.is_empty());
+    assert_eq!(serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap(), before);
+    assert!(e.resident_state().expect("resident fixture").undo.is_empty());
 }
 
 #[test]
@@ -223,38 +223,38 @@ fn protocol_edits_outside_transformed_content_use_the_same_engine_bounds() {
         let e = shared.lock().unwrap();
         (
             e.project_id.clone(),
-            e.doc.id.clone(),
-            e.doc.revision,
-            e.doc.layers[0].id.clone(),
+            e.resident_state().expect("resident fixture").document.id.clone(),
+            e.resident_state().expect("resident fixture").document.revision,
+            e.resident_state().expect("resident fixture").document.layers[0].id.clone(),
         )
     };
     server::dispatch(&shared,"edit",&json!({"actor":"human","project_id":project,"document_id":document,"expected_revision":revision,"commands":[{"op":"paint","layer":layer,"points":[[8,8]],"radius":3,"color":[20,100,245,255]}],"feedback":"request"})).unwrap();
-    assert!(pixel(&shared.lock().unwrap().doc, 8, 8)[3] > 0);
+    assert!(pixel(&shared.lock().unwrap().resident_state().expect("resident fixture").document, 8, 8)[3] > 0);
 }
 
 #[test]
 fn expanding_storage_preserves_off_canvas_pixels_and_hidden_rgb_at_both_depths() {
     for depth in [8, 16] {
         let mut e = Engine::new();
-        e.doc = Document::new_depth(96, 80, depth).unwrap();
-        let l = &mut e.doc.layers[0];
+        e.resident_state_mut().expect("resident fixture").document = Document::new_depth(96, 80, depth).unwrap();
+        let l = &mut e.resident_state_mut().expect("resident fixture").document.layers[0];
         l.x = -6;
         l.y = 24;
         l.pixels = Raster::new_depth(20, 16, depth);
         l.pixels.set16(1, 1, [12347, 23459, 34571, 0]);
         l.pixels.set16(2, 2, [45679, 56781, 60001, 65535]);
-        let before = e.doc.clone();
-        let id = e.doc.layers[0].id.clone();
+        let before = e.resident_state().expect("resident fixture").document.clone();
+        let id = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
         edit(
             &mut e,
             json!({"op":"paint","layer":id,"points":[[85,8]],"radius":3,"color":[20,100,245,255]}),
         );
-        assert_old_pixels(&before, &e.doc);
-        assert_ne!(pixel(&e.doc, -5, 25), [0; 4]);
-        assert!(pixel(&e.doc, 85, 8)[3] > 0);
+        assert_old_pixels(&before, &e.resident_state().expect("resident fixture").document);
+        assert_ne!(pixel(&e.resident_state().expect("resident fixture").document, -5, 25), [0; 4]);
+        assert!(pixel(&e.resident_state().expect("resident fixture").document, 85, 8)[3] > 0);
         e.undo("human").unwrap();
         assert_eq!(
-            serde_json::to_value(&e.doc.layers).unwrap(),
+            serde_json::to_value(&e.resident_state().expect("resident fixture").document.layers).unwrap(),
             serde_json::to_value(&before.layers).unwrap()
         );
     }
@@ -263,7 +263,7 @@ fn expanding_storage_preserves_off_canvas_pixels_and_hidden_rgb_at_both_depths()
 #[test]
 fn expanding_storage_translates_liquify_points_polygons_and_coverage_together() {
     let mut e = fixture(16, false);
-    let id = e.doc.layers[0].id.clone();
+    let id = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
     let mut coverage = Raster::new(12, 10);
     coverage.set(2, 4, [128; 4]);
     let coverage = selection::from_mask(coverage).unwrap();
@@ -271,13 +271,13 @@ fn expanding_storage_translates_liquify_points_polygons_and_coverage_together() 
         &mut e,
         json!({"op":"effect.add","layer":id,"kind":"liquify","settings":{"strokes":[{"mode":"push","points":[[2,4],[5,4]],"radius":3,"strength":0.5,"selection":[0,0,12,10],"polygon":[[0,0],[12,0],[12,10],[0,10]],"coverage":coverage}]}}),
     );
-    let before = e.doc.clone();
+    let before = e.resident_state().expect("resident fixture").document.clone();
     let old = &before.layers[0];
     edit(
         &mut e,
         json!({"op":"paint","layer":id,"points":[[8,8]],"radius":3,"color":[20,100,245,255]}),
     );
-    let l = &e.doc.layers[0];
+    let l = &e.resident_state().expect("resident fixture").document.layers[0];
     let (dx, dy) = (old.x - l.x, old.y - l.y);
     let stroke = &l.effects[0].settings["strokes"][0];
     let points: Vec<[f32; 2]> = serde_json::from_value(stroke["points"].clone()).unwrap();
@@ -295,7 +295,7 @@ fn expanding_storage_translates_liquify_points_polygons_and_coverage_together() 
     assert_eq!(shifted.value(2 + dx, 4 + dy), coverage.value(2, 4));
     e.undo("human").unwrap();
     assert_eq!(
-        serde_json::to_value(&e.doc.layers).unwrap(),
+        serde_json::to_value(&e.resident_state().expect("resident fixture").document.layers).unwrap(),
         serde_json::to_value(&before.layers).unwrap()
     );
 }
@@ -304,10 +304,10 @@ fn expanding_storage_translates_liquify_points_polygons_and_coverage_together() 
 fn invisible_strokes_do_not_expand_sources_or_discard_native_originals() {
     for field in ["opacity", "flow"] {
         let mut e = fixture(16, true);
-        let before = serde_json::to_value(&e.doc.layers).unwrap();
-        let mut command = json!({"op":"paint","layer":e.doc.layers[0].id,"points":[[8,8]],"radius":3,"color":[20,100,245,255]});
+        let before = serde_json::to_value(&e.resident_state().expect("resident fixture").document.layers).unwrap();
+        let mut command = json!({"op":"paint","layer":e.resident_state().expect("resident fixture").document.layers[0].id,"points":[[8,8]],"radius":3,"color":[20,100,245,255]});
         command[field] = json!(0);
         edit(&mut e, command);
-        assert_eq!(serde_json::to_value(&e.doc.layers).unwrap(), before);
+        assert_eq!(serde_json::to_value(&e.resident_state().expect("resident fixture").document.layers).unwrap(), before);
     }
 }

@@ -199,16 +199,16 @@ fn nested_adjustments_read_prepared_external_layers_and_refresh_after_edits_undo
 {
     for depth in [8, 16] {
         let mut e = Engine::new();
-        e.doc = nested(depth);
+        e.resident_state_mut().expect("resident fixture").document = nested(depth);
         let mut adjustment = layer("Inner invert", "adjustment", depth, [[0; 4]; 2]);
-        adjustment.parent = Some(e.doc.layers[1].id.clone());
+        adjustment.parent = Some(e.resident_state().expect("resident fixture").document.layers[1].id.clone());
         invert(&mut adjustment);
         let mut lower = layer("Outside invert", "adjustment", depth, [[0; 4]; 2]);
         lower.opacity = 0.5;
         invert(&mut lower);
-        invert(&mut e.doc.layers[3]);
-        e.doc.layers.insert(2, adjustment);
-        e.doc.layers.insert(4, lower);
+        invert(&mut e.resident_state_mut().expect("resident fixture").document.layers[3]);
+        e.resident_state_mut().expect("resident fixture").document.layers.insert(2, adjustment);
+        e.resident_state_mut().expect("resident fixture").document.layers.insert(4, lower);
         let expected = |doc: &Document| -> Vec<u16> {
             (0..2)
                 .flat_map(|x| {
@@ -231,22 +231,22 @@ fn nested_adjustments_read_prepared_external_layers_and_refresh_after_edits_undo
                 })
                 .collect()
         };
-        let baseline = render(&e.doc);
-        assert_eq!(baseline, expected(&e.doc));
-        let mut scattered = e.doc.clone();
-        scattered.layers = [2, 3, 1, 0, 4, 5].map(|i| e.doc.layers[i].clone()).to_vec();
+        let baseline = render(&e.resident_state().expect("resident fixture").document);
+        assert_eq!(baseline, expected(&e.resident_state().expect("resident fixture").document));
+        let mut scattered = e.resident_state().expect("resident fixture").document.clone();
+        scattered.layers = [2, 3, 1, 0, 4, 5].map(|i| e.resident_state().expect("resident fixture").document.layers[i].clone()).to_vec();
         assert_eq!(render(&scattered), baseline);
-        let top = e.doc.layers[0].id.clone();
+        let top = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
         let preview = Engine::preview_edits(
-            e.doc.clone(),
+            e.resident_state().expect("resident fixture").document.clone(),
             &[json!({"op":"layer.update","layer":top,"blend":"normal"})],
         )
         .unwrap();
         assert_ne!(render(&preview), baseline);
-        assert_eq!(render(&e.doc), baseline);
-        assert_eq!(e.doc.revision, 0);
-        assert!(e.undo.is_empty());
-        let bg = e.doc.layers[5].id.clone();
+        assert_eq!(render(&e.resident_state().expect("resident fixture").document), baseline);
+        assert_eq!(e.resident_state().expect("resident fixture").document.revision, 0);
+        assert!(e.resident_state().expect("resident fixture").undo.is_empty());
+        let bg = e.resident_state().expect("resident fixture").document.layers[5].id.clone();
         e.edit(
             "human",
             &[json!({"op":"paint.fill","layer":bg,"color":[23,67,89,255]})],
@@ -255,15 +255,15 @@ fn nested_adjustments_read_prepared_external_layers_and_refresh_after_edits_undo
             "Outside backdrop",
         )
         .unwrap();
-        assert_eq!(render(&e.doc), expected(&e.doc));
-        assert_ne!(render(&e.doc), baseline);
+        assert_eq!(render(&e.resident_state().expect("resident fixture").document), expected(&e.resident_state().expect("resident fixture").document));
+        assert_ne!(render(&e.resident_state().expect("resident fixture").document), baseline);
         e.undo("human").unwrap();
-        assert_eq!(render(&e.doc), baseline);
+        assert_eq!(render(&e.resident_state().expect("resident fixture").document), baseline);
         e.redo("human").unwrap();
-        assert_eq!(render(&e.doc), expected(&e.doc));
+        assert_eq!(render(&e.resident_state().expect("resident fixture").document), expected(&e.resident_state().expect("resident fixture").document));
         assert_eq!(
-            render(&psd::decode(&psd::encode(&e.doc).unwrap()).unwrap()),
-            render(&e.doc)
+            render(&psd::decode(&psd::encode(&e.resident_state().expect("resident fixture").document).unwrap()).unwrap()),
+            render(&e.resident_state().expect("resident fixture").document)
         );
     }
 }
@@ -271,9 +271,9 @@ fn nested_adjustments_read_prepared_external_layers_and_refresh_after_edits_undo
 #[test]
 fn shared_commands_reject_unsupported_combinations_atomically_and_honor_folder_reservations() {
     let mut e = Engine::new();
-    e.doc = nested(16);
-    let folder = e.doc.layers[0].id.clone();
-    let ink = e.doc.layers[2].id.clone();
+    e.resident_state_mut().expect("resident fixture").document = nested(16);
+    let folder = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
+    let ink = e.resident_state().expect("resident fixture").document.layers[2].id.clone();
     let top = layer(
         "Above folder",
         "paint",
@@ -281,8 +281,8 @@ fn shared_commands_reject_unsupported_combinations_atomically_and_honor_folder_r
         [[50001, 17001, 23003, 65535]; 2],
     );
     let top_id = top.id.clone();
-    e.doc.layers.insert(0, top);
-    let baseline = serde_json::to_value(&e.doc).unwrap();
+    e.resident_state_mut().expect("resident fixture").document.layers.insert(0, top);
+    let baseline = serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap();
     for command in [
         json!({"op":"layer.update","layer":ink,"blend":"pass_through"}),
         json!({"op":"effect.add","layer":folder,"kind":"blur"}),
@@ -291,10 +291,10 @@ fn shared_commands_reject_unsupported_combinations_atomically_and_honor_folder_r
         assert!(e
             .edit("human", &[command], None, None, "Unsupported combination")
             .is_err());
-        assert_eq!(serde_json::to_value(&e.doc).unwrap(), baseline);
-        assert!(e.undo.is_empty());
+        assert_eq!(serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap(), baseline);
+        assert!(e.resident_state().expect("resident fixture").undo.is_empty());
     }
-    assert!(merge::prepare(&e.doc, &[folder.clone()], None)
+    assert!(merge::prepare(&e.resident_state().expect("resident fixture").document, &[folder.clone()], None)
         .err()
         .unwrap()
         .contains("isolated"));
@@ -309,7 +309,7 @@ fn shared_commands_reject_unsupported_combinations_atomically_and_honor_folder_r
             "Folder blend"
         )
         .is_err());
-    assert_eq!(serde_json::to_value(&e.doc).unwrap(), baseline);
+    assert_eq!(serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap(), baseline);
     e.leases.clear();
     e.edit(
         "human",
@@ -321,7 +321,7 @@ fn shared_commands_reject_unsupported_combinations_atomically_and_honor_folder_r
     .unwrap();
     e.undo("human").unwrap();
     assert_eq!(
-        e.doc.layers.iter().find(|l| l.id == folder).unwrap().blend,
+        e.resident_state().expect("resident fixture").document.layers.iter().find(|l| l.id == folder).unwrap().blend,
         "pass_through"
     );
 }

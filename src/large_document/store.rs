@@ -15,6 +15,11 @@ use super::{
     access::Access, budget::Charge, index::Index, DiskBudget, DiskReservation, Error,
     ResidentBudget, Result,
 };
+#[path = "store/custody.rs"]
+mod custody;
+#[path = "store/retained.rs"]
+mod retained;
+use custody::Inner;
 
 const FILE_MAGIC: &[u8; 8] = b"PBTILES1";
 const SEAL: &[u8; 8] = b"PBSEAL01";
@@ -299,11 +304,12 @@ struct State {
     expected: Stamp,
     blocks: Index<Digest, BlockRef>,
     head: Option<CommitRef>,
+    indexed: Option<CommitRef>,
     readonly: bool,
     poisoned: bool,
 }
 
-struct Inner {
+struct Backing {
     root: PathBuf,
     directory: File,
     directory_id: (u64, u64),
@@ -320,22 +326,21 @@ struct Inner {
     may_be_published: AtomicBool,
 }
 
-// File's final close releases its exclusive lock. Source backing survives Drop;
-// disk reservations are released only by explicit proven retirement.
-
 #[derive(Clone)]
 pub struct Store(Arc<Inner>);
-pub(crate) struct WeakStore(Weak<Inner>);
-impl WeakStore {
-    pub(crate) fn upgrade(&self) -> Option<Store> {
-        self.0.upgrade().map(Store)
-    }
-}
+pub(crate) use custody::{ParkedSource, RetiredSource, WeakStore};
 
 /// A source fragment which has never been exposed as document/history/recovery
 /// authority. The actual session and workspace I/O admission belongs to its caller.
 pub struct FreshFragment {
     store: Store,
+}
+/// A retry is possible only before the unique-owner unlink attempt. Later
+/// failures retain disk debt and require inventory reconciliation.
+#[must_use]
+pub(crate) struct RefusedRetirement {
+    pub(crate) error: Error,
+    pub(crate) fragment: Option<FreshFragment>,
 }
 impl FreshFragment {
     pub fn create(
@@ -363,7 +368,25 @@ impl FreshFragment {
         self.store
     }
     pub fn abort(self, check: Check<'_>) -> Result<()> {
-        self.store.retire_unpublished(check)
+        self.try_abort(check).map_err(|refused| refused.error)
+    }
+    pub(crate) fn try_abort(self, check: Check<'_>) -> std::result::Result<(), RefusedRetirement> {
+        if let Err(error) = self.store.verify_unpublished(check) {
+            return Err(RefusedRetirement {
+                error,
+                fragment: Some(self),
+            });
+        }
+        let inner = Arc::try_unwrap(self.store.0).map_err(|owner| RefusedRetirement {
+            error: Error::Busy,
+            fragment: Some(Self {
+                store: Store(owner),
+            }),
+        })?;
+        Store::retire_unique(inner).map_err(|error| RefusedRetirement {
+            error,
+            fragment: None,
+        })
     }
 }
 
@@ -409,6 +432,7 @@ impl Snapshot {
             (2, self.metadata_digest),
             self.metadata.1,
             check,
+            None,
             |bytes, check| {
                 read_checked(&self.store.0.file, self.metadata.0, bytes, check)?;
                 if digest_parts(b"META", [&bytes[..]], check)? != self.metadata_digest {
@@ -462,8 +486,8 @@ impl Store {
         self.0.may_be_published.load(Ordering::Acquire)
     }
 
-    pub(crate) fn downgrade(&self) -> WeakStore {
-        WeakStore(Arc::downgrade(&self.0))
+    pub(crate) fn downgrade(&self) -> Result<WeakStore> {
+        Inner::downgrade(&self.0)
     }
     pub(crate) fn same_owner(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
@@ -475,7 +499,11 @@ impl Store {
     pub(crate) fn checkpoint_reference(&self) -> Result<Option<CommitRef>> {
         Ok(self.state()?.head)
     }
+    #[cfg(test)]
     fn retire_unpublished(self, check: Check<'_>) -> Result<()> {
+        FreshFragment { store: self }.abort(check)
+    }
+    fn verify_unpublished(&self, check: Check<'_>) -> Result<()> {
         if self.0.may_be_published.load(Ordering::Acquire) {
             return Err(Error::Invalid(
                 "Published source retirement requires a retained-owner inventory",
@@ -484,13 +512,25 @@ impl Store {
         if Arc::strong_count(&self.0) != 1 {
             return Err(Error::Busy);
         }
+        if self.state()?.readonly {
+            return Err(Error::Interrupted);
+        }
+        self.verify_retained(check)
+    }
+    /// Validate all records against the exact retained read/write index. This
+    /// never selects an unconfirmed manifest or advances the publication head.
+    fn verify_retained(&self, check: Check<'_>) -> Result<()> {
         let write = self.0.access.write()?;
         let state = self.state()?;
-        if state.poisoned || state.readonly {
+        if state.poisoned {
             return Err(Error::Interrupted);
         }
         let expected = state.expected;
-        let head = state.head;
+        let head = if state.readonly {
+            state.indexed.or(state.head)
+        } else {
+            state.head
+        };
         let blocks = state.blocks.len();
         drop(state);
         check()?;
@@ -523,7 +563,10 @@ impl Store {
         check()?;
         self.check_source(expected)?;
         drop(write);
-        let inner = Arc::try_unwrap(self.0).map_err(|_| Error::Busy)?;
+        Ok(())
+    }
+    fn retire_unique(inner: Inner) -> Result<()> {
+        let inner = inner.into_backing();
         // No Store owner can be created after unique ownership is established.
         // The caller still holds its session/workspace I/O admission here.
         if inner.may_be_published.load(Ordering::Acquire) {
@@ -531,7 +574,7 @@ impl Store {
         }
         super::linear::unlink_owned(&inner.file, &inner.path)?;
         crate::server::sync_parent(&inner.path).map_err(|_| Error::Changed)?;
-        let Inner {
+        let Backing {
             root,
             directory,
             directory_id,
@@ -569,18 +612,47 @@ impl Store {
     pub fn resident_budget(&self) -> ResidentBudget {
         self.0.budget.clone()
     }
+    #[cfg(test)]
+    pub(crate) fn file_bytes_for_test(&self) -> Result<Vec<u8>> {
+        let _read = self.0.access.read()?;
+        let expected = self.state()?.expected;
+        if expected.bytes > 64 * 1024 * 1024 {
+            return Err(Error::Budget);
+        }
+        self.check_source(expected)?;
+        let mut bytes = vec![0; expected.bytes as usize];
+        read_exact_at(&self.0.file, 0, &mut bytes)?;
+        self.check_source(expected)?;
+        Ok(bytes)
+    }
 
     /// Select an independently retained checkpoint using an already-held owner.
     /// Prefix validation never advances this owner's publication head.
+    /// Readonly owners may extend their admitted read index to explicit later prefixes.
     pub fn snapshot(&self, selected: CommitRef, check: Check<'_>) -> Result<Snapshot> {
         let _read = self.0.access.read()?;
         let state = self.state()?;
         let head = state.head.ok_or(Error::Corrupt)?;
+        let indexed = if state.readonly {
+            state.indexed.unwrap_or(head)
+        } else {
+            head
+        };
         if selected.store != self.0.id
             || selected.source != head.source
-            || selected.end > head.end
-            || selected.revision > head.revision
+            || selected.end > state.expected.bytes
         {
+            return Err(Error::Corrupt);
+        }
+        if selected.end > indexed.end {
+            if !state.readonly {
+                return Err(Error::Corrupt);
+            }
+            drop(state);
+            drop(_read);
+            return self.select_later(selected, check);
+        }
+        if selected.revision > indexed.revision {
             return Err(Error::Corrupt);
         }
         let expected = state.expected;
@@ -709,7 +781,7 @@ impl Store {
         write_all_at(&file, 8, &id)?;
         file.sync_all()?;
         crate::server::sync_parent(&path).map_err(|_| Error::Changed)?;
-        let store = Self(Arc::new(Inner {
+        let store = Self(Inner::new(Backing {
             root: root.into(),
             directory,
             directory_id,
@@ -724,6 +796,7 @@ impl Store {
                 expected: stamp(&file)?,
                 blocks: Index::new(),
                 head: None,
+                indexed: None,
                 readonly: false,
                 poisoned: false,
             }),
@@ -794,7 +867,7 @@ impl Store {
         let count = preflight_index(&file, selected.end, limits, check)?;
         let mut blocks = Index::new();
         blocks.reserve_to(count, &budget, limits.max_blocks)?;
-        let store = Self(Arc::new(Inner {
+        let store = Self(Inner::new(Backing {
             root: root.into(),
             directory,
             directory_id,
@@ -810,55 +883,58 @@ impl Store {
                 expected,
                 blocks,
                 head: None,
+                indexed: Some(selected),
                 readonly: expected.bytes != selected.end,
                 poisoned: false,
             }),
             cache: Mutex::new(Index::new()),
             may_be_published: AtomicBool::new(true),
         }));
-        store.check_source(expected)?;
-        let mut offset = FILE_HEADER;
-        let mut last = None;
-        while offset < selected.end {
-            check()?;
-            let record = read_record(&store.0.file, offset, selected.end, limits, check)?;
-            if &record.kind == b"TILE" {
-                let block = store.block_record(&record)?;
-                let mut state = store.state()?;
-                if state.blocks.len() >= limits.max_blocks
-                    || state.blocks.insert_reserved(block.digest, block)?.is_some()
-                {
-                    return Err(Error::Corrupt);
-                }
-            } else if &record.kind == b"CMIT" {
-                let snapshot = store.manifest_record(&record, check)?;
-                last = Some(snapshot);
-            } else {
-                return Err(Error::Corrupt);
-            }
-            offset = record.end;
-        }
-        let snapshot = last.ok_or(Error::Corrupt)?;
-        if snapshot.commit != selected || offset != selected.end {
-            return Err(Error::Corrupt);
-        }
-        check()?;
-        store.check_source(expected)?;
-        Ok(snapshot)
+        store.read_selected(selected, None, check)
+    }
+
+    pub(crate) fn check_writable_owner(&self) -> Result<()> {
+        let _read = self.0.access.read()?;
+        self.writable()
     }
 
     pub fn put(&self, spec: TileSpec, bytes: &[u8], check: Check<'_>) -> Result<BlockRef> {
+        self.put_inner(spec, bytes, check, None)
+    }
+
+    /// A tile transaction checks its external owner at I/O boundaries and
+    /// polls active work between bounded chunks on the held store handle.
+    pub(crate) fn put_guarded(
+        &self,
+        spec: TileSpec,
+        bytes: &[u8],
+        active: Check<'_>,
+        owner: Check<'_>,
+    ) -> Result<BlockRef> {
+        self.put_inner(spec, bytes, active, Some(owner))
+    }
+
+    fn put_inner(
+        &self,
+        spec: TileSpec,
+        bytes: &[u8],
+        check: Check<'_>,
+        mut owner: Option<Check<'_>>,
+    ) -> Result<BlockRef> {
         if bytes.len() != spec.bytes() {
             return Err(Error::Invalid(
                 "Native tile byte length differs from its specification",
             ));
         }
-        check()?;
+        check_boundary(check, &mut owner)?;
         let _write = self.0.access.write()?;
         self.writable()?;
         let spec_bytes = spec.encode();
         let digest = digest_parts(b"TILE", [&spec_bytes[..], bytes], check)?;
         let expected = self.state()?.expected;
+        if let Some(owner) = owner.as_mut() {
+            owner()?;
+        }
         self.check_source(expected)?;
         if let Some(reference) = self.state()?.blocks.get(&digest).copied() {
             return Ok(reference);
@@ -869,7 +945,15 @@ impl Store {
         self.state()?
             .blocks
             .reserve_one(&self.0.budget, self.0.limits.max_blocks)?;
-        let record = self.append(b"TILE", [&spec_bytes[..], bytes], digest, check)?;
+        let record = self.append_with(
+            b"TILE", (spec_bytes.len() + bytes.len()) as u64, digest, check, owner,
+            |offset, check| {
+                let mut at = offset;
+                append_bytes(&self.0.file, &mut at, &spec_bytes, check)?;
+                append_bytes(&self.0.file, &mut at, bytes, check)?;
+                Ok(at)
+            },
+        )?;
         let reference = BlockRef {
             store: self.0.id,
             digest,
@@ -881,33 +965,107 @@ impl Store {
     }
 
     pub fn pin(&self, reference: BlockRef, check: Check<'_>) -> Result<PinnedTile> {
-        if reference.store != self.0.id
-            || self.state()?.blocks.get(&reference.digest) != Some(&reference)
-        {
-            return Err(Error::Corrupt);
-        }
+        self.pin_inner(reference, check, None)
+    }
+
+    /// Keep the external owner checks around the held read and digest. Poll
+    /// cancellation between chunks without reopening the inventory there.
+    pub(crate) fn pin_guarded(
+        &self,
+        reference: BlockRef,
+        active: Check<'_>,
+        owner: Check<'_>,
+    ) -> Result<PinnedTile> {
+        self.pin_inner(reference, active, Some(owner))
+    }
+
+    fn pin_inner(
+        &self,
+        reference: BlockRef,
+        check: Check<'_>,
+        owner: Option<Check<'_>>,
+    ) -> Result<PinnedTile> {
+        self.check_block(reference)?;
         let bytes = self.load(
             (1, reference.digest),
             reference.bytes(),
             check,
-            |bytes, check| {
-                read_checked(
-                    &self.0.file,
-                    reference.offset + RECORD_HEADER + 8,
-                    bytes,
-                    check,
-                )?;
-                let spec = reference.spec.encode();
-                if digest_parts(b"TILE", [&spec[..], &bytes[..]], check)? != reference.digest {
-                    return Err(Error::Corrupt);
-                }
-                Ok(())
-            },
+            owner,
+            |bytes, check| self.read_tile(reference, bytes, check),
         )?;
         Ok(PinnedTile {
             spec: reference.spec,
             bytes,
         })
+    }
+
+    pub(crate) const PIN_BATCH_LIMIT: usize = 16;
+
+    /// Read one bounded group from the same held store. Missing slots have no
+    /// backing reference. Return pins only after the final owner check.
+    pub(crate) fn pin_batch(
+        &self,
+        references: &[Option<BlockRef>],
+        output: &mut [Option<PinnedTile>],
+        active: Check<'_>,
+        owner: Check<'_>,
+    ) -> Result<()> {
+        if references.is_empty()
+            || references.len() > Self::PIN_BATCH_LIMIT
+            || references.len() != output.len()
+            || output.iter().any(Option::is_some)
+        {
+            return Err(Error::Invalid("Invalid native tile pin batch"));
+        }
+        let _read = self.0.access.read()?;
+        let expected = self.state()?.expected;
+        let mut owner = Some(owner);
+        check_boundary(active, &mut owner)?;
+        self.check_source(expected)?;
+        let result = (|| {
+            for (&reference, slot) in references.iter().zip(&mut *output) {
+                active()?;
+                let Some(reference) = reference else {
+                    continue;
+                };
+                self.check_block(reference)?;
+                let bytes = self.load_cached(
+                    (1, reference.digest),
+                    reference.bytes(),
+                    active,
+                    |bytes, check| self.read_tile(reference, bytes, check),
+                    &mut |_, _| Ok(()),
+                )?;
+                *slot = Some(PinnedTile {
+                    spec: reference.spec,
+                    bytes,
+                });
+            }
+            check_boundary(active, &mut owner)?;
+            self.check_source(expected)
+        })();
+        if result.is_err() {
+            output.fill_with(|| None);
+        }
+        result
+    }
+
+    fn check_block(&self, reference: BlockRef) -> Result<()> {
+        if reference.store != self.0.id
+            || self.state()?.blocks.get(&reference.digest) != Some(&reference)
+        {
+            return Err(Error::Corrupt);
+        }
+        Ok(())
+    }
+
+    fn read_tile(&self, reference: BlockRef, bytes: &mut [u8], check: Check<'_>) -> Result<()> {
+        read_checked(&self.0.file, reference.offset + RECORD_HEADER + 8, bytes, check)?;
+        let spec = reference.spec.encode();
+        if digest_parts(b"TILE", [&spec[..], &bytes[..]], check)? != reference.digest {
+            return Err(Error::Corrupt);
+        }
+        Ok(())
     }
 
     pub fn commit(
@@ -1021,6 +1179,11 @@ impl Store {
     }
 
     fn check_source(&self, expected: Stamp) -> Result<()> {
+        let mut header = [0; FILE_HEADER as usize];
+        read_exact_at(&self.0.file, 0, &mut header)?;
+        if &header[..8] != FILE_MAGIC || header[8..] != self.0.id {
+            return Err(Error::Corrupt);
+        }
         validate_ancestors(&self.0.root)?;
         regular(&self.0.path)?;
         let named_root = open_directory(&self.0.root)?;
@@ -1046,12 +1209,32 @@ impl Store {
         key: (u8, Digest),
         length: usize,
         check: Check<'_>,
+        mut owner: Option<Check<'_>>,
         read: impl FnOnce(&mut [u8], Check<'_>) -> Result<()>,
     ) -> Result<PinnedBytes> {
         let _read = self.0.access.read()?;
         let expected = self.state()?.expected;
         self.check_source(expected)?;
-        check()?;
+        check_boundary(check, &mut owner)?;
+        let guarded = owner.is_some();
+        self.load_cached(key, length, check, read, &mut |check, cached| {
+            if !cached || guarded {
+                check_boundary(check, &mut owner)?;
+            }
+            self.check_source(expected)
+        })
+    }
+
+    // Callers hold a store read permit and validate its source before and
+    // after use. Each uncached payload still verifies its exact digest.
+    fn load_cached(
+        &self,
+        key: (u8, Digest),
+        length: usize,
+        check: Check<'_>,
+        read: impl FnOnce(&mut [u8], Check<'_>) -> Result<()>,
+        validate: &mut dyn FnMut(Check<'_>, bool) -> Result<()>,
+    ) -> Result<PinnedBytes> {
         let cached = self
             .0
             .cache
@@ -1060,14 +1243,13 @@ impl Store {
             .get(&key)
             .and_then(Weak::upgrade);
         if let Some(data) = cached {
-            self.check_source(expected)?;
+            validate(check, true)?;
             return Ok(PinnedBytes(data));
         }
         let charge = self.0.budget.reserve(length)?;
         let mut bytes = super::budget::allocate(length)?;
         read(&mut bytes, check)?;
-        check()?;
-        self.check_source(expected)?;
+        validate(check, false)?;
         let candidate = Arc::new(Resident {
             bytes,
             _charge: charge,
@@ -1179,25 +1361,6 @@ impl Store {
         })
     }
 
-    fn append<'a>(
-        &self,
-        kind: &[u8; 4],
-        parts: impl IntoIterator<Item = &'a [u8]> + Clone,
-        digest: Digest,
-        check: Check<'_>,
-    ) -> Result<Record> {
-        let length = parts.clone().into_iter().try_fold(0u64, |n, bytes| {
-            n.checked_add(bytes.len() as u64).ok_or(Error::Budget)
-        })?;
-        self.append_with(kind, length, digest, check, |offset, check| {
-            let mut at = offset;
-            for bytes in parts {
-                append_bytes(&self.0.file, &mut at, bytes, check)?;
-            }
-            Ok(at)
-        })
-    }
-
     fn append_manifest(
         &self,
         header: &[u8],
@@ -1207,7 +1370,7 @@ impl Store {
         digest: Digest,
         check: Check<'_>,
     ) -> Result<Record> {
-        self.append_with(b"CMIT", length as u64, digest, check, |offset, check| {
+        self.append_with(b"CMIT", length as u64, digest, check, None, |offset, check| {
             let mut at = offset;
             append_bytes(&self.0.file, &mut at, header, check)?;
             append_bytes(&self.0.file, &mut at, metadata, check)?;
@@ -1224,6 +1387,7 @@ impl Store {
         length: u64,
         digest: Digest,
         check: Check<'_>,
+        mut owner: Option<Check<'_>>,
         write: impl FnOnce(u64, Check<'_>) -> Result<u64>,
     ) -> Result<Record> {
         let expected = self.state()?.expected;
@@ -1234,7 +1398,7 @@ impl Store {
             .and_then(|n| n.checked_add(SEAL.len() as u64))
             .filter(|n| *n <= self.0.limits.disk_bytes)
             .ok_or(Error::Budget)?;
-        check()?;
+        check_boundary(check, &mut owner)?;
         self.check_source(expected)?;
         if let Some(charge) = &self.0.disk {
             charge.grow(end - expected.bytes)?;
@@ -1261,19 +1425,22 @@ impl Store {
             if written != end - SEAL.len() as u64 {
                 return Err(Error::Corrupt);
             }
-            check()?;
+            check_boundary(check, &mut owner)?;
             write_all_at(&self.0.file, written, SEAL)?;
             self.0.file.sync_all()?;
             let after = stamp(&self.0.file)?;
             if after.bytes != end {
                 return Err(Error::Changed);
             }
+            if let Some(owner) = owner.as_mut() {
+                owner()?;
+            }
             self.check_source(after)?;
             let checked = read_record(&self.0.file, expected.bytes, end, self.0.limits, check)?;
             if checked.digest != digest || checked.kind != *kind {
                 return Err(Error::Corrupt);
             }
-            check()?;
+            check_boundary(check, &mut owner)?;
             self.check_source(after)?;
             self.state()?.expected = after;
             Ok(record)
@@ -1288,6 +1455,14 @@ impl Store {
         }
         result
     }
+}
+
+fn check_boundary(active: Check<'_>, owner: &mut Option<Check<'_>>) -> Result<()> {
+    active()?;
+    if let Some(owner) = owner {
+        owner()?;
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]

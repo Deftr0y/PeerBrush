@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 fn fixture(depth: u16) -> (Shared, Shared, workspace::Registry) {
     let mut e = Engine::new();
-    e.doc = Document::new_depth(8, 6, depth).unwrap();
+    e.resident_state_mut().expect("resident fixture").document = Document::new_depth(8, 6, depth).unwrap();
     let root = Arc::new(Mutex::new(e));
     let registry = workspace::attach(&root);
     let second = workspace::new_project(&root, 8, 6, depth, None).unwrap();
@@ -21,14 +21,14 @@ fn reviewed(shared: &Shared, discard: bool) -> Reviewed {
     let e = shared.lock().unwrap();
     Reviewed {
         project: e.project_id.clone(),
-        document: e.doc.id.clone(),
-        revision: e.doc.revision,
+        document: e.resident_state().expect("resident fixture").document.id.clone(),
+        revision: e.resident_state().expect("resident fixture").document.revision,
         discard,
     }
 }
 fn dirty(shared: &Shared, name: &str) {
     let mut e = shared.lock().unwrap();
-    let layer = e.doc.layers[0].id.clone();
+    let layer = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
     e.edit(
         "human",
         &[json!({"op":"layer.update","layer":layer,"name":name})],
@@ -42,7 +42,7 @@ fn unchanged(root: &Shared, second: &Shared, before: &[Vec<u8>; 2]) {
     for (shared, bytes) in [root, second].into_iter().zip(before) {
         let e = shared.lock().unwrap();
         assert!(!e.closed);
-        assert_eq!(e.doc.export_png().unwrap(), *bytes);
+        assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), *bytes);
     }
 }
 
@@ -53,8 +53,8 @@ fn final_exit_requires_every_dirty_source_and_never_closes_a_subset() {
         dirty(&root, "Unsaved one");
         dirty(&second, "Unsaved two");
         let before = [
-            root.lock().unwrap().doc.export_png().unwrap(),
-            second.lock().unwrap().doc.export_png().unwrap(),
+            root.lock().unwrap().resident_state().expect("resident fixture").document.export_png().unwrap(),
+            second.lock().unwrap().resident_state().expect("resident fixture").document.export_png().unwrap(),
         ];
         assert!(finish_exit(
             &registry,
@@ -63,12 +63,12 @@ fn final_exit_requires_every_dirty_source_and_never_closes_a_subset() {
         .is_err());
         unchanged(&root, &second, &before);
         assert_eq!(workspace::handles_in(&registry).len(), 2);
-        assert_eq!(second.lock().unwrap().doc.layers[0].name, "Unsaved two");
-        assert_eq!(root.lock().unwrap().undo.len(), 1);
+        assert_eq!(second.lock().unwrap().resident_state().expect("resident fixture").document.layers[0].name, "Unsaved two");
+        assert_eq!(root.lock().unwrap().resident_state().expect("resident fixture").undo.len(), 1);
         finish_exit(&registry, &[reviewed(&root, true), reviewed(&second, true)]).unwrap();
         assert!(root.lock().unwrap().closed && second.lock().unwrap().closed);
-        assert_eq!(root.lock().unwrap().doc.bit_depth, depth);
-        assert_eq!(root.lock().unwrap().doc.export_png().unwrap(), before[0]);
+        assert_eq!(root.lock().unwrap().resident_state().expect("resident fixture").document.bit_depth, depth);
+        assert_eq!(root.lock().unwrap().resident_state().expect("resident fixture").document.export_png().unwrap(), before[0]);
         assert!(workspace::new_project(&root, 8, 6, depth, None).is_err());
     }
 }
@@ -80,9 +80,9 @@ fn newer_human_work_and_replaced_source_invalidate_discard_reviews() {
     dirty(&root, "New human work");
     assert!(finish_exit(&registry, &old).is_err());
     assert!(!second.lock().unwrap().closed);
-    assert_eq!(root.lock().unwrap().doc.layers[0].name, "New human work");
+    assert_eq!(root.lock().unwrap().resident_state().expect("resident fixture").document.layers[0].name, "New human work");
     let old = vec![reviewed(&root, true), reviewed(&second, false)];
-    second.lock().unwrap().doc.id = peerbrush::engine::id();
+    second.lock().unwrap().resident_state_mut().expect("resident fixture").document.id = peerbrush::engine::id();
     assert!(finish_exit(&registry, &old).is_err());
     assert!(!root.lock().unwrap().closed);
 }
@@ -134,14 +134,14 @@ fn failed_save_keeps_dirty_state_history_and_both_projects_open() {
     let e = root.lock().unwrap();
     assert!(!e.closed);
     assert_eq!(e.saved_revision, 0);
-    assert_eq!(e.undo.len(), 1);
-    assert_eq!(e.doc.layers[0].name, "Keep unsaved");
+    assert_eq!(e.resident_state().expect("resident fixture").undo.len(), 1);
+    assert_eq!(e.resident_state().expect("resident fixture").document.layers[0].name, "Keep unsaved");
     assert!(!second.lock().unwrap().closed);
 }
 #[test]
 fn successful_save_retains_native_samples_and_current_standard_composite_before_exit() {
     let (root, second, registry) = fixture(16);
-    root.lock().unwrap().doc.layers[0]
+    root.lock().unwrap().resident_state_mut().expect("resident fixture").document.layers[0]
         .pixels
         .set16(2, 3, [10001, 30003, 50007, 65535]);
     dirty(&root, "Native source");
@@ -156,11 +156,11 @@ fn successful_save_retains_native_samples_and_current_standard_composite_before_
     );
     assert_eq!(
         reopened.export_png().unwrap(),
-        root.lock().unwrap().doc.export_png().unwrap()
+        root.lock().unwrap().resident_state().expect("resident fixture").document.export_png().unwrap()
     );
     finish_exit(&registry, &[source, reviewed(&second, false)]).unwrap();
     let e = root.lock().unwrap();
-    assert_eq!(e.saved_revision, e.doc.revision);
+    assert_eq!(e.saved_revision, e.resident_state().expect("resident fixture").document.revision);
 }
 
 #[test]
@@ -176,8 +176,8 @@ fn reviewed_save_rejects_a_newer_revision_before_capturing_or_writing() {
     let e = root.lock().unwrap();
     assert!(!e.closed);
     assert_eq!(e.saved_revision, 0);
-    assert_eq!(e.doc.layers[0].name, "New human work");
-    assert_eq!(e.undo.len(), 2);
+    assert_eq!(e.resident_state().expect("resident fixture").document.layers[0].name, "New human work");
+    assert_eq!(e.resident_state().expect("resident fixture").undo.len(), 2);
 }
 
 #[test]
@@ -202,9 +202,9 @@ fn requesting_native_close_review_requires_human_and_exact_source_without_closin
         e.native_close_review,
         Some((source.document, source.revision))
     );
-    assert_eq!(e.doc.layers[0].name, "Review in native workspace");
-    assert_eq!(e.doc.revision, 1);
-    assert_eq!(e.undo.len(), 1);
+    assert_eq!(e.resident_state().expect("resident fixture").document.layers[0].name, "Review in native workspace");
+    assert_eq!(e.resident_state().expect("resident fixture").document.revision, 1);
+    assert_eq!(e.resident_state().expect("resident fixture").undo.len(), 1);
     assert!(!root.lock().unwrap().closed);
 }
 

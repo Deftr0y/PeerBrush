@@ -27,6 +27,14 @@ pub(crate) trait StageSession {
     }
     fn store_for_lineage(&self, lineage: [u8; 16]) -> Result<Store>;
     fn seal_store(&self, store: &Store, blocks: &[BlockRef], metadata: &[u8]) -> Result<Snapshot>;
+    fn try_seal_store(
+        &self,
+        store: &Store,
+        blocks: &[BlockRef],
+        metadata: &[u8],
+    ) -> Result<Option<Snapshot>> {
+        self.seal_store(store, blocks, metadata).map(Some)
+    }
 }
 pub(crate) trait StageRuntime {
     type Session: StageSession;
@@ -164,6 +172,7 @@ impl ResidentCapture {
             planes: vec![],
             resident: &resident,
             decoded: vec![],
+            prepared: None,
         };
         let metadata = Document36::capture(&self.document, &mut capture)?;
         let mut sources = Vec::new();
@@ -248,16 +257,61 @@ fn seal_sources<S: StageSession>(
     session: &S,
     check: &dyn Fn() -> Result<()>,
 ) -> Result<(Vec<Snapshot>, crate::large_document::Reservation)> {
-    // Current-limit derived bridge: all descriptor copies are admitted before
-    // building the per-store tables. This does not evict resident live authority.
+    seal_sources_limited(scene, session, 65536, 65536, check)
+}
+/// Off-lock checkpoint capture from the actual immutable native generation.
+/// This retains native surfaces and never projects through resident Raster.
+pub(crate) fn seal_native_sources(
+    scene: &SceneSnapshot,
+    session: &crate::workspace::source_runtime::SourceSession,
+    maximum_refs: usize,
+    maximum_stores: usize,
+    check: &dyn Fn() -> Result<()>,
+) -> Result<super::source_copy::SealedSources> {
+    check()?;
+    scene.native_document()?;
+    if maximum_refs == 0
+        || maximum_refs > 1_048_576
+        || maximum_stores == 0
+        || maximum_stores > 4096
+        || !scene.budget().same_pool(&session.resident())
+        || !scene.disk_budget().same_pool(&session.disk())
+    {
+        return Err("Native checkpoint sources differ from their actual session admission".into());
+    }
+    session.check()?;
+    super::source_copy::seal_sources(
+        scene.rasters().as_slice(),
+        scene.budget(),
+        scene.disk_budget(),
+        session,
+        &scene.render_key()?,
+        (maximum_refs, maximum_stores),
+        0,
+        check,
+    )
+}
+fn seal_sources_limited<S: StageSession>(
+    scene: &SceneSnapshot,
+    session: &S,
+    maximum_refs: usize,
+    maximum_stores: usize,
+    check: &dyn Fn() -> Result<()>,
+) -> Result<(Vec<Snapshot>, crate::large_document::Reservation)> {
+    // Admit descriptor copies before building per-store tables. The captured
+    // source owners remain unchanged through checkpoint publication.
+    check()?;
     let count = scene.rasters().iter().try_fold(0usize, |n, (_, surface)| {
-        n.checked_add(surface.physical_tiles().count())
-            .filter(|n| *n <= 65536)
-            .ok_or_else(|| "Derived scene has too many physical tile references".to_string())
+        surface.physical_tiles().try_fold(n, |n, _| {
+            check()?;
+            n.checked_add(1)
+                .filter(|n| *n <= maximum_refs)
+                .ok_or_else(|| "Derived scene has too many physical tile references".to_string())
+        })
     })?;
     let bytes = count
-        .checked_mul(std::mem::size_of::<BlockRef>() + 256)
-        .and_then(|n| n.checked_add(128))
+        .checked_mul(3 * std::mem::size_of::<BlockRef>() + 512)
+        .and_then(|n| n.checked_add(4096))
         .ok_or("Derived seal metadata overflow")?;
     let charge = scene
         .budget()
@@ -268,12 +322,15 @@ fn seal_sources<S: StageSession>(
         for tile in surface.physical_tiles() {
             check()?;
             session.check()?;
+            if stores.len() >= maximum_stores && !stores.contains_key(&tile.owner().identity()) {
+                return Err("Native checkpoint source count exceeds admission".into());
+            }
             let entry = stores
                 .entry(tile.owner().identity())
                 .or_insert_with(|| (tile.owner().clone(), vec![]));
             entry
                 .1
-                .try_reserve_exact(1)
+                .try_reserve(1)
                 .map_err(|_| "Derived seal reference allocation refused")?;
             entry.1.push(tile.reference());
         }
@@ -303,7 +360,223 @@ struct Collector<'a> {
     planes: Vec<PlaneInput>,
     resident: &'a ResidentBudget,
     decoded: Vec<Arc<MetadataCharge>>,
+    prepared: Option<BTreeMap<*const Raster, Surface>>,
 }
+
+/// Capture standard Photoshop metadata and assemble its provisional source roster.
+/// The caller must qualify its native render before adopting it.
+pub(crate) fn stage_decoded(
+    document: &Document,
+    direct: Option<&crate::psd::DecodedBacked>,
+    fragment: &crate::large_document::FreshFragment,
+    session: &crate::workspace::source_runtime::SourceSession,
+    check: &dyn Fn() -> Result<()>,
+) -> Result<super::super::native::NativeDocument> {
+    let resident = session.resident();
+    let disk = session.disk();
+    // The standard decoder already bounds padded resident tiles. Admit the
+    // additional descriptor graph and copied metadata before capture.
+    let mut bytes = 4 * 1024 * 1024usize;
+    for layer in &document.layers {
+        check()?;
+        if layer.source.is_some() {
+            return Err("Conventional backing requires standard Photoshop layer sources".into());
+        }
+        bytes = bytes
+            .checked_add(layer.name.len())
+            .ok_or("Photoshop metadata admission overflow")?;
+        for data in &layer.psd_metadata {
+            bytes = bytes
+                .checked_add(data.data.len())
+                .ok_or("Photoshop metadata admission overflow")?;
+        }
+        for effect in &layer.effects {
+            crate::effects::regional::metadata_bytes(&effect.settings, 0, &mut bytes)?;
+        }
+        for step in layer.mask.iter().flat_map(|mask| &mask.steps) {
+            crate::effects::regional::metadata_bytes(&step.settings, 0, &mut bytes)?;
+        }
+    }
+    for data in &document.psd_global_metadata {
+        bytes = bytes
+            .checked_add(data.data.len())
+            .ok_or("Photoshop metadata admission overflow")?;
+    }
+    if let Some(file_info) = &document.psd_file_info {
+        bytes = bytes
+            .checked_add(file_info.len())
+            .ok_or("Photoshop metadata admission overflow")?;
+    }
+    if bytes > 64 * 1024 * 1024 {
+        return Err("Conventional Photoshop metadata exceeds native capture admission".into());
+    }
+    let owner = MetadataCharge::reserve(&resident, bytes, check)?;
+    let prepared = direct
+        .map(|decoded| -> Result<_> {
+            let mut sources = BTreeMap::new();
+            for layer in &document.layers {
+                check()?;
+                if let Some(color) = decoded.color.get(&layer.id) {
+                    sources.insert(std::ptr::from_ref(&layer.pixels), color.clone());
+                }
+                if let Some(mask) = decoded.masks.get(&layer.id) {
+                    let paint = layer
+                        .mask
+                        .as_ref()
+                        .and_then(|mask| mask.steps.iter().find(|step| step.kind == "paint"))
+                        .ok_or("Backed Photoshop mask has no paint step")?;
+                    sources.insert(std::ptr::from_ref(&paint.pixels), mask.clone());
+                    if let Some(original) = &paint.pixels.retained {
+                        let surface = decoded
+                            .mask_originals
+                            .get(&layer.id)
+                            .ok_or("Missing backed Photoshop mask original")?;
+                        sources.insert(std::ptr::from_ref(original.pixels.as_ref()), surface.clone());
+                    }
+                }
+            }
+            if sources.len() != decoded.color.len() + decoded.masks.len() + decoded.mask_originals.len()
+            {
+                return Err("Unmapped backed Photoshop source".into());
+            }
+            Ok(sources)
+        })
+        .transpose()?;
+    let mut collector = Collector {
+        planes: Vec::new(),
+        resident: &resident,
+        decoded: vec![owner],
+        prepared,
+    };
+    let metadata = Document36::capture(document, &mut collector)?;
+    if collector
+        .prepared
+        .as_ref()
+        .is_some_and(|sources| !sources.is_empty())
+    {
+        return Err("Uncaptured backed Photoshop source".into());
+    }
+    let mut sources = Vec::new();
+    sources
+        .try_reserve_exact(collector.planes.len())
+        .map_err(|_| "Decoded native source roster allocation refused")?;
+    let mut failure = None;
+    for plane in collector.planes {
+        check()?;
+        let surface = match plane {
+            PlaneInput::Stored(surface) if direct.is_some() => surface,
+            PlaneInput::Resident(raster)
+                if raster.tiles.is_empty() && raster.samples16.is_empty() =>
+            {
+                Surface::zero(raster.width, raster.height, raster.depth)
+                    .map_err(|e| e.to_string())?
+            }
+            PlaneInput::Resident(raster) => {
+                let staged =
+                    Surface::stage_current_pixels(&raster, fragment.store().clone(), &mut || {
+                        check().map_err(|reason| {
+                            failure = Some(reason);
+                            crate::large_document::Error::Cancelled
+                        })
+                    });
+                staged.map_err(|e| failure.take().unwrap_or_else(|| e.to_string()))?
+            }
+            PlaneInput::Stored(_) => {
+                return Err(
+                    "Conventional Photoshop decoder returned an unexpected backed source".into(),
+                )
+            }
+        };
+        sources.push(surface);
+    }
+    let owner = MetadataCharge::combine(&collector.decoded, check)?;
+    let pending = PendingScene::new(
+        Admitted::from_parts(Arc::new(metadata), owner),
+        RasterRoster::new(sources)?,
+        resident,
+        disk,
+    )?;
+    let native = super::super::native::NativeDocument::from_pending(pending)?;
+    native.validate_editable(check)?;
+    check()?;
+    Ok(native)
+}
+
+pub(crate) fn seal_decoded(
+    scene: &SceneSnapshot,
+    session: &crate::workspace::source_runtime::SourceSession,
+    check: &dyn Fn() -> Result<()>,
+) -> Result<()> {
+    seal_sources(scene, session, check).map(|_| ())
+}
+
+/// Stage an immutable clipboard tree without publishing any backing source.
+/// The caller attaches these outputs to the actual paste delta or retires them.
+pub(crate) fn stage_resident_clipboard(
+    snapshot: &crate::layer_clipboard::Layers,
+    base: &super::super::native::NativeDocument,
+    session: &crate::workspace::source_runtime::SourceSession,
+    outputs: &mut Vec<super::super::native::StagedOutput>,
+    check: &dyn Fn() -> Result<()>,
+) -> Result<super::super::native::NativeDocument> {
+    let resident = base.budget();
+    // Use the resident capture envelope while cloning the editable descriptors.
+    let owner = MetadataCharge::reserve(resident, 64 * 1024 * 1024, check)?;
+    let document = crate::layer_clipboard::validated_document(snapshot)?;
+    let mut capture = Collector {
+        planes: vec![],
+        resident,
+        decoded: vec![owner],
+        prepared: None,
+    };
+    let metadata = Document36::capture(&document, &mut capture)?;
+    drop(document);
+    let count = capture.planes.len();
+    let occupied = capture.planes.iter().filter(|plane| {
+        matches!(plane, PlaneInput::Resident(raster) if !raster.tiles.is_empty() || !raster.samples16.is_empty())
+    }).count();
+    let bytes = count * std::mem::size_of::<Surface>()
+        + occupied * std::mem::size_of::<super::super::native::StagedOutput>();
+    let _inventory = MetadataCharge::reserve(resident, bytes, check)?;
+    outputs
+        .try_reserve_exact(occupied)
+        .map_err(|_| "Clipboard staging output allocation refused")?;
+    let mut sources = Vec::new();
+    sources
+        .try_reserve_exact(count)
+        .map_err(|_| "Clipboard source roster allocation refused")?;
+    for plane in capture.planes {
+        check()?;
+        let surface = match plane {
+            PlaneInput::Resident(raster) if raster.tiles.is_empty() && raster.samples16.is_empty() => {
+                Surface::zero(raster.width, raster.height, raster.depth)
+                    .map_err(|error| error.to_string())?
+            }
+            PlaneInput::Resident(raster) => {
+                let output = crate::retained::transaction::stage(base, session, check, |store, guard| {
+                    Surface::stage_current_pixels(&raster, store.clone(), &mut || guard())
+                        .map_err(|error| error.to_string())
+                })?;
+                let surface = output.surface().clone();
+                outputs.push(output);
+                surface
+            }
+            PlaneInput::Stored(_) => return Err("Resident clipboard contains an unexpected backed source".into()),
+        };
+        sources.push(surface);
+    }
+    let owner = MetadataCharge::combine(&capture.decoded, check)?;
+    let pending = PendingScene::new(
+        Admitted::from_parts(Arc::new(metadata), owner),
+        RasterRoster::new(sources)?,
+        resident.clone(),
+        base.disk_budget().clone(),
+    )?;
+    let native = super::super::native::NativeDocument::from_pending(pending)?;
+    native.validate_editable(check)?;
+    Ok(native)
+}
+
 impl Collector<'_> {
     fn next(&self) -> Result<u32> {
         if self.planes.len() >= MAX_RASTER_LOCATIONS {
@@ -314,19 +587,36 @@ impl Collector<'_> {
 }
 impl RasterCollector for Collector<'_> {
     fn resident(&mut self, raster: &Raster) -> Result<RasterRef36> {
-        raster.validate_layout()?;
+        if self.prepared.is_some() {
+            raster.validate_layout_with_limits(crate::raster::CanvasLimits::Native)?;
+        } else {
+            raster.validate_layout()?;
+        }
         let id = self.next()?;
         self.planes
             .try_reserve(1)
             .map_err(|_| "Scene source handle allocation refused")?;
-        self.planes.push(PlaneInput::Resident(Raster {
-            width: raster.width,
-            height: raster.height,
-            depth: raster.depth,
-            tiles: raster.tiles.clone(),
-            samples16: raster.samples16.clone(),
-            retained: None,
-        }));
+        let input = if let Some(prepared) = &mut self.prepared {
+            if !raster.tiles.is_empty() || !raster.samples16.is_empty() {
+                return Err("Unexpected resident pixels in backed Photoshop metadata".into());
+            }
+            let surface = match prepared.remove(&std::ptr::from_ref(raster)) {
+                Some(surface) => surface,
+                None => Surface::zero(raster.width, raster.height, raster.depth)
+                    .map_err(|e| e.to_string())?,
+            };
+            PlaneInput::Stored(surface)
+        } else {
+            PlaneInput::Resident(Raster {
+                width: raster.width,
+                height: raster.height,
+                depth: raster.depth,
+                tiles: raster.tiles.clone(),
+                samples16: raster.samples16.clone(),
+                retained: None,
+            })
+        };
+        self.planes.push(input);
         let retained = raster
             .retained
             .as_ref()
@@ -348,6 +638,9 @@ impl RasterCollector for Collector<'_> {
         })
     }
     fn surface(&mut self, surface: &Surface) -> Result<RasterRef36> {
+        if self.prepared.is_some() {
+            return Err("Unexpected embedded source in backed Photoshop metadata".into());
+        }
         let id = self.next()?;
         self.planes
             .try_reserve(1)
@@ -374,7 +667,7 @@ impl RasterCollector for Collector<'_> {
     }
 }
 
-fn legacy_coverage_bytes(value: &Value) -> Result<usize> {
+pub(crate) fn legacy_coverage_bytes(value: &Value) -> Result<usize> {
     let object = value
         .as_object()
         .ok_or("Invalid captured coverage metadata")?;

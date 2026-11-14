@@ -9,7 +9,6 @@ use std::{
 const CACHE_BYTES: usize = 8 * 1024 * 1024;
 const CACHE_ENTRIES: usize = 64;
 const SYSTEM_FONT_BYTES: usize = 64 * 1024 * 1024;
-const SYSTEM_FACE_BYTES: usize = 32 * 1024 * 1024;
 // Representative clusters select one complete face per script; collection
 // indices are retained. Installed fonts are presentation inputs only.
 const SCRIPTS: &[(&[&str], &str)] = &[
@@ -163,45 +162,36 @@ fn selected_system_face(
     preferred: &[&str],
     sample: &str,
 ) -> Option<SystemFace> {
-    let mut candidates = preferred
-        .iter()
-        .filter_map(|family| {
-            db.query(&fontdb::Query {
-                families: &[fontdb::Family::Name(family)],
-                ..Default::default()
-            })
+    let preferred = preferred.iter().filter_map(|family| {
+        db.query(&fontdb::Query {
+            families: &[fontdb::Family::Name(family)],
+            ..Default::default()
         })
-        .collect::<Vec<_>>();
-    let mut remaining = db
-        .faces()
-        .filter(|face| face.style == fontdb::Style::Normal)
-        .collect::<Vec<_>>();
-    remaining.sort_by_key(|face| {
-        (
-            face.weight.0.abs_diff(400),
-            face.post_script_name.clone(),
-            face.index,
-        )
     });
-    candidates.extend(remaining.into_iter().map(|face| face.id));
+    let remaining = std::iter::once_with(|| {
+        let mut faces = db
+            .faces()
+            .filter(|face| face.style == fontdb::Style::Normal)
+            .collect::<Vec<_>>();
+        faces.sort_by(|a, b| {
+            (a.weight.0.abs_diff(400), &a.post_script_name, a.index)
+                .cmp(&(b.weight.0.abs_diff(400), &b.post_script_name, b.index))
+        });
+        faces.into_iter().map(|face| face.id)
+    }).flatten();
     let mut seen = std::collections::HashSet::new();
-    for id in candidates {
+    for id in preferred.chain(remaining) {
         if !seen.insert(id) {
             continue;
         }
         let face = db.face(id)?;
-        // Check file length before fontdb reads it; never retain unbounded
-        // installed font data or map files that another process can modify.
         let fontdb::Source::File(path) = &face.source else {
             continue;
         };
-        if !std::fs::metadata(path).is_ok_and(|m| m.len() <= SYSTEM_FACE_BYTES as u64) {
+        let Ok(bytes) = crate::fonts::read_owned(path) else {
             continue;
-        }
-        if let Some(Some(bytes)) = db.with_face_data(id, |bytes, index| {
-            (bytes.len() <= SYSTEM_FACE_BYTES && covers(bytes, index, sample))
-                .then(|| bytes.to_vec())
-        }) {
+        };
+        if covers(&bytes, face.index, sample) {
             return Some(SystemFace {
                 id,
                 family: face.families.first()?.0.clone(),
@@ -920,7 +910,7 @@ mod tests {
         // The font's metadata was already discovered. Recheck current length
         // before reading selected data, including a subsequently enlarged file.
         let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
-        file.set_len(SYSTEM_FACE_BYTES as u64 + 1).unwrap();
+        file.set_len(crate::fonts::FILE_BYTES as u64 + 1).unwrap();
         assert!(selected_system_face(&db, &["Ubuntu Sans"], "abc").is_none());
         drop(file);
         std::fs::remove_dir_all(dir).unwrap();

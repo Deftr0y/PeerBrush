@@ -39,7 +39,6 @@ impl NativeDocument {
             now,
             closed,
             write_available,
-            false,
             None,
         )
     }
@@ -64,8 +63,7 @@ impl NativeDocument {
             now,
             closed,
             write_available,
-            true,
-            Some(descriptor.shared_scopes()),
+            Some(&descriptor),
         )?;
         let admission = edit
             .admission
@@ -85,8 +83,7 @@ impl NativeDocument {
         now: u64,
         closed: bool,
         write_available: bool,
-        engine_derived: bool,
-        shared_scopes: Option<Arc<Intent>>,
+        descriptor: Option<&CommandDescriptor>,
     ) -> Result<CapturedEdit> {
         if closed || !write_available {
             return Err("Native editor capture is closed or write-fenced".into());
@@ -101,7 +98,7 @@ impl NativeDocument {
             return Err("Invalid native editor actor or scope count".into());
         }
         for scope in scopes {
-            if !engine_derived
+            if descriptor.is_none()
                 && scope.rect.is_some_and(|r| {
                     r.iter().any(|v| v.unsigned_abs() > 100000) || r[0] > r[2] || r[1] > r[3]
                 })
@@ -117,13 +114,14 @@ impl NativeDocument {
                         .layers
                         .iter()
                         .any(|item| item.id == layer)
+                    && !descriptor.is_some_and(|descriptor| descriptor.allows_copy_scope(target))
                 {
                     return Err("Unknown native editor scope target".into());
                 }
             }
         }
-        let scopes = match shared_scopes {
-            Some(scopes) => scopes,
+        let scopes = match descriptor {
+            Some(descriptor) => descriptor.shared_scopes(),
             None => Arc::new(Intent::from_scopes(
                 IntentKind::Capture,
                 scopes,

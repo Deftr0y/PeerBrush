@@ -162,6 +162,123 @@ def png(depth=16, *, bad_filter=False):
 
 
 class FixtureContract(unittest.TestCase):
+    def test_desktop_registration_requires_exact_backup_and_uses_only_read_only_discovery(self):
+        with tempfile.TemporaryDirectory(prefix='peerbrush-desktop-registration-') as temporary:
+            root = Path(temporary).resolve()
+            state = root / 'canvas'
+            launcher = root / 'stable' / 'peerbrush'
+            legacy = root / 'old' / 'peerbrush'
+            route = dict(command=str(launcher), args=['mcp', '--state-dir', str(state)])
+            status = json.dumps(dict(manifest_status='ready', connection=dict(category='ready'),
+                                     stdio=route, clients=[dict(client='Cursor', category='matching')]))
+            for valid_backup in (True, False):
+                with self.subTest(valid_backup=valid_backup):
+                    registration = upgrade.PackageRegistration(root / str(valid_backup), state)
+                    run = mock.Mock(return_value=status)
+
+                    def connect():
+                        original = registration.config.read_bytes()
+                        config = json.loads(original)
+                        self.assertEqual(config['mcpServers']['peerbrush']['command'], str(legacy))
+                        config['mcpServers']['peerbrush'] = route
+                        backup = registration.config.with_name('mcp.json.peerbrush-fixture.bak')
+                        backup.write_bytes(original if valid_backup else b'wrong backup')
+                        registration.config.write_text(json.dumps(config), encoding='utf-8')
+                        registration.manifest.parent.mkdir()
+                        registration.manifest.write_bytes(b'fixture discovery manifest')
+
+                    if valid_backup:
+                        self.assertEqual(registration.check(launcher, legacy, {}, run, desktop_connect=connect),
+                                         [launcher, *route['args']])
+                        run.assert_called_once_with([launcher, 'discover', '--status', '--state-dir', state],
+                                                    registration.environment({}))
+                    else:
+                        with self.assertRaisesRegex(ValueError, 'did not back up the exact original'):
+                            registration.check(launcher, legacy, {}, run, desktop_connect=connect)
+                        run.assert_not_called()
+
+    def test_package_registration_reuses_saved_route_without_writing_after_upgrade(self):
+        with tempfile.TemporaryDirectory(prefix='peerbrush-registration-proof-') as temporary:
+            root = Path(temporary).resolve()
+            state = root / 'canvas'
+            launcher = root / 'stable' / 'peerbrush'
+            registration = upgrade.PackageRegistration(root / 'client', state)
+            registration.manifest.parent.mkdir()
+            route = dict(command=str(launcher), args=['mcp', '--state-dir', str(state)])
+            config = json.dumps(dict(mcpServers=dict(peerbrush=route))).encode()
+            registration.saved = config, b'fixture discovery manifest'
+            registration.config.write_bytes(config)
+            registration.manifest.write_bytes(registration.saved[1])
+            run = mock.Mock(return_value=json.dumps(dict(manifest_status='ready',
+                connection=dict(category='ready'), stdio=route, clients=[dict(client='Cursor', category='matching')])))
+            self.assertEqual(registration.check(launcher, root / 'old' / 'peerbrush', {}, run),
+                             [launcher, *route['args']])
+            run.assert_called_once()
+            self.assertEqual(run.call_args.args[0], [launcher, 'discover', '--status', '--state-dir', state])
+            registration.config.write_bytes(b'changed client file')
+            with self.assertRaisesRegex(ValueError, 'changed the saved MCP registration'):
+                registration.check(launcher, root / 'old' / 'peerbrush', {}, run)
+            run.assert_called_once()
+
+    def test_package_workspace_receipt_checks_real_files_after_removal(self):
+        with tempfile.TemporaryDirectory(prefix='peerbrush-workspace-proof-') as temporary:
+            root = Path(temporary).resolve()
+            artwork = root / 'Artwork 作品.psb'
+            prefs = root / 'tool-settings.json'
+            artwork.write_bytes(b'fixture project')
+            prefs.write_bytes(b'fixture preferences')
+            workspace = upgrade.PackageWorkspace(root, root)
+            workspace.files = {path: upgrade.bounded_file(path, 1024)[0] for path in (artwork, prefs)}
+            workspace.projects[artwork] = ({}, (32, 24, 16, b'fixture native samples'))
+            receipt = workspace.retention_receipt()
+            self.assertEqual(receipt['tool_preferences_sha256'], workspace.files[prefs])
+            self.assertEqual(receipt['projects'][0]['format'], 'psb')
+            self.assertEqual(receipt['projects'][0]['bit_depth'], 16)
+            self.assertNotIn(str(artwork), json.dumps(receipt))
+            artwork.write_bytes(b'changed project')
+            with self.assertRaisesRegex(ValueError, 'changed real user preferences or artwork'):
+                workspace.retention_receipt()
+
+    def test_desktop_startup_requires_the_exact_clean_tabs_and_reads_each_native_project(self):
+        with tempfile.TemporaryDirectory(prefix='peerbrush-startup-proof-') as temporary:
+            root = Path(temporary).resolve()
+            workspace = upgrade.PackageWorkspace(root, root)
+            rows, states, samples = [], {}, {}
+            for depth, extension in [(8, 'psd'), (16, 'psb')]:
+                path = root / f'Artwork {depth} 作品.{extension}'
+                path.write_bytes(b'synthetic file fixture')
+                workspace.files[path] = upgrade.bounded_file(path, 1024)[0]
+                project = f'tab-{depth}'
+                observed_path = '\\\\?\\' + str(path) if os.name == 'nt' and path.drive.endswith(':') else str(path)
+                rows.append(dict(path=observed_path, project_id=project, dirty=False, loading=None))
+                state = dict(document=dict(id=project, width=32, height=24, bit_depth=depth, read_only=False),
+                             layers=[dict(kind='paint', bounds=[0, 0, 32, 24], source=upgrade.fixture_shape())])
+                states[project] = state
+                samples[project] = (32, 24, depth, bytes([depth]))
+                workspace.projects[path] = upgrade.editable_snapshot(state), samples[project]
+
+            def rpc(method, parameters):
+                if method == 'projects':
+                    self.assertEqual(parameters, {'action': 'list'})
+                    return dict(projects=rows, active_project_id=rows[0]['project_id'])
+                self.assertEqual(method, 'observe')
+                return dict(state=states[parameters['project_id']])
+
+            def export(targeted):
+                return samples[targeted('observe', {})['state']['document']['id']]
+
+            with mock.patch.object(workspace, 'export', side_effect=export) as readback:
+                workspace.check_startup_projects(rpc)
+                self.assertEqual(readback.call_count, 2)
+            original = rows[1]
+            rows[1] = dict(original, project_id=rows[0]['project_id'])
+            with mock.patch.object(workspace, 'export', side_effect=export):
+                with self.assertRaisesRegex(ValueError, 'independent clean fixture tabs'):
+                    workspace.check_startup_projects(rpc)
+            rows[1] = dict(original, path=rows[0]['path'])
+            with self.assertRaisesRegex(ValueError, 'duplicate project path'):
+                workspace.check_startup_projects(rpc)
+
     def test_installed_runuser_stays_bound_when_child_path_excludes_its_directory(self):
         with tempfile.TemporaryDirectory(prefix='peerbrush-runuser-') as temporary:
             root = Path(temporary).resolve()

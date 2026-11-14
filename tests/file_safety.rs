@@ -27,10 +27,10 @@ impl Drop for Directory {
 }
 fn fixture(depth: u16) -> server::Shared {
     let mut e = Engine::new();
-    e.doc = Document::new_depth(9, 7, depth).unwrap();
+    e.resident_state_mut().expect("resident fixture").document = Document::new_depth(9, 7, depth).unwrap();
     for y in 0..7 {
         for x in 0..9 {
-            e.doc.layers[0]
+            e.resident_state_mut().expect("resident fixture").document.layers[0]
                 .pixels
                 .set16(x, y, [10001 + x as u16, 20003 + y as u16, 40007, 65535]);
         }
@@ -39,13 +39,13 @@ fn fixture(depth: u16) -> server::Shared {
 }
 fn paint(s: &server::Shared, value: u16) {
     let mut e = s.lock().unwrap();
-    e.doc.layers[0]
+    e.resident_state_mut().expect("resident fixture").document.layers[0]
         .pixels
         .set16(4, 3, [value, 23459, 45671, 65535]);
-    e.doc.revision += 1;
+    e.resident_state_mut().expect("resident fixture").document.revision += 1;
 }
 fn png(s: &server::Shared) -> Vec<u8> {
-    s.lock().unwrap().doc.export_png().unwrap()
+    s.lock().unwrap().resident_state().expect("resident fixture").document.export_png().unwrap()
 }
 
 #[test]
@@ -61,20 +61,20 @@ fn impossible_raw_psd_and_psb_saves_reject_before_replacing_files_or_work() {
                 let mut engine = shared.lock().unwrap();
                 // This valid sparse canvas needs over 256 MiB of raw standard
                 // channels even at eight bits, before sources or record metadata.
-                engine.doc.width = 8192;
-                engine.doc.height = 4096;
-                engine.doc.layers[0].pixels =
+                engine.resident_state_mut().expect("resident fixture").document.width = 8192;
+                engine.resident_state_mut().expect("resident fixture").document.height = 4096;
+                engine.resident_state_mut().expect("resident fixture").document.layers[0].pixels =
                     peerbrush::raster::Raster::new_depth(8192, 4096, depth);
-                engine.doc.layers[0]
+                engine.resident_state_mut().expect("resident fixture").document.layers[0]
                     .pixels
                     .set16(2, 3, [12345, 23457, 34569, 50001]);
-                engine.doc.revision += 1;
+                engine.resident_state_mut().expect("resident fixture").document.revision += 1;
                 (
-                    serde_json::to_value(&engine.doc).unwrap(),
+                    serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap(),
                     engine.saved_revision,
                     engine.file_version,
                     engine.path.clone(),
-                    (engine.undo.len(), engine.redo.len()),
+                    (engine.resident_state().expect("resident fixture").undo.len(), engine.resident_state().expect("resident fixture").redo.len()),
                 )
             };
             for _ in 0..2 {
@@ -83,12 +83,12 @@ fn impossible_raw_psd_and_psb_saves_reject_before_replacing_files_or_work() {
                     .contains("Uncompressed Photoshop channels alone"));
                 assert_eq!(fs::read(&path).unwrap(), original);
                 let engine = shared.lock().unwrap();
-                assert_eq!(serde_json::to_value(&engine.doc).unwrap(), before);
+                assert_eq!(serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap(), before);
                 assert_eq!(engine.saved_revision, saved_revision);
                 assert_eq!(engine.file_version, file_version);
                 assert_eq!(engine.path, source_path);
-                assert_eq!((engine.undo.len(), engine.redo.len()), history);
-                assert_ne!(engine.saved_revision, engine.doc.revision);
+                assert_eq!((engine.resident_state().expect("resident fixture").undo.len(), engine.resident_state().expect("resident fixture").redo.len()), history);
+                assert_ne!(engine.saved_revision, engine.resident_state().expect("resident fixture").document.revision);
             }
             assert!(versions(&directory).is_empty());
         }
@@ -117,8 +117,8 @@ fn reviewed(s: &server::Shared, discard: bool) -> workspace::lifecycle::Reviewed
     let e = s.lock().unwrap();
     workspace::lifecycle::Reviewed {
         project: e.project_id.clone(),
-        document: e.doc.id.clone(),
-        revision: e.doc.revision,
+        document: e.resident_state().expect("resident fixture").document.id.clone(),
+        revision: e.resident_state().expect("resident fixture").document.revision,
         discard,
     }
 }
@@ -194,8 +194,8 @@ fn stale_two_instance_saves_close_orders_and_recovery_preserve_manual_artwork() 
             let saved = fs::read(&path).unwrap();
             standard_composite(&saved, &artwork);
             assert!(server::save(&stale, &path).is_err());
-            let id = stale.lock().unwrap().doc.id.clone();
-            let rev = stale.lock().unwrap().doc.revision;
+            let id = stale.lock().unwrap().resident_state().expect("resident fixture").document.id.clone();
+            let rev = stale.lock().unwrap().resident_state().expect("resident fixture").document.revision;
             assert!(server::save_confirmed_source(&stale, &path, &id, rev, true).is_err());
             assert!(
                 workspace::lifecycle::finish_exit(&stale_registry, &[reviewed(&stale, false)])
@@ -224,7 +224,7 @@ fn stale_two_instance_saves_close_orders_and_recovery_preserve_manual_artwork() 
             let reopened = fixture(depth);
             server::open(&reopened, &path).unwrap();
             assert_eq!(png(&reopened), artwork);
-            assert_eq!(reopened.lock().unwrap().doc.bit_depth, depth);
+            assert_eq!(reopened.lock().unwrap().resident_state().expect("resident fixture").document.bit_depth, depth);
             let backups = versions(&dir);
             assert_eq!(backups.len(), 1);
             assert_eq!(fs::read(&backups[0]).unwrap(), initial_file);
@@ -280,7 +280,7 @@ fn save_as_and_exports_require_consent_and_keep_exact_previous_versions() {
         assert!(server::save(&s, &target).is_err());
         assert_eq!(fs::read(&target).unwrap(), old_file);
         let e = s.lock().unwrap();
-        let (id, rev) = (e.doc.id.clone(), e.doc.revision);
+        let (id, rev) = (e.resident_state().expect("resident fixture").document.id.clone(), e.resident_state().expect("resident fixture").document.revision);
         drop(e);
         server::save_confirmed_source(&s, &target, &id, rev, true).unwrap();
         standard_composite(&fs::read(&target).unwrap(), &before);
@@ -371,7 +371,7 @@ fn failures_preserve_destination_and_work_and_successful_retention_is_bounded() 
     assert_eq!(png(&s), artwork);
     {
         let e = s.lock().unwrap();
-        assert_ne!(e.saved_revision, e.doc.revision);
+        assert_ne!(e.saved_revision, e.resident_state().expect("resident fixture").document.revision);
     }
     fs::remove_file(full).unwrap();
     for i in 0..5 {
@@ -417,13 +417,13 @@ fn export_never_replaces_a_loaded_working_source_even_with_a_misleading_extensio
     let s = fixture(16);
     fs::write(
         &path,
-        peerbrush::psd::encode(&s.lock().unwrap().doc).unwrap(),
+        peerbrush::psd::encode(&s.lock().unwrap().resident_state().expect("resident fixture").document).unwrap(),
     )
     .unwrap();
     server::open(&s, &path).unwrap();
     let original = fs::read(&path).unwrap();
     let e = s.lock().unwrap();
-    let (id, rev) = (e.doc.id.clone(), e.doc.revision);
+    let (id, rev) = (e.resident_state().expect("resident fixture").document.id.clone(), e.resident_state().expect("resident fixture").document.revision);
     drop(e);
     assert!(server::export_confirmed_source(&s, &path, &id, rev).is_err());
     assert_eq!(fs::read(&path).unwrap(), original);

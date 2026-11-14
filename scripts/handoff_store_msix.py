@@ -7,7 +7,7 @@ import re
 import sys
 import tempfile
 
-from package import git, regular_file
+from package import git, regular_file, release_version_order
 from package_macos_dmg import bounded_file, private_inspection_directory
 from prepare_site_release import recognize, validate_inventory
 from production_readiness import assess, handoff_path, unique_fields
@@ -127,8 +127,8 @@ def previous_selection(path, checksum, manifest):
                 or not 0 < asset['bytes'] <= limit):
             raise ValueError('Invalid previous Store asset record.')
         selected_hash(asset['sha256'])
-    current_version = tuple(map(int, manifest['version'].split('.')))
-    prior_version = tuple(map(int, previous['version'].split('.')))
+    current_version = release_version_order(manifest['version'])
+    prior_version = release_version_order(previous['version'])
     if current_version < prior_version:
         raise ValueError('Store bundle cannot downgrade an existing application version.')
     if current_version == prior_version:

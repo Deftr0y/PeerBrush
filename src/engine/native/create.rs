@@ -16,15 +16,136 @@ impl NativeDocument {
         check: &dyn Fn() -> Result<()>,
     ) -> Result<Self> {
         check()?;
-        if !(1..=16000).contains(&width)
-            || !(1..=16000).contains(&height)
-            || ![8, 16].contains(&depth)
-        {
-            return Err("Native canvas requires 1-16000 pixels per edge and RGB8 or RGB16".into());
+        crate::raster::CanvasLimits::Native.check(width, height)?;
+        if ![8, 16].contains(&depth) {
+            return Err("Native canvas requires RGB8 or RGB16".into());
         }
+        let surface = Surface::zero(width, height, depth).map_err(|e| e.to_string())?;
+        Self::single_layer(surface, None, None, None, Default::default(), None, pool, disk, check)
+    }
+
+    pub(crate) fn new_image(
+        surface: Surface,
+        name: &str,
+        layer: &str,
+        definition: Option<Admitted<super::super::scene::Source36>>,
+        pool: &ResidentBudget,
+        disk: &DiskBudget,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<Self> {
+        crate::raster::CanvasLimits::Native.check(surface.width(), surface.height())?;
+        let names = Some((name, layer, true));
+        if let Some(definition) = definition {
+            if !definition.owner().uses_budget(pool)
+                || (definition.width, definition.height) != (surface.width(), surface.height())
+            {
+                return Err(
+                    "Native image definition differs from its source frame or admission".into(),
+                );
+            }
+            let document = definition.map_unique(|definition, _| {
+                Self::single_layer(surface, names, Some(definition), None, Default::default(), None, pool, disk, check)
+            })?;
+            return Ok((*document).clone());
+        }
+        Self::single_layer(surface, names, None, None, Default::default(), None, pool, disk, check)
+    }
+
+    pub(crate) fn new_protected_preview(
+        surface: Surface,
+        name: &str,
+        reason: &str,
+        profile: Option<Vec<u8>>,
+        srgb_tagged: bool,
+        resources: crate::psd::DocumentResources,
+        file_info: Option<super::super::scene::MetadataPayload<Vec<u8>>>,
+        pool: &ResidentBudget,
+        disk: &DiskBudget,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<Self> {
+        crate::raster::CanvasLimits::Native.check(surface.width(), surface.height())?;
+        Self::single_layer(
+            surface,
+            Some((name, "Saved PSD composite", srgb_tagged)),
+            None,
+            Some((reason, profile)),
+            resources,
+            file_info,
+            pool,
+            disk,
+            check,
+        )
+    }
+
+    pub(crate) fn new_compatible_copy(
+        surface: Surface,
+        name: &str,
+        layer: &str,
+        srgb_tagged: bool,
+        resources: crate::psd::DocumentResources,
+        file_info: Option<super::super::scene::MetadataPayload<Vec<u8>>>,
+        pool: &ResidentBudget,
+        disk: &DiskBudget,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<Self> {
+        crate::raster::CanvasLimits::Native.check(surface.width(), surface.height())?;
+        Self::single_layer(
+            surface,
+            Some((name, layer, srgb_tagged)),
+            None,
+            None,
+            resources,
+            file_info,
+            pool,
+            disk,
+            check,
+        )
+    }
+
+    pub(crate) fn with_protected_structure(self, structure: Option<crate::psd::ProtectedStructure>) -> Result<Self> {
+        let Some(structure) = structure else { return Ok(self); };
+        self.protected_composite()?;
+        if !structure.owner().uses_budget(self.budget()) {
+            return Err("Photoshop source diagnostics belong to a different resident pool".into());
+        }
+        let core = self.core.map_unique(|mut core, _| {
+            core.protected_structure = Some(structure);
+            Ok(core)
+        })?;
+        Ok(Self { core })
+    }
+
+    fn single_layer(
+        surface: Surface,
+        image: Option<(&str, &str, bool)>,
+        definition: Option<super::super::scene::Source36>,
+        protection: Option<(&str, Option<Vec<u8>>)>,
+        resources: crate::psd::DocumentResources,
+        file_info: Option<super::super::scene::MetadataPayload<Vec<u8>>>,
+        pool: &ResidentBudget,
+        disk: &DiskBudget,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<Self> {
+        let (width, height, depth) = (surface.width(), surface.height(), surface.depth());
+        resources.validate()?;
         // Includes bounded UUID/name strings, one layer and one source handle.
         // The roster separately retains its ordinary descriptor admission.
-        let owner = MetadataCharge::reserve(pool, HEADER_BYTES, check)?;
+        let bytes = image
+            .map_or(Some(HEADER_BYTES), |(name, layer, _)| {
+                HEADER_BYTES
+                    .checked_add(name.len())?
+                    .checked_add(layer.len())
+            })
+            .and_then(|bytes| {
+                if let Some((reason, profile)) = &protection {
+                    bytes.checked_add(reason.len())?
+                        .checked_add(profile.as_ref().map_or(0, Vec::len))
+                } else {
+                    Some(bytes)
+                }
+            })
+            .ok_or("Native image name admission overflow")?;
+        let owner = MetadataCharge::reserve(pool, bytes, check)?;
         let mut layers = Vec::new();
         layers
             .try_reserve_exact(1)
@@ -35,7 +156,7 @@ impl NativeDocument {
             .map_err(|_| "New native source allocation refused")?;
         layers.push(Layer36 {
             id: super::super::id(),
-            name: "Paint 1".into(),
+            name: image.map_or("Paint 1", |(_, layer, _)| layer).into(),
             kind: "paint".into(),
             parent: None,
             clip_to: None,
@@ -56,36 +177,58 @@ impl NativeDocument {
             mask: None,
             effects: Vec::new(),
             psd_metadata: Vec::new().into(),
-            source: None,
+            source: definition,
         });
-        sources.push(Surface::zero(width, height, depth).map_err(|e| e.to_string())?);
+        sources.push(surface);
         // One standard full-canvas layer plus the mandatory current composite
         // already determines a raw lower bound, even for a known-zero source.
         let needs_psb =
             u64::from(width) * u64::from(height) * u64::from(depth / 8) * 8 + 78 > 2_000_000_000;
+        let read_only = protection.is_some();
+        let (icc_profile, warnings) = protection.map_or((None, Vec::new()), |(reason, profile)| {
+            (profile.map(super::super::scene::MetadataPayload::from), vec![reason.to_owned()])
+        });
         let metadata = Document36 {
             id: super::super::id(),
-            name: if needs_psb {
-                "Untitled.psb"
-            } else {
-                "Untitled.psd"
-            }
-            .into(),
+            name: image
+                .map_or(
+                    if needs_psb {
+                        "Untitled.psb"
+                    } else {
+                        "Untitled.psd"
+                    },
+                    |(name, _, _)| name,
+                )
+                .into(),
             width,
             height,
             revision: 0,
             bit_depth: depth,
-            icc_profile: None,
-            srgb_tagged: false,
+            icc_profile,
+            srgb_tagged: image.is_some_and(|(_, _, tagged)| tagged),
+            psd_intentionally_untagged: resources.intentionally_untagged,
+            psd_rgb8_multiply: false,
+            psd_resolution: resources.resolution,
+            psd_print_scale: resources.scale,
+            psd_pixel_aspect: resources.pixel_aspect,
+            psd_grid: resources.grid,
+            psd_layer_id_seed: resources.layer_id_seed,
+            psd_print_flags: resources.print_flags,
+            psd_print_flags_info: resources.print_flags_info,
+            psd_copyright: resources.copyright,
+            psd_file_info: file_info,
+            psd_global_angle: resources.global_angle,
+            psd_global_altitude: resources.global_altitude,
             psd_global_mask: None,
+            psd_global_metadata: None,
             layers,
             filters: Vec::new(),
             selection: None,
             selection_polygon: None,
             selection_coverage: None,
             selection_previous: None,
-            read_only: false,
-            warnings: Vec::new().into(),
+            read_only,
+            warnings: warnings.into(),
         };
         check()?;
         let pending = PendingScene::new(

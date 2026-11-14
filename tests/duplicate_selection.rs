@@ -10,7 +10,7 @@ fn edit(engine: &mut Engine, command: Value) -> Value {
         .edit(
             "human",
             &[command],
-            Some(engine.doc.revision),
+            Some(engine.resident_state().expect("resident fixture").document.revision),
             None,
             "Duplicate selection regression",
         )
@@ -18,8 +18,8 @@ fn edit(engine: &mut Engine, command: Value) -> Value {
 }
 fn fixture(depth: u16) -> (Engine, String) {
     let mut engine = Engine::new();
-    engine.doc = Document::new_depth(32, 24, depth).unwrap();
-    let layer = &mut engine.doc.layers[0];
+    engine.resident_state_mut().expect("resident fixture").document = Document::new_depth(32, 24, depth).unwrap();
+    let layer = &mut engine.resident_state_mut().expect("resident fixture").document.layers[0];
     layer.x = 3;
     layer.y = 2;
     for y in 0..24 {
@@ -30,7 +30,7 @@ fn fixture(depth: u16) -> (Engine, String) {
         }
     }
     {
-        let id = engine.doc.layers[0].id.clone();
+        let id = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
         (engine, id)
     }
 }
@@ -56,15 +56,15 @@ fn selected_native_pixels_keep_holes_feather_sources_coordinates_and_psd_undo() 
             &mut engine,
             json!({"op":"selection","kind":"rectangle","mode":"subtract","rect":[12,10,17,15]}),
         );
-        engine.undo.clear();
-        let before = engine.doc.clone();
+        engine.resident_state_mut().expect("resident fixture").undo.clear();
+        let before = engine.resident_state().expect("resident fixture").document.clone();
         let selected = Image::copy(&before, &id, false, false).unwrap();
         let result = edit(
             &mut engine,
             json!({"op":"layer.duplicate_selection","layer":id,"document_id":before.id,"source_revision":before.revision}),
         );
         assert_eq!(result["created_roots"].as_array().unwrap().len(), 1);
-        let copy = &engine.doc.layers[0];
+        let copy = &engine.resident_state().expect("resident fixture").document.layers[0];
         assert_eq!(copy.id, result["created_roots"][0].as_str().unwrap());
         assert_eq!([copy.x, copy.y], selected.origin.unwrap());
         assert_eq!(copy.kind, "paint");
@@ -88,36 +88,36 @@ fn selected_native_pixels_keep_holes_feather_sources_coordinates_and_psd_undo() 
             assert_eq!(copy.pixels.rgba(), selected.bytes);
         }
         assert_eq!(
-            engine.doc.layers[1].pixels.rgba16(),
+            engine.resident_state().expect("resident fixture").document.layers[1].pixels.rgba16(),
             before.layers[0].pixels.rgba16()
         );
         assert_eq!(
-            serde_json::to_value(&engine.doc.layers[1].mask).unwrap(),
+            serde_json::to_value(&engine.resident_state().expect("resident fixture").document.layers[1].mask).unwrap(),
             serde_json::to_value(&before.layers[0].mask).unwrap()
         );
         assert_eq!(
-            serde_json::to_value(&engine.doc.layers[1].effects).unwrap(),
+            serde_json::to_value(&engine.resident_state().expect("resident fixture").document.layers[1].effects).unwrap(),
             serde_json::to_value(&before.layers[0].effects).unwrap()
         );
-        assert_eq!(selection::current(&engine.doc).unwrap().value(14, 12), 0.0);
-        assert_eq!(engine.undo.len(), 1);
-        let rendered = engine.doc.export_png().unwrap();
-        let reopened = psd::decode(&psd::encode(&engine.doc).unwrap()).unwrap();
+        assert_eq!(selection::current(&engine.resident_state().expect("resident fixture").document).unwrap().value(14, 12), 0.0);
+        assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), 1);
+        let rendered = engine.resident_state().expect("resident fixture").document.export_png().unwrap();
+        let reopened = psd::decode(&psd::encode(&engine.resident_state().expect("resident fixture").document).unwrap()).unwrap();
         assert!(!reopened.read_only);
         assert_eq!(reopened.export_png().unwrap(), rendered);
         assert_eq!(reopened.layers[0].pixels.rgba16(), words);
         engine.undo("human").unwrap();
-        assert_eq!(engine.doc.layers.len(), 1);
+        assert_eq!(engine.resident_state().expect("resident fixture").document.layers.len(), 1);
         assert_eq!(
-            engine.doc.export_png().unwrap(),
+            engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
             before.export_png().unwrap()
         );
         assert_eq!(
-            engine.doc.layers[0].pixels.rgba16(),
+            engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(),
             before.layers[0].pixels.rgba16()
         );
         engine.redo("human").unwrap();
-        assert_eq!(engine.doc.export_png().unwrap(), rendered);
+        assert_eq!(engine.resident_state().expect("resident fixture").document.export_png().unwrap(), rendered);
     }
 }
 
@@ -129,16 +129,16 @@ fn unselected_layer_copy_retains_native_editable_sources_and_only_copies_active_
         &mut engine,
         json!({"op":"effect.add","layer":id,"kind":"levels","settings":{"gamma":1.3}}),
     );
-    let source = engine.doc.layers[0].clone();
+    let source = engine.resident_state().expect("resident fixture").document.layers[0].clone();
     edit(&mut engine, json!({"op":"layer.add","name":"Other layer"}));
-    engine.undo.clear();
+    engine.resident_state_mut().expect("resident fixture").undo.clear();
     let result = edit(
         &mut engine,
         json!({"op":"layer.duplicate_selection","layer":id}),
     );
-    assert_eq!(engine.doc.layers.len(), 3);
+    assert_eq!(engine.resident_state().expect("resident fixture").document.layers.len(), 3);
     let copied = engine
-        .doc
+        .resident_state().expect("resident fixture").document
         .layers
         .iter()
         .find(|layer| layer.id == result["created_roots"][0].as_str().unwrap())
@@ -151,7 +151,7 @@ fn unselected_layer_copy_retains_native_editable_sources_and_only_copies_active_
         copied.mask.as_ref().unwrap().steps[0].pixels.rgba16(),
         source.mask.as_ref().unwrap().steps[0].pixels.rgba16()
     );
-    assert_eq!(engine.undo.len(), 1);
+    assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), 1);
 }
 
 #[test]
@@ -159,7 +159,7 @@ fn selected_copies_keep_clipping_units_contiguous_and_their_original_base() {
     let (mut engine, base) = fixture(16);
     let added = edit(&mut engine, json!({"op":"layer.add","name":"Clipped ink"}));
     let clip = added["created"][0].as_str().unwrap().to_string();
-    engine.doc.layers[0]
+    engine.resident_state_mut().expect("resident fixture").document.layers[0]
         .pixels
         .set16(4, 4, [41237, 12347, 33559, 65535]);
     edit(
@@ -175,18 +175,18 @@ fn selected_copies_keep_clipping_units_contiguous_and_their_original_base() {
         json!({"op":"layer.duplicate_selection","layer":base}),
     );
     assert_eq!(
-        engine.doc.layers[0].id,
+        engine.resident_state().expect("resident fixture").document.layers[0].id,
         base_copy["created_roots"][0].as_str().unwrap()
     );
-    assert!(engine.doc.layers[0].clip_to.is_none());
-    assert_eq!(engine.doc.layers[1].id, clip);
-    assert_eq!(engine.doc.layers[2].id, base);
+    assert!(engine.resident_state().expect("resident fixture").document.layers[0].clip_to.is_none());
+    assert_eq!(engine.resident_state().expect("resident fixture").document.layers[1].id, clip);
+    assert_eq!(engine.resident_state().expect("resident fixture").document.layers[2].id, base);
     let clip_copy = edit(
         &mut engine,
         json!({"op":"layer.duplicate_selection","layer":clip}),
     );
     let copy = engine
-        .doc
+        .resident_state().expect("resident fixture").document
         .layers
         .iter()
         .find(|layer| layer.id == clip_copy["created_roots"][0].as_str().unwrap())
@@ -196,11 +196,11 @@ fn selected_copies_keep_clipping_units_contiguous_and_their_original_base() {
         copy.pixels.get16(4 - copy.x, 4 - copy.y),
         [41237, 12347, 33559, 65535]
     );
-    psd::validate(&engine.doc).unwrap();
-    let reopened = psd::decode(&psd::encode(&engine.doc).unwrap()).unwrap();
+    psd::validate(&engine.resident_state().expect("resident fixture").document).unwrap();
+    let reopened = psd::decode(&psd::encode(&engine.resident_state().expect("resident fixture").document).unwrap()).unwrap();
     assert_eq!(
         reopened.export_png().unwrap(),
-        engine.doc.export_png().unwrap()
+        engine.resident_state().expect("resident fixture").document.export_png().unwrap()
     );
 }
 
@@ -212,16 +212,16 @@ fn duplicate_refuses_empty_locked_reserved_stale_and_wrong_document_sources_atom
             &mut engine,
             json!({"op":"selection","kind":"rectangle","rect":[5,4,20,18]}),
         );
-        let mut command = json!({"op":"layer.duplicate_selection","layer":id,"document_id":engine.doc.id,"source_revision":engine.doc.revision});
+        let mut command = json!({"op":"layer.duplicate_selection","layer":id,"document_id":engine.resident_state().expect("resident fixture").document.id,"source_revision":engine.resident_state().expect("resident fixture").document.revision});
         match failure {
             "empty" => {
                 edit(
                     &mut engine,
                     json!({"op":"selection","kind":"rectangle","mode":"intersect","rect":[25,20,31,24]}),
                 );
-                command["source_revision"] = json!(engine.doc.revision);
+                command["source_revision"] = json!(engine.resident_state().expect("resident fixture").document.revision);
             }
-            "locked" => engine.doc.layers[0].locked = true,
+            "locked" => engine.resident_state_mut().expect("resident fixture").document.layers[0].locked = true,
             "reserved" => {
                 engine
                     .reserve("agent", "Working", vec![Scope::layer(&id)])
@@ -231,8 +231,8 @@ fn duplicate_refuses_empty_locked_reserved_stale_and_wrong_document_sources_atom
             "document" => command["document_id"] = json!("different-document"),
             _ => unreachable!(),
         }
-        let before = engine.doc.clone();
-        let history = engine.undo.len();
+        let before = engine.resident_state().expect("resident fixture").document.clone();
+        let history = engine.resident_state().expect("resident fixture").undo.len();
         assert!(
             engine
                 .edit(
@@ -245,13 +245,13 @@ fn duplicate_refuses_empty_locked_reserved_stale_and_wrong_document_sources_atom
                 .is_err(),
             "{failure}"
         );
-        assert_eq!(engine.doc.layers.len(), 1);
-        assert_eq!(engine.doc.revision, before.revision);
+        assert_eq!(engine.resident_state().expect("resident fixture").document.layers.len(), 1);
+        assert_eq!(engine.resident_state().expect("resident fixture").document.revision, before.revision);
         assert_eq!(
-            engine.doc.layers[0].pixels.rgba16(),
+            engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(),
             before.layers[0].pixels.rgba16()
         );
-        assert_eq!(engine.doc.selection, before.selection);
-        assert_eq!(engine.undo.len(), history);
+        assert_eq!(engine.resident_state().expect("resident fixture").document.selection, before.selection);
+        assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), history);
     }
 }

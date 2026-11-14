@@ -3,6 +3,7 @@ use crate::{
     engine::{native::CommandDescriptor, Document, Engine},
     large_document::{BlockRef, Limits, Snapshot},
     retained::planning,
+    transform::native::Checks,
 };
 use serde_json::json;
 use std::{cell::Cell, path::PathBuf};
@@ -226,46 +227,122 @@ fn complete_linked_outputs_and_generated_fill_original_match_legacy_in_one_candi
 }
 #[test]
 fn cancel_after_first_sealed_plane_retires_all_outputs_and_preserves_base() {
-    let fixture = Fixture::new(16, "paint", Some(true));
-    let baseline = fixture.disk.used().unwrap();
+    for editable in [false, true] {
+        let mut legacy = planning::tests::fixture(16, "paint", Some(true));
+        if editable {
+            legacy.layers[0].source = Some(std::sync::Arc::new(serde_json::from_value::<crate::source::Source>(json!({
+            "width":17,"height":19,"content":{"kind":"shape","shape":"ellipse","bounds":[0.,0.,17.,19.],
+                "points":[],"closed":true,"fill":[12347,23459,34571,45679],"stroke":[0,0,0,0],"stroke_width":0.}
+        })).unwrap()));
+        }
+        let fixture = Fixture::from_legacy(legacy);
+        let baseline = fixture.disk.used().unwrap();
+        let session = fixture.session();
+        let command = json!({"op":"transform","angle":17,"selection_only":false});
+        let mut work = Work::new(10_000_000).unwrap();
+        let plan = planning::layer(
+            &fixture.document,
+            &fixture.legacy.layers[0].id,
+            &command,
+            &mut work,
+            &|| Ok(()),
+        )
+        .unwrap()
+        .unwrap();
+        let reason = prepare(
+            fixture.document.capture_edit().unwrap(),
+            &[plan],
+            &session,
+            &mut work,
+            &|| {
+                if session.created.get() >= 2 {
+                    Err("cancel after first sealed plane".into())
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .err()
+        .unwrap();
+        assert_eq!(reason, "cancel after first sealed plane");
+        assert_eq!(session.created.get(), 2);
+        assert_eq!(fixture.disk.used().unwrap(), baseline);
+        assert_eq!(fixture.document.metadata().revision(), 0);
+        let layer = fixture.document.metadata().layers().next().unwrap();
+        planning::tests::assert_pixels(
+            fixture.document.source(layer.pixels().slot()).unwrap(),
+            &fixture.legacy.layers[0].pixels,
+            &fixture.pool,
+        );
+        drop(session);
+        fixture.finish();
+    }
+}
+
+#[test]
+fn editable_plane_refuses_another_definition_wrong_depth_and_cancel_before_io() {
+    let mut legacy = planning::tests::fixture(16, "paint", None);
+    legacy.layers[0].source = Some(std::sync::Arc::new(serde_json::from_value::<crate::source::Source>(json!({
+        "width":17,"height":19,"content":{"kind":"shape","shape":"rectangle","bounds":[0.,0.,17.,19.],
+            "points":[],"closed":true,"fill":[12347,23459,34571,45679],"stroke":[0,0,0,0],"stroke_width":0.}
+    })).unwrap()));
+    let fixture = Fixture::from_legacy(legacy);
     let session = fixture.session();
-    let command = json!({"op":"transform","angle":17,"selection_only":false});
+    let layer = fixture.document.metadata().layer(0).unwrap();
+    let source = layer.source().unwrap();
+    let foreign: crate::engine::scene::Source36 = serde_json::from_value(json!(source)).unwrap();
+    let edit = fixture.document.capture_edit().unwrap();
+    let cancellation = edit.cancellation();
     let mut work = Work::new(10_000_000).unwrap();
-    let plan = planning::layer(
+    let baseline = fixture.disk.used().unwrap();
+    for (definition, depth) in [(&foreign, 16), (source, 8)] {
+        let plane = Plane {
+            target: layer.pixels().slot(),
+            pixels: Pixels::Editable {
+                source: definition,
+                matrix: source.matrix,
+                depth,
+            },
+        };
+        let error = stage_plane(
+            &fixture.document,
+            &plane,
+            [17, 19],
+            &session,
+            &cancellation,
+            &mut work,
+            &|| Ok(()),
+            &|| Ok(()),
+        )
+        .err()
+        .unwrap();
+        assert!(error.contains("differs from its captured source"));
+        assert_eq!(session.created.get(), 0);
+        assert_eq!(fixture.disk.used().unwrap(), baseline);
+    }
+    cancellation.cancel();
+    let plane = Plane {
+        target: layer.pixels().slot(),
+        pixels: Pixels::Editable {
+            source,
+            matrix: source.matrix,
+            depth: 16,
+        },
+    };
+    assert!(stage_plane(
         &fixture.document,
-        &fixture.legacy.layers[0].id,
-        &command,
+        &plane,
+        [17, 19],
+        &session,
+        &cancellation,
         &mut work,
         &|| Ok(()),
+        &|| Ok(())
     )
-    .unwrap()
-    .unwrap();
-    let reason = prepare(
-        fixture.document.capture_edit().unwrap(),
-        &[plan],
-        &session,
-        &mut work,
-        &|| {
-            if session.created.get() >= 2 {
-                Err("cancel after first sealed plane".into())
-            } else {
-                Ok(())
-            }
-        },
-    )
-    .err()
-    .unwrap();
-    assert_eq!(reason, "cancel after first sealed plane");
-    assert_eq!(session.created.get(), 2);
+    .is_err());
+    assert_eq!(session.created.get(), 0);
     assert_eq!(fixture.disk.used().unwrap(), baseline);
-    assert_eq!(fixture.document.metadata().revision(), 0);
-    let layer = fixture.document.metadata().layers().next().unwrap();
-    planning::tests::assert_pixels(
-        fixture.document.source(layer.pixels().slot()).unwrap(),
-        &fixture.legacy.layers[0].pixels,
-        &fixture.pool,
-    );
-    drop(session);
+    drop((plane, foreign, edit, session));
     fixture.finish();
 }
 
@@ -516,6 +593,88 @@ fn folder_transforms_hidden_nested_children_and_masks_once_at_native_precision()
 }
 
 #[test]
+fn sparse_affine_transform_keeps_native_samples_across_a_tile_boundary() {
+    use crate::raster::{backed::Region, project16, Raster, TILE};
+
+    for depth in [8, 16] {
+        let mut doc = Document::new_depth(1, 1, depth).unwrap();
+        doc.width = 16000;
+        doc.height = 16000;
+        let mut raster = Raster::new_depth(16000, 16000, depth);
+        let color = [12347, 23459, 34571, 65535];
+        raster.set16(1, 0, color);
+        raster.set16(TILE as i32, TILE as i32 + 1, color);
+        raster.set16(15999, 15999, color);
+        doc.layers[0].pixels = raster;
+        let fixture = Fixture::from_legacy(doc);
+        let session = fixture.session();
+        let baseline = fixture.disk.used().unwrap();
+        let input = fixture.document.metadata().layers().next().unwrap().pixels();
+        let input_key = fixture.document.source(input.slot()).unwrap().key();
+        let command = json!({
+            "op": "transform",
+            "layer": fixture.legacy.layers[0].id,
+            "selection_only": false,
+            "fractional_translation": true,
+            "dx": -0.5
+        });
+        let descriptor =
+            CommandDescriptor::from_normalized(&fixture.document, 0, &[command], &|| Ok(())).unwrap();
+        let token = descriptor.commands().next().unwrap().token();
+        let captured = fixture
+            .document
+            .capture_descriptor(descriptor, "human", &[], 1, false, true)
+            .unwrap();
+        let prepared = prepare_command(
+            captured,
+            token,
+            &session,
+            &mut Work::new(2_000_000).unwrap(),
+            &|| Ok(()),
+        )
+        .unwrap();
+        {
+            let preview = prepared.preview();
+            let layer = preview.metadata().layers().next().unwrap();
+            assert_eq!(layer.origin(), [0, 0]);
+            let pixels = layer.pixels();
+            let surface = preview.source(pixels.slot()).unwrap();
+            assert_eq!([surface.width(), surface.height()], [16000, 16000]);
+            assert_eq!(surface.depth(), depth);
+            assert_eq!(surface.physical_tiles().count(), 4);
+            let retained = pixels.retained().unwrap().pixels().slot();
+            assert_eq!(preview.source(retained).unwrap().key(), input_key);
+            let x = TILE as i32;
+            let y = x + 1;
+            let row = surface
+                .prepare_region(Region::new([x - 2, y, x + 2, y + 1]).unwrap(), &mut || Ok(()))
+                .unwrap();
+            let expected = if depth == 8 {
+                let [r, g, b, _] = color.map(|v| u16::from(project16(v)) * 257);
+                [r, g, b, 128 * 257]
+            } else {
+                [color[0], color[1], color[2], 32768]
+            };
+            assert_eq!(row.pixel16(x - 2, y).unwrap(), [0; 4]);
+            assert_eq!(row.pixel16(x - 1, y).unwrap(), expected);
+            assert_eq!(row.pixel16(x, y).unwrap(), expected);
+            assert_eq!(row.pixel16(x + 1, y).unwrap(), [0; 4]);
+        }
+        fixture
+            .document
+            .adopt(prepared)
+            .err()
+            .unwrap()
+            .abort(&session, &|| Ok(()))
+            .unwrap();
+        assert_eq!(fixture.document.metadata().revision(), 0);
+        assert_eq!(fixture.disk.used().unwrap(), baseline);
+        drop(session);
+        fixture.finish();
+    }
+}
+
+#[test]
 fn folder_locked_descendant_and_work_limit_refuse_before_output_creation() {
     let mut doc = folder_document(16);
     doc.layers[3].locked = true;
@@ -635,6 +794,55 @@ fn folder_move_does_not_scan_native_pixels_for_an_unused_pivot() {
 }
 
 #[test]
+fn sparse_selected_scale_samples_across_tile_seams_and_reuses_unselected_pixels() {
+    use crate::raster::TILE;
+    use crate::transform::native::selected::{self, Placement, Selection};
+
+    for depth in [8, 16] {
+        let mut doc = Document::new_depth(4096, 2048, depth).unwrap();
+        let paint = [12347, 23459, 34571, 65535];
+        let hidden = [54321, 43213, 32123, 0];
+        doc.layers[0].pixels.set16(512, 512, paint);
+        doc.layers[0].pixels.set16(4000, 1800, hidden);
+        doc.selection = Some([0, 0, 3800, 1600]);
+        let fixture = Fixture::from_legacy(doc);
+        let session = fixture.session();
+        let fragment = session.fresh().unwrap();
+        let selection = Selection::new(&fixture.document).unwrap();
+        let placement = Placement::for_selection(&selection, &json!({
+            "op":"transform", "pivot":[0.,0.], "scale_x":0.5, "scale_y":0.5,
+            "dx":0.5, "dy":0.25, "fractional_translation":true,
+        }), &fixture.pool).unwrap();
+        let layer = fixture.document.metadata().layer(0).unwrap();
+        let source = fixture.document.source(layer.pixels().slot()).unwrap();
+        let written = selected::write(
+            source, &selection, &placement, layer.origin(), [4096, 2048], None, true,
+            fragment.store(), &mut Work::new(4_000_000).unwrap(),
+            Checks { active: &|| Ok(()), owner: &|| Ok(()) },
+        ).unwrap();
+        assert!(written.cleared_retained);
+        let untouched = (4000 / TILE, 1800 / TILE);
+        assert_eq!(written.surface.physical_tile(untouched).unwrap().reference(),
+            source.physical_tile(untouched).unwrap().reference());
+        let at = |surface: &Surface, x, y| {
+            let region = crate::raster::backed::Region::new([x, y, x + 1, y + 1]).unwrap();
+            surface.prepare_region(region, &mut || Ok(())).unwrap().pixel16(x, y).unwrap()
+        };
+        let native = |pixel: [u16; 4]| {
+            if depth == 8 { pixel.map(|v| u16::from(crate::raster::project16(v)) * 257) } else { pixel }
+        };
+        assert_eq!(at(&written.surface, 256, 256), native([paint[0], paint[1], paint[2], 32768]));
+        assert_eq!(at(&written.surface, 512, 512), [0; 4]);
+        assert_eq!(at(&written.surface, 4000, 1800), native(hidden));
+        assert_eq!(at(source, 512, 512), native(paint));
+        drop((written, placement, selection));
+        session.abort_fragment(fragment, &|| Ok(())).unwrap();
+        drop(session);
+        fixture.finish();
+    }
+}
+
+#[test]
 fn virtual_selected_cut_remainder_and_blend_match_actual_legacy_native_pixels() {
     use crate::transform::native::selected::{self, Placement, Selection};
     let mut cases = 0;
@@ -691,9 +899,10 @@ fn virtual_selected_cut_remainder_and_blend_match_actual_legacy_native_pixels() 
                         layer.origin(),
                         [layer.pixels().width(), layer.pixels().height()],
                         (kind == "fill").then_some(layer.color()),
+                        true,
                         fragment.store(),
                         &mut Work::new(20_000_000).unwrap(),
-                        &|| Ok(()),
+                        Checks { active: &|| Ok(()), owner: &|| Ok(()) },
                     )
                     .unwrap();
                     assert_eq!(
@@ -715,7 +924,7 @@ fn virtual_selected_cut_remainder_and_blend_match_actual_legacy_native_pixels() 
                             &placement,
                             fragment.store(),
                             &mut Work::new(20_000_000).unwrap(),
-                            &|| Ok(()),
+                            Checks { active: &|| Ok(()), owner: &|| Ok(()) },
                         )
                         .unwrap();
                         let old = expected.selection_coverage.as_ref().unwrap();
@@ -781,6 +990,46 @@ fn contour_edges(contours: &[Vec<[f32; 2]>]) -> Vec<([i32; 2], [i32; 2])> {
 }
 
 #[test]
+fn sparse_selected_scale_keeps_soft_mask_samples_and_contours() {
+    use crate::transform::native::selected::{self, Placement, Selection};
+
+    let mut doc = Document::new_depth(4096, 2048, 16).unwrap();
+    let mut mask = crate::raster::Raster::new(4096, 2048);
+    mask.set(512, 512, [191; 4]);
+    mask.set(3000, 1000, [255; 4]);
+    let area = [0, 0, 3800, 1600];
+    doc.selection = Some(area);
+    doc.selection_coverage = Some(crate::selection::Coverage {
+        mask, bounds: area, origin: [0, 0], contours: vec![],
+    });
+    let fixture = Fixture::from_legacy(doc);
+    let session = fixture.session();
+    let fragment = session.fresh().unwrap();
+    let selection = Selection::new(&fixture.document).unwrap();
+    let placement = Placement::for_selection(&selection, &json!({
+        "op":"transform", "pivot":[0.,0.], "scale_x":0.5, "scale_y":0.5,
+        "dx":0.5, "dy":0.25, "fractional_translation":true,
+    }), &fixture.pool).unwrap();
+    let output = selected::write_coverage(
+        &selection, &placement, fragment.store(), &mut Work::new(1_200_000).unwrap(),
+        Checks { active: &|| Ok(()), owner: &|| Ok(()) },
+    ).unwrap();
+    assert_eq!(output.bounds(), [256, 256, 1501, 501]);
+    assert_eq!(output.origin(), [0, 0]);
+    assert_eq!(output.mask().physical_tiles().len(), 2);
+    assert_eq!(contour_edges(output.contours()).len(), 4);
+    for (x, y, value) in [(256, 256, 96), (1500, 500, 128), (1000, 380, 0)] {
+        let region = crate::raster::backed::Region::new([x, y, x + 1, y + 1]).unwrap();
+        let view = output.mask().prepare_region(region, &mut || Ok(())).unwrap();
+        assert_eq!(view.pixel(x, y).unwrap(), [value; 4]);
+    }
+    drop((output, placement, selection));
+    session.abort_fragment(fragment, &|| Ok(())).unwrap();
+    drop(session);
+    fixture.finish();
+}
+
+#[test]
 fn selected_folder_geometry_scalar_preserves_canvas_clipping_and_contour_edges() {
     use crate::transform::native::selected::{self, Placement, Selection};
     for polygon in [false, true] {
@@ -806,7 +1055,7 @@ fn selected_folder_geometry_scalar_preserves_canvas_clipping_and_contour_edges()
                 &placement,
                 fragment.store(),
                 &mut Work::new(20_000_000).unwrap(),
-                &|| Ok(()),
+                Checks { active: &|| Ok(()), owner: &|| Ok(()) },
             )
             .unwrap();
             let old = expected.selection_coverage.as_ref().unwrap();

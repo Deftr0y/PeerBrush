@@ -1,6 +1,6 @@
 [package]
 name = "peerbrush"
-version = "0.30.1"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.92"
 license = "GPL-3.0-only"
@@ -23,8 +23,13 @@ unicode-bidi = "0.3"
 roxmltree = "0.21"
 svgtypes = "0.16"
 arboard = { version = "3.6", features = ["wayland-data-control"] }
-eframe = { version = "0.31", default-features = false, features = ["default_fonts", "wgpu", "x11", "wayland"] }
+eframe = { version = "0.31", default-features = false, features = ["accesskit", "default_fonts", "wgpu", "x11", "wayland"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "gif", "tiff", "webp", "ico", "pnm", "tga", "qoi"] }
+gif = "=0.14.2"
+tiff = "=0.11.3"
+zune-core = "=0.5.3"
+zune-jpeg = "=0.5.15"
+image-webp = "=0.2.4"
 png = "=0.18.1"
 moxcms = "0.8.1"
 jpegxl-sys = { version = "=0.13.0", features = ["vendored"] }
@@ -45,7 +50,11 @@ ab_glyph = "0.2"
 ttf-parser = "=0.25.1"
 ring = "0.17.14"
 unicode-script = "0.5.8"
+unicode-segmentation = "1.13.3"
 harfrust = "=0.12.0"
+
+[build-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [target.'cfg(windows)'.dependencies]
 clipboard-win = "5.4.1"
@@ -73,9 +82,13 @@ strip = true
 
 
 [patch.crates-io]
+arboard = { path = "vendor/arboard" }
 tiny-skia = { path = "vendor/tiny-skia" }
 tiny-skia-path = { path = "vendor/tiny-skia-path" }
 resvg = { path = "vendor/resvg" }
 cmake = { path = "vendor/cmake" }
 egui-winit = { path = "vendor/egui-winit" }
 jpegxl-src = { path = "vendor/jpegxl-src" }
+
+image-webp = { path = "vendor/image-webp" }
+zune-jpeg = { path = "vendor/zune-jpeg" }

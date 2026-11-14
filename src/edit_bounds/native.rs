@@ -1,7 +1,7 @@
 //! Explicit bounded frame expansion. Geometry grants no document/source authority.
 use crate::{
     large_document::{PinnedBytes, ResidentBudget, ScratchBytes},
-    raster::{project16, Pixel16, TILE},
+    raster::TILE,
 };
 
 pub(crate) struct FrameExpansion {
@@ -116,8 +116,8 @@ impl FrameExpansion {
         }))
     }
     pub(crate) fn tiles(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
-        (0..self.new_shape[1].div_ceil(TILE))
-            .flat_map(move |y| (0..self.new_shape[0].div_ceil(TILE)).map(move |x| (x, y)))
+        (0..self.new_shape[0].div_ceil(TILE))
+            .flat_map(move |x| (0..self.new_shape[1].div_ceil(TILE)).map(move |y| (x, y)))
     }
     fn destination(&self, key: (u32, u32)) -> Result<[i32; 4], String> {
         if key.0 >= self.new_shape[0].div_ceil(TILE) || key.1 >= self.new_shape[1].div_ceil(TILE) {
@@ -142,39 +142,29 @@ impl FrameExpansion {
         ];
         Ok((source[0] < source[2] && source[1] < source[3]).then_some(source))
     }
-    /// The source callback reads prepared memory only and returns errors for
-    /// missing pixels. Original physical padding is outside the logical source;
+    /// The source callback reads native rows from the prepared old-source
+    /// window. Original physical padding is outside the logical source;
     /// it cannot become editable pixels when the storage frame changes.
     pub(crate) fn render_tile(
         &self,
         key: (u32, u32),
         check: &mut dyn FnMut() -> Result<(), String>,
-        mut pixel: impl FnMut(i32, i32) -> Result<Pixel16, String>,
+        mut copy_row: impl FnMut(i32, &mut [u8]) -> Result<(), String>,
     ) -> Result<PinnedBytes, String> {
         check()?;
         let source = self.source_reads(key)?;
-        let length = (TILE * TILE) as usize * if self.depth == 16 { 8 } else { 4 };
+        let stride = if self.depth == 16 { 8 } else { 4 };
+        let length = (TILE * TILE) as usize * stride;
         let mut output =
             ScratchBytes::new(&self.pool, length, length).map_err(|e| e.to_string())?;
-        if let Some(source) = source {
-            for y in source[1]..source[3] {
+        if let Some([left, top, right, bottom]) = source {
+            let local_x = (left + self.shift[0]) as u32 - key.0 * TILE;
+            let row_bytes = (right - left) as usize * stride;
+            for y in top..bottom {
                 check()?;
-                for x in source[0]..source[2] {
-                    let value = pixel(x, y)?;
-                    let local_x = (x + self.shift[0]) as u32 - key.0 * TILE;
-                    let local_y = (y + self.shift[1]) as u32 - key.1 * TILE;
-                    let index = (local_y * TILE + local_x) as usize;
-                    if self.depth == 16 {
-                        for (c, value) in value.into_iter().enumerate() {
-                            output[index * 8 + c * 2..index * 8 + c * 2 + 2]
-                                .copy_from_slice(&value.to_be_bytes());
-                        }
-                    } else {
-                        for (c, value) in value.into_iter().enumerate() {
-                            output[index * 4 + c] = project16(value);
-                        }
-                    }
-                }
+                let local_y = (y + self.shift[1]) as u32 - key.1 * TILE;
+                let start = (local_y * TILE + local_x) as usize * stride;
+                copy_row(y, &mut output[start..start + row_bytes])?;
             }
         }
         check()?;
@@ -185,13 +175,14 @@ impl FrameExpansion {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::raster::project16;
     #[test]
     fn expansion_keeps_offcanvas_samples_low_bits_hidden_rgb_and_zero_padding() {
         for depth in [8, 16] {
             let pool = ResidentBudget::new(4 * 1024 * 1024).unwrap();
             let plan = FrameExpansion::for_edit(
                 [273, 265],
-                [17, 13],
+                [87, 13],
                 [200, -3],
                 [0, 0, 5, 5],
                 None,
@@ -202,27 +193,43 @@ mod tests {
             .unwrap();
             assert_eq!(plan.old_origin, [200, -3]);
             assert_eq!(plan.new_origin, [0, -3]);
-            assert_eq!(plan.new_shape, [273, 268]);
+            assert_eq!(plan.new_shape, [287, 268]);
             assert_eq!(plan.shift, [200, 0]);
-            assert_eq!(plan.source_reads((0, 0)).unwrap(), Some([0, 0, 17, 13]));
+            assert_eq!(plan.source_reads((0, 0)).unwrap(), Some([0, 0, 56, 13]));
+            assert_eq!(plan.source_reads((1, 0)).unwrap(), Some([56, 0, 87, 13]));
             assert_eq!(plan.source_reads((1, 1)).unwrap(), None);
             for key in plan.tiles() {
+                let source = plan.source_reads(key).unwrap();
                 let bytes = plan
-                    .render_tile(key, &mut || Ok(()), |x, y| {
-                        assert!((0..17).contains(&x) && (0..13).contains(&y));
-                        Ok([
-                            12347 + x as u16 * 17,
-                            33559 + y as u16 * 31,
-                            51237,
-                            if x % 3 == 0 { 0 } else { 45679 },
-                        ])
+                    .render_tile(key, &mut || Ok(()), |y, row| {
+                        let [left, top, right, bottom] = source.expect("unexpected source row");
+                        assert!((top..bottom).contains(&y));
+                        let stride = if depth == 16 { 8 } else { 4 };
+                        assert_eq!(row.len(), (right - left) as usize * stride);
+                        for (x, dst) in (left..right).zip(row.chunks_exact_mut(stride)) {
+                            let value = [
+                                12347 + x as u16 * 17,
+                                33559 + y as u16 * 31,
+                                51237,
+                                if x % 3 == 0 { 0 } else { 45679 },
+                            ];
+                            if depth == 16 {
+                                for (word, bytes) in value.into_iter().zip(dst.chunks_exact_mut(2))
+                                {
+                                    bytes.copy_from_slice(&word.to_be_bytes());
+                                }
+                            } else {
+                                dst.copy_from_slice(&value.map(project16));
+                            }
+                        }
+                        Ok(())
                     })
                     .unwrap();
                 for y in 0..TILE {
                     for x in 0..TILE {
                         let gx = (key.0 * TILE + x) as i32;
                         let gy = (key.1 * TILE + y) as i32;
-                        let expected = if (200..217).contains(&gx) && (0..13).contains(&gy) {
+                        let expected = if (200..287).contains(&gx) && (0..13).contains(&gy) {
                             let sx = gx - 200;
                             [
                                 12347 + sx as u16 * 17,
@@ -334,7 +341,7 @@ mod tests {
                         Ok(())
                     }
                 },
-                |_, _| Ok([12347, 33559, 51237, 45679])
+                |_, _| Ok(())
             )
             .is_err());
         assert_eq!(pool.used(), 0);

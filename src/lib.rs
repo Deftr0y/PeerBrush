@@ -67,3 +67,4 @@ pub mod ui;
 pub mod updates;
 pub mod warp;
 pub mod workspace;
+mod worker_pipe;

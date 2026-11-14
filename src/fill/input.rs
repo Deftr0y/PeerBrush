@@ -18,7 +18,7 @@ pub(crate) struct FillBaseline {
     color: [u8; 4],
 }
 impl FillBaseline {
-    fn capture(input: &RasterInput<'_>) -> Result<Option<Self>, String> {
+    pub(crate) fn capture(input: &RasterInput<'_>) -> Result<Option<Self>, String> {
         if input.is_mask() || input.layer_metadata().kind() != "fill" {
             return Ok(None);
         }
@@ -42,7 +42,7 @@ impl FillBaseline {
     pub(crate) fn logical_origin(&self) -> [i32; 2] {
         self.binding.origin()
     }
-    fn tile(
+    pub(crate) fn tile(
         &self,
         input: &RasterInput<'_>,
         frame: Option<&InputFrame>,
@@ -99,7 +99,7 @@ impl FillBaseline {
 }
 pub(crate) struct FillStage<'d, 's> {
     pub output: BuiltTiles<'d, 's>,
-    baseline: Option<FillBaseline>,
+    pub(crate) baseline: Option<FillBaseline>,
 }
 impl FillStage<'_, '_> {
     pub(crate) fn baseline(&self) -> Option<&FillBaseline> {
@@ -173,14 +173,6 @@ fn validate(
     }
     Ok(())
 }
-fn foreground_color(parameters: &serde_json::Value) -> Result<[u8; 4], String> {
-    let values = parameters["color"]
-        .as_array()
-        .filter(|v| v.len() == 4 && v.iter().all(|v| v.as_u64().is_some_and(|n| n <= 255)))
-        .ok_or("Fill color must contain four byte values")?;
-    Ok(std::array::from_fn(|i| values[i].as_u64().unwrap() as u8))
-}
-
 /// Semantic-equivalent color prebaseline for a mask command that expands a
 /// procedural fill. The coordinator pairs this kind transition and every mask
 /// output in one batch; it is not a color draw or a separate publication.
@@ -200,9 +192,14 @@ pub(crate) fn stage_visual_frame<'d, 's>(
         check()?;
         guard.check_active()
     };
-    let output = stage_frame_with(input, frame, session, &mut checked, |key, _raw, check| {
-        baseline.tile(input, Some(frame), key, check)
-    })?;
+    let output = stage_frame_with(
+        input,
+        frame,
+        session,
+        &mut checked,
+        None,
+        |key, _raw, check| baseline.tile(input, Some(frame), key, check),
+    )?;
     Ok(FillStage {
         output: BuiltTiles::Draft(output),
         baseline: Some(baseline),
@@ -217,7 +214,7 @@ pub(crate) fn stage_child_fill<'d, 's>(
     session: &'s SourceSession,
     check: &mut dyn FnMut() -> Result<(), String>,
 ) -> Result<BuiltTiles<'d, 's>, String> {
-    guard.validate(input, None, &["paint.fill"])?;
+    guard.validate(input, None, &["paint.fill", "fill"])?;
     validate(input, session, check)?;
     if input.is_mask() || input.layer_metadata().kind() != "group" {
         return Err("Native foreground-fill insertion requires its captured folder".into());
@@ -226,21 +223,24 @@ pub(crate) fn stage_child_fill<'d, 's>(
     let selection = input.selection()?;
     let canvas = [0, 0, metadata.width() as i32, metadata.height() as i32];
     let parameters = guard.parameters();
-    let mut area = clip(
-        parameters
-            .get("rect")
-            .and_then(crate::engine::rect)
-            .or(selection.bounds())
-            .unwrap_or(canvas),
-        canvas,
-    );
+    let legacy = parameters["op"] == "fill";
+    let color = if legacy {
+        crate::engine::color(parameters).map(super::expand_byte)
+    } else {
+        super::foreground_color(parameters, metadata.depth())?
+    };
+    let requested = if legacy {
+        None
+    } else {
+        parameters.get("rect").and_then(crate::engine::rect)
+    };
+    let mut area = clip(requested.or(selection.bounds()).unwrap_or(canvas), canvas);
     if let Some(bounds) = selection.bounds() {
         area = clip(area, bounds);
     }
-    if empty(area) {
+    if empty(area) && !legacy {
         return Ok(BuiltTiles::Unchanged);
     }
-    let color = foreground_color(parameters)?;
     let plan = PreparedFill::new(
         metadata.width(),
         metadata.height(),
@@ -251,6 +251,7 @@ pub(crate) fn stage_child_fill<'d, 's>(
         selection.polygon(),
         input.pool(),
     )?;
+    let plan = if legacy { plan.literal() } else { plan };
     let mut checked = || {
         guard.check_active()?;
         session.check()?;
@@ -368,7 +369,15 @@ fn stage_clear_impl<'d, 's>(
         for ty in 0..shape[1].div_ceil(TILE) {
             for tx in 0..shape[0].div_ceil(TILE) {
                 let key = (tx, ty);
-                if baseline.is_none() && !touches(local, key) {
+                let selected = if touches(local, key) {
+                    let overlap = clip(input.tile_document_rect(key)?, area);
+                    selection.may_cover(overlap)?.then_some(overlap)
+                } else {
+                    None
+                };
+                if baseline.is_none()
+                    && (selected.is_none() || input.surface().physical_tile(key).is_none())
+                {
                     continue;
                 }
                 check()?;
@@ -379,8 +388,8 @@ fn stage_clear_impl<'d, 's>(
                     before.bytes().clone()
                 };
                 let mut after = semantic_before.clone();
-                if touches(local, key) {
-                    let coverage = selection.prepare(input.tile_document_rect(key)?, check)?;
+                if let Some(overlap) = selected {
+                    let coverage = selection.prepare(overlap, check)?;
                     after = clear.render_tile(key, &after, check, |x, y| coverage.value(x, y))?;
                 }
                 crate::edit_bounds::input::check_proposal(
@@ -417,6 +426,7 @@ pub(crate) fn stage_fill<'d, 's>(
     session: &'s SourceSession,
     check: &mut dyn FnMut() -> Result<(), String>,
 ) -> Result<FillStage<'d, 's>, String> {
+    let color = input.color(color).map(super::expand_byte);
     stage_fill_impl(input, color, requested, frame, None, session, check)
 }
 pub(crate) fn stage_fill_guarded<'d, 's>(
@@ -428,7 +438,7 @@ pub(crate) fn stage_fill_guarded<'d, 's>(
 ) -> Result<FillStage<'d, 's>, String> {
     guard.validate(input, frame, &["paint.fill"])?;
     let parameters = guard.parameters();
-    let color = foreground_color(parameters)?;
+    let color = super::foreground_color(parameters, input.depth())?;
     let requested = parameters.get("rect").and_then(crate::engine::rect);
     let mut checked = || {
         guard.check_active()?;
@@ -447,7 +457,7 @@ pub(crate) fn stage_fill_guarded<'d, 's>(
 }
 fn stage_fill_impl<'d, 's>(
     input: &RasterInput<'d>,
-    color: [u8; 4],
+    color: [u16; 4],
     requested: Option<[i32; 4]>,
     frame: Option<&InputFrame>,
     guard: Option<&crate::edit_bounds::input::WriteGuard<'_>>,
@@ -507,12 +517,12 @@ fn stage_fill_impl<'d, 's>(
         input.depth(),
         local,
         origin,
-        input.color(color),
+        color,
         selection.polygon(),
         input.pool(),
     )?;
     if let Some(frame) = frame {
-        let draft = stage_frame_with(input, frame, session, check, |key, raw, check| {
+        let draft = stage_frame_with(input, frame, session, check, None, |key, raw, check| {
             let before = if let Some(baseline) = &baseline {
                 baseline.tile(input, Some(frame), key, check)?
             } else {

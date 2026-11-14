@@ -324,7 +324,7 @@ impl<'scene, 'output, 'session> StagedNativeRows<'scene, 'output, 'session> {
         check: &dyn Fn() -> Result<(), String>,
     ) -> Result<(), String> {
         let result = (|| {
-            self.check(check)?;
+            check()?;
             if start >= self.raw_bytes
                 || start % CHUNK as u64 != 0
                 || count != (self.raw_bytes - start).min(CHUNK as u64) as usize
@@ -346,30 +346,12 @@ impl<'scene, 'output, 'session> StagedNativeRows<'scene, 'output, 'session> {
                     Error::Cancelled
                 })
             };
-            let reading = (|| -> Result<(), String> {
-                let mut cursor = bytes
-                    .cursor(start, count as u64, &mut active)
-                    .map_err(|e| e.to_string())?;
-                // Exactly one actual Read; read_exact retry cannot hide a changed
-                // transport or undercount repeated authenticated chunk reads.
-                let n = cursor
-                    .read(&mut output[..count])
-                    .map_err(|e| e.to_string())?;
-                if n != count {
-                    return Err("Native original chunk read was incomplete".into());
-                }
-                let mut extra = [0];
-                if cursor.read(&mut extra).map_err(|e| e.to_string())? != 0 {
-                    return Err("Native original chunk has trailing bytes".into());
-                }
-                Ok(())
-            })();
+            let reading = bytes.read_complete_chunk_into(start, count, output, &mut active);
             drop(active);
             if let Some(error) = failure {
                 return Err(error);
             }
-            reading?;
-            self.check(check)
+            reading.map_err(|e| e.to_string())
         })();
         if result.is_err() {
             self.failed.store(true, Ordering::Release);
@@ -393,7 +375,6 @@ impl<'scene, 'output, 'session> StagedNativeRows<'scene, 'output, 'session> {
                 return Err("Native row source is failed".into());
             }
             check()?;
-            self.session.check()?;
             self.input.check_session(self.session)?;
             let source = self.input.bytes();
             if source.role() != ByteRole::StraightNativeRgba

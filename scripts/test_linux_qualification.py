@@ -627,7 +627,7 @@ class LinuxFacts(unittest.TestCase):
             arguments = shlex.split(body.replace('\\\n', ' '))
             selected = arguments[arguments.index('--package') + 1]
             self.assertEqual(destination, selected)
-            canonical = f"peerbrush_{qualifier.deb_version(self.q['version'])}_amd64.deb"
+            canonical = qualifier.deb_filename(self.q['version'])
             self.assertEqual(Path(selected.replace('${VERSION}', self.q['version'])).name, canonical)
             owned = self.f.fixture.base / ('driver-command-' + str(index))
             owned.mkdir()

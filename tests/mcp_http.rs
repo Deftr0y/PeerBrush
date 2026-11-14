@@ -49,13 +49,13 @@ fn private_stream_preserves_exact_observation_wire_and_existing_auth_origin_guar
             .send_json(query),
     );
     assert_eq!(origin.status(), 403);
-    assert!(canvas.shared.lock().unwrap().undo.is_empty());
+    assert!(canvas.shared.lock().unwrap().resident_state().expect("resident fixture").undo.is_empty());
 }
 
 #[test]
 fn modern_fonts_are_bounded_path_free_and_independent_of_document_history() {
     let canvas = Canvas::new();
-    let before = peerbrush::psd::encode(&canvas.shared.lock().unwrap().doc).unwrap();
+    let before = peerbrush::psd::encode(&canvas.shared.lock().unwrap().resident_state().expect("resident fixture").document).unwrap();
     let call = |args| {
         let query = modern_request(
             json!("fonts"),
@@ -96,10 +96,10 @@ fn modern_fonts_are_bounded_path_free_and_independent_of_document_history() {
         assert_eq!(call(args)["result"]["isError"], true);
     }
     assert_eq!(
-        peerbrush::psd::encode(&canvas.shared.lock().unwrap().doc).unwrap(),
+        peerbrush::psd::encode(&canvas.shared.lock().unwrap().resident_state().expect("resident fixture").document).unwrap(),
         before
     );
-    assert!(canvas.shared.lock().unwrap().undo.is_empty());
+    assert!(canvas.shared.lock().unwrap().resident_state().expect("resident fixture").undo.is_empty());
     let schema = server::tools()
         .as_array()
         .unwrap()
@@ -129,7 +129,7 @@ fn modern_tool_settings_are_guarded_independent_and_return_real_preview_pixels()
             .into_json::<Value>()
             .unwrap()
     };
-    let before = peerbrush::psd::encode(&canvas.shared.lock().unwrap().doc).unwrap();
+    let before = peerbrush::psd::encode(&canvas.shared.lock().unwrap().resident_state().expect("resident fixture").document).unwrap();
     let updated = call(
         json!({"action":"set","tool":"brush","actor":"preference-artist","expected_tool_revision":0,"settings":{"radius":12.5,"opacity":0.4}}),
     );
@@ -158,10 +158,10 @@ fn modern_tool_settings_are_guarded_independent_and_return_real_preview_pixels()
     let metadata: Value = serde_json::from_str(content[0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(metadata["views"][0]["coordinate_space"], "brush_preview");
     assert_eq!(
-        peerbrush::psd::encode(&canvas.shared.lock().unwrap().doc).unwrap(),
+        peerbrush::psd::encode(&canvas.shared.lock().unwrap().resident_state().expect("resident fixture").document).unwrap(),
         before
     );
-    assert!(canvas.shared.lock().unwrap().undo.is_empty());
+    assert!(canvas.shared.lock().unwrap().resident_state().expect("resident fixture").undo.is_empty());
 }
 
 #[test]
@@ -205,13 +205,13 @@ fn modern_async_open_exposes_progress_cancel_and_exact_native_sources() {
     }
     let mut e = canvas.shared.lock().unwrap();
     assert!(e.loading.is_none());
-    assert_ne!(e.doc.id, doc.id);
+    assert_ne!(e.resident_state().expect("resident fixture").document.id, doc.id);
     assert_eq!(
-        e.doc.layers[0].pixels.get16(3, 7),
+        e.resident_state().expect("resident fixture").document.layers[0].pixels.get16(3, 7),
         [60001, 12347, 34569, 65535]
     );
-    assert!(e.undo.is_empty());
-    assert_eq!(e.state()["file_status"], "PSD opened");
+    assert!(e.resident_state().expect("resident fixture").undo.is_empty());
+    assert_eq!(e.capture_state().unwrap().project().unwrap()["file_status"], "PSD opened");
 }
 
 struct Canvas {
@@ -225,10 +225,10 @@ fn modern_live_wand_updates_return_actual_selection_content_and_enforce_sources(
     let canvas = Canvas::new();
     let (project, document, layer, pixels) = {
         let mut e = canvas.shared.lock().unwrap();
-        e.doc = peerbrush::engine::Document::new_depth(32, 24, 16).unwrap();
+        e.resident_state_mut().expect("resident fixture").document = peerbrush::engine::Document::new_depth(32, 24, 16).unwrap();
         for y in 0..24 {
             for x in 0..32 {
-                e.doc.layers[0].pixels.set16(
+                e.resident_state_mut().expect("resident fixture").document.layers[0].pixels.set16(
                     x,
                     y,
                     if x < 10 {
@@ -241,9 +241,9 @@ fn modern_live_wand_updates_return_actual_selection_content_and_enforce_sources(
         }
         (
             e.project_id.clone(),
-            e.doc.id.clone(),
-            e.doc.layers[0].id.clone(),
-            e.doc.export_png().unwrap(),
+            e.resident_state().expect("resident fixture").document.id.clone(),
+            e.resident_state().expect("resident fixture").document.layers[0].id.clone(),
+            e.resident_state().expect("resident fixture").document.export_png().unwrap(),
         )
     };
     let call = |name: &str, arguments: Value| {
@@ -282,7 +282,7 @@ fn modern_live_wand_updates_return_actual_selection_content_and_enforce_sources(
     assert!(mask.get_pixel(9, 12)[0] > 0 && mask.get_pixel(9, 12)[0] < 255);
     assert_eq!(mask.get_pixel(20, 12)[0], 0);
     assert_eq!(
-        canvas.shared.lock().unwrap().doc.export_png().unwrap(),
+        canvas.shared.lock().unwrap().resident_state().expect("resident fixture").document.export_png().unwrap(),
         pixels
     );
     let stale = call(
@@ -290,8 +290,8 @@ fn modern_live_wand_updates_return_actual_selection_content_and_enforce_sources(
         json!({"actor":"wand-agent","expected_revision":1,"commands":[{"op":"selection.wand_update","tolerance":255}]}),
     );
     assert_eq!(stale["result"]["isError"], true);
-    assert_eq!(canvas.shared.lock().unwrap().doc.revision, 2);
-    assert_eq!(canvas.shared.lock().unwrap().undo.len(), 2);
+    assert_eq!(canvas.shared.lock().unwrap().resident_state().expect("resident fixture").document.revision, 2);
+    assert_eq!(canvas.shared.lock().unwrap().resident_state().expect("resident fixture").undo.len(), 2);
     let created = call(
         "peerbrush_edit",
         json!({"actor":"wand-agent","project_id":project,"document_id":document,"expected_revision":2,"commands":[{"op":"mask.add","layer":layer}]}),
@@ -309,9 +309,9 @@ fn modern_live_wand_updates_return_actual_selection_content_and_enforce_sources(
             .to_rgba8();
     assert_eq!(actual, mask);
     let e = canvas.shared.lock().unwrap();
-    assert_eq!(e.undo.len(), 3);
+    assert_eq!(e.resident_state().expect("resident fixture").undo.len(), 3);
     assert_eq!(
-        e.doc.layers[0].mask.as_ref().unwrap().steps[0].pixels.depth,
+        e.resident_state().expect("resident fixture").document.layers[0].mask.as_ref().unwrap().steps[0].pixels.depth,
         16
     );
 }
@@ -321,8 +321,8 @@ fn modern_code_runs_async_returns_actual_images_and_allows_cancellation() {
     let canvas = Canvas::new();
     let (project, document, layer, task) = {
         let mut e = canvas.shared.lock().unwrap();
-        e.doc = peerbrush::engine::Document::new_depth(40, 32, 16).unwrap();
-        let layer = e.doc.layers[0].id.clone();
+        e.resident_state_mut().expect("resident fixture").document = peerbrush::engine::Document::new_depth(40, 32, 16).unwrap();
+        let layer = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
         let task = e
             .reserve(
                 "http-code",
@@ -331,7 +331,7 @@ fn modern_code_runs_async_returns_actual_images_and_allows_cancellation() {
             )
             .unwrap()
             .id;
-        (e.project_id.clone(), e.doc.id.clone(), layer, task)
+        (e.project_id.clone(), e.resident_state().expect("resident fixture").document.id.clone(), layer, task)
     };
     let call = |arguments: Value| {
         let q = modern_request(
@@ -371,7 +371,7 @@ fn modern_code_runs_async_returns_actual_images_and_allows_cancellation() {
         .iter()
         .any(|i| i["type"] == "image"));
     assert_eq!(
-        canvas.shared.lock().unwrap().doc.layers[0]
+        canvas.shared.lock().unwrap().resident_state().expect("resident fixture").document.layers[0]
             .pixels
             .get16(3, 4),
         [60001, 12347, 34569, 65535]
@@ -402,7 +402,7 @@ fn modern_code_runs_async_returns_actual_images_and_allows_cancellation() {
         std::thread::sleep(Duration::from_millis(5));
     }
     assert!(discarded, "Cancellation must finish without committing");
-    assert_eq!(canvas.shared.lock().unwrap().doc.revision, 1);
+    assert_eq!(canvas.shared.lock().unwrap().resident_state().expect("resident fixture").document.revision, 1);
 }
 
 #[test]
@@ -449,8 +449,8 @@ fn modern_brush_library_custom_persistence_and_actual_png_feedback() {
         false
     );
     let mut e = canvas.shared.lock().unwrap();
-    assert_eq!(e.state()["dirty"], false);
-    assert!(e.undo.is_empty());
+    assert_eq!(e.capture_state().unwrap().project().unwrap()["dirty"], false);
+    assert!(e.resident_state().expect("resident fixture").undo.is_empty());
 }
 
 #[test]
@@ -458,8 +458,8 @@ fn modern_proposal_feedback_is_explicit_and_acceptance_is_atomic() {
     let canvas = Canvas::new();
     let (document, layer) = {
         let mut e = canvas.shared.lock().unwrap();
-        e.doc = peerbrush::engine::Document::new_depth(16, 16, 16).unwrap();
-        (e.doc.id.clone(), e.doc.layers[0].id.clone())
+        e.resident_state_mut().expect("resident fixture").document = peerbrush::engine::Document::new_depth(16, 16, 16).unwrap();
+        (e.resident_state().expect("resident fixture").document.id.clone(), e.resident_state().expect("resident fixture").document.layers[0].id.clone())
     };
     let call = |name: &str, arguments: Value| -> Value {
         let q = modern_request(
@@ -503,9 +503,9 @@ fn modern_proposal_feedback_is_explicit_and_acceptance_is_atomic() {
     );
     {
         let e = canvas.shared.lock().unwrap();
-        assert_eq!(e.doc.layers[0].pixels.get16(3, 4), [0; 4]);
-        assert_eq!(e.doc.revision, 0);
-        assert!(e.undo.is_empty());
+        assert_eq!(e.resident_state().expect("resident fixture").document.layers[0].pixels.get16(3, 4), [0; 4]);
+        assert_eq!(e.resident_state().expect("resident fixture").document.revision, 0);
+        assert!(e.resident_state().expect("resident fixture").undo.is_empty());
     }
     let refused = call(
         "peerbrush_proposal",
@@ -518,14 +518,14 @@ fn modern_proposal_feedback_is_explicit_and_acceptance_is_atomic() {
     );
     assert_eq!(accepted["result"]["isError"], false);
     let mut e = canvas.shared.lock().unwrap();
-    assert_eq!(e.doc.revision, 1);
-    assert_eq!(e.undo.len(), 1);
+    assert_eq!(e.resident_state().expect("resident fixture").document.revision, 1);
+    assert_eq!(e.resident_state().expect("resident fixture").undo.len(), 1);
     assert_eq!(
-        e.doc.layers[0].pixels.get16(3, 4),
+        e.resident_state().expect("resident fixture").document.layers[0].pixels.get16(3, 4),
         [230 * 257, 40 * 257, 80 * 257, 65535]
     );
     e.undo("human").unwrap();
-    assert_eq!(e.doc.layers[0].pixels.get16(3, 4), [0; 4]);
+    assert_eq!(e.resident_state().expect("resident fixture").document.layers[0].pixels.get16(3, 4), [0; 4]);
     drop(e);
     let recovery = call("peerbrush_task", json!({"action":"recovery"}));
     assert_eq!(recovery["result"]["isError"], false);
@@ -715,7 +715,7 @@ fn legacy_notifications_and_responses_have_no_body_and_cannot_edit() {
         assert_eq!(accepted.status(), 202);
         assert!(accepted.into_string().unwrap().is_empty());
     }
-    assert_eq!(canvas.shared.lock().unwrap().doc.revision, 0);
+    assert_eq!(canvas.shared.lock().unwrap().resident_state().expect("resident fixture").document.revision, 0);
 }
 
 #[test]
@@ -775,7 +775,7 @@ fn transport_rejects_unsafe_origins_and_requires_local_authentication() {
         404,
         -32601,
     );
-    assert!(canvas.shared.lock().unwrap().doc.revision == 0);
+    assert!(canvas.shared.lock().unwrap().resident_state().expect("resident fixture").document.revision == 0);
 }
 
 #[test]
@@ -1085,7 +1085,7 @@ fn modern_places_image_pixels_and_returns_actual_png_feedback() {
             .to_rgba8();
     assert_eq!(decoded.dimensions(), (4, 4));
     assert_eq!(decoded.get_pixel(2, 2).0, [32, 96, 192, 255]);
-    assert_eq!(canvas.shared.lock().unwrap().doc.revision, 1);
+    assert_eq!(canvas.shared.lock().unwrap().resident_state().expect("resident fixture").document.revision, 1);
 }
 
 #[test]
@@ -1124,7 +1124,7 @@ fn modern_edits_native_vector_sources_and_returns_actual_png_and_properties() {
     let canvas = Canvas::new();
     {
         let mut e = canvas.shared.lock().unwrap();
-        e.doc = peerbrush::engine::Document::new_depth(32, 32, 16).unwrap();
+        e.resident_state_mut().expect("resident fixture").document = peerbrush::engine::Document::new_depth(32, 32, 16).unwrap();
     }
     let source = json!({"width":16,"height":16,"content":{"kind":"shape","shape":"rectangle","bounds":[2,2,14,14],"points":[],"closed":true,"fill":[12345,23457,34569,65535],"stroke":[0,0,0,0],"stroke_width":0}});
     let q = modern_request(
@@ -1143,14 +1143,14 @@ fn modern_edits_native_vector_sources_and_returns_actual_png_and_properties() {
     assert_eq!(image.get_pixel(8, 10).0, [48, 91, 135, 255]);
     let mut e = canvas.shared.lock().unwrap();
     let observed: peerbrush::source::Source =
-        serde_json::from_value(e.state()["layers"][0]["source"].clone()).unwrap();
+        serde_json::from_value(e.capture_state().unwrap().project().unwrap()["layers"][0]["source"].clone()).unwrap();
     let requested: peerbrush::source::Source = serde_json::from_value(source).unwrap();
     assert_eq!(observed, requested);
     assert_eq!(
-        e.doc.layers[0].pixels.get16(4, 4),
+        e.resident_state().expect("resident fixture").document.layers[0].pixels.get16(4, 4),
         [12345, 23457, 34569, 65535]
     );
-    assert_eq!(e.undo.len(), 1);
+    assert_eq!(e.resident_state().expect("resident fixture").undo.len(), 1);
     assert_eq!(e.ai_change.as_ref().unwrap().tool, "layers");
 }
 
@@ -1159,17 +1159,17 @@ fn modern_transform_cycles_preserve_native_originals_and_return_current_pixels()
     let canvas = Canvas::new();
     let (id, before) = {
         let mut e = canvas.shared.lock().unwrap();
-        e.doc = peerbrush::engine::Document::new_depth(32, 32, 16).unwrap();
+        e.resident_state_mut().expect("resident fixture").document = peerbrush::engine::Document::new_depth(32, 32, 16).unwrap();
         for y in 4..28 {
             for x in 4..28 {
-                e.doc.layers[0].pixels.set16(
+                e.resident_state_mut().expect("resident fixture").document.layers[0].pixels.set16(
                     x,
                     y,
                     [12345 + x as u16 * 347, 23457 + y as u16 * 283, 34569, 65535],
                 );
             }
         }
-        (e.doc.layers[0].id.clone(), e.doc.export_png().unwrap())
+        (e.resident_state().expect("resident fixture").document.layers[0].id.clone(), e.resident_state().expect("resident fixture").document.export_png().unwrap())
     };
     let commands = [
         json!({"op":"transform","layer":id,"angle":31,"pivot":[16,16],"selection_only":false}),
@@ -1204,14 +1204,14 @@ fn modern_transform_cycles_preserve_native_originals_and_return_current_pixels()
         ]
     );
     let mut e = canvas.shared.lock().unwrap();
-    assert!(e.doc.export_png().unwrap() == before);
-    assert_eq!(e.undo.len(), 1);
-    assert_eq!(e.state()["layers"][0]["transform_source"]["bit_depth"], 16);
-    assert_eq!(e.state()["layers"][0]["transform_source"]["width"], 32);
+    assert!(e.resident_state().expect("resident fixture").document.export_png().unwrap() == before);
+    assert_eq!(e.resident_state().expect("resident fixture").undo.len(), 1);
+    assert_eq!(e.capture_state().unwrap().project().unwrap()["layers"][0]["transform_source"]["bit_depth"], 16);
+    assert_eq!(e.capture_state().unwrap().project().unwrap()["layers"][0]["transform_source"]["width"], 32);
     assert_eq!(e.ai_change.as_ref().unwrap().tool, "scale");
     e.undo("transform-agent").unwrap();
-    assert!(e.doc.export_png().unwrap() == before);
-    assert!(e.doc.layers[0].pixels.retained.is_none());
+    assert!(e.resident_state().expect("resident fixture").document.export_png().unwrap() == before);
+    assert!(e.resident_state().expect("resident fixture").document.layers[0].pixels.retained.is_none());
 }
 
 #[test]
@@ -1219,13 +1219,13 @@ fn modern_async_save_exposes_exact_run_terminal_status_and_native_psb_sources() 
     let canvas = Canvas::new();
     let (document, revision) = {
         let mut e = canvas.shared.lock().unwrap();
-        e.doc = peerbrush::engine::Document::new_depth(32, 16, 16).unwrap();
-        e.doc.layers[0]
+        e.resident_state_mut().expect("resident fixture").document = peerbrush::engine::Document::new_depth(32, 16, 16).unwrap();
+        e.resident_state_mut().expect("resident fixture").document.layers[0]
             .pixels
             .set16(3, 7, [60001, 12347, 34569, 32769]);
-        e.doc.layers[0].pixels.set16(2, 5, [10001, 20003, 30007, 0]);
-        e.doc.revision = 1;
-        (e.doc.id.clone(), e.doc.revision)
+        e.resident_state_mut().expect("resident fixture").document.layers[0].pixels.set16(2, 5, [10001, 20003, 30007, 0]);
+        e.resident_state_mut().expect("resident fixture").document.revision = 1;
+        (e.resident_state().expect("resident fixture").document.id.clone(), e.resident_state().expect("resident fixture").document.revision)
     };
     let path = canvas.dir.join("async-native.psb");
     let call = modern_request(
@@ -1244,6 +1244,8 @@ fn modern_async_save_exposes_exact_run_terminal_status_and_native_psb_sources() 
         .is_some_and(|run| !run.is_empty()));
     assert_eq!(result["saving"]["document_id"], document);
     assert_eq!(result["saving"]["revision"], revision);
+    let projects = peerbrush::workspace::state(&canvas.shared);
+    assert_eq!(projects["projects"][0]["saving"]["run"], result["saving"]["run"]);
     let control = canvas.shared.lock().unwrap().saving.clone().unwrap();
     for _ in 0..100 {
         if control.status().finished {
@@ -1256,8 +1258,8 @@ fn modern_async_save_exposes_exact_run_terminal_status_and_native_psb_sources() 
     assert!(!control.cancel());
     let mut e = canvas.shared.lock().unwrap();
     assert_eq!(e.saved_revision, revision);
-    assert!(e.undo.is_empty() && e.redo.is_empty());
-    let observed = e.state();
+    assert!(e.resident_state().expect("resident fixture").undo.is_empty() && e.resident_state().expect("resident fixture").redo.is_empty());
+    let observed = e.capture_state().unwrap().project().unwrap();
     assert_eq!(observed["saving"]["finished"], true);
     assert_eq!(observed["saving"]["stage"], "Saved");
     assert_eq!(observed["file_status"], "Photoshop document saved");
@@ -1266,7 +1268,7 @@ fn modern_async_save_exposes_exact_run_terminal_status_and_native_psb_sources() 
     assert!(!decoded.read_only);
     assert_eq!(
         decoded.layers[0].pixels.rgba16(),
-        e.doc.layers[0].pixels.rgba16()
+        e.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16()
     );
 }
 
@@ -1276,13 +1278,13 @@ fn modern_synchronous_save_keeps_terminal_reply_and_shared_consent_schema() {
         let canvas = Canvas::new();
         let (document, revision) = {
             let mut e = canvas.shared.lock().unwrap();
-            e.doc = peerbrush::engine::Document::new_depth(8, 4, depth).unwrap();
-            e.doc.layers[0]
+            e.resident_state_mut().expect("resident fixture").document = peerbrush::engine::Document::new_depth(8, 4, depth).unwrap();
+            e.resident_state_mut().expect("resident fixture").document.layers[0]
                 .pixels
                 .set16(2, 1, [60001, 12347, 34569, 32769]);
-            e.doc.layers[0].pixels.set16(3, 2, [10001, 20003, 30007, 0]);
-            e.doc.revision = 1;
-            (e.doc.id.clone(), e.doc.revision)
+            e.resident_state_mut().expect("resident fixture").document.layers[0].pixels.set16(3, 2, [10001, 20003, 30007, 0]);
+            e.resident_state_mut().expect("resident fixture").document.revision = 1;
+            (e.resident_state().expect("resident fixture").document.id.clone(), e.resident_state().expect("resident fixture").document.revision)
         };
         let path = canvas.dir.join("synchronous.psd");
         let call = modern_request(
@@ -1309,10 +1311,10 @@ fn modern_synchronous_save_keeps_terminal_reply_and_shared_consent_schema() {
         assert!(!decoded.read_only);
         assert_eq!(
             decoded.layers[0].pixels.rgba16(),
-            e.doc.layers[0].pixels.rgba16()
+            e.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16()
         );
         assert_eq!(e.saved_revision, revision);
-        assert!(e.undo.is_empty() && e.redo.is_empty());
+        assert!(e.resident_state().expect("resident fixture").undo.is_empty() && e.resident_state().expect("resident fixture").redo.is_empty());
     }
     let tools = server::tools();
     let schema = &tools

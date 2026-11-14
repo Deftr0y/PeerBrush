@@ -29,11 +29,11 @@ fn lossy_saves_require_explicit_acceptance_bound_to_the_current_source() {
             std::env::temp_dir().join(format!("peerbrush-save-loss-{}", peerbrush::engine::id()));
         std::fs::create_dir_all(&root).unwrap();
         let mut engine = Engine::new();
-        engine.doc = fixture(depth);
-        engine.doc.layers[0].effects = vec![effect(true)];
-        let document = engine.doc.id.clone();
-        let revision = engine.doc.revision;
-        let before = serde_json::to_value(&engine.doc).unwrap();
+        engine.resident_state_mut().expect("resident fixture").document = fixture(depth);
+        engine.resident_state_mut().expect("resident fixture").document.layers[0].effects = vec![effect(true)];
+        let document = engine.resident_state().expect("resident fixture").document.id.clone();
+        let revision = engine.resident_state().expect("resident fixture").document.revision;
+        let before = serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap();
         let shared = Arc::new(Mutex::new(engine));
         let path = root.join("Styled.psd");
         assert!(server::save(&shared, &path).is_err());
@@ -51,7 +51,7 @@ fn lossy_saves_require_explicit_acceptance_bound_to_the_current_source() {
             assert!(!path.exists());
         }
         assert_eq!(
-            serde_json::to_value(&shared.lock().unwrap().doc).unwrap(),
+            serde_json::to_value(&shared.lock().unwrap().resident_state().expect("resident fixture").document).unwrap(),
             before
         );
         assert_eq!(shared.lock().unwrap().saved_revision, 0);
@@ -71,13 +71,13 @@ fn lossy_saves_require_explicit_acceptance_bound_to_the_current_source() {
             assert_eq!(restored.layers[0].effects.len(), 1);
             assert_eq!(
                 restored.export_png().unwrap(),
-                shared.lock().unwrap().doc.export_png().unwrap()
+                shared.lock().unwrap().resident_state().expect("resident fixture").document.export_png().unwrap()
             );
         }
         // A completed save grants no continuing permission to later revisions.
         {
             let mut e = shared.lock().unwrap();
-            let layer = e.doc.layers[0].id.clone();
+            let layer = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
             e.edit(
                 "human",
                 &[json!({"op":"layer.update","layer":layer,"name":"Later human work"})],
@@ -103,7 +103,7 @@ fn save_acceptance_keeps_plain_saves_and_protected_and_overwrite_guards() {
             std::env::temp_dir().join(format!("peerbrush-save-policy-{}", peerbrush::engine::id()));
         std::fs::create_dir_all(&root).unwrap();
         let mut engine = Engine::new();
-        engine.doc = fixture(depth);
+        engine.resident_state_mut().expect("resident fixture").document = fixture(depth);
         let shared = Arc::new(Mutex::new(engine));
         let plain = root.join("Plain.psd");
         server::save(&shared, &plain).unwrap();
@@ -112,7 +112,7 @@ fn save_acceptance_keeps_plain_saves_and_protected_and_overwrite_guards() {
         std::fs::write(&existing, &original).unwrap();
         let (document, revision) = {
             let mut engine = shared.lock().unwrap();
-            let layer = engine.doc.layers[0].id.clone();
+            let layer = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
             engine
                 .edit(
                     "human",
@@ -122,7 +122,7 @@ fn save_acceptance_keeps_plain_saves_and_protected_and_overwrite_guards() {
                     "Effect requiring review",
                 )
                 .unwrap();
-            (engine.doc.id.clone(), engine.doc.revision)
+            (engine.resident_state().expect("resident fixture").document.id.clone(), engine.resident_state().expect("resident fixture").document.revision)
         };
         let request = json!({"action":"save","path":existing,"actor":"human","document_id":document,"expected_revision":revision,"accept_editability_loss":true});
         assert!(server::dispatch(&shared, "document", &request)
@@ -131,10 +131,10 @@ fn save_acceptance_keeps_plain_saves_and_protected_and_overwrite_guards() {
         assert_eq!(std::fs::read(&existing).unwrap(), original);
         {
             let mut engine = shared.lock().unwrap();
-            engine.doc.read_only = true;
-            engine.doc.warnings = vec!["Unsupported Photoshop source".into()];
+            engine.resident_state_mut().expect("resident fixture").document.read_only = true;
+            engine.resident_state_mut().expect("resident fixture").document.warnings = vec!["Unsupported Photoshop source".into()];
         }
-        let before = serde_json::to_value(&shared.lock().unwrap().doc).unwrap();
+        let before = serde_json::to_value(&shared.lock().unwrap().resident_state().expect("resident fixture").document).unwrap();
         let mut protected_request = request;
         protected_request["overwrite"] = json!(true);
         assert!(server::dispatch(&shared, "document", &protected_request)
@@ -143,7 +143,7 @@ fn save_acceptance_keeps_plain_saves_and_protected_and_overwrite_guards() {
         assert_eq!(std::fs::read(&existing).unwrap(), original);
         assert_eq!(std::fs::read(&plain).unwrap(), original);
         assert_eq!(
-            serde_json::to_value(&shared.lock().unwrap().doc).unwrap(),
+            serde_json::to_value(&shared.lock().unwrap().resident_state().expect("resident fixture").document).unwrap(),
             before
         );
         drop(shared);
@@ -279,6 +279,7 @@ fn filters_and_adjustments_report_the_actual_visible_composite_and_hidden_source
                 let mut adjustment = Layer::new("Adjustment", "adjustment", 8, 6);
                 adjustment.pixels = Raster::new_depth(8, 6, depth);
                 adjustment.effects = vec![effect(true)];
+                adjustment.effects[0].weight = 0.5; // Weighted inversion still requires a bake.
                 doc.layers.insert(0, adjustment);
             }
             let report = compatibility::report(&doc).unwrap();
@@ -312,7 +313,7 @@ fn filters_and_adjustments_report_the_actual_visible_composite_and_hidden_source
 fn editable_vector_masks_effects_and_opacity_losses_are_specific_and_reports_are_source_bound() {
     for depth in [8, 16] {
         let mut engine = Engine::new();
-        engine.doc = fixture(depth);
+        engine.resident_state_mut().expect("resident fixture").document = fixture(depth);
         let source = Source {
             width: 8,
             height: 6,
@@ -336,7 +337,7 @@ fn editable_vector_masks_effects_and_opacity_losses_are_specific_and_reports_are
                 "Vector source",
             )
             .unwrap();
-        let layer = &mut engine.doc.layers[0];
+        let layer = &mut engine.resident_state_mut().expect("resident fixture").document.layers[0];
         layer.opacity = 0.5;
         layer.effects = vec![effect(true)];
         layer.mask = Some(Mask {
@@ -353,11 +354,11 @@ fn editable_vector_masks_effects_and_opacity_losses_are_specific_and_reports_are
                 settings: json!(null),
             }],
         });
-        let before = serde_json::to_value(&engine.doc).unwrap();
-        let revision = engine.doc.revision;
-        let document = engine.doc.id.clone();
+        let before = serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap();
+        let revision = engine.resident_state().expect("resident fixture").document.revision;
+        let document = engine.resident_state().expect("resident fixture").document.id.clone();
         let shared = Arc::new(Mutex::new(engine));
-        let report = compatibility::report(&shared.lock().unwrap().doc).unwrap();
+        let report = compatibility::report(&shared.lock().unwrap().resident_state().expect("resident fixture").document).unwrap();
         for code in [
             LossCode::EditableSourceRasterized,
             LossCode::MaskStackBaked,
@@ -383,10 +384,10 @@ fn editable_vector_masks_effects_and_opacity_losses_are_specific_and_reports_are
             assert!(server::dispatch(&shared, "document", &bad).is_err());
         }
         assert_eq!(
-            serde_json::to_value(&shared.lock().unwrap().doc).unwrap(),
+            serde_json::to_value(&shared.lock().unwrap().resident_state().expect("resident fixture").document).unwrap(),
             before
         );
-        assert_eq!(shared.lock().unwrap().undo.len(), 1);
+        assert_eq!(shared.lock().unwrap().resident_state().expect("resident fixture").undo.len(), 1);
         let mut protected = fixture(depth);
         protected.read_only = true;
         protected.warnings = vec!["Unsupported Photoshop feature: lmfx".into()];

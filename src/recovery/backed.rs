@@ -1,8 +1,8 @@
 //! Native backing recovery is separate from PSD/Source36 standard-data proof.
-//! These internal operations do not enable live native-document adoption.
+//! Framing/source proof alone grants no editable workspace registration.
 use crate::{
     engine::scene::{Document36, PendingScene, RasterRoster, SceneSnapshot, StagedScene},
-    large_document::{BlockRef, CommitRef, Error, ScratchBytes, Snapshot},
+    large_document::{BlockRef, BufferedWrite, CommitRef, Error, ScratchBytes, Snapshot},
     psd::{
         canonical36::{Canonical, Limits as JsonLimits, Stats},
         memory36::{Admission, MetadataCharge, WorkingSet},
@@ -175,6 +175,29 @@ impl Write for Count {
 }
 
 impl Capture {
+    pub(crate) fn from_native(
+        scene: &SceneSnapshot,
+        session: &SourceSession,
+        limits: Limits,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<Self> {
+        limits.validate()?;
+        let sealed = crate::engine::scene::seal_native_sources(
+            scene,
+            session,
+            limits.refs,
+            limits.stores,
+            check,
+        )?;
+        Self::new_with_rasters(
+            scene,
+            &sealed.rasters,
+            &sealed.seals,
+            session,
+            limits,
+            check,
+        )
+    }
     pub(crate) fn from_staged(
         staged: &StagedScene<SourceSession>,
         session: &SourceSession,
@@ -188,6 +211,16 @@ impl Capture {
     }
     pub(crate) fn new(
         scene: &SceneSnapshot,
+        seals: &[Snapshot],
+        session: &SourceSession,
+        limits: Limits,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<Self> {
+        Self::new_with_rasters(scene, scene.rasters(), seals, session, limits, check)
+    }
+    fn new_with_rasters(
+        scene: &SceneSnapshot,
+        sources: &RasterRoster,
         seals: &[Snapshot],
         session: &SourceSession,
         limits: Limits,
@@ -253,24 +286,24 @@ impl Capture {
             return Err("Captured recovery metadata identity differs from its scene".into());
         }
         let count = typed.visit_rasters(|reference| {
-            scene.rasters().get(reference)?;
+            sources.get(reference)?;
             Ok(())
         })?;
-        if count != scene.rasters().len() {
+        if count != sources.len() {
             return Err("Captured recovery metadata omits a raster source".into());
         }
         drop(typed);
         drop(raw);
         drop(raw_charge);
         let mut refs = 0usize;
-        for (_, raster) in scene.rasters().iter() {
+        for (_, raster) in sources.iter() {
             check()?;
             refs = refs
                 .checked_add(raster.physical_tiles().count())
                 .filter(|n| *n <= limits.refs)
                 .ok_or("Native recovery reference limit exceeded")?;
         }
-        let roster_len = scene.rasters().len();
+        let roster_len = sources.len();
         let index_bytes = refs
             .checked_mul(2 * std::mem::size_of::<Tile>())
             .and_then(|n| {
@@ -325,7 +358,7 @@ impl Capture {
             .try_reserve_exact(tables.len())
             .map_err(|_| "Recovery owner coverage allocation refused")?;
         referenced.resize(tables.len(), false);
-        for (id, raster) in scene.rasters().iter() {
+        for (id, raster) in sources.iter() {
             check()?;
             let mut tiles = Vec::new();
             let count = raster.physical_tiles().count();
@@ -438,13 +471,41 @@ impl Capture {
         }
         Ok(())
     }
-    /// This is intentionally not called by the live resident-Document worker.
-    /// Native engine adoption and complete recovery ownership dispatch are gates.
+    pub(crate) fn encoded_len(&self) -> Result<u64> {
+        let bytes = HEADER
+            .checked_add(self.metadata.len() as u64)
+            .and_then(|n| n.checked_add(self.tables.len() as u64 * 112))
+            .and_then(|n| n.checked_add(self.rasters.len() as u64 * 20))
+            .and_then(|n| {
+                n.checked_add(
+                    self.rasters
+                        .iter()
+                        .map(|r| r.tiles.len() as u64 * 16)
+                        .sum::<u64>(),
+                )
+            })
+            .and_then(|n| n.checked_add(32))
+            .filter(|n| *n <= MAX_MARKER)
+            .ok_or("Native recovery framing exceeds its declared bounds")?;
+        Ok(bytes)
+    }
+    /// Publish one immutable frame; the autosave coordinator owns retention.
     pub(crate) fn publish(
         &self,
         snapshot: [u8; 16],
         session: &SourceSession,
         check: &dyn Fn() -> Result<()>,
+    ) -> Result<()> {
+        self.publish_with_completion(snapshot, session, check, check)
+    }
+    /// Source-generation checks end at publication. Completion still verifies
+    /// the actual instance/service and selected immutable source owners.
+    pub(crate) fn publish_with_completion(
+        &self,
+        snapshot: [u8; 16],
+        session: &SourceSession,
+        check: &dyn Fn() -> Result<()>,
+        complete: &dyn Fn() -> Result<()>,
     ) -> Result<()> {
         if snapshot == [0; 16] {
             return Err("Recovery marker identity is empty".into());
@@ -468,16 +529,8 @@ impl Capture {
         counted.hash.update(DOMAIN);
         self.write_body(snapshot, &mut counted)?;
         let payload_sha: [u8; 32] = counted.hash.finish().as_ref().try_into().unwrap();
-        let expected = HEADER
-            + self.metadata.len() as u64
-            + self.tables.len() as u64 * 112
-            + self.rasters.len() as u64 * 20
-            + self
-                .rasters
-                .iter()
-                .map(|r| r.tiles.len() as u64 * 16)
-                .sum::<u64>();
-        if counted.bytes != expected || expected.checked_add(32).is_none_or(|n| n > MAX_MARKER) {
+        let expected = self.encoded_len()? - 32;
+        if counted.bytes != expected {
             return Err("Recovery marker framing exceeds its declared bounds".into());
         }
         let mut full = HashWriter {
@@ -500,16 +553,12 @@ impl Capture {
         })?;
         let mut scratch = ScratchBytes::new(&session.resident(), 64 * 1024, 64 * 1024)
             .map_err(|e| e.to_string())?;
-        let result = session.publish_recovery_marker(
+        let result = session.publish_recovery_marker_with_completion(
             snapshot,
             full.bytes,
             sha256,
             &mut |output| {
-                let mut buffered = Buffered {
-                    output,
-                    scratch: &mut scratch,
-                    used: 0,
-                };
+                let mut buffered = BufferedWrite::new(output, &mut scratch);
                 self.write_body(snapshot, &mut buffered)?;
                 buffered
                     .write_all(&payload_sha)
@@ -523,42 +572,16 @@ impl Capture {
                 }
                 Ok(())
             },
+            complete,
         );
         let result = result.and_then(|_| {
             let mut marker = session.open_recovery_marker(snapshot)?;
-            session.register_checkpoint(proof, &mut marker, check)
+            session.register_checkpoint(proof, &mut marker, complete)
         });
         if result.is_err() {
             self.failed.store(true, Ordering::Release);
         }
         result
-    }
-}
-struct Buffered<'a> {
-    output: &'a mut dyn Write,
-    scratch: &'a mut ScratchBytes,
-    used: usize,
-}
-impl Write for Buffered<'_> {
-    fn write(&mut self, mut bytes: &[u8]) -> io::Result<usize> {
-        let length = bytes.len();
-        while !bytes.is_empty() {
-            let count = bytes.len().min(self.scratch.len() - self.used);
-            self.scratch[self.used..self.used + count].copy_from_slice(&bytes[..count]);
-            self.used += count;
-            bytes = &bytes[count..];
-            if self.used == self.scratch.len() {
-                self.flush()?;
-            }
-        }
-        Ok(length)
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        if self.used != 0 {
-            self.output.write_all(&self.scratch[..self.used])?;
-            self.used = 0;
-        }
-        self.output.flush()
     }
 }
 struct HashWriter {
@@ -1017,6 +1040,7 @@ mod tests {
         held: Option<Directory>,
         runtime: Option<Arc<SourceRuntime>>,
         connection: Option<crate::server::Connection>,
+        shared: Option<crate::server::Shared>,
     }
     impl Fixture {
         fn new() -> Self {
@@ -1029,9 +1053,24 @@ mod tests {
             fs::create_dir(&base).unwrap();
             let held = Some(Directory::open(&base).unwrap());
             let shared = Arc::new(Mutex::new(Engine::new()));
-            let connection = crate::server::start(shared, base.join("state")).unwrap();
-            let context = PersistentRootContext::from_explicit_state(&connection).unwrap();
-            let runtime = SourceRuntime::new(
+            let mut connection = crate::server::start(shared.clone(), base.join("state")).unwrap();
+            connection
+                .instance_lock
+                .as_mut()
+                .unwrap()
+                .stop_recovery_for_test();
+            let runtime = Self::new_runtime(&connection);
+            Self {
+                base,
+                held,
+                runtime: Some(runtime),
+                connection: Some(connection),
+                shared: Some(shared),
+            }
+        }
+        fn new_runtime(connection: &crate::server::Connection) -> Arc<SourceRuntime> {
+            let context = PersistentRootContext::from_explicit_state(connection).unwrap();
+            SourceRuntime::new(
                 context,
                 RuntimeLimits {
                     resident_bytes: 128 * 1024 * 1024,
@@ -1045,20 +1084,20 @@ mod tests {
                     },
                 },
             )
-            .unwrap();
-            Self {
-                base,
-                held,
-                runtime: Some(runtime),
-                connection: Some(connection),
-            }
+            .unwrap()
         }
         fn runtime(&self) -> &Arc<SourceRuntime> {
             self.runtime.as_ref().unwrap()
         }
+        fn workspace(&self) -> crate::workspace::Registry {
+            let workspace = crate::workspace::attach(self.shared.as_ref().unwrap());
+            workspace.lock().unwrap().source_runtime = Some(self.runtime().clone());
+            workspace
+        }
     }
     impl Drop for Fixture {
         fn drop(&mut self) {
+            drop(self.shared.take());
             drop(self.runtime.take());
             drop(self.connection.take());
             let temp = fs::canonicalize(std::env::temp_dir()).unwrap();
@@ -1118,30 +1157,64 @@ mod tests {
     }
     fn stage(f: &Fixture, depth: u16) -> StagedScene<Session> {
         let mut engine = Engine::new();
-        engine.doc = Document::new_depth(512, 256, depth).unwrap();
-        engine.doc.layers[0]
+        engine
+            .resident_state_mut()
+            .expect("resident fixture")
+            .document = Document::new_depth(512, 256, depth).unwrap();
+        engine
+            .resident_state_mut()
+            .expect("resident fixture")
+            .document
+            .layers[0]
             .pixels
             .set16(2, 3, [12345, 23456, 34567, 45678]);
-        engine.doc.layers[0]
+        engine
+            .resident_state_mut()
+            .expect("resident fixture")
+            .document
+            .layers[0]
             .pixels
             .set16(511, 255, [65535, 32768, 1, 65535]);
-        let original = engine.doc.layers[0].pixels.clone();
-        engine.doc.layers[0].pixels.retained = Some(Box::new(crate::retained::Original {
+        let original = engine
+            .resident_state()
+            .expect("resident fixture")
+            .document
+            .layers[0]
+            .pixels
+            .clone();
+        engine
+            .resident_state_mut()
+            .expect("resident fixture")
+            .document
+            .layers[0]
+            .pixels
+            .retained = Some(Box::new(crate::retained::Original {
             pixels: Box::new(original),
             matrix: crate::retained::IDENTITY,
             projective: None,
             warps: vec![],
         }));
-        engine.doc.layers[0].effects.push(crate::effects::Effect {
-            id: crate::engine::id(),
-            kind: "blur".into(),
-            enabled: true,
-            weight: 0.75,
-            settings: Arc::new(serde_json::json!({"radius": 2.0})),
-        });
+        engine
+            .resident_state_mut()
+            .expect("resident fixture")
+            .document
+            .layers[0]
+            .effects
+            .push(crate::effects::Effect {
+                id: crate::engine::id(),
+                kind: "blur".into(),
+                enabled: true,
+                weight: 0.75,
+                settings: Arc::new(serde_json::json!({"radius": 2.0})),
+            });
         let mut mask = crate::raster::Raster::new_depth(512, 256, depth);
         mask.set16(3, 2, [32768; 4]);
-        engine.doc.layers[0].mask = Some(crate::engine::Mask {
+        engine
+            .resident_state_mut()
+            .expect("resident fixture")
+            .document
+            .layers[0]
+            .mask = Some(crate::engine::Mask {
             enabled: true,
             linked: true,
             cache_key: crate::engine::id(),
@@ -1163,9 +1236,21 @@ mod tests {
             origin: [0, 0],
             contours: vec![vec![[0.0, 0.0], [512.0, 0.0], [512.0, 256.0]]],
         };
-        engine.doc.selection = Some(coverage.bounds);
-        engine.doc.selection_coverage = Some(coverage.clone());
-        engine.doc.selection_previous = Some(coverage);
+        engine
+            .resident_state_mut()
+            .expect("resident fixture")
+            .document
+            .selection = Some(coverage.bounds);
+        engine
+            .resident_state_mut()
+            .expect("resident fixture")
+            .document
+            .selection_coverage = Some(coverage.clone());
+        engine
+            .resident_state_mut()
+            .expect("resident fixture")
+            .document
+            .selection_previous = Some(coverage);
         let cache = LegacyTileCache::new(&f.runtime().resident(), 32).unwrap();
         engine
             .capture_scene(None)
@@ -1215,6 +1300,1934 @@ mod tests {
                         assert_eq!(before.pixel16(x, y).unwrap(), after.pixel16(x, y).unwrap());
                     }
                 }
+            }
+        }
+    }
+    fn native_engine(f: &Fixture, depth: u16) -> Engine {
+        let staged = stage(f, depth);
+        let document = crate::engine::native::NativeDocument::from_pending(
+            staged.scene.into_provisional_pending().unwrap(),
+        )
+        .unwrap();
+        let mut engine = Engine::from_native(document, 8).unwrap();
+        engine.saved_revision = u64::MAX;
+        engine
+    }
+    fn install_autosave_document(f: &Fixture, depth: u16) -> crate::workspace::Registry {
+        let workspace = f.workspace();
+        let source = native_engine(f, depth);
+        let document = source.native_document().unwrap().clone();
+        let mut engine = f.shared.as_ref().unwrap().lock().unwrap();
+        engine.authority =
+            crate::engine::authority::DocumentAuthority::from_native(document, 40).unwrap();
+        engine.saved_revision = u64::MAX;
+        drop(engine);
+        workspace
+    }
+    #[test]
+    #[cfg(windows)]
+    fn refused_orphan_cleanup_does_not_withhold_an_actual_native_checkpoint() {
+        for depth in [8, 16] {
+            let f = Fixture::new();
+            let workspace = install_autosave_document(&f, depth);
+            let shared = f.shared.as_ref().unwrap();
+            let key = shared.lock().unwrap().native_document().unwrap().key();
+            let history = shared.lock().unwrap().history_lengths();
+            let session = f.runtime().begin().unwrap();
+            let orphan = session.store_for_lineage([0x74; 16]).unwrap();
+            let spec = crate::large_document::TileSpec::new(256, 256, depth).unwrap();
+            let physical = orphan.filesystem_identity().1;
+            let path = source_file_contents(&f)
+                .into_iter()
+                .find(|(_, (identity, _))| *identity == physical)
+                .unwrap()
+                .0
+                .parent()
+                .unwrap()
+                .to_owned();
+            assert!(orphan
+                .put(spec, &vec![47; spec.bytes()], &mut || {
+                    if std::fs::metadata(path.join("blocks.pbt")).unwrap().len() > 24 {
+                        Err(crate::large_document::Error::Cancelled)
+                    } else {
+                        Ok(())
+                    }
+                })
+                .is_err());
+            let original = orphan.file_bytes_for_test().unwrap();
+            drop((orphan, session));
+            assert!(f
+                .runtime()
+                .begin_existing()
+                .unwrap()
+                .collect_sources(&|| Ok(()))
+                .is_err());
+            let charged = f.runtime().disk().used().unwrap();
+            let mut versions = crate::recovery::Versions::new();
+            crate::recovery::checkpoint(&workspace, &f.base, &mut versions);
+            let catalog = crate::recovery::catalog_in(&workspace, &f.base, &|| Ok(())).unwrap();
+            assert!(catalog.native.error().is_none());
+            assert_eq!(catalog.native.entries().len(), 1);
+            assert!(catalog.native.entries()[0].error.is_none());
+            assert_eq!(shared.lock().unwrap().native_document().unwrap().key(), key);
+            assert_eq!(shared.lock().unwrap().history_lengths(), history);
+            f.runtime()
+                .begin_existing()
+                .unwrap()
+                .cleanup_check()
+                .unwrap();
+            assert!(f.runtime().disk().used().unwrap() > charged);
+            let session = f.runtime().begin_existing().unwrap();
+            assert_eq!(
+                session
+                    .owned_file_bytes_for_test(&path.join("blocks.pbt"))
+                    .unwrap(),
+                original
+            );
+        }
+    }
+    fn autosave_name(f: &Fixture, name: &str) {
+        let shared = f.shared.as_ref().unwrap();
+        let (id, revision, layer) = {
+            let engine = shared.lock().unwrap();
+            let document = engine.native_document().unwrap();
+            (
+                document.metadata().id().to_owned(),
+                document.metadata().revision(),
+                document.metadata().layer(0).unwrap().id().to_owned(),
+            )
+        };
+        crate::server::edit_shared(
+            shared,
+            "human",
+            &[serde_json::json!({"op":"layer.update","layer":layer,"name":name})],
+            Some(revision),
+            None,
+            "Autosave fixture edit",
+            None,
+            Some(&id),
+        )
+        .unwrap();
+    }
+    #[test]
+    #[cfg(windows)]
+    fn native_autosave_keeps_three_versions_deduplicates_and_cleans_saved_work() {
+        for depth in [8, 16] {
+            let f = Fixture::new();
+            let workspace = install_autosave_document(&f, depth);
+            let shared = f.shared.as_ref().unwrap();
+            let mut versions = crate::recovery::Versions::new();
+            let source = shared
+                .lock()
+                .unwrap()
+                .capture_scene(None)
+                .unwrap()
+                .into_native()
+                .unwrap();
+            for revision in 0..5 {
+                if revision != 0 {
+                    autosave_name(&f, &format!("Revision {revision}"));
+                }
+                let before = {
+                    let engine = shared.lock().unwrap();
+                    (
+                        engine.native_document().unwrap().key(),
+                        engine.history_lengths(),
+                    )
+                };
+                crate::recovery::checkpoint(&workspace, &f.base, &mut versions);
+                let error = workspace.lock().unwrap().recovery_error.clone();
+                assert!(error.is_none(), "{error:?}");
+                let engine = shared.lock().unwrap();
+                assert_eq!(engine.native_document().unwrap().key(), before.0);
+                assert_eq!(engine.history_lengths(), before.1);
+                assert_eq!(engine.saved_revision, u64::MAX);
+                assert!(engine.path.is_none());
+            }
+            let catalog = crate::recovery::catalog_in(&workspace, &f.base, &|| Ok(())).unwrap();
+            assert_eq!(
+                catalog
+                    .native
+                    .entries()
+                    .iter()
+                    .map(|entry| entry.revision.unwrap())
+                    .collect::<Vec<_>>(),
+                [4, 3, 2]
+            );
+            assert!(catalog
+                .native
+                .entries()
+                .iter()
+                .all(|entry| entry.bit_depth == Some(depth) && entry.error.is_none()));
+            let files = source_file_contents(&f);
+            let disk = f.runtime().disk().used().unwrap();
+            crate::recovery::checkpoint(&workspace, &f.base, &mut versions);
+            assert_eq!(source_file_contents(&f), files);
+            assert_eq!(f.runtime().disk().used().unwrap(), disk);
+            let current = shared
+                .lock()
+                .unwrap()
+                .capture_scene(None)
+                .unwrap()
+                .into_native()
+                .unwrap();
+            for ((_, before), (_, after)) in source.rasters().iter().zip(current.rasters().iter()) {
+                let region = crate::raster::backed::Region::new([0, 0, 512, 256]).unwrap();
+                let before = before.prepare_region(region, &mut || Ok(())).unwrap();
+                let after = after.prepare_region(region, &mut || Ok(())).unwrap();
+                for (x, y) in [(2, 3), (511, 255)] {
+                    assert_eq!(before.pixel16(x, y).unwrap(), after.pixel16(x, y).unwrap());
+                }
+            }
+            crate::server::save(shared, &f.base.join("Saved native work.psd")).unwrap();
+            let saved_key = shared.lock().unwrap().native_document().unwrap().key();
+            crate::recovery::checkpoint(&workspace, &f.base, &mut versions);
+            assert!(crate::recovery::catalog_in(&workspace, &f.base, &|| Ok(()))
+                .unwrap()
+                .native
+                .entries()
+                .is_empty());
+            assert_eq!(
+                shared.lock().unwrap().native_document().unwrap().key(),
+                saved_key
+            );
+            let session = f.runtime().begin_existing().unwrap();
+            assert_eq!(
+                session
+                    .checkpoint_census(&|| Ok(()))
+                    .unwrap()
+                    .registered_count(),
+                0
+            );
+            assert!(f.base.join("Saved native work.psd").is_file());
+        }
+    }
+    #[test]
+    #[cfg(windows)]
+    fn busy_native_retention_retries_without_creating_unbounded_checkpoints_and_close_cleans() {
+        let f = Fixture::new();
+        let workspace = install_autosave_document(&f, 16);
+        let mut versions = crate::recovery::Versions::new();
+        for revision in 0..3 {
+            if revision != 0 {
+                autosave_name(&f, &format!("Earlier {revision}"));
+            }
+            crate::recovery::checkpoint(&workspace, &f.base, &mut versions);
+        }
+        let blocker = f.runtime().begin_existing().unwrap();
+        autosave_name(&f, "Durable before pruning");
+        crate::recovery::checkpoint(&workspace, &f.base, &mut versions);
+        let catalog = crate::recovery::catalog_in(&workspace, &f.base, &|| Ok(())).unwrap();
+        assert_eq!(catalog.native.entries().len(), 4);
+        assert!(workspace
+            .lock()
+            .unwrap()
+            .recovery_error
+            .as_ref()
+            .unwrap()
+            .contains("checkpoint is durable"));
+        let disk = f.runtime().disk().used().unwrap();
+        crate::recovery::checkpoint(&workspace, &f.base, &mut versions);
+        assert_eq!(f.runtime().disk().used().unwrap(), disk);
+        autosave_name(&f, "Newer human work");
+        crate::recovery::checkpoint(&workspace, &f.base, &mut versions);
+        assert_eq!(f.runtime().disk().used().unwrap(), disk);
+        assert_eq!(
+            crate::recovery::catalog_in(&workspace, &f.base, &|| Ok(()))
+                .unwrap()
+                .native
+                .entries()
+                .len(),
+            4
+        );
+        drop(blocker);
+        crate::recovery::checkpoint(&workspace, &f.base, &mut versions);
+        assert!(workspace.lock().unwrap().recovery_error.is_none());
+        let catalog = crate::recovery::catalog_in(&workspace, &f.base, &|| Ok(())).unwrap();
+        assert_eq!(
+            catalog
+                .native
+                .entries()
+                .iter()
+                .map(|entry| entry.revision.unwrap())
+                .collect::<Vec<_>>(),
+            [4, 3, 2]
+        );
+        let (project, id, revision) = {
+            let engine = f.shared.as_ref().unwrap().lock().unwrap();
+            (
+                engine.project_id.clone(),
+                engine.native_document().unwrap().metadata().id().to_owned(),
+                engine.native_document().unwrap().metadata().revision(),
+            )
+        };
+        crate::workspace::close_in(&workspace, &project, &id, revision, true, "human").unwrap();
+        crate::recovery::checkpoint(&workspace, &f.base, &mut versions);
+        assert!(workspace.lock().unwrap().recovery_retired.is_empty());
+        assert!(versions.native.is_empty());
+        assert!(crate::recovery::catalog_in(&workspace, &f.base, &|| Ok(()))
+            .unwrap()
+            .native
+            .entries()
+            .is_empty());
+    }
+    #[test]
+    #[cfg(windows)]
+    fn native_autosave_protects_the_new_checkpoint_when_older_clocks_are_in_the_future() {
+        let f = Fixture::new();
+        let workspace = install_autosave_document(&f, 16);
+        let scene = f
+            .shared
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .capture_scene(None)
+            .unwrap()
+            .into_native()
+            .unwrap();
+        let session = f.runtime().begin_existing().unwrap();
+        let id = *uuid::Uuid::new_v4().as_bytes();
+        Capture::from_native(&scene, &session, limits(), &|| Ok(()))
+            .unwrap()
+            .publish(id, &session, &|| Ok(()))
+            .unwrap();
+        let bytes = marker_bytes(&session, id);
+        for _ in 0..3 {
+            rewritten(&session, bytes.clone(), |bytes| {
+                bytes[80..88].copy_from_slice(&u64::MAX.to_be_bytes())
+            });
+        }
+        session
+            .discard_checkpoint(id, limits(), &|| Ok(()))
+            .unwrap();
+        autosave_name(&f, "Latest actual work");
+        crate::recovery::checkpoint(&workspace, &f.base, &mut Default::default());
+        let catalog = crate::recovery::catalog_in(&workspace, &f.base, &|| Ok(())).unwrap();
+        assert_eq!(catalog.native.entries().len(), 3);
+        assert_eq!(
+            catalog
+                .native
+                .entries()
+                .iter()
+                .filter(|entry| entry.timestamp_ms == Some(u64::MAX))
+                .count(),
+            2
+        );
+        assert_eq!(
+            catalog
+                .native
+                .entries()
+                .iter()
+                .filter(|entry| entry.revision == Some(1))
+                .count(),
+            1
+        );
+    }
+    #[test]
+    fn native_autosave_reports_unavailable_platforms_without_a_resident_copy() {
+        if cfg!(windows) {
+            return;
+        }
+        let f = Fixture::new();
+        let workspace = install_autosave_document(&f, 16);
+        let disk = f.runtime().disk().used().unwrap();
+        let key = f
+            .shared
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .native_document()
+            .unwrap()
+            .key();
+        crate::recovery::checkpoint(&workspace, &f.base, &mut Default::default());
+        assert!(workspace
+            .lock()
+            .unwrap()
+            .recovery_error
+            .as_ref()
+            .unwrap()
+            .contains("retention is unavailable"));
+        assert_eq!(f.runtime().disk().used().unwrap(), disk);
+        assert_eq!(
+            f.shared
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .native_document()
+                .unwrap()
+                .key(),
+            key
+        );
+        assert!(f
+            .shared
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .resident_state()
+            .is_err());
+    }
+    #[test]
+    #[cfg(windows)]
+    fn native_autosave_cancels_changed_work_and_checks_cached_service_identity() {
+        let f = Fixture::new();
+        let workspace = install_autosave_document(&f, 16);
+        let shared = f.shared.as_ref().unwrap();
+        let scene = shared
+            .lock()
+            .unwrap()
+            .capture_scene(None)
+            .unwrap()
+            .into_native()
+            .unwrap();
+        let directory = f.base.join("state/native-sources-v1");
+        let changed = std::cell::Cell::new(false);
+        let operation = crate::server::FileOperation::begin_workspace(&workspace).unwrap();
+        let result =
+            crate::recovery::native::checkpoint(&workspace, &f.base, shared, &scene, None, &|| {
+                assert!(shared.try_lock().is_ok());
+                assert!(workspace.try_lock().is_ok());
+                let has_bytes = fs::read_dir(&directory).unwrap().flatten().any(|entry| {
+                    entry.file_name().to_string_lossy().starts_with("pending-")
+                        && entry.metadata().unwrap().len() != 0
+                });
+                if has_bytes && !changed.replace(true) {
+                    autosave_name(&f, "Later human work");
+                }
+                Ok(())
+            });
+        assert!(changed.get());
+        assert!(result.err().unwrap().contains("source changed"));
+        drop(operation);
+        assert!(!fs::read_dir(&directory)
+            .unwrap()
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().starts_with("pending-")));
+        assert!(crate::recovery::catalog_in(&workspace, &f.base, &|| Ok(()))
+            .unwrap()
+            .native
+            .entries()
+            .is_empty());
+        let mut versions = crate::recovery::Versions::new();
+        crate::recovery::checkpoint(&workspace, &f.base, &mut versions);
+        assert!(workspace.lock().unwrap().recovery_error.is_none());
+        let files = source_file_contents(&f);
+        let foreign = Fixture::new();
+        workspace.lock().unwrap().source_runtime = Some(foreign.runtime().clone());
+        crate::recovery::checkpoint(&workspace, &f.base, &mut versions);
+        assert!(workspace
+            .lock()
+            .unwrap()
+            .recovery_error
+            .as_ref()
+            .unwrap()
+            .contains("source service changed"));
+        assert!(!foreign.base.join("state/native-sources-v1").exists());
+        assert_eq!(source_file_contents(&f), files);
+        workspace.lock().unwrap().source_runtime = Some(f.runtime().clone());
+        crate::recovery::checkpoint(&workspace, &f.base, &mut versions);
+        assert!(workspace.lock().unwrap().recovery_error.is_none());
+        assert_eq!(source_file_contents(&f), files);
+    }
+    #[test]
+    #[cfg(windows)]
+    fn a_human_edit_after_native_publication_keeps_the_durable_snapshot_and_next_tick() {
+        let f = Fixture::new();
+        let workspace = install_autosave_document(&f, 16);
+        let shared = f.shared.as_ref().unwrap();
+        let scene = shared
+            .lock()
+            .unwrap()
+            .capture_scene(None)
+            .unwrap()
+            .into_native()
+            .unwrap();
+        let directory = f.base.join("state/native-sources-v1");
+        let edited = std::cell::Cell::new(false);
+        let operation = crate::server::FileOperation::begin_workspace(&workspace).unwrap();
+        let result =
+            crate::recovery::native::checkpoint(&workspace, &f.base, shared, &scene, None, &|| {
+                let published = fs::read_dir(&directory).unwrap().flatten().any(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("recovery-v3-")
+                });
+                if published && !edited.replace(true) {
+                    autosave_name(&f, "Newer after publication");
+                }
+                Ok(())
+            })
+            .unwrap();
+        drop(operation);
+        assert!(edited.get());
+        assert!(result.error.is_none());
+        assert_eq!(result.saved.key, scene.key());
+        assert_ne!(
+            shared.lock().unwrap().native_document().unwrap().key(),
+            scene.key()
+        );
+        let catalog = crate::recovery::catalog_in(&workspace, &f.base, &|| Ok(())).unwrap();
+        assert!(catalog.native.error().is_none());
+        assert_eq!(catalog.native.entries().len(), 1);
+        assert_eq!(catalog.native.entries()[0].revision, Some(0));
+        let mut versions = crate::recovery::Versions::new();
+        versions
+            .native
+            .insert(scene.identity().project_id.clone(), result.saved);
+        crate::recovery::checkpoint(&workspace, &f.base, &mut versions);
+        assert!(workspace.lock().unwrap().recovery_error.is_none());
+        let catalog = crate::recovery::catalog_in(&workspace, &f.base, &|| Ok(())).unwrap();
+        assert_eq!(
+            catalog
+                .native
+                .entries()
+                .iter()
+                .map(|entry| entry.revision.unwrap())
+                .collect::<Vec<_>>(),
+            [1, 0]
+        );
+        assert_eq!(shared.lock().unwrap().history_lengths(), [1, 0]);
+    }
+    #[test]
+    #[cfg(windows)]
+    fn native_autosave_defers_active_work_in_either_tab_and_retries_next_tick() {
+        let f = Fixture::new();
+        let workspace = install_autosave_document(&f, 16);
+        let shared = f.shared.as_ref().unwrap();
+        let mut versions = crate::recovery::Versions::new();
+        crate::recovery::checkpoint(&workspace, &f.base, &mut versions);
+        let project = shared.lock().unwrap().project_id.clone();
+        let original = versions.native[&project].key;
+        autosave_name(&f, "Newer foreground work");
+        let active = crate::server::FileOperation::begin(shared).unwrap();
+        crate::recovery::checkpoint(&workspace, &f.base, &mut versions);
+        assert_eq!(versions.native[&project].key, original);
+        assert!(workspace.lock().unwrap().recovery_error.is_none());
+        drop(active);
+        let other = crate::workspace::new_project(shared, 8, 8, 8, None).unwrap();
+        let scene = other
+            .lock()
+            .unwrap()
+            .capture_scene(None)
+            .unwrap()
+            .into_native()
+            .unwrap();
+        let edit = crate::workspace::native_dispatch::begin_edit_scene(&other, &scene).unwrap();
+        crate::recovery::checkpoint(&workspace, &f.base, &mut versions);
+        assert_eq!(versions.native[&project].key, original);
+        assert!(workspace.lock().unwrap().recovery_error.is_none());
+        drop(edit);
+        crate::recovery::checkpoint(&workspace, &f.base, &mut versions);
+        assert_ne!(versions.native[&project].key, original);
+        assert!(workspace.lock().unwrap().recovery_error.is_none());
+    }
+    #[test]
+    #[cfg(windows)]
+    fn native_autosave_admission_and_unreadable_records_preserve_complete_versions() {
+        let f = Fixture::new();
+        let workspace = install_autosave_document(&f, 16);
+        let mut versions = crate::recovery::Versions::new();
+        let disk = f.runtime().disk().used().unwrap();
+        let budget = f.runtime().resident();
+        let ballast =
+            MetadataCharge::reserve(&budget, budget.limit() - budget.used(), &|| Ok(())).unwrap();
+        crate::recovery::checkpoint(&workspace, &f.base, &mut versions);
+        assert!(workspace.lock().unwrap().recovery_error.is_some());
+        assert_eq!(f.runtime().disk().used().unwrap(), disk);
+        drop(ballast);
+        crate::recovery::checkpoint(&workspace, &f.base, &mut versions);
+        assert!(workspace.lock().unwrap().recovery_error.is_none());
+        let catalog = crate::recovery::catalog_in(&workspace, &f.base, &|| Ok(())).unwrap();
+        let original = uuid::Uuid::parse_str(
+            catalog.native.entries()[0]
+                .snapshot
+                .strip_prefix("native:")
+                .unwrap(),
+        )
+        .unwrap();
+        let session = f.runtime().begin_existing().unwrap();
+        let bytes = marker_bytes(&session, *original.as_bytes());
+        let corrupt = rewritten(&session, bytes.clone(), |bytes| bytes[19] = 99);
+        let corrupt_bytes = marker_bytes(&session, corrupt);
+        drop(session);
+        autosave_name(&f, "Must retain earlier work");
+        crate::recovery::checkpoint(&workspace, &f.base, &mut versions);
+        assert!(workspace
+            .lock()
+            .unwrap()
+            .recovery_error
+            .as_ref()
+            .unwrap()
+            .contains("inventory is incomplete"));
+        let session = f.runtime().begin_existing().unwrap();
+        assert_eq!(marker_bytes(&session, *original.as_bytes()), bytes);
+        assert_eq!(marker_bytes(&session, corrupt), corrupt_bytes);
+        assert_eq!(session.recovery_marker_ids().unwrap().iter().count(), 2);
+    }
+    #[test]
+    #[cfg(windows)]
+    fn real_periodic_worker_publishes_a_restorable_native_checkpoint_and_joins() {
+        let f = Fixture::new();
+        let workspace = install_autosave_document(&f, 16);
+        let shared = f.shared.as_ref().unwrap();
+        let source = shared
+            .lock()
+            .unwrap()
+            .capture_scene(None)
+            .unwrap()
+            .into_native()
+            .unwrap();
+        let mut worker = crate::recovery::Worker::start(workspace.clone(), f.base.clone()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut ready = false;
+        while std::time::Instant::now() < deadline {
+            ready = f
+                .runtime()
+                .begin_existing()
+                .and_then(|session| session.recovery_marker_ids())
+                .is_ok_and(|ids| ids.iter().next().is_some());
+            if ready {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        worker.stop();
+        assert!(
+            ready,
+            "Periodic native autosave did not publish within its deadline"
+        );
+        assert_eq!(
+            workspace
+                .lock()
+                .unwrap()
+                .file_operations
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+        assert_eq!(
+            shared.lock().unwrap().native_document().unwrap().key(),
+            source.key()
+        );
+        assert_eq!(shared.lock().unwrap().history_lengths(), [0, 0]);
+        let catalog = crate::recovery::catalog_in(&workspace, &f.base, &|| Ok(())).unwrap();
+        assert_eq!(catalog.native.entries().len(), 1);
+        let restored = crate::recovery::restore(
+            &workspace,
+            &f.base,
+            &catalog.native.entries()[0].snapshot,
+            &Default::default(),
+            None,
+        )
+        .unwrap();
+        let restored = restored
+            .lock()
+            .unwrap()
+            .capture_scene(None)
+            .unwrap()
+            .into_native()
+            .unwrap();
+        for ((_, before), (_, after)) in source.rasters().iter().zip(restored.rasters().iter()) {
+            let region = crate::raster::backed::Region::new([0, 0, 512, 256]).unwrap();
+            let before = before.prepare_region(region, &mut || Ok(())).unwrap();
+            let after = after.prepare_region(region, &mut || Ok(())).unwrap();
+            for (x, y) in [(2, 3), (511, 255)] {
+                assert_eq!(before.pixel16(x, y).unwrap(), after.pixel16(x, y).unwrap());
+            }
+        }
+    }
+    fn commit(engine: &mut Engine, session: &SourceSession, commands: &[serde_json::Value]) {
+        let prepared = crate::engine::native::worker::prepare(
+            crate::engine::native::worker::tests::capture(&engine.authority, commands),
+            session,
+            &|| Ok(()),
+        )
+        .unwrap();
+        let (base, history, delta) = prepared.into_parts();
+        let commit = history
+            .prepare_commit(
+                &base,
+                delta,
+                crate::engine::native::HistoryRequest {
+                    actor: "human",
+                    label: "Recovery fixture",
+                    task: None,
+                    gesture: None,
+                },
+                &|| Ok(()),
+            )
+            .unwrap();
+        engine
+            .authority
+            .commit_native(
+                crate::engine::native::Publication {
+                    actor: "human",
+                    leases: &[],
+                    now: 0,
+                    closed: false,
+                    write_available: true,
+                },
+                commit,
+            )
+            .unwrap()
+            .retire(session, &|| session.cleanup_check())
+            .unwrap();
+    }
+    #[test]
+    fn live_native_capture_preserves_exact_metadata_samples_and_engine_history() {
+        for depth in [8, 16] {
+            let f = Fixture::new();
+            let mut engine = native_engine(&f, depth);
+            let session = f.runtime().begin().unwrap();
+            let layer = engine.authority.view().layer(0).unwrap().id().to_owned();
+            commit(
+                &mut engine,
+                &session,
+                &[serde_json::json!({"op":"layer.update","layer":layer,"visible":false})],
+            );
+            let key = engine.native_document().unwrap().key();
+            let scene = engine.capture_scene(None).unwrap().into_native().unwrap();
+            let capture = Capture::from_native(&scene, &session, limits(), &|| Ok(())).unwrap();
+            let id = *uuid::Uuid::new_v4().as_bytes();
+            capture.publish(id, &session, &|| Ok(())).unwrap();
+            let decoded = load(&session, id, limits(), &|| Ok(())).unwrap();
+            let before =
+                Canonical::from_serializable(&scene.metadata(), limits().metadata, &|| Ok(()))
+                    .unwrap();
+            let after = Canonical::from_serializable(
+                decoded.pending.metadata(),
+                limits().metadata,
+                &|| Ok(()),
+            )
+            .unwrap();
+            assert_eq!(before.bytes(), after.bytes());
+            assert_eq!(decoded.project, capture.project);
+            assert_eq!(decoded.marker.snapshot(), id);
+            assert_eq!(scene.rasters().len(), decoded.pending.rasters().len());
+            for ((id, original), (restored_id, restored)) in
+                scene.rasters().iter().zip(decoded.pending.rasters().iter())
+            {
+                assert_eq!(id, restored_id);
+                assert_eq!(original.depth(), restored.depth());
+                let region = crate::raster::backed::Region::new([0, 0, 512, 256]).unwrap();
+                let original = original.prepare_region(region, &mut || Ok(())).unwrap();
+                let restored = restored.prepare_region(region, &mut || Ok(())).unwrap();
+                for y in 0..256 {
+                    for x in 0..512 {
+                        assert_eq!(
+                            original.pixel16(x, y).unwrap(),
+                            restored.pixel16(x, y).unwrap()
+                        );
+                    }
+                }
+            }
+            assert!(engine.resident_state().is_err());
+            assert_eq!(engine.native_document().unwrap().key(), key);
+            assert_eq!(engine.history_lengths(), [1, 0]);
+            assert_eq!(engine.saved_revision, u64::MAX);
+        }
+    }
+    #[test]
+    fn native_zero_and_newly_painted_sources_seal_without_a_resident_stage() {
+        for depth in [8, 16] {
+            let f = Fixture::new();
+            let session = f.runtime().begin().unwrap();
+            let document = crate::engine::native::NativeDocument::new_blank(
+                4,
+                2,
+                depth,
+                &session.resident(),
+                &session.disk(),
+                &|| Ok(()),
+            )
+            .unwrap();
+            let mut engine = Engine::from_native(document, 8).unwrap();
+            let layer = engine.authority.view().layer(0).unwrap().id().to_owned();
+            for painted in [false, true] {
+                if painted {
+                    commit(
+                        &mut engine,
+                        &session,
+                        &[
+                            serde_json::json!({"op":"paint.fill","layer":layer,"rect":[0,0,4,2],"color":[39,101,233,255]}),
+                        ],
+                    );
+                }
+                let scene = engine.capture_scene(None).unwrap().into_native().unwrap();
+                let capture = Capture::from_native(&scene, &session, limits(), &|| Ok(())).unwrap();
+                assert_eq!(capture.tables.is_empty(), !painted);
+                let id = *uuid::Uuid::new_v4().as_bytes();
+                capture.publish(id, &session, &|| Ok(())).unwrap();
+                let decoded = load(&session, id, limits(), &|| Ok(())).unwrap();
+                let original = scene.rasters().iter().next().unwrap().1;
+                let restored = decoded.pending.rasters().iter().next().unwrap().1;
+                let region = crate::raster::backed::Region::new([0, 0, 4, 2]).unwrap();
+                let original = original.prepare_region(region, &mut || Ok(())).unwrap();
+                let restored = restored.prepare_region(region, &mut || Ok(())).unwrap();
+                for y in 0..2 {
+                    for x in 0..4 {
+                        let expected = if painted {
+                            [39 * 257, 101 * 257, 233 * 257, 65535]
+                        } else {
+                            [0; 4]
+                        };
+                        assert_eq!(original.pixel16(x, y).unwrap(), expected);
+                        assert_eq!(restored.pixel16(x, y).unwrap(), expected);
+                    }
+                }
+                assert!(engine.resident_state().is_err());
+                assert_eq!(engine.native_document().unwrap().key(), scene.key());
+                assert_eq!(engine.history_lengths(), [usize::from(painted), 0]);
+                assert_eq!(engine.saved_revision, 0);
+            }
+        }
+    }
+    #[test]
+    fn native_capture_refuses_pending_foreign_cancelled_and_over_limit_sources() {
+        let f = Fixture::new();
+        let staged = stage(&f, 16);
+        let session = f.runtime().begin().unwrap();
+        assert!(Capture::from_native(&staged.scene, &session, limits(), &|| Ok(())).is_err());
+        let engine = native_engine(&f, 16);
+        let scene = engine.capture_scene(None).unwrap().into_native().unwrap();
+        let key = engine.native_document().unwrap().key();
+        let disk = session.disk().used().unwrap();
+        let resident = session.resident().used();
+        let foreign = Fixture::new();
+        let foreign_session = foreign.runtime().begin().unwrap();
+        assert!(Capture::from_native(&scene, &foreign_session, limits(), &|| Ok(())).is_err());
+        assert!(
+            Capture::from_native(&scene, &session, limits(), &|| Err("Cancelled".into())).is_err()
+        );
+        assert!(Capture::from_native(
+            &scene,
+            &session,
+            Limits {
+                refs: 1,
+                ..limits()
+            },
+            &|| Ok(())
+        )
+        .is_err());
+        assert!(Capture::from_native(
+            &scene,
+            &session,
+            Limits {
+                stores: 0,
+                ..limits()
+            },
+            &|| Ok(())
+        )
+        .is_err());
+        assert_eq!(session.disk().used().unwrap(), disk);
+        assert_eq!(session.resident().used(), resident);
+        assert_eq!(engine.native_document().unwrap().key(), key);
+        assert_eq!(engine.history_lengths(), [0, 0]);
+        assert_eq!(engine.saved_revision, u64::MAX);
+        assert_eq!(
+            session
+                .checkpoint_census(&|| Ok(()))
+                .unwrap()
+                .registered_count(),
+            0
+        );
+        // Refusal keeps every source usable for a subsequent valid capture.
+        assert!(Capture::from_native(&scene, &session, limits(), &|| Ok(())).is_ok());
+    }
+    #[test]
+    fn shared_restore_registers_distinct_unsaved_native_tabs_and_keeps_every_source() {
+        for depth in [8, 16] {
+            let f = Fixture::new();
+            let workspace = f.workspace();
+            let initiating = f
+                .shared
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .project_id
+                .clone();
+            let original_root = f
+                .shared
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .resident_state()
+                .unwrap()
+                .document
+                .id
+                .clone();
+            let engine = native_engine(&f, depth);
+            let scene = engine.capture_scene(None).unwrap().into_native().unwrap();
+            let session = f.runtime().begin().unwrap();
+            let capture = Capture::from_native(&scene, &session, limits(), &|| Ok(())).unwrap();
+            let id = uuid::Uuid::new_v4();
+            capture
+                .publish(*id.as_bytes(), &session, &|| Ok(()))
+                .unwrap();
+            let bytes = marker_bytes(&session, *id.as_bytes());
+            let disk = session.disk().used().unwrap();
+            let first = crate::recovery::restore(
+                &workspace,
+                &f.base,
+                &id.to_string(),
+                &Default::default(),
+                Some(&initiating),
+            )
+            .unwrap();
+            let first_project = first.lock().unwrap().project_id.clone();
+            let second = crate::recovery::restore(
+                &workspace,
+                &f.base,
+                &id.to_string(),
+                &Default::default(),
+                Some(&initiating),
+            )
+            .unwrap();
+            for restored in [&first, &second] {
+                let e = restored.lock().unwrap();
+                assert!(e.resident_state().is_err());
+                assert!(e.path.is_none());
+                assert_eq!(e.saved_revision, u64::MAX);
+                assert_eq!(e.history_lengths(), [0, 0]);
+                let native = e.native_document().unwrap();
+                assert_ne!(native.metadata().id(), scene.identity().document_id);
+                assert_eq!(native.metadata().depth(), depth);
+                let restored_scene = e.capture_scene(None).unwrap().into_native().unwrap();
+                let mut original = serde_json::to_value(scene.metadata()).unwrap();
+                original["id"] = serde_json::json!(native.metadata().id());
+                assert_eq!(
+                    original,
+                    serde_json::to_value(restored_scene.metadata()).unwrap()
+                );
+                drop(e);
+                for ((_, before), (_, after)) in
+                    scene.rasters().iter().zip(restored_scene.rasters().iter())
+                {
+                    let region = crate::raster::backed::Region::new([0, 0, 512, 256]).unwrap();
+                    let before = before.prepare_region(region, &mut || Ok(())).unwrap();
+                    let after = after.prepare_region(region, &mut || Ok(())).unwrap();
+                    for y in 0..256 {
+                        for x in 0..512 {
+                            assert_eq!(before.pixel16(x, y).unwrap(), after.pixel16(x, y).unwrap());
+                        }
+                    }
+                }
+            }
+            assert_ne!(
+                first
+                    .lock()
+                    .unwrap()
+                    .native_document()
+                    .unwrap()
+                    .metadata()
+                    .id(),
+                second
+                    .lock()
+                    .unwrap()
+                    .native_document()
+                    .unwrap()
+                    .metadata()
+                    .id()
+            );
+            assert_eq!(crate::workspace::entries_in(&workspace).len(), 3);
+            assert_eq!(
+                crate::workspace::active_id(f.shared.as_ref().unwrap()),
+                first_project
+            );
+            assert_eq!(
+                f.shared
+                    .as_ref()
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .resident_state()
+                    .unwrap()
+                    .document
+                    .id,
+                original_root
+            );
+            assert_eq!(marker_bytes(&session, *id.as_bytes()), bytes);
+            assert_eq!(session.disk().used().unwrap(), disk);
+        }
+    }
+    #[test]
+    fn native_recovery_restores_after_reopening_the_real_source_inventory() {
+        for depth in [8, 16] {
+            let mut f = Fixture::new();
+            let workspace = f.workspace();
+            let id = uuid::Uuid::new_v4();
+            #[cfg(windows)]
+            let retired = uuid::Uuid::new_v4();
+            let expected;
+            {
+                let engine = native_engine(&f, depth);
+                let scene = engine.capture_scene(None).unwrap().into_native().unwrap();
+                let session = f.runtime().begin().unwrap();
+                let capture = Capture::from_native(&scene, &session, limits(), &|| Ok(())).unwrap();
+                capture
+                    .publish(*id.as_bytes(), &session, &|| Ok(()))
+                    .unwrap();
+                #[cfg(windows)]
+                capture
+                    .publish(*retired.as_bytes(), &session, &|| Ok(()))
+                    .unwrap();
+                let raster = scene.rasters().iter().next().unwrap().1;
+                let region = crate::raster::backed::Region::new([0, 0, 4, 4]).unwrap();
+                expected = raster
+                    .prepare_region(region, &mut || Ok(()))
+                    .unwrap()
+                    .pixel16(2, 3)
+                    .unwrap();
+            }
+            #[cfg(windows)]
+            f.runtime()
+                .begin_existing()
+                .unwrap()
+                .discard_checkpoint(*retired.as_bytes(), limits(), &|| Ok(()))
+                .unwrap();
+            workspace.lock().unwrap().source_runtime = None;
+            drop(f.runtime.take());
+            let runtime = Fixture::new_runtime(f.connection.as_ref().unwrap());
+            workspace.lock().unwrap().source_runtime = Some(runtime.clone());
+            f.runtime = Some(runtime);
+            let restored = crate::recovery::restore(
+                &workspace,
+                &f.base,
+                &id.to_string(),
+                &Default::default(),
+                None,
+            )
+            .unwrap();
+            let scene = restored
+                .lock()
+                .unwrap()
+                .capture_scene(None)
+                .unwrap()
+                .into_native()
+                .unwrap();
+            assert_eq!(scene.metadata().depth(), depth);
+            let raster = scene.rasters().iter().next().unwrap().1;
+            let region = crate::raster::backed::Region::new([0, 0, 4, 4]).unwrap();
+            assert_eq!(
+                raster
+                    .prepare_region(region, &mut || Ok(()))
+                    .unwrap()
+                    .pixel16(2, 3)
+                    .unwrap(),
+                expected
+            );
+            let session = f.runtime().begin_existing().unwrap();
+            #[cfg(windows)]
+            assert!(session.open_recovery_marker(*retired.as_bytes()).is_err());
+            assert!(session.open_recovery_marker(*id.as_bytes()).is_ok());
+            assert_eq!(
+                session
+                    .checkpoint_census(&|| Ok(()))
+                    .unwrap()
+                    .registered_count(),
+                1
+            );
+        }
+    }
+    struct RefusedMirror<'a> {
+        session: &'a SourceSession,
+        original: Store,
+        alias: bool,
+        cancelled: std::cell::Cell<bool>,
+    }
+    impl StageSession for RefusedMirror<'_> {
+        fn check(&self) -> Result<()> {
+            if self.cancelled.get() {
+                Err("cancel after mirror admission".into())
+            } else {
+                self.session.check()
+            }
+        }
+        fn store_for_lineage(&self, lineage: [u8; 16]) -> Result<Store> {
+            if self.alias {
+                Ok(self.original.clone())
+            } else {
+                let mirror = self.session.store_for_lineage(lineage)?;
+                self.cancelled.set(true);
+                Ok(mirror)
+            }
+        }
+        fn seal_store(
+            &self,
+            store: &Store,
+            refs: &[BlockRef],
+            metadata: &[u8],
+        ) -> Result<Snapshot> {
+            self.session.seal_store(store, refs, metadata)
+        }
+        fn try_seal_store(
+            &self,
+            store: &Store,
+            refs: &[BlockRef],
+            metadata: &[u8],
+        ) -> Result<Option<Snapshot>> {
+            self.session.try_seal_store(store, refs, metadata)
+        }
+    }
+    #[test]
+    fn reopened_catalog_selects_every_shared_prefix_and_can_recheckpoint_the_middle_version() {
+        for depth in [8, 16] {
+            let mut f = Fixture::new();
+            let workspace = f.workspace();
+            let ids = [[0x11; 16], [0x22; 16], [0x33; 16]];
+            let mut expected = Vec::new();
+            let mut selections = Vec::new();
+            let mut physical = None;
+            {
+                let mut resident = Engine::from_document(Document::new_depth(4, 4, depth).unwrap());
+                let cache = LegacyTileCache::new(&f.runtime().resident(), 8).unwrap();
+                for (at, id) in ids.into_iter().enumerate() {
+                    let document = &mut resident.resident_state_mut().unwrap().document;
+                    document.layers[0].pixels.set16(
+                        2,
+                        3,
+                        [
+                            12347 + at as u16 * 1000,
+                            23459 + at as u16 * 2000,
+                            34571 + at as u16 * 3000,
+                            if at == 0 { 0 } else { 65535 },
+                        ],
+                    );
+                    document.revision = at as u64;
+                    expected.push(document.layers[0].pixels.get16(2, 3));
+                    let captured = resident.capture_scene(None).unwrap();
+                    let staged = captured
+                        .stage(&Runtime(f.runtime().clone()), &cache, &|| Ok(()))
+                        .unwrap();
+                    let selected = staged.seals[0].reference();
+                    selections.push(selected);
+                    let owner = staged.seals[0].store().identity();
+                    if let Some(previous) = physical {
+                        assert_eq!(owner, previous);
+                    } else {
+                        physical = Some(owner);
+                    }
+                    let native = crate::engine::native::NativeDocument::from_pending(
+                        staged.scene.into_provisional_pending().unwrap(),
+                    )
+                    .unwrap();
+                    let engine = Engine::from_native(native, 8).unwrap();
+                    let scene = engine.capture_scene(None).unwrap().into_native().unwrap();
+                    let session = f.runtime().begin_existing().unwrap();
+                    Capture::from_native(&scene, &session, limits(), &|| Ok(()))
+                        .unwrap()
+                        .publish(id, &session, &|| Ok(()))
+                        .unwrap();
+                }
+            }
+            assert_ne!(selections[0], selections[1]);
+            assert_ne!(selections[1], selections[2]);
+            workspace.lock().unwrap().source_runtime = None;
+            drop(f.runtime.take());
+            let runtime = Fixture::new_runtime(f.connection.as_ref().unwrap());
+            workspace.lock().unwrap().source_runtime = Some(runtime.clone());
+            f.runtime = Some(runtime);
+            let catalog = crate::recovery::catalog_in(&workspace, &f.base, &|| Ok(())).unwrap();
+            assert!(catalog.native.error().is_none());
+            assert_eq!(catalog.native.entries().len(), 3);
+            assert!(
+                catalog
+                    .native
+                    .entries()
+                    .iter()
+                    .all(|entry| entry.error.is_none()),
+                "{:?}",
+                catalog
+                    .native
+                    .entries()
+                    .iter()
+                    .map(|entry| &entry.error)
+                    .collect::<Vec<_>>()
+            );
+            let session = f.runtime().begin_existing().unwrap();
+            let mut metadata = None;
+            for at in [2, 0, 1] {
+                let decoded = load(&session, ids[at], limits(), &|| Ok(())).unwrap();
+                let store = decoded.seals[0].store();
+                assert_eq!(store.checkpoint_reference().unwrap(), Some(selections[0]));
+                let raster = decoded.pending.rasters().iter().next().unwrap().1;
+                let region = crate::raster::backed::Region::new([0, 0, 4, 4]).unwrap();
+                assert_eq!(
+                    raster
+                        .prepare_region(region, &mut || Ok(()))
+                        .unwrap()
+                        .pixel16(2, 3)
+                        .unwrap(),
+                    expected[at]
+                );
+                if at == 1 {
+                    metadata = Some(decoded.pending);
+                }
+            }
+            let mut union = Vec::new();
+            for selected in &selections[..2] {
+                let source = session.resolve_store(physical.unwrap(), *selected).unwrap();
+                source
+                    .visit_blocks(&mut || Ok(()), |reference| {
+                        union.push(reference);
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            let store = session
+                .resolve_store(physical.unwrap(), selections[0])
+                .unwrap()
+                .store();
+            let unchanged = store.file_bytes_for_test().unwrap();
+            assert!(session
+                .seal_store(&store, &union, b"unsupported readonly union")
+                .is_err());
+            assert_eq!(store.file_bytes_for_test().unwrap(), unchanged);
+            let mut selected_refs = Vec::new();
+            for selected in &selections[..2] {
+                let source = session.resolve_store(physical.unwrap(), *selected).unwrap();
+                let mut refs = Vec::new();
+                source
+                    .visit_blocks(&mut || Ok(()), |reference| {
+                        refs.push(reference);
+                        Ok(())
+                    })
+                    .unwrap();
+                assert_eq!(refs.len(), 1);
+                selected_refs.push(refs[0]);
+            }
+            for across_layers in [false, true] {
+                let owner =
+                    MetadataCharge::reserve(&session.resident(), 65536, &|| Ok(())).unwrap();
+                let mut typed: Document36 =
+                    crate::engine::scene::wire_copy(metadata.as_ref().unwrap().metadata());
+                typed.width = 512;
+                typed.height = 256;
+                typed.layers[0].pixels.width = 512;
+                typed.layers[0].pixels.height = 256;
+                let make_surface = |refs| {
+                    Surface::from_plane(
+                        crate::raster::backed::Plane::from_blocks(
+                            512,
+                            256,
+                            depth,
+                            store.clone(),
+                            refs,
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap()
+                };
+                let mut surfaces = vec![make_surface(std::collections::BTreeMap::from([(
+                    (0, 0),
+                    selected_refs[0],
+                )]))];
+                if across_layers {
+                    let mut second = crate::engine::scene::wire_copy(&typed.layers[0]);
+                    second.id = crate::engine::id();
+                    second.pixels.id = 2;
+                    typed.layers.push(second);
+                    surfaces.push(make_surface(std::collections::BTreeMap::from([(
+                        (1, 0),
+                        selected_refs[1],
+                    )])));
+                } else {
+                    surfaces[0] = make_surface(std::collections::BTreeMap::from([
+                        ((0, 0), selected_refs[0]),
+                        ((1, 0), selected_refs[1]),
+                    ]));
+                }
+                let pending = PendingScene::new(
+                    crate::psd::memory36::Admitted::from_parts(Arc::new(typed), owner),
+                    RasterRoster::new(surfaces).unwrap(),
+                    session.resident(),
+                    session.disk(),
+                )
+                .unwrap();
+                let native = crate::engine::native::NativeDocument::from_pending(pending).unwrap();
+                let engine = Engine::from_native(native, 8).unwrap();
+                let mixed = engine.capture_scene(None).unwrap().into_native().unwrap();
+                let key = mixed.key();
+                assert!(crate::engine::scene::seal_native_sources(
+                    &mixed,
+                    &session,
+                    1024,
+                    16,
+                    &|| Err("cancel union".into()),
+                )
+                .is_err());
+                for alias in [true, false] {
+                    let refused = RefusedMirror {
+                        session: &session,
+                        original: store.clone(),
+                        alias,
+                        cancelled: std::cell::Cell::new(false),
+                    };
+                    let disk_before = session.disk().used().unwrap();
+                    assert!(crate::engine::scene::source_copy::seal_sources(
+                        mixed.rasters().as_slice(),
+                        &session.resident(),
+                        &session.disk(),
+                        &refused,
+                        b"refused mirror fixture",
+                        (1024, 16),
+                        0,
+                        &|| Ok(()),
+                    )
+                    .is_err());
+                    assert_eq!(store.file_bytes_for_test().unwrap(), unchanged);
+                    assert!(session.disk().used().unwrap() >= disk_before);
+                }
+                let foreign = ResidentBudget::new(1024 * 1024).unwrap();
+                assert!(crate::engine::scene::source_copy::seal_sources(
+                    mixed.rasters().as_slice(),
+                    &foreign,
+                    &session.disk(),
+                    &session,
+                    b"foreign admission fixture",
+                    (1024, 16),
+                    0,
+                    &|| Ok(()),
+                )
+                .is_err());
+                let sealed =
+                    crate::engine::scene::seal_native_sources(&mixed, &session, 1024, 16, &|| {
+                        Ok(())
+                    })
+                    .unwrap();
+                assert_eq!(sealed.seals.len(), 1);
+                let mirror = sealed.seals[0].store();
+                assert_ne!(mirror.identity(), store.identity());
+                let mirror_bytes = mirror.file_bytes_for_test().unwrap();
+                let retry =
+                    crate::engine::scene::seal_native_sources(&mixed, &session, 1024, 16, &|| {
+                        Ok(())
+                    })
+                    .unwrap();
+                assert!(retry.seals[0].store().same_owner(&mirror));
+                assert_eq!(mirror.file_bytes_for_test().unwrap(), mirror_bytes);
+                for (_, surface) in sealed.rasters.iter() {
+                    for tile in surface.physical_tiles() {
+                        assert!(tile.owner().same_owner(&mirror));
+                        let original = selected_refs
+                            .iter()
+                            .find(|reference| reference.digest() == tile.reference().digest())
+                            .unwrap();
+                        assert_eq!(original.spec(), tile.reference().spec());
+                        assert_eq!(
+                            store.pin(*original, &mut || Ok(())).unwrap().bytes(),
+                            mirror
+                                .pin(tile.reference(), &mut || Ok(()))
+                                .unwrap()
+                                .bytes(),
+                        );
+                    }
+                }
+                let output = crate::engine::native::OutputDraft::new(
+                    mixed.rasters().ordinal(1).unwrap().clone(),
+                    vec![],
+                )
+                .seal(engine.native_document().unwrap(), &session, &|| Ok(()))
+                .unwrap_or_else(|failure| panic!("{}", failure.reason()));
+                output.abort(&session, &|| Ok(())).unwrap();
+                let capture = Capture::from_native(&mixed, &session, limits(), &|| Ok(())).unwrap();
+                let snapshot = *uuid::Uuid::new_v4().as_bytes();
+                capture.publish(snapshot, &session, &|| Ok(())).unwrap();
+                let decoded = load(&session, snapshot, limits(), &|| Ok(())).unwrap();
+                assert_eq!(decoded.seals.len(), 1);
+                assert_eq!(
+                    decoded.pending.rasters().len(),
+                    if across_layers { 2 } else { 1 }
+                );
+                for ((_, before), (_, after)) in
+                    mixed.rasters().iter().zip(decoded.pending.rasters().iter())
+                {
+                    let region = crate::raster::backed::Region::new([0, 0, 512, 256]).unwrap();
+                    let before = before.prepare_region(region, &mut || Ok(())).unwrap();
+                    let after = after.prepare_region(region, &mut || Ok(())).unwrap();
+                    for (x, y) in [(2, 3), (258, 3), (511, 255)] {
+                        assert_eq!(before.pixel16(x, y).unwrap(), after.pixel16(x, y).unwrap());
+                    }
+                }
+                assert_eq!(mixed.key(), key);
+                assert_eq!(engine.history_lengths(), [0, 0]);
+                assert_eq!(store.checkpoint_reference().unwrap(), Some(selections[0]));
+                assert_eq!(store.file_bytes_for_test().unwrap(), unchanged);
+            }
+            let native =
+                crate::engine::native::NativeDocument::from_pending(metadata.unwrap()).unwrap();
+            let engine = Engine::from_native(native, 8).unwrap();
+            let scene = engine.capture_scene(None).unwrap().into_native().unwrap();
+            let capture = Capture::from_native(&scene, &session, limits(), &|| Ok(())).unwrap();
+            assert_eq!(scene.metadata().revision(), 1);
+            let before = source_file_contents(&f);
+            let next = *uuid::Uuid::new_v4().as_bytes();
+            capture.publish(next, &session, &|| Ok(())).unwrap();
+            let after = source_file_contents(&f);
+            for (path, value) in &before {
+                assert_eq!(after.get(path), Some(value));
+            }
+            assert_eq!(
+                session
+                    .checkpoint_census(&|| Ok(()))
+                    .unwrap()
+                    .registered_count(),
+                6
+            );
+            let restored = crate::recovery::restore(
+                &workspace,
+                &f.base,
+                &format!("native:{}", uuid::Uuid::from_bytes(next)),
+                &Default::default(),
+                None,
+            )
+            .unwrap();
+            let scene = restored
+                .lock()
+                .unwrap()
+                .capture_scene(None)
+                .unwrap()
+                .into_native()
+                .unwrap();
+            let raster = scene.rasters().iter().next().unwrap().1;
+            let region = crate::raster::backed::Region::new([0, 0, 4, 4]).unwrap();
+            assert_eq!(
+                raster
+                    .prepare_region(region, &mut || Ok(()))
+                    .unwrap()
+                    .pixel16(2, 3)
+                    .unwrap(),
+                expected[1]
+            );
+        }
+    }
+    #[test]
+    fn recovery_registration_refuses_cancel_foreign_session_full_workspace_and_changed_marker() {
+        for refusal in ["cancel", "session", "workspace", "full", "marker"] {
+            let f = Fixture::new();
+            let workspace = f.workspace();
+            let engine = native_engine(&f, 16);
+            let scene = engine.capture_scene(None).unwrap().into_native().unwrap();
+            let session = f.runtime().begin().unwrap();
+            let capture = Capture::from_native(&scene, &session, limits(), &|| Ok(())).unwrap();
+            let id = *uuid::Uuid::new_v4().as_bytes();
+            capture.publish(id, &session, &|| Ok(())).unwrap();
+            if refusal == "full" {
+                for _ in 1..crate::workspace::MAX_PROJECTS {
+                    crate::workspace::new_project(f.shared.as_ref().unwrap(), 1, 1, 8, None)
+                        .unwrap();
+                }
+            }
+            let count = crate::workspace::entries_in(&workspace).len();
+            let decoded = load(&session, id, limits(), &|| Ok(())).unwrap();
+            let control = crate::loading::Control::default();
+            let other = f.runtime().begin().unwrap();
+            let foreign = Fixture::new();
+            if refusal == "cancel" {
+                control.cancel();
+            }
+            if refusal == "workspace" {
+                workspace.lock().unwrap().source_runtime = Some(foreign.runtime().clone());
+            }
+            if refusal == "marker" {
+                session.corrupt_checkpoint_for_test(id, 112).unwrap();
+            }
+            let bytes = marker_bytes(&session, id);
+            let disk = session.disk().used().unwrap();
+            let attempted = if refusal == "session" {
+                &other
+            } else {
+                &session
+            };
+            assert!(
+                crate::workspace::register_native_recovery(
+                    &workspace, attempted, decoded, &control, None
+                )
+                .is_err(),
+                "{refusal}"
+            );
+            assert_eq!(crate::workspace::entries_in(&workspace).len(), count);
+            assert_eq!(marker_bytes(&session, id), bytes);
+            assert_eq!(session.disk().used().unwrap(), disk);
+        }
+    }
+    #[test]
+    fn valid_marker_hash_never_admits_unsupported_native_metadata_as_editable_work() {
+        for (from, to) in [
+            (
+                b"\"kind\":\"paint\"".as_slice(),
+                b"\"kind\":\"taint\"".as_slice(),
+            ),
+            (
+                b"\"blend\":\"normal\"".as_slice(),
+                b"\"blend\":\"future\"".as_slice(),
+            ),
+            (
+                b"\"kind\":\"blur\"".as_slice(),
+                b"\"kind\":\"nope\"".as_slice(),
+            ),
+            (b"\"weight\":0.75".as_slice(), b"\"weight\":9.75".as_slice()),
+        ] {
+            let f = Fixture::new();
+            let workspace = f.workspace();
+            let engine = native_engine(&f, 16);
+            let scene = engine.capture_scene(None).unwrap().into_native().unwrap();
+            let session = f.runtime().begin().unwrap();
+            let capture = Capture::from_native(&scene, &session, limits(), &|| Ok(())).unwrap();
+            let id = *uuid::Uuid::new_v4().as_bytes();
+            capture.publish(id, &session, &|| Ok(())).unwrap();
+            let changed = rewritten(&session, marker_bytes(&session, id), |bytes| {
+                let at = bytes.windows(from.len()).position(|b| b == from).unwrap();
+                bytes[at..at + from.len()].copy_from_slice(to);
+            });
+            let decoded = load(&session, changed, limits(), &|| Ok(())).unwrap();
+            let bytes = marker_bytes(&session, changed);
+            let disk = session.disk().used().unwrap();
+            assert!(crate::workspace::register_native_recovery(
+                &workspace,
+                &session,
+                decoded,
+                &Default::default(),
+                None
+            )
+            .is_err());
+            assert_eq!(crate::workspace::entries_in(&workspace).len(), 1);
+            assert_eq!(marker_bytes(&session, changed), bytes);
+            assert_eq!(session.disk().used().unwrap(), disk);
+        }
+    }
+    #[test]
+    fn missing_native_recovery_never_creates_a_source_namespace_or_tab() {
+        let f = Fixture::new();
+        let workspace = f.workspace();
+        let source = f
+            .connection
+            .as_ref()
+            .unwrap()
+            .state_dir
+            .join("native-sources-v1");
+        assert!(!source.exists());
+        assert!(crate::recovery::restore(
+            &workspace,
+            &f.base,
+            &uuid::Uuid::new_v4().to_string(),
+            &Default::default(),
+            None
+        )
+        .is_err());
+        assert!(!source.exists());
+        assert_eq!(f.runtime().disk().used().unwrap(), 0);
+        assert_eq!(crate::workspace::entries_in(&workspace).len(), 1);
+    }
+    #[test]
+    fn catalog_lists_native_depths_and_damaged_records_without_changing_sources() {
+        for depth in [8, 16] {
+            let f = Fixture::new();
+            let workspace = f.workspace();
+            let engine = native_engine(&f, depth);
+            let scene = engine.capture_scene(None).unwrap().into_native().unwrap();
+            let session = f.runtime().begin().unwrap();
+            let capture = Capture::from_native(&scene, &session, limits(), &|| Ok(())).unwrap();
+            let id = *uuid::Uuid::new_v4().as_bytes();
+            capture.publish(id, &session, &|| Ok(())).unwrap();
+            let bytes = marker_bytes(&session, id);
+            let damaged = rewritten(&session, bytes.clone(), |bytes| bytes[0] ^= 0x55);
+            let damaged_bytes = marker_bytes(&session, damaged);
+            let disk = session.disk().used().unwrap();
+            let listed = crate::recovery::catalog_in(&workspace, &f.base, &|| Ok(())).unwrap();
+            assert!(listed.native.error().is_none());
+            assert_eq!(listed.native.entries().len(), 2);
+            let good_id = format!("native:{}", uuid::Uuid::from_bytes(id));
+            let good = listed
+                .native
+                .entries()
+                .iter()
+                .find(|e| e.snapshot == good_id)
+                .unwrap();
+            assert_eq!(good.bit_depth, Some(depth));
+            assert_eq!(
+                good.document_id.as_deref(),
+                Some(scene.identity().document_id.as_str())
+            );
+            assert_eq!(good.display_name, scene.metadata().name());
+            assert_eq!(good.read_only, Some(false));
+            assert!(good.error.is_none());
+            let bad_id = format!("native:{}", uuid::Uuid::from_bytes(damaged));
+            let bad = listed
+                .native
+                .entries()
+                .iter()
+                .find(|e| e.snapshot == bad_id)
+                .unwrap();
+            assert!(bad.error.is_some());
+            assert!(bad.document_id.is_none());
+            assert!(bad.revision.is_none());
+            assert!(bad.timestamp_ms.is_none());
+            assert_eq!(marker_bytes(&session, id), bytes);
+            assert_eq!(marker_bytes(&session, damaged), damaged_bytes);
+            assert_eq!(session.disk().used().unwrap(), disk);
+            // An active reader keeps discard busy, even for a valid checkpoint.
+            assert!(crate::recovery::discard_in(&workspace, &f.base, &good_id).is_err());
+            assert_eq!(marker_bytes(&session, id), bytes);
+        }
+    }
+    #[test]
+    fn mixed_catalog_identical_snapshot_uuids_restore_the_explicit_format() {
+        let f = Fixture::new();
+        let workspace = f.workspace();
+        {
+            let mut root = f.shared.as_ref().unwrap().lock().unwrap();
+            root.resident_state_mut().unwrap().document = Document::new_depth(4, 2, 8).unwrap();
+            let layer = root.resident_state().unwrap().document.layers[0].id.clone();
+            root.edit(
+                "human",
+                &[serde_json::json!({"op":"paint.fill","layer":layer,"color":[17,29,43,255]})],
+                None,
+                None,
+                "Legacy work",
+            )
+            .unwrap();
+        }
+        crate::recovery::checkpoint(&workspace, &f.base, &mut Default::default());
+        let legacy = crate::recovery::catalog(&f.base).pop().unwrap();
+        let legacy_bytes = fs::read(f.base.join(&legacy.file)).unwrap();
+        let engine = native_engine(&f, 16);
+        let scene = engine.capture_scene(None).unwrap().into_native().unwrap();
+        let session = f.runtime().begin().unwrap();
+        let id = *uuid::Uuid::parse_str(&legacy.snapshot).unwrap().as_bytes();
+        Capture::from_native(&scene, &session, limits(), &|| Ok(()))
+            .unwrap()
+            .publish(id, &session, &|| Ok(()))
+            .unwrap();
+        let listed = crate::recovery::catalog_in(&workspace, &f.base, &|| Ok(())).unwrap();
+        assert_eq!(listed.versions.len(), 1);
+        assert_eq!(listed.native.entries().len(), 1);
+        let native = crate::recovery::restore(
+            &workspace,
+            &f.base,
+            &listed.native.entries()[0].snapshot,
+            &Default::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            native
+                .lock()
+                .unwrap()
+                .native_document()
+                .unwrap()
+                .metadata()
+                .depth(),
+            16
+        );
+        let resident = crate::recovery::restore(
+            &workspace,
+            &f.base,
+            &legacy.snapshot,
+            &Default::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            resident
+                .lock()
+                .unwrap()
+                .resident_state()
+                .unwrap()
+                .document
+                .bit_depth,
+            8
+        );
+        assert_eq!(fs::read(f.base.join(&legacy.file)).unwrap(), legacy_bytes);
+        assert!(session.open_recovery_marker(id).is_ok());
+    }
+    #[test]
+    fn catalog_absence_cancel_and_admission_failure_never_drop_recovery_data() {
+        let f = Fixture::new();
+        let workspace = f.workspace();
+        let source = f
+            .connection
+            .as_ref()
+            .unwrap()
+            .state_dir
+            .join("native-sources-v1");
+        let empty = crate::recovery::catalog_in(&workspace, &f.base, &|| Ok(())).unwrap();
+        assert!(empty.native.entries().is_empty());
+        assert!(empty.native.error().is_none());
+        assert!(!source.exists());
+        fs::create_dir(&source).unwrap();
+        let incomplete = crate::recovery::catalog_in(&workspace, &f.base, &|| Ok(())).unwrap();
+        assert!(incomplete.native.error().is_some());
+        assert!(fs::read_dir(&source).unwrap().next().is_none());
+        let engine = native_engine(&f, 16);
+        let scene = engine.capture_scene(None).unwrap().into_native().unwrap();
+        let session = f.runtime().begin().unwrap();
+        let id = *uuid::Uuid::new_v4().as_bytes();
+        Capture::from_native(&scene, &session, limits(), &|| Ok(()))
+            .unwrap()
+            .publish(id, &session, &|| Ok(()))
+            .unwrap();
+        let bytes = marker_bytes(&session, id);
+        let disk = session.disk().used().unwrap();
+        let calls = std::cell::Cell::new(0);
+        assert!(crate::recovery::catalog_in(&workspace, &f.base, &|| {
+            calls.set(calls.get() + 1);
+            if calls.get() >= 12 {
+                Err("Cancelled discovery".into())
+            } else {
+                Ok(())
+            }
+        })
+        .is_err());
+        let budget = f.runtime().resident();
+        let remaining = budget.limit() - budget.used();
+        let ballast = MetadataCharge::reserve(&budget, remaining, &|| Ok(())).unwrap();
+        let refused = crate::recovery::catalog_in(&workspace, &f.base, &|| Ok(())).unwrap();
+        assert!(refused.native.error().is_some());
+        assert!(refused.native.entries().is_empty());
+        drop(ballast);
+        assert_eq!(marker_bytes(&session, id), bytes);
+        assert_eq!(session.disk().used().unwrap(), disk);
+        assert_eq!(crate::workspace::entries_in(&workspace).len(), 1);
+    }
+    #[test]
+    #[cfg(windows)]
+    fn discard_releases_only_one_marker_and_preserves_shared_native_sources_and_open_tabs() {
+        for depth in [8, 16] {
+            let f = Fixture::new();
+            let workspace = f.workspace();
+            let engine = native_engine(&f, depth);
+            let key = engine.native_document().unwrap().key();
+            let scene = engine.capture_scene(None).unwrap().into_native().unwrap();
+            let first = uuid::Uuid::new_v4();
+            let second = uuid::Uuid::new_v4();
+            let marker_length;
+            {
+                let session = f.runtime().begin().unwrap();
+                let capture = Capture::from_native(&scene, &session, limits(), &|| Ok(())).unwrap();
+                for id in [first, second] {
+                    capture
+                        .publish(*id.as_bytes(), &session, &|| Ok(()))
+                        .unwrap();
+                }
+                marker_length = session
+                    .open_recovery_marker(*first.as_bytes())
+                    .unwrap()
+                    .len();
+            }
+            let restored = crate::recovery::restore(
+                &workspace,
+                &f.base,
+                &format!("native:{first}"),
+                &Default::default(),
+                None,
+            )
+            .unwrap();
+            let restored_key = restored.lock().unwrap().native_document().unwrap().key();
+            let directory = f.base.join("state/native-sources-v1");
+            let mut before = source_file_contents(&f);
+            let marker = directory.join(format!("recovery-v3-{first}.pbr"));
+            before.remove(&marker).unwrap();
+            let disk = f.runtime().disk().used().unwrap();
+            crate::recovery::discard_in(&workspace, &f.base, &format!("native:{first}")).unwrap();
+            assert_eq!(source_file_contents(&f), before);
+            assert_eq!(f.runtime().disk().used().unwrap(), disk - marker_length);
+            assert_eq!(engine.native_document().unwrap().key(), key);
+            assert_eq!(engine.history_lengths(), [0, 0]);
+            let restored_scene = {
+                let engine = restored.lock().unwrap();
+                assert_eq!(engine.native_document().unwrap().key(), restored_key);
+                assert_eq!(engine.history_lengths(), [0, 0]);
+                engine.capture_scene(None).unwrap().into_native().unwrap()
+            };
+            for ((_, original), (_, restored)) in
+                scene.rasters().iter().zip(restored_scene.rasters().iter())
+            {
+                let region = crate::raster::backed::Region::new([0, 0, 512, 256]).unwrap();
+                let original = original.prepare_region(region, &mut || Ok(())).unwrap();
+                let restored = restored.prepare_region(region, &mut || Ok(())).unwrap();
+                for (x, y) in [(2, 3), (511, 255)] {
+                    assert_eq!(
+                        original.pixel16(x, y).unwrap(),
+                        restored.pixel16(x, y).unwrap()
+                    );
+                }
+            }
+            let session = f.runtime().begin_existing().unwrap();
+            assert!(session.open_recovery_marker(*first.as_bytes()).is_err());
+            let remaining = load(&session, *second.as_bytes(), limits(), &|| Ok(())).unwrap();
+            assert_eq!(remaining.pending.metadata().bit_depth, depth);
+            assert_eq!(
+                session
+                    .checkpoint_census(&|| Ok(()))
+                    .unwrap()
+                    .registered_count(),
+                1
+            );
+        }
+    }
+    fn source_file_contents(
+        fixture: &Fixture,
+    ) -> std::collections::BTreeMap<PathBuf, ((u64, u64), Vec<u8>)> {
+        let session = fixture.runtime().begin_existing().unwrap();
+        source_files(&session, &fixture.base.join("state/native-sources-v1"))
+    }
+    fn source_files(
+        session: &SourceSession,
+        directory: &std::path::Path,
+    ) -> std::collections::BTreeMap<PathBuf, ((u64, u64), Vec<u8>)> {
+        let mut files = std::collections::BTreeMap::new();
+        for entry in fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                files.extend(source_files(session, &path));
+            } else {
+                let file = fs::File::open(&path).unwrap();
+                files.insert(
+                    path.clone(),
+                    (
+                        crate::file_safety::identity(&file).unwrap(),
+                        session.owned_file_bytes_for_test(&path).unwrap(),
+                    ),
+                );
+            }
+        }
+        files
+    }
+    #[test]
+    #[cfg(windows)]
+    fn discard_refuses_live_cursors_child_retention_cancellation_and_unknown_frames() {
+        let f = Fixture::new();
+        let engine = native_engine(&f, 16);
+        let scene = engine.capture_scene(None).unwrap().into_native().unwrap();
+        let session = f.runtime().begin().unwrap();
+        let id = *uuid::Uuid::new_v4().as_bytes();
+        Capture::from_native(&scene, &session, limits(), &|| Ok(()))
+            .unwrap()
+            .publish(id, &session, &|| Ok(()))
+            .unwrap();
+        let cursor = session.open_recovery_marker(id).unwrap();
+        let disk = session.disk().used().unwrap();
+        assert!(f
+            .runtime()
+            .begin_existing()
+            .unwrap()
+            .discard_checkpoint(id, limits(), &|| Ok(()))
+            .is_err());
+        drop(cursor);
+        let bytes = marker_bytes(&session, id);
+        let future = rewritten(&session, bytes.clone(), |bytes| bytes[19] = 4);
+        drop(session);
+        let session = f.runtime().begin_existing().unwrap();
+        let child = session.retain_for_child().unwrap();
+        assert!(session
+            .discard_checkpoint(id, limits(), &|| Ok(()))
+            .is_err());
+        drop(child);
+        assert!(f
+            .runtime()
+            .begin_existing()
+            .unwrap()
+            .discard_checkpoint(id, limits(), &|| Err("Cancelled".into()))
+            .is_err());
+        let charged = f.runtime().disk().used().unwrap();
+        assert!(charged > disk);
+        assert!(f
+            .runtime()
+            .begin_existing()
+            .unwrap()
+            .discard_checkpoint(future, limits(), &|| Ok(()))
+            .is_err());
+        let session = f.runtime().begin_existing().unwrap();
+        assert_eq!(marker_bytes(&session, id), bytes);
+        assert_eq!(f.runtime().disk().used().unwrap(), charged);
+        drop(session);
+        let marker = f.base.join(format!(
+            "state/native-sources-v1/recovery-v3-{}.pbr",
+            uuid::Uuid::from_bytes(id)
+        ));
+        let human_link = f.base.join("human-marker-link.pbr");
+        fs::hard_link(&marker, &human_link).unwrap();
+        assert!(f.runtime().begin_existing().is_err());
+        assert_eq!(fs::read(&marker).unwrap(), bytes);
+        assert_eq!(fs::read(&human_link).unwrap(), bytes);
+        assert_eq!(f.runtime().disk().used().unwrap(), charged);
+    }
+    #[test]
+    #[cfg(windows)]
+    fn discard_restores_before_move_and_retains_roots_and_debt_after_uncertain_removal() {
+        use crate::workspace::source_runtime::RetirementFault;
+        for fault in [
+            RetirementFault::Detached,
+            RetirementFault::PanicDetached,
+            RetirementFault::Moved,
+            RetirementFault::Unlinked,
+        ] {
+            let f = Fixture::new();
+            let engine = native_engine(&f, 16);
+            let scene = engine.capture_scene(None).unwrap().into_native().unwrap();
+            let session = f.runtime().begin().unwrap();
+            let id = *uuid::Uuid::new_v4().as_bytes();
+            Capture::from_native(&scene, &session, limits(), &|| Ok(()))
+                .unwrap()
+                .publish(id, &session, &|| Ok(()))
+                .unwrap();
+            let bytes = marker_bytes(&session, id);
+            let disk = session.disk().used().unwrap();
+            drop(session);
+            let session = f.runtime().begin_existing().unwrap();
+            let checks = std::cell::Cell::new(0);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                session.discard_checkpoint_with_fault(
+                    id,
+                    limits(),
+                    &|| {
+                        let count = checks.get();
+                        checks.set(count + 1);
+                        if count != 0 {
+                            assert!(f.runtime().begin_existing().is_err());
+                            assert!(f.runtime().begin_existing_if_present().is_err());
+                        }
+                        Ok(())
+                    },
+                    fault,
+                )
+            }));
+            if fault == RetirementFault::PanicDetached {
+                assert!(result.is_err());
+            } else {
+                let error = result.unwrap().unwrap_err();
+                assert!(
+                    error.contains(if fault == RetirementFault::Detached {
+                        "Cancelled after detach"
+                    } else {
+                        "disposal is uncertain"
+                    }),
+                    "{error}"
+                );
+            }
+            assert_eq!(f.runtime().disk().used().unwrap(), disk);
+            let session = f.runtime().begin_existing().unwrap();
+            if matches!(
+                fault,
+                RetirementFault::Detached | RetirementFault::PanicDetached
+            ) {
+                assert_eq!(marker_bytes(&session, id), bytes);
+                assert_eq!(
+                    session
+                        .checkpoint_census(&|| Ok(()))
+                        .unwrap()
+                        .registered_count(),
+                    1
+                );
+            } else {
+                assert!(session.recovery_marker_ids().is_err());
+                assert!(session.checkpoint_census(&|| Ok(())).is_err());
             }
         }
     }
@@ -1302,7 +3315,7 @@ mod tests {
             .all(|s| s.check_owner(&mut || Ok(())).is_ok()));
     }
     #[test]
-    fn failed_durable_capture_latches_and_keeps_its_pending_bytes_unselected() {
+    fn failed_durable_capture_latches_and_never_selects_failed_bytes() {
         let f = Fixture::new();
         let staged = stage(&f, 16);
         let session = f.runtime().begin().unwrap();
@@ -1332,8 +3345,12 @@ mod tests {
             reached_write.get(),
             "Failure must occur after actual pending bytes"
         );
-        assert!(pending.is_file());
-        assert!(fs::metadata(&pending).unwrap().len() != 0);
+        if cfg!(windows) {
+            assert!(!pending.exists());
+        } else {
+            assert!(pending.is_file());
+            assert!(fs::metadata(&pending).unwrap().len() != 0);
+        }
         assert!(session.open_recovery_marker(id).is_err());
         assert!(capture
             .publish(*uuid::Uuid::new_v4().as_bytes(), &session, &|| Ok(()))
@@ -1365,12 +3382,89 @@ mod tests {
         assert!(retained.is_file());
     }
     #[test]
+    #[cfg(windows)]
+    fn source_collection_keeps_registered_recovery_roots_until_the_marker_is_retired() {
+        for depth in [8, 16] {
+            let mut f = Fixture::new();
+            let engine = native_engine(&f, depth);
+            let scene = engine.capture_scene(None).unwrap().into_native().unwrap();
+            let session = f.runtime().begin().unwrap();
+            let id = *uuid::Uuid::new_v4().as_bytes();
+            let capture = Capture::from_native(&scene, &session, limits(), &|| Ok(())).unwrap();
+            capture.publish(id, &session, &|| Ok(())).unwrap();
+            drop((capture, session, scene, engine));
+            drop(f.runtime.take());
+            f.runtime = Some(Fixture::new_runtime(f.connection.as_ref().unwrap()));
+            let workspace = f.workspace();
+            let before_unregistered = source_file_contents(&f);
+            assert!(f
+                .runtime()
+                .begin_existing()
+                .unwrap()
+                .collect_sources(&|| Ok(()))
+                .is_err());
+            assert_eq!(source_file_contents(&f), before_unregistered);
+            let catalog = crate::recovery::catalog_in(&workspace, &f.base, &|| Ok(())).unwrap();
+            assert!(catalog.native.error().is_none());
+            assert_eq!(catalog.native.entries().len(), 1);
+            assert!(catalog.native.entries()[0].error.is_none());
+            let before = source_file_contents(&f);
+            let charged = f.runtime().disk().used().unwrap();
+            let collected = f
+                .runtime()
+                .begin_existing()
+                .unwrap()
+                .collect_sources(&|| Ok(()))
+                .unwrap();
+            assert_eq!(collected.sources, 0);
+            assert_eq!(source_file_contents(&f), before);
+            assert_eq!(f.runtime().disk().used().unwrap(), charged);
+            let session = f.runtime().begin_existing().unwrap();
+            let decoded = load(&session, id, limits(), &|| Ok(())).unwrap();
+            let raster = decoded.pending.rasters().ordinal(1).unwrap();
+            let region = crate::raster::backed::Region::new([0, 0, 512, 256]).unwrap();
+            assert!(
+                raster
+                    .prepare_region(region, &mut || Ok(()))
+                    .unwrap()
+                    .pixel16(2, 3)
+                    .unwrap()[0]
+                    > 0
+            );
+            drop(decoded);
+            drop(session);
+            f.runtime()
+                .begin_existing()
+                .unwrap()
+                .discard_checkpoint(id, limits(), &|| Ok(()))
+                .unwrap();
+            let collected = f
+                .runtime()
+                .begin_existing()
+                .unwrap()
+                .collect_sources(&|| Ok(()))
+                .unwrap();
+            assert!(collected.sources > 0);
+            assert!(collected.bytes > 0);
+            assert_eq!(f.runtime().disk().used().unwrap(), 56);
+            assert_eq!(
+                f.runtime()
+                    .begin_existing()
+                    .unwrap()
+                    .checkpoint_census(&|| Ok(()))
+                    .unwrap()
+                    .registered_count(),
+                0
+            );
+        }
+    }
+    #[test]
     fn registered_checkpoint_keeps_selected_owners_after_live_scene_and_capture_drop() {
         let mut f = Fixture::new();
         let staged = stage(&f, 16);
         let session = f.runtime().begin().unwrap();
         let physical = staged.seals[0].store();
-        let weak = physical.downgrade();
+        let weak = physical.downgrade().unwrap();
         let identity = physical.identity();
         let selected = staged.seals[0].reference();
         let capture =
@@ -1441,7 +3535,7 @@ mod tests {
         drop(decoded);
     }
     #[test]
-    fn checkpoint_census_preserves_pending_and_corrupt_marker_bytes_and_source_debt() {
+    fn checkpoint_census_preserves_corrupt_or_unretired_marker_debt() {
         for corrupt in [false, true] {
             let f = Fixture::new();
             let staged = stage(&f, 16);
@@ -1477,7 +3571,17 @@ mod tests {
                     .is_err());
             }
             let retained = session.disk().used().unwrap();
-            assert!(session.checkpoint_census(&|| Ok(())).is_err());
+            if corrupt || !cfg!(windows) {
+                assert!(session.checkpoint_census(&|| Ok(())).is_err());
+            } else {
+                assert_eq!(
+                    session
+                        .checkpoint_census(&|| Ok(()))
+                        .unwrap()
+                        .registered_count(),
+                    1
+                );
+            }
             assert_eq!(session.disk().used().unwrap(), retained);
             assert!(staged.seals[0].store().publication_marked());
         }

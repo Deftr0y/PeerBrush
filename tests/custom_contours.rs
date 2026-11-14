@@ -122,14 +122,14 @@ fn contour_mapping_retains_native_piecewise_endpoints_and_nonmonotone_values() {
     }
     for depth in [8, 16] {
         let mut engine = Engine::new();
-        engine.doc = Document::new_depth(4, 1, depth).unwrap();
+        engine.resident_state_mut().expect("resident fixture").document = Document::new_depth(4, 1, depth).unwrap();
         let levels = [10000u16, 20000, 40000, 50000];
         for (x, level) in levels.into_iter().enumerate() {
-            engine.doc.layers[0]
+            engine.resident_state_mut().expect("resident fixture").document.layers[0]
                 .pixels
                 .set16(x as i32, 0, [level, level, level, 65535]);
         }
-        let layer = engine.doc.layers[0].id.clone();
+        let layer = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
         engine
             .edit(
                 "human",
@@ -140,10 +140,10 @@ fn contour_mapping_retains_native_piecewise_endpoints_and_nonmonotone_values() {
             )
             .unwrap();
         let rendered = if depth == 16 {
-            peerbrush::depth16::render(&engine.doc).unwrap().words
+            peerbrush::depth16::render(&engine.resident_state().expect("resident fixture").document).unwrap().words
         } else {
             engine
-                .doc
+                .resident_state().expect("resident fixture").document
                 .preview(None, 4, None, false)
                 .unwrap()
                 .2
@@ -171,9 +171,9 @@ fn contour_mapping_retains_native_piecewise_endpoints_and_nonmonotone_values() {
 #[test]
 fn malformed_or_inapplicable_contours_rollback_pixels_and_history_atomically() {
     let mut engine = Engine::new();
-    engine.doc = Document::new_depth(4, 4, 16).unwrap();
-    let layer = engine.doc.layers[0].id.clone();
-    let before = serde_json::to_value(&engine.doc).unwrap();
+    engine.resident_state_mut().expect("resident fixture").document = Document::new_depth(4, 4, 16).unwrap();
+    let layer = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
+    let before = serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap();
     let mut invalid = vec![
         json!(null),
         json!([]),
@@ -193,8 +193,8 @@ fn malformed_or_inapplicable_contours_rollback_pixels_and_history_atomically() {
             json!({"op":"paint.fill","layer":layer,"rect":[0,0,1,1],"color":[255,0,0,255]}),
             json!({"op":"effect.add","layer":layer,"kind":"contour","settings":{"contour":"custom","contour_points":bad}})
         ],None,None,"Invalid contour").is_err());
-        assert_eq!(serde_json::to_value(&engine.doc).unwrap(), before);
-        assert!(engine.undo.is_empty());
+        assert_eq!(serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap(), before);
+        assert!(engine.resident_state().expect("resident fixture").undo.is_empty());
     }
     for (kind, value) in [
         ("contour", json!({"contour":"custom"})),
@@ -210,10 +210,10 @@ fn malformed_or_inapplicable_contours_rollback_pixels_and_history_atomically() {
 }
 fn fixture(depth: u16) -> Engine {
     let mut engine = Engine::new();
-    engine.doc = Document::new_depth(32, 24, depth).unwrap();
+    engine.resident_state_mut().expect("resident fixture").document = Document::new_depth(32, 24, depth).unwrap();
     for y in 4..20 {
         for x in 4..28 {
-            engine.doc.layers[0].pixels.set16(
+            engine.resident_state_mut().expect("resident fixture").document.layers[0].pixels.set16(
                 x,
                 y,
                 [
@@ -240,24 +240,24 @@ fn every_custom_style_contour_retains_sources_preview_undo_and_current_psd_psb_o
             "drop_shadow",
         ] {
             let mut engine = fixture(depth);
-            let layer = engine.doc.layers[0].id.clone();
-            let before = engine.doc.export_png().unwrap();
-            let source = engine.doc.layers[0].pixels.rgba16();
+            let layer = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
+            let before = engine.resident_state().expect("resident fixture").document.export_png().unwrap();
+            let source = engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16();
             let custom = json!({"contour":"custom","contour_points":[{"position":0.,"value":0.1},{"position":0.4,"value":0.8},{"position":1.,"value":0.2}]});
             let command = json!({"op":"effect.add","layer":layer,"kind":kind,"settings":custom});
             let preview =
-                Engine::preview_edits(engine.doc.clone(), std::slice::from_ref(&command)).unwrap();
+                Engine::preview_edits(engine.resident_state().expect("resident fixture").document.clone(), std::slice::from_ref(&command)).unwrap();
             engine
                 .edit("human", &[command], None, None, "Custom style contour")
                 .unwrap();
-            let current = engine.doc.export_png().unwrap();
+            let current = engine.resident_state().expect("resident fixture").document.export_png().unwrap();
             assert_eq!(current, preview.export_png().unwrap());
             assert_ne!(current, before, "{depth} {kind}");
-            assert_eq!(engine.undo.len(), 1);
-            assert_eq!(engine.doc.layers[0].pixels.rgba16(), source);
+            assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), 1);
+            assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(), source);
             for output in [
-                psd::encode(&engine.doc).unwrap(),
-                psd::encode_psb(&engine.doc).unwrap(),
+                psd::encode(&engine.resident_state().expect("resident fixture").document).unwrap(),
+                psd::encode_psb(&engine.resident_state().expect("resident fixture").document).unwrap(),
             ] {
                 assert_eq!(
                     embedded(&output)["format"],
@@ -277,14 +277,14 @@ fn every_custom_style_contour_retains_sources_preview_undo_and_current_psd_psb_o
                     custom["contour_points"]
                 );
             }
-            let standard = psd::decode(&strip(&psd::encode(&engine.doc).unwrap())).unwrap();
+            let standard = psd::decode(&strip(&psd::encode(&engine.resident_state().expect("resident fixture").document).unwrap())).unwrap();
             assert!(!standard.read_only);
             assert!(standard.layers[0].effects.is_empty());
             assert_eq!(standard.export_png().unwrap(), current);
             engine.undo("human").unwrap();
-            assert_eq!(engine.doc.export_png().unwrap(), before);
+            assert_eq!(engine.resident_state().expect("resident fixture").document.export_png().unwrap(), before);
             engine.redo("human").unwrap();
-            assert_eq!(engine.doc.export_png().unwrap(), current);
+            assert_eq!(engine.resident_state().expect("resident fixture").document.export_png().unwrap(), current);
         }
     }
 }
@@ -292,7 +292,7 @@ fn every_custom_style_contour_retains_sources_preview_undo_and_current_psd_psb_o
 fn future_and_malformed_contour_sources_preserve_native_composites_and_disabled_definitions() {
     for depth in [8, 16] {
         let mut engine = fixture(depth);
-        let layer = engine.doc.layers[0].id.clone();
+        let layer = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
         engine
             .edit(
                 "human",
@@ -302,12 +302,12 @@ fn future_and_malformed_contour_sources_preserve_native_composites_and_disabled_
                 "Contour source",
             )
             .unwrap();
-        let effect = engine.doc.layers[0].effects[0].id.clone();
+        let effect = engine.resident_state().expect("resident fixture").document.layers[0].effects[0].id.clone();
         for disabled in [false, true] {
             engine.edit("human",&[json!({"op":"effect.update","layer":layer,"effect":effect,"enabled":!disabled})],None,None,"Contour bypass").unwrap();
             for bytes in [
-                psd::encode(&engine.doc).unwrap(),
-                psd::encode_psb(&engine.doc).unwrap(),
+                psd::encode(&engine.resident_state().expect("resident fixture").document).unwrap(),
+                psd::encode_psb(&engine.resident_state().expect("resident fixture").document).unwrap(),
             ] {
                 let source = embedded(&bytes);
                 assert_eq!(source["format"], 21);
@@ -341,15 +341,15 @@ fn future_and_malformed_contour_sources_preserve_native_composites_and_disabled_
 #[test]
 fn shared_custom_contour_feedback_and_reservations_preserve_human_native_work() {
     let engine = fixture(16);
-    let layer = engine.doc.layers[0].id.clone();
-    let document = engine.doc.id.clone();
-    let source = engine.doc.layers[0].pixels.rgba16();
+    let layer = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
+    let document = engine.resident_state().expect("resident fixture").document.id.clone();
+    let source = engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16();
     let shared = Arc::new(Mutex::new(engine));
     let result=server::dispatch(&shared,"edit",&json!({"actor":"human","document_id":document,"expected_revision":0,"commands":[{"op":"effect.add","layer":layer,"kind":"contour","settings":settings()}],"feedback":"always","max_edge":64})).unwrap();
     assert_eq!(result["images"][0]["document_rect"], json!([0, 0, 32, 24]));
     assert!(result["images"][0]["data"].as_str().unwrap().len() > 20);
     let mut engine = shared.lock().unwrap();
-    assert_eq!(engine.doc.layers[0].pixels.rgba16(), source);
+    assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(), source);
     engine
         .reserve(
             "assistant",
@@ -360,8 +360,8 @@ fn shared_custom_contour_feedback_and_reservations_preserve_human_native_work() 
             }],
         )
         .unwrap();
-    let before = serde_json::to_value(&engine.doc).unwrap();
-    let history = engine.undo.len();
+    let before = serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap();
+    let history = engine.resident_state().expect("resident fixture").undo.len();
     assert!(engine
         .edit(
             "human",
@@ -371,6 +371,6 @@ fn shared_custom_contour_feedback_and_reservations_preserve_human_native_work() 
             "Reserved contour"
         )
         .is_err());
-    assert_eq!(serde_json::to_value(&engine.doc).unwrap(), before);
-    assert_eq!(engine.undo.len(), history);
+    assert_eq!(serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap(), before);
+    assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), history);
 }

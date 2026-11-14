@@ -14,6 +14,10 @@ import threading
 import time
 
 
+UPDATE_OWNERS = ('MicrosoftStore', 'WindowsAppInstaller', 'WindowsPackage', 'LinuxPackage', 'NixPackage',
+                 'ScoopPackage', 'HomebrewPackage', 'Direct', 'Unknown')
+
+
 def installed_alias(path):
     """Read the actual APPEXECLINK tag; a copied EXE with this name is not an alias."""
     import ctypes
@@ -49,9 +53,10 @@ def validate_installation_observation(raw, *, platform, family=None, expected_ro
     if not 0 < len(raw) <= 16 * 1024:
         raise ValueError('Installation observation exceeds its byte bound')
     record = json.loads(raw, object_pairs_hook=unique)
-    if (not isinstance(record, dict) or set(record) != {'schema', 'format', 'platform', 'build', 'package',
+    if (not isinstance(record, dict) or set(record) - {'update_owner'} != {'schema', 'format', 'platform', 'build', 'package',
             'installed_acceptance', 'update_eligible'} or type(record['schema']) is not int or record['schema'] != 1
             or record['format'] != 'PeerBrushInstallationObservationV1' or record['platform'] != platform
+            or ('update_owner' in record and record['update_owner'] not in UPDATE_OWNERS)
             or record['installed_acceptance'] != 'not-established' or record['update_eligible'] is not False):
         raise ValueError('Installation observation cannot grant installed acceptance or update eligibility')
     build = record['build']
@@ -88,10 +93,16 @@ def validate_installation_observation(raw, *, platform, family=None, expected_ro
     return record
 
 
-def observe_installation(executable, *, family=None, expected_route=None):
+def require_linux_update_owner(raw, owner, build):
+    observation = validate_installation_observation(raw, platform='linux')
+    if observation.get('update_owner') != owner or observation['build'] != build:
+        raise ValueError(f'Installed Linux build or {owner} update ownership differs from the selection.')
+
+
+def observe_installation(executable, *, family=None, expected_route=None, env=None, run_as=()):
     try:
-        process = subprocess.Popen([str(executable), '--installation-info'], stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        process = subprocess.Popen([*run_as, str(executable), '--installation-info'], stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env)
     except OSError:
         raise ValueError('Cannot launch the selected installation observation') from None
     output = queue.Queue(maxsize=1)
@@ -170,7 +181,7 @@ def verify_live_bridge(process, lines, identifier):
         raise ValueError('Project listing did not return a live workspace')
 
 
-def smoke(executable, state_dir, allow_portable=False, expected_route=None):
+def smoke(executable, state_dir, allow_portable=False, expected_route=None, *, env=None, run_as=()):
     executable=executable.absolute()
     if not executable.exists():raise ValueError('Executable/alias is not present')
     if not allow_portable:
@@ -184,12 +195,12 @@ def smoke(executable, state_dir, allow_portable=False, expected_route=None):
     if not state_dir.is_absolute() or not (state_dir/'connection.json').is_file():
         raise ValueError('Pass the disposable state directory of an already running PeerBrush')
     observation = observe_installation(executable, family=None if allow_portable else executable.parent.name,
-                                      expected_route=expected_route)
+                                      expected_route=expected_route, env=env, run_as=run_as)
     processes=[]
     sessions=[]
     try:
         for index in range(2):
-            process=subprocess.Popen([str(executable),'mcp','--state-dir',str(state_dir)],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
+            process=subprocess.Popen([*run_as,str(executable),'mcp','--state-dir',str(state_dir)],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,env=env)
             processes.append(process)
             lines=queue.Queue()
             sessions.append((process,lines))

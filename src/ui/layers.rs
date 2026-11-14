@@ -4,6 +4,102 @@ use crate::engine::{
     Layer,
 };
 const TREE_INDENT: f32 = 22.0;
+
+fn sweep_hits_eye(from: Pos2, to: Pos2, eye: Rect) -> bool {
+    if !eye.is_positive() {
+        return false;
+    }
+    let mut enter: f32 = 0.;
+    let mut exit: f32 = 1.;
+    for (start, end, min, max) in [
+        (from.x, to.x, eye.left(), eye.right()),
+        (from.y, to.y, eye.top(), eye.bottom()),
+    ] {
+        let delta = end - start;
+        if delta == 0. {
+            if start < min || start > max {
+                return false;
+            }
+        } else {
+            let a = (min - start) / delta;
+            let b = (max - start) / delta;
+            enter = enter.max(a.min(b));
+            exit = exit.min(a.max(b));
+        }
+    }
+    enter <= exit
+}
+
+pub(super) fn label_color(label: &str) -> Option<Color32> {
+    let [r, g, b] = match label {
+        "red" => [232, 104, 105],
+        "orange" => [237, 143, 85],
+        "yellow" => [238, 196, 99],
+        "green" => [136, 192, 101],
+        "blue" => [107, 165, 222],
+        "violet" => [174, 136, 218],
+        "gray" => [164, 161, 172],
+        "seafoam" => [112, 201, 173],
+        "indigo" => [129, 139, 227],
+        "magenta" => [221, 116, 192],
+        "fuchsia" => [238, 123, 159],
+        _ => return None,
+    };
+    Some(Color32::from_rgb(r, g, b))
+}
+
+pub(super) const BLEND_ENDPOINTS: [&str; 4] = ["Black low", "Black high", "White low", "White high"];
+
+pub(super) fn blend_range(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    channel: usize,
+    values: &mut [u8; 4],
+    mut displayed: [f32; 4],
+) -> Option<egui::Response> {
+    let (outer, _) = ui.allocate_exact_size(Vec2::new(224., 88.), egui::Sense::hover());
+    let ramp = Rect::from_center_size(outer.center(), Vec2::new(outer.width() - 18., 12.));
+    let x = |value: f32| ramp.left() + value / 255. * ramp.width();
+    gradient_stops::paint_ramp(ui.painter(), ramp, |fraction| {
+        let n = (fraction * 255.).round() as u8;
+        match channel {
+            1 => Color32::from_rgb(n, 0, 0),
+            2 => Color32::from_rgb(0, n, 0),
+            3 => Color32::from_rgb(0, 0, n),
+            _ => Color32::from_gray(n),
+        }
+    });
+    let mut changed = None;
+    // Separate handle rows also work when multiple endpoints have the same value.
+    let rows = [ramp.top() - 10., ramp.bottom() + 10., ramp.top() - 28., ramp.bottom() + 28.];
+    for (index, (name, y)) in BLEND_ENDPOINTS.into_iter().zip(rows).enumerate() {
+        let label = format!("{name} · {}", displayed[index].round() as u8);
+        let center = egui::pos2(x(displayed[index]), y);
+        let (mut response, point) = controls::point_handle(ui, id.with(index), center, &label);
+        if let Some(point) = point.filter(|point| (point.x - center.x).abs() > 0.001) {
+            let low = index.checked_sub(1).map_or(0, |previous| values[previous]);
+            let high = values.get(index + 1).copied().unwrap_or(255);
+            let value = (((point.x - ramp.left()) / ramp.width() * 255.).round() as u8).clamp(low, high);
+            if value != values[index] {
+                values[index] = value;
+                displayed[index] = f32::from(value);
+                response.mark_changed();
+            }
+        }
+        let x = x(displayed[index]);
+        let center = egui::pos2(x, y);
+        let edge = if y < ramp.top() { ramp.top() } else { ramp.bottom() };
+        let stroke = if response.hovered() || response.dragged() { ACCENT } else { MUTED };
+        ui.painter().line_segment([center, egui::pos2(x, edge)], Stroke::new(1., stroke));
+        let color = if index < 2 { Color32::from_gray(24) } else { Color32::from_gray(238) };
+        ui.painter().circle(center, 4., color, Stroke::new(1.2, stroke));
+        if response.changed() {
+            changed = Some(response);
+        }
+    }
+    changed
+}
+
 #[derive(Default)]
 struct FolderSummary {
     direct: usize,
@@ -13,18 +109,15 @@ struct FolderSummary {
 
 struct TreeInfo<'a> {
     doc: DocumentView<'a>,
-    order: crate::tree::TreeOrder,
+    order: &'a crate::tree::TreeOrder,
     visibility: Option<(bool, HashSet<String>)>,
-    folders: HashMap<String, FolderSummary>,
-    paths: HashMap<String, String>,
+    ordinals: HashMap<&'a str, usize>,
+    folders: HashMap<&'a str, FolderSummary>,
 }
 impl<'a> TreeInfo<'a> {
-    fn new(doc: DocumentView<'a>, selected: &HashSet<String>) -> Self {
-        Self::ordered(doc, crate::tree::TreeOrder::original(doc), selected, None)
-    }
     fn ordered(
         doc: DocumentView<'a>,
-        order: crate::tree::TreeOrder,
+        order: &'a crate::tree::TreeOrder,
         selected: &HashSet<String>,
         visibility: Option<(bool, HashSet<String>)>,
     ) -> Self {
@@ -32,41 +125,32 @@ impl<'a> TreeInfo<'a> {
             doc,
             order,
             visibility,
+            ordinals: doc
+                .layers()
+                .enumerate()
+                .map(|(index, layer)| (layer.id(), index))
+                .collect(),
             folders: HashMap::new(),
-            paths: HashMap::new(),
         };
         for (index, layer) in doc.layers().enumerate() {
-            let mut names = vec![layer.name()];
             let mut parent = result.order.parent(index, layer);
+            let selected = usize::from(selected.contains(layer.id()));
             for depth in 0..16 {
-                let Some(ancestor) = parent.and_then(|id| doc.find_layer(id)) else {
+                let Some(&ordinal) = parent.and_then(|id| result.ordinals.get(id)) else {
                     break;
                 };
-                let summary = result.folders.entry(ancestor.id().to_owned()).or_default();
+                let ancestor = doc.layer(ordinal).unwrap();
+                let summary = result.folders.entry(ancestor.id()).or_default();
                 summary.direct += usize::from(depth == 0);
                 summary.descendants += 1;
-                summary.selected += usize::from(selected.contains(layer.id()));
-                names.push(ancestor.name());
-                let ordinal = doc
-                    .layers()
-                    .position(|candidate| candidate.id() == ancestor.id())
-                    .unwrap();
+                summary.selected += selected;
                 parent = result.order.parent(ordinal, ancestor);
             }
-            names.reverse();
-            result
-                .paths
-                .insert(layer.id().to_owned(), names.join(" / "));
         }
         result
     }
     fn parent(&self, layer: LayerView<'a>) -> Option<&str> {
-        let index = self
-            .doc
-            .layers()
-            .position(|candidate| candidate.id() == layer.id())
-            .unwrap();
-        self.order.parent(index, layer)
+        self.order.parent(*self.ordinals.get(layer.id())?, layer)
     }
     fn visible(&self, layer: LayerView<'a>) -> bool {
         self.visibility
@@ -75,11 +159,15 @@ impl<'a> TreeInfo<'a> {
             .map(|(visible, _)| *visible)
             .unwrap_or(layer.visible())
     }
-    fn path(&self, id: &str) -> &str {
-        self.paths.get(id).map(String::as_str).unwrap_or("")
+    fn path(&self, id: &str) -> String {
+        folder_path(id, |id| {
+            let &index = self.ordinals.get(id)?;
+            let ancestor = self.doc.layer(index).unwrap();
+            Some((ancestor.name(), self.order.parent(index, ancestor)))
+        })
     }
     fn tooltip(&self, layer: LayerView<'a>) -> String {
-        let mut text = self.path(layer.id()).to_owned();
+        let mut text = self.path(layer.id());
         if layer.kind() == "group" {
             let empty = FolderSummary::default();
             let summary = self.folders.get(layer.id()).unwrap_or(&empty);
@@ -94,6 +182,25 @@ impl<'a> TreeInfo<'a> {
         text
     }
 }
+
+fn folder_path<'a>(id: &str, lookup: impl Fn(&str) -> Option<(&'a str, Option<&'a str>)>) -> String {
+    let mut names = Vec::new();
+    let mut current = Some(id);
+    for _ in 0..=16 {
+        let Some((name, parent)) = current.and_then(&lookup) else { break };
+        names.push(name);
+        current = parent;
+    }
+    names.reverse();
+    names.join(" / ")
+}
+fn layer_hover(response: egui::Response, text: impl FnOnce() -> String) -> egui::Response {
+    response.on_hover_ui(|ui| {
+        ui.set_max_width(ui.spacing().tooltip_width);
+        ui.add(egui::Label::new(text()));
+    })
+}
+
 struct TreeAnchor {
     disclosure: Rect,
     ai: bool,
@@ -102,18 +209,21 @@ struct TreeAnchor {
 fn paint_tree_guides(
     painter: &egui::Painter,
     tree: &TreeInfo<'_>,
-    anchors: &HashMap<String, TreeAnchor>,
+    anchors: &HashMap<&str, TreeAnchor>,
 ) {
+    let mut visible_children = HashMap::<&str, Vec<_>>::new();
+    for (index, layer) in tree.doc.layers().enumerate() {
+        if let Some((parent, anchor)) = tree.order.parent(index, layer).zip(anchors.get(layer.id())) {
+            if anchors.contains_key(parent) {
+                visible_children.entry(parent).or_default().push((layer, anchor));
+            }
+        }
+    }
     for parent in tree.doc.layers().filter(|l| l.kind() == "group") {
-        let Some(root) = anchors.get(parent.id()) else {
+        let Some((root, children)) = anchors.get(parent.id()).zip(visible_children.get(parent.id()))
+        else {
             continue;
         };
-        let children: Vec<_> = tree
-            .doc
-            .layers()
-            .filter(|l| tree.parent(*l) == Some(parent.id()))
-            .filter_map(|l| anchors.get(l.id()).map(|anchor| (l, anchor)))
-            .collect();
         let x = root.disclosure.center().x;
         let start = root.disclosure.bottom();
         let end = children
@@ -131,7 +241,7 @@ fn paint_tree_guides(
                 Stroke::new(1., color.gamma_multiply(root.opacity)),
             );
         }
-        for (layer, child) in children {
+        for &(layer, child) in children {
             let y = child.disclosure.center().y;
             let end = if layer.kind() == "group" {
                 child.disclosure.left() - 2.
@@ -169,25 +279,91 @@ fn click_modifiers(ui: &egui::Ui) -> egui::Modifiers {
 fn rows(
     doc: DocumentView<'_>,
     order: &crate::tree::TreeOrder,
+    collapsed: &HashSet<String>,
+) -> Vec<(usize, usize)> {
+    let mut children = HashMap::<Option<&str>, Vec<usize>>::new();
+    for &index in order.indices() {
+        let layer = doc.layer(index).unwrap();
+        children.entry(order.parent(index, layer)).or_default().push(index);
+    }
+    let mut visible = Vec::with_capacity(order.indices().len());
+    append_rows(doc, &children, None, 0, collapsed, &mut visible);
+    visible
+}
+
+fn append_rows(
+    doc: DocumentView<'_>,
+    children: &HashMap<Option<&str>, Vec<usize>>,
     parent: Option<&str>,
     depth: usize,
     collapsed: &HashSet<String>,
     out: &mut Vec<(usize, usize)>,
 ) {
-    if depth > 16 {
-        return;
-    }
-    for &index in order.indices() {
+    for &index in children.get(&parent).into_iter().flatten() {
         let layer = doc.layer(index).unwrap();
-        if order.parent(index, layer) != parent {
-            continue;
-        }
         out.push((index, depth));
-        if layer.kind() == "group" && !collapsed.contains(layer.id()) {
-            rows(doc, order, Some(layer.id()), depth + 1, collapsed, out);
+        if depth < 16 && layer.kind() == "group" && !collapsed.contains(layer.id()) {
+            append_rows(doc, children, Some(layer.id()), depth + 1, collapsed, out);
         }
     }
 }
+
+pub(super) struct LayerDropPlan {
+    parent: Option<String>,
+    before: Option<String>,
+    order: crate::tree::TreeOrder,
+    hint: String,
+}
+
+impl LayerDrag {
+    fn plan_drop(
+        &mut self,
+        doc: DocumentView<'_>,
+        parent: Option<&str>,
+        before: Option<&str>,
+    ) -> Result<Arc<LayerDropPlan>, String> {
+        if let Some(plan) = self.drop_plan.as_ref().filter(|plan| {
+            plan.parent.as_deref() == parent && plan.before.as_deref() == before
+        }) {
+            return Ok(plan.clone());
+        }
+        self.drop_plan = None;
+        self.commands.clear();
+        let (order, commands) = crate::tree::reparent_view(doc, &self.ids, parent, before)?;
+        let destination = parent.map_or_else(
+            || "Top level".to_owned(),
+            |id| folder_path(id, |id| doc.find_layer(id).map(|layer| (layer.name(), layer.parent()))),
+        );
+        let hint = if let Some(id) = before {
+            let name = doc.find_layer(id).map_or("", |layer| layer.name());
+            format!("{destination} · before {name}")
+        } else {
+            format!("{destination} · at end")
+        };
+        self.target = order
+            .indices()
+            .iter()
+            .position(|&index| doc.layer(index).unwrap().id() == self.id)
+            .unwrap_or(0);
+        self.commands = commands;
+        let plan = Arc::new(LayerDropPlan {
+            parent: parent.map(str::to_owned),
+            before: before.map(str::to_owned),
+            order,
+            hint,
+        });
+        self.drop_plan = Some(plan.clone());
+        Ok(plan)
+    }
+}
+
+pub(super) fn layer_gesture_interrupted(ctx: &egui::Context) -> bool {
+    PeerBrush::pointer_contact_cancelled(ctx) || ctx.input(|input| {
+        !input.focused || input.viewport().close_requested() || input.key_pressed(egui::Key::Escape)
+            || input.events.iter().any(|event| matches!(event, egui::Event::WindowFocused(false)))
+    })
+}
+
 impl PeerBrush {
     pub(super) fn set_solo(&mut self, active: bool) {
         self.isolate = active;
@@ -212,6 +388,7 @@ impl PeerBrush {
     }
     pub(super) fn select_channel(&mut self, mask: bool) {
         if self.mask != mask {
+            self.duplicate_repeat = None;
             self.set_solo(false);
             self.mask_step = None;
             self.last_preview = None;
@@ -239,8 +416,15 @@ impl PeerBrush {
         }
     }
     pub(super) fn begin_rename<'a>(&mut self, _doc: impl Into<DocumentView<'a>>, id: &str) {
+        if self.edit_worker.pending() {
+            self.message = "An edit is still being applied; wait for its result".into();
+            return;
+        }
         if self.rename_edit.is_some() {
             self.finish_rename();
+            if self.rename_edit.is_some() || self.edit_worker.pending() {
+                return;
+            }
         }
         let (document, revision, name) = {
             let e = self.shared.lock().unwrap();
@@ -267,6 +451,10 @@ impl PeerBrush {
         });
     }
     pub(super) fn finish_rename(&mut self) {
+        if self.edit_worker.pending() {
+            self.message = "An edit is still being applied; rename draft preserved".into();
+            return;
+        }
         let Some(edit) = self.rename_edit.take() else {
             return;
         };
@@ -277,25 +465,12 @@ impl PeerBrush {
             self.message = "Layer names need text".into();
             return;
         }
-        let result = {
-            let mut e = self.shared.lock().unwrap();
-            if e.doc.id != edit.document {
-                Err("The document changed while renaming".into())
-            } else {
-                e.edit(
-                    "human",
-                    &[json!({"op":"layer.update","layer":edit.layer,"name":edit.text})],
-                    Some(edit.revision),
-                    None,
-                    "Rename layer",
-                )
-            }
-        };
-        self.message = result
-            .map(|_| "Renamed layer".into())
-            .unwrap_or_else(|e| e)
-            .into();
-        self.last_preview = None;
+        self.apply_action(
+            vec![json!({"op":"layer.update","layer":edit.layer,"name":edit.text})],
+            "Rename layer",
+            Some((&edit.document, edit.revision)),
+            edit_job::Origin::Action,
+        );
     }
     fn inline_rename(&mut self, ui: &mut egui::Ui, width: f32) {
         let mut commit = false;
@@ -344,6 +519,7 @@ impl PeerBrush {
     }
     fn select_target(&mut self, id: &str, mask: bool) {
         if self.selected != id || self.mask != mask {
+            self.duplicate_repeat = None;
             self.set_solo(false);
         }
         self.liquify_effect = None;
@@ -351,6 +527,7 @@ impl PeerBrush {
         self.selection_layers = [id.to_string()].into_iter().collect();
         self.selection_anchor = id.into();
         self.mask = mask;
+        self.clear_duplicate_if_selection_changed();
         self.mask_step = None;
         self.last_preview = None;
     }
@@ -366,8 +543,7 @@ impl PeerBrush {
         let mods = click_modifiers(ui);
         let command = mods.command || mods.ctrl;
         if mods.shift {
-            let mut visible = vec![];
-            rows(doc, order, None, 0, &self.collapsed, &mut visible);
+            let visible = rows(doc, order, &self.collapsed);
             let a = visible
                 .iter()
                 .position(|&(i, _)| doc.layer(i).unwrap().id() == self.selection_anchor);
@@ -405,10 +581,11 @@ impl PeerBrush {
         } else {
             self.select_content(id);
         }
-        if previous != (self.selected.clone(), false) {
+        if previous.0 != self.selected || previous.1 {
             self.set_solo(false);
         }
         self.mask = false;
+        self.clear_duplicate_if_selection_changed();
         self.mask_step = None;
         self.last_preview = None;
     }
@@ -446,44 +623,68 @@ impl PeerBrush {
         ui: &mut egui::Ui,
         l: LayerView<'_>,
         indent: f32,
+        show_details: bool,
         thumb: Option<&TextureHandle>,
         mask_thumb: Option<&TextureHandle>,
         tree: &TreeInfo<'_>,
+        reserved: bool,
     ) -> Rect {
         let doc = tree.doc;
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 5.0;
-            let (grip, _) = ui.allocate_exact_size(Vec2::new(6.0, 28.0), egui::Sense::hover());
-            for x in 0..2 {
-                for y in 0..3 {
-                    ui.painter().circle_filled(
-                        grip.center() + Vec2::new((x as f32 - 0.5) * 3.0, (y as f32 - 1.0) * 4.0),
-                        0.8,
-                        MUTED.gamma_multiply(0.5),
-                    );
+            let (grip, grip_response) = ui.allocate_exact_size(Vec2::new(6.0, 28.0), egui::Sense::hover());
+            if show_details {
+                let label = l.color_label();
+                if let Some(color) = label_color(label) {
+                    ui.painter().circle_filled(grip.center() - Vec2::new(0., 10.), 2.5, color);
+                    grip_response.on_hover_text(format!("Layer color label · {label}"));
+                }
+                for x in 0..2 {
+                    for y in 0..3 {
+                        ui.painter().circle_filled(
+                            grip.center() + Vec2::new((x as f32 - 0.5) * 3.0, (y as f32 - 1.0) * 4.0),
+                            0.8,
+                            MUTED.gamma_multiply(0.5),
+                        );
+                    }
                 }
             }
-            let eye = eye_button(ui, tree.visible(l));
+            let visible = tree.visible(l);
+            let eye = eye_button(ui, visible);
+            if !show_details && eye.gained_focus() {
+                eye.scroll_to_me(None);
+            }
             self.eye_rects.insert(l.id().to_owned(), eye.rect);
-            if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
-                if eye.rect.contains(pos) && ui.clip_rect().contains(pos) {
-                    if ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary)) {
-                        if !self.selection_layers.contains(l.id()) {
-                            self.select_content(l.id());
-                        }
-                        self.eye_sweep = Some(EyeSweep {
-                            gesture: crate::engine::id(),
-                            previous: pos,
-                            revision: doc.revision(),
-                            visible: !tree.visible(l),
-                            ids: [l.id().to_owned()].into_iter().collect(),
-                        });
-                        self.layer_drag = None;
-                    } else if ui.input(|i| i.pointer.primary_down()) {
-                        if let Some(sweep) = &mut self.eye_sweep {
-                            sweep.ids.insert(l.id().to_owned());
-                        }
+            if eye.clicked() && !eye.clicked_by(egui::PointerButton::Primary)
+                && self.eye_sweep.is_none() && self.layer_drag.is_none()
+            {
+                if !self.selection_layers.contains(l.id()) {
+                    self.select_content(l.id());
+                }
+                self.apply_action(
+                    vec![json!({"op":"layer.update","layer":l.id(),"visible":!visible})],
+                    "Toggle layer visibility",
+                    Some((doc.id(), doc.revision())),
+                    edit_job::Origin::Action,
+                );
+            }
+            if self.eye_sweep.is_none() && self.layer_drag.is_none() && eye.enabled()
+                && ui.input(|i| i.pointer.primary_pressed()) && !layer_gesture_interrupted(ui.ctx())
+            {
+                let (press, _) = ui.input(|input| canvas_contact(input, false));
+                if let Some((pos, _)) = press.filter(|&(pos, _)| canvas_press_hits(ui, &eye, pos)) {
+                    if !self.selection_layers.contains(l.id()) {
+                        self.select_content(l.id());
                     }
+                    self.eye_sweep = Some(EyeSweep {
+                        gesture: crate::engine::id(),
+                        document: doc.id().to_owned(),
+                        previous: pos,
+                        native: doc.native().map(|doc| doc.key()),
+                        revision: doc.revision(),
+                        visible: !visible,
+                        ids: [l.id().to_owned()].into_iter().collect(),
+                    });
                 }
             }
             ui.add_space(indent);
@@ -501,6 +702,9 @@ impl PeerBrush {
                         "Collapse folder"
                     },
                 );
+                if !show_details && response.gained_focus() {
+                    response.scroll_to_me(None);
+                }
                 if response.clicked() {
                     if !self.collapsed.remove(l.id()) {
                         self.collapsed.insert(l.id().to_owned());
@@ -511,11 +715,16 @@ impl PeerBrush {
                 ui.allocate_exact_size(Vec2::new(20.0, 24.0), egui::Sense::hover())
                     .0
             };
+            // Keep row navigation, folder guides and visibility geometry during scroll.
+            // Names, thumbnails and mask controls are needed only in the viewport.
+            if !show_details {
+                return disclosure;
+            }
             if l.kind() == "group" {
                 let (r, response) = ui.allocate_exact_size(Vec2::splat(30.0), egui::Sense::click());
                 icons::paint(ui.painter(), r, Icon::Folder, true);
                 if response.clicked() {
-                    self.select_row(ui, doc, &tree.order, l.id());
+                    self.select_row(ui, doc, tree.order, l.id());
                 }
             } else if l.kind() == "adjustment" {
                 let (r, response) = ui.allocate_exact_size(Vec2::splat(30.), egui::Sense::click());
@@ -538,7 +747,6 @@ impl PeerBrush {
                 ui.label(RichText::new("↳").color(MUTED))
                     .on_hover_text("Clipped to the base below");
             }
-            let reserved = self.ai_reserved(l.id());
             if reserved {
                 ui.label(RichText::new("AI").size(10.).color(AI_BLUE))
                     .on_hover_text(
@@ -601,8 +809,8 @@ impl PeerBrush {
                     } else {
                         MUTED
                     },
-                )
-                .on_hover_text(tree.tooltip(l));
+                );
+                let name = layer_hover(name, || tree.tooltip(l));
                 if name.clicked() {
                     self.select_row(ui, doc, &tree.order, l.id());
                     let time = ui.input(|i| i.time);
@@ -645,15 +853,14 @@ impl PeerBrush {
                                 egui::Sense::hover()
                             },
                         ),
-                    )
-                    .on_hover_text(if hidden_selection {
-                        format!(
-                            "{}\nClick to reveal selected layers without changing selection",
-                            tree.tooltip(l)
-                        )
-                    } else {
-                        tree.tooltip(l)
-                    });
+                    );
+                let response = layer_hover(response, || {
+                    let mut text = tree.tooltip(l);
+                    if hidden_selection {
+                        text.push_str("\nClick to reveal selected layers without changing selection");
+                    }
+                    text
+                });
                 if response.clicked() {
                     self.collapsed.remove(l.id());
                     for child in doc
@@ -679,7 +886,7 @@ impl PeerBrush {
                 }
             }
             if l.mask().is_some() {
-                self.mask_link_button(ui, doc, l);
+                self.mask_link_button(ui, doc, l, reserved);
                 if self
                     .thumb_button(
                         ui,
@@ -717,6 +924,7 @@ impl PeerBrush {
         ui: &mut egui::Ui,
         doc: impl Into<DocumentView<'a>>,
         layer: impl Into<LayerView<'a>>,
+        reserved: bool,
     ) -> egui::Response {
         let doc = doc.into();
         let layer = layer.into();
@@ -728,20 +936,20 @@ impl PeerBrush {
         };
         let response = ui
             .add_enabled_ui(
-                !doc.read_only() && !self.busy && !layer.locked() && !self.ai_reserved(layer.id()),
+                !doc.read_only() && !self.busy && !layer.locked() && !reserved,
                 |ui| icons::small_button(ui, Icon::Connect, tip),
             )
             .inner;
         if response.clicked() {
             self.edit(vec![json!({"op":"mask.link","layer":layer.id(),"linked":!linked,"document_id":doc.id(),"source_revision":doc.revision()})], if linked { "Unlink mask" } else { "Link mask" });
-            let engine = self.shared.lock().unwrap();
-            if let Some(mask) = crate::engine::view::current(&engine)
-                .find_layer(layer.id())
-                .and_then(|current| current.mask())
-            {
-                linked = mask.linked();
+            if let Ok(engine) = self.shared.try_lock() {
+                let current = crate::engine::view::current(&engine);
+                if current.id() == doc.id() {
+                    if let Some(mask) = current.find_layer(layer.id()).and_then(|layer| layer.mask()) {
+                        linked = mask.linked();
+                    }
+                }
             }
-            drop(engine);
             ui.ctx().request_repaint();
         }
         if !linked {
@@ -771,13 +979,18 @@ impl PeerBrush {
         });
         response
     }
-    pub(super) fn layer_list(&mut self, ui: &mut egui::Ui, doc: &Document) {
-        let view = DocumentView::Resident(doc);
-        let original_order = crate::tree::TreeOrder::original(view);
+    pub(super) fn layer_list<'a>(
+        &mut self,
+        ui: &mut egui::Ui,
+        doc: impl Into<DocumentView<'a>>,
+        reserved: &HashSet<&str>,
+    ) {
+        let doc = doc.into();
+        let view = doc;
         let mut context_menu = self
             .layer_context
             .take()
-            .filter(|(document, _)| document == &doc.id)
+            .filter(|(document, _)| document == &doc.id())
             .map(|(_, menu)| menu)
             .unwrap_or_default();
         if let Some(root) = context_menu.as_ref() {
@@ -797,46 +1010,49 @@ impl PeerBrush {
         if self
             .layer_drag
             .as_ref()
-            .is_some_and(|d| d.revision != doc.revision)
+            .is_some_and(|d| d.document != doc.id() || d.revision != doc.revision() || d.native != doc.native().map(|doc| doc.key()))
             || self
                 .eye_sweep
                 .as_ref()
-                .is_some_and(|s| s.revision != doc.revision)
+                .is_some_and(|s| s.document != doc.id() || s.revision != doc.revision() || s.native != doc.native().map(|doc| doc.key()))
         {
             self.layer_drag = None;
             self.eye_sweep = None;
             self.message = "Layer gesture cancelled: document changed".into();
         }
-        if let (Some(sweep), Some(pointer)) =
-            (&mut self.eye_sweep, ui.input(|i| i.pointer.interact_pos()))
-        {
-            if ui.input(|i| i.pointer.primary_down()) {
-                let segment = Rect::from_two_pos(sweep.previous, pointer).expand(1.0);
-                for (id, rect) in &self.eye_rects {
-                    if rect.intersects(segment) {
-                        sweep.ids.insert(id.clone());
-                    }
-                }
-                sweep.previous = pointer;
-            }
-        }
+        let held = self.layer_drag.is_some() || self.eye_sweep.is_some();
+        let (release_point, sweep_points) = ui.input(|input| {
+            let (start, release) = canvas_contact_range(input, held);
+            let release_point = release.and_then(|index| primary_button_sample(&input.events[index]))
+                .map(|(_, point, _)| point);
+            let end = release.map_or(input.events.len(), |index| index + 1);
+            let points = if self.eye_sweep.is_some() || !held && input.pointer.primary_pressed() {
+                input.events[start..end].iter().filter_map(|event| match event {
+                    egui::Event::PointerMoved(point) => Some(*point),
+                    _ => primary_button_sample(event).filter(|(pressed, _, _)| !pressed)
+                        .map(|(_, point, _)| point),
+                }).collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            (release_point, points)
+        });
         self.layer_rects.clear();
         self.eye_rects.clear();
         let reserve = (ui.available_height() * 0.58).clamp(280.0, 480.0);
         let height = (ui.available_height() - reserve).max(46.0);
         egui::ScrollArea::vertical().max_height(height).auto_shrink([false,true]).show(ui,|ui| {
-            let mut original=vec![];rows(view,&original_order,None,0,&self.collapsed,&mut original);
             let base=ui.cursor().min;let width=ui.available_width();
-            let pointer=ui.input(|i|i.pointer.interact_pos());
-            let mut preview=crate::tree::TreeOrder::original(view);let mut open=self.collapsed.clone();let mut drop_folder=None;
-            let mut drop_hint=None;
+            let pointer=release_point.or_else(|| ui.input(|i|i.pointer.interact_pos()));
+            let mut preview=None;let mut open=std::borrow::Cow::Borrowed(&self.collapsed);let mut drop_folder=None;
             if let (Some(drag),Some(pointer))=(&mut self.layer_drag,pointer) {
+                let original=rows(view,&crate::tree::TreeOrder::original(view),&self.collapsed);
                 let slot=((pointer.y-base.y)/46.0).floor().max(0.0) as usize;
                 let target=original.get(slot).map(|&(i,depth)|(view.layer(i).unwrap(),depth));
                 let (parent,before)=if let Some((target,depth))=target {
                     let y=pointer.y-(base.y+slot as f32*46.0);
                     if target.kind()=="group" && (10.0..32.0).contains(&y) && !drag.ids.iter().any(|id|id==target.id()) {
-                        drop_folder=Some(target.id().to_owned());open.remove(target.id());
+                        drop_folder=Some(target.id().to_owned());open.to_mut().remove(target.id());
                         (Some(target.id()),view.layers().find(|l|l.parent()==Some(target.id())&&!drag.ids.iter().any(|id|id==l.id())).map(|l|l.id()))
                     } else {
                         let parent=if depth>0 && pointer.x<base.x+45.0 {None}else{target.parent()};
@@ -846,67 +1062,88 @@ impl PeerBrush {
                         (parent,before)
                     }
                 } else {(None,None)};
-                match crate::tree::reparent_view(view,&drag.ids,parent,before) {
-                    Ok((p,commands))=>{
-                        let info=TreeInfo::new(view,&self.selection_layers);
-                        let destination=parent.map(|id|info.path(id)).unwrap_or("Top level");
-                        drop_hint=Some(if let Some(id)=before {
-                            let name=view.layers().find(|l|l.id()==id).map(|l|l.name()).unwrap_or("");
-                            format!("{} · before {}",destination,name)
-                        } else {format!("{} · at end",destination)});
-                        drag.target=p.indices().iter().position(|&i|view.layer(i).unwrap().id()==drag.id).unwrap_or(0);drag.commands=commands;preview=p;
-                    }
-                    Err(e)=>{drag.commands.clear();self.message=e.into();}
+                match drag.plan_drop(view,parent,before) {
+                    Ok(plan)=>preview=Some(plan),
+                    Err(e)=>self.message=e.into(),
                 }
             }
             let visibility=self.eye_sweep.as_ref().map(|sweep|(sweep.visible,sweep.ids.clone()));
-            let tree=TreeInfo::ordered(view,preview,&self.selection_layers,visibility);
-            let mut ordered=vec![];rows(view,&tree.order,None,0,&open,&mut ordered);
+            let original;
+            let order=if let Some(plan)=&preview {&plan.order}else{
+                original=crate::tree::TreeOrder::original(view);
+                &original
+            };
+            let tree=TreeInfo::ordered(view,order,&self.selection_layers,visibility);
+            let ordered=rows(view,tree.order,&open);
             let mut floating=None;
             let mut anchors=HashMap::new();
+            let time=ui.input(|i| i.time);
             for (slot,(index,depth)) in ordered.iter().copied().enumerate() {
                 let l=view.layer(index).unwrap();let target=slot as f32*46.0;
-                let time=ui.input(|i| i.time);
-                let ai=self.ai_layer(l.id(),time);
+                let locked_by_ai=reserved.contains(l.id());
+                let ai=locked_by_ai || self.animation.layer(l.id(),time);
                 let duration=if ai {0.36}else{0.12};
-                let offset=ui.ctx().animate_value_with_time(ui.id().with((&doc.id,l.id(),"position")),target,duration);
-                let indent=ui.ctx().animate_value_with_time(ui.id().with((&doc.id,l.id(),"indent")),depth as f32*TREE_INDENT,duration);
+                let offset=ui.ctx().animate_value_with_time(ui.id().with((&doc.id(),l.id(),"position")),target,duration);
+                let indent=ui.ctx().animate_value_with_time(ui.id().with((&doc.id(),l.id(),"indent")),depth as f32*TREE_INDENT,duration);
                 let arrival=self.animation.arrival(l.id(),time);
                 let solo_opacity = self.solo_row_opacity(l.id());
                 let row_opacity = arrival * solo_opacity;
                 let rect=Rect::from_min_size(base+Vec2::new((1.0-arrival)*14.0,offset),Vec2::new(width,42.0));
                 self.layer_rects.insert(l.id().to_owned(),rect);
                 let held=self.layer_drag.as_ref().is_some_and(|d|d.ids.iter().any(|id|id==l.id()));
-                let response=ui.interact(rect,ui.id().with((&doc.id,l.id(),"row")),egui::Sense::click_and_drag());
-                if response.drag_started() && self.eye_sweep.is_none() && !self.rename_edit.as_ref().is_some_and(|edit| edit.layer == l.id()) {
+                let response=ui.interact(rect,ui.id().with((&doc.id(),l.id(),"row")),egui::Sense::click_and_drag());
+                let visible = ui.is_rect_visible(rect);
+                if !visible && response.gained_focus() {
+                    response.scroll_to_me(None);
+                }
+                if response.drag_started() && self.eye_sweep.is_none()
+                    && !layer_gesture_interrupted(ui.ctx())
+                    && !self.rename_edit.as_ref().is_some_and(|edit| edit.layer == l.id())
+                {
                     if !self.selection_layers.contains(l.id()) {self.select_content(l.id());}
                     let start=ui.input(|i|i.pointer.press_origin()).unwrap_or(rect.center());
-                    self.layer_drag=Some(LayerDrag {gesture:crate::engine::id(),id:l.id().to_owned(),revision:doc.revision,offset:start.y-rect.top(),target:index,ids:crate::tree::roots_view(view,&self.selection_layers),commands:vec![]});
+                    self.layer_drag=Some(LayerDrag {gesture:crate::engine::id(),document:doc.id().to_owned(),id:l.id().to_owned(),revision:doc.revision(),native:doc.native().map(|doc|doc.key()),offset:start.y-rect.top(),target:index,ids:crate::tree::roots_view(view,&self.selection_layers),commands:vec![],drop_plan:None});
                 }
-                if response.clicked(){self.select_row(ui,view,&original_order,l.id());}
-                let thumb=if l.kind()=="group"{None}else{self.thumbnail(ui,doc,l.id(),false)};
-                let mask_thumb=if l.mask().is_some(){self.thumbnail(ui,doc,l.id(),true)}else{None};
+                if response.clicked(){self.select_row(ui,view,&crate::tree::TreeOrder::original(view),l.id());}
+                response.widget_info(|| egui::WidgetInfo::selected(
+                    egui::WidgetType::Button, response.enabled(), self.selection_layers.contains(l.id()), l.name(),
+                ));
+                let floating_row = held && self.layer_drag.as_ref().is_some_and(|drag| drag.id == l.id());
+                let thumb = if l.kind() != "group" && (visible || floating_row) {
+                    self.thumbnail(ui, doc, l.id(), false)
+                } else {
+                    None
+                };
+                let mask_thumb = if visible && !held && l.mask().is_some() {
+                    self.thumbnail(ui, doc, l.id(), true)
+                } else {
+                    None
+                };
                 if held {
                     let gap=Rect::from_min_size(base+Vec2::new(0.0,target),Vec2::new(width,42.0));
                     ui.painter().line_segment([gap.left_top(),gap.right_top()],Stroke::new(2.0_f32,ACCENT));
                     if self.layer_drag.as_ref().is_some_and(|d|d.id==l.id()){floating=Some((l,thumb,depth));}
                 } else {
-                    let selected=self.selection_layers.contains(l.id());
-                    let hover=ui.ctx().animate_bool_with_time(response.id.with("hover"),response.hovered(),0.08);
-                    if selected {ui.painter().rect_filled(rect,5,Color32::from_rgb(74,48,71).gamma_multiply(solo_opacity));
-                        ui.painter().rect_filled(Rect::from_min_size(rect.min+Vec2::new(0.0,5.0),Vec2::new(2.0,32.0)),1,ACCENT.gamma_multiply(solo_opacity));}
-                    else if hover>0.0 {ui.painter().rect_filled(rect,5,Color32::WHITE.gamma_multiply(0.035*hover*solo_opacity));}
-                    if ai {
-                        let pulse=0.065+0.02*(time as f32*4.0).sin();
-                        ui.painter().rect_filled(rect,5,AI_BLUE.gamma_multiply(pulse*solo_opacity));
-                        ui.painter().rect_filled(Rect::from_min_size(rect.min+Vec2::new(0.0,4.0),Vec2::new(2.0,34.0)),1,AI_BLUE.gamma_multiply(solo_opacity));
+                    if visible {
+                        let selected=self.selection_layers.contains(l.id());
+                        let hover=ui.ctx().animate_bool_with_time(response.id.with("hover"),response.hovered(),0.08);
+                        if selected {ui.painter().rect_filled(rect,5,Color32::from_rgb(74,48,71).gamma_multiply(solo_opacity));
+                            ui.painter().rect_filled(Rect::from_min_size(rect.min+Vec2::new(0.0,5.0),Vec2::new(2.0,32.0)),1,ACCENT.gamma_multiply(solo_opacity));}
+                        else if hover>0.0 {ui.painter().rect_filled(rect,5,Color32::WHITE.gamma_multiply(0.035*hover*solo_opacity));}
+                        if ai {
+                            let pulse=0.065+0.02*(time as f32*4.0).sin();
+                            ui.painter().rect_filled(rect,5,AI_BLUE.gamma_multiply(pulse*solo_opacity));
+                            ui.painter().rect_filled(Rect::from_min_size(rect.min+Vec2::new(0.0,4.0),Vec2::new(2.0,34.0)),1,AI_BLUE.gamma_multiply(solo_opacity));
+                        }
+                        if drop_folder.as_deref()==Some(l.id()){ui.painter().rect_stroke(rect,4,Stroke::new(1.0_f32,ACCENT),egui::StrokeKind::Inside);}
+                        icons::paint_focus(ui, &response);
                     }
-                    if drop_folder.as_deref()==Some(l.id()){ui.painter().rect_stroke(rect,4,Stroke::new(1.0_f32,ACCENT),egui::StrokeKind::Inside);}
+                    let editing = self.rename_edit.as_ref().is_some_and(|edit| edit.layer == l.id());
                     let disclosure=ui.scope_builder(egui::UiBuilder::new().id_salt(l.id()).max_rect(rect.shrink2(Vec2::new(4.0,4.0))),|ui| {
                         ui.set_opacity(row_opacity);
-                        self.layer_contents(ui,l,indent,thumb.as_ref(),mask_thumb.as_ref(),&tree)
+                        self.layer_contents(ui,l,indent,visible || editing,thumb.as_ref(),mask_thumb.as_ref(),&tree,locked_by_ai)
                     }).inner;
-                    anchors.insert(l.id().to_owned(),TreeAnchor {disclosure,ai,opacity:row_opacity});
+                    anchors.insert(l.id(),TreeAnchor {disclosure,ai,opacity:row_opacity});
                 }
                 // Child controls own their primary interactions. Test the clipped row
                 // directly for secondary clicks, including over those controls.
@@ -918,8 +1155,10 @@ impl PeerBrush {
                     }
                 }
                 context_visible |= context_menu.as_ref().is_some_and(|root|root.id==response.id);
-                let response=response.on_hover_text(format!("{}\nClick to select · Ctrl/Cmd or Shift for multiple · Drag into folders · Drag left to move out · Right-click anywhere for options",tree.tooltip(l)));
-                context_menu.show(&response,|ui|self.layer_menu(ui,doc,&doc.layers[index]));
+                let response=if visible {
+                    layer_hover(response,||format!("{}\nClick to select · Ctrl/Cmd or Shift for multiple · Drag into folders · Drag left to move out · Right-click anywhere for options",tree.tooltip(l)))
+                } else { response };
+                context_menu.show(&response,|ui|self.layer_menu(ui,doc,l,locked_by_ai));
             }
             paint_tree_guides(ui.painter(),&tree,&anchors);
             if let (Some((layer,thumb,depth)),Some(pointer),Some(drag))=(floating,pointer,&self.layer_drag) {
@@ -934,31 +1173,47 @@ impl PeerBrush {
                 else if let Some(t)=thumb {painter.image(t.id(),image_rect,Rect::from_min_max(Pos2::ZERO,Pos2::new(1.0,1.0)),Color32::WHITE);}
                 let label=if drag.ids.len()>1 {format!("{}  +{}",layer.name(),drag.ids.len()-1)}else{layer.name().to_owned()};
                 painter.text(egui::pos2(x+38.0,rect.center().y),egui::Align2::LEFT_CENTER,label,egui::FontId::proportional(12.0),Color32::WHITE);
-                if let Some(hint)=drop_hint {
-                    let galley=painter.layout_no_wrap(hint,egui::FontId::proportional(11.0),ACCENT);
+                if let Some(plan)=&preview {
+                    let galley=painter.layout_no_wrap(plan.hint.clone(),egui::FontId::proportional(11.0),ACCENT);
                     let at=egui::pos2(rect.left()+8.,rect.bottom()+4.);
                     painter.with_clip_rect(Rect::from_min_size(at,Vec2::new(width-16.,20.))).galley(at,galley,ACCENT);
                 }
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
             }
-            if ui.input(|i|i.pointer.button_released(egui::PointerButton::Primary)) {
+            if let Some(sweep) = &mut self.eye_sweep {
+                let clip = ui.clip_rect();
+                let previous_count = sweep.ids.len();
+                for point in sweep_points {
+                    for (id, rect) in &self.eye_rects {
+                        if !sweep.ids.contains(id)
+                            && rect.intersect(clip).is_positive()
+                            && sweep_hits_eye(sweep.previous, point, rect.expand(1.).intersect(clip))
+                        {
+                            sweep.ids.insert(id.clone());
+                        }
+                    }
+                    sweep.previous = point;
+                }
+                if sweep.ids.len() != previous_count {
+                    ui.ctx().request_repaint();
+                }
+            }
+            if release_point.is_some() {
                 if let Some(drag)=self.layer_drag.take() {
                     if pointer.is_some_and(|p|ui.clip_rect().contains(p)) && !drag.commands.is_empty() {
-                        let result=self.shared.lock().unwrap().edit("human",&drag.commands,Some(drag.revision),None,"Move layers");
-                        self.message=result.map(|_|"Move layers".into()).unwrap_or_else(|e|e).into();self.last_preview=None;
+                        self.apply_action(drag.commands,"Move layers",Some((&drag.document,drag.revision)),edit_job::Origin::Action);
                         if let Some(id)=drop_folder {self.collapsed.remove(&id);}
                     }
                 }
                 if let Some(sweep)=self.eye_sweep.take() {
                     let commands=sweep.ids.iter().map(|id|json!({"op":"layer.update","layer":id,"visible":sweep.visible})).collect::<Vec<_>>();
-                    let result=self.shared.lock().unwrap().edit("human",&commands,Some(sweep.revision),None,"Layer visibility sweep");
-                    self.message=result.map(|_|"Layer visibility".into()).unwrap_or_else(|e|e).into();self.last_preview=None;
+                    self.apply_action(commands,"Layer visibility sweep",Some((&sweep.document,sweep.revision)),edit_job::Origin::Action);
                 }
             }
             ui.advance_cursor_after_rect(Rect::from_min_size(base,Vec2::new(width,ordered.len() as f32*46.0)));
         });
         if context_visible && context_menu.is_some() {
-            self.layer_context = Some((doc.id.clone(), context_menu));
+            self.layer_context = Some((doc.id().to_owned(), context_menu));
         }
     }
 }
@@ -969,7 +1224,7 @@ mod tests {
     fn fixture(depth: u16) -> (PeerBrush, egui::Context, Vec<String>, Document) {
         let ctx = egui::Context::default();
         let mut engine = crate::engine::Engine::new();
-        engine.doc = Document::new_depth(8, 8, depth).unwrap();
+        engine.resident_state_mut().expect("resident fixture").document = Document::new_depth(8, 8, depth).unwrap();
         let mut outer = Layer::new("Outer", "group", 8, 8);
         outer.opacity = 0.6;
         let mut inner = Layer::new("Inner", "group", 8, 8);
@@ -982,19 +1237,19 @@ mod tests {
         let unrelated = Layer::new("Other folder", "group", 8, 8);
         let mut other = Layer::new("Other paint", "paint", 8, 8);
         other.parent = Some(unrelated.id.clone());
-        engine.doc.layers = vec![outer, inner, leaf, sibling, loose, unrelated, other];
-        engine.doc.ensure_depth();
+        engine.resident_state_mut().expect("resident fixture").document.layers = vec![outer, inner, leaf, sibling, loose, unrelated, other];
+        engine.resident_state_mut().expect("resident fixture").document.ensure_depth();
         for (index, color) in [
             (2, [12345, 23457, 34569, 65535]),
             (4, [52345, 11357, 4569, 65535]),
         ] {
             for y in 0..8 {
                 for x in 0..8 {
-                    engine.doc.layers[index].pixels.set16(x, y, color);
+                    engine.resident_state_mut().expect("resident fixture").document.layers[index].pixels.set16(x, y, color);
                 }
             }
         }
-        let ids: Vec<_> = engine.doc.layers.iter().map(|l| l.id.clone()).collect();
+        let ids: Vec<_> = engine.resident_state().expect("resident fixture").document.layers.iter().map(|l| l.id.clone()).collect();
         engine
             .edit(
                 "human",
@@ -1004,8 +1259,8 @@ mod tests {
                 "Native mask",
             )
             .unwrap();
-        engine.undo.clear();
-        let before = engine.doc.clone();
+        engine.resident_state_mut().expect("resident fixture").undo.clear();
+        let before = engine.resident_state().expect("resident fixture").document.clone();
         let mut app = PeerBrush::init(
             &ctx,
             std::sync::Arc::new(std::sync::Mutex::new(engine)),
@@ -1058,17 +1313,77 @@ mod tests {
             .unwrap_or_else(|| panic!("Missing visible {value}"))
     }
     #[test]
+    fn layer_gestures_cancel_on_same_revision_document_replacement() {
+        let (mut app, ctx, ids, before) = fixture(16);
+        let pointer = egui::pos2(40., 40.);
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![button(pointer, true)],
+                ..Default::default()
+            },
+            |_| {},
+        );
+        app.layer_drag = Some(LayerDrag {
+            gesture: crate::engine::id(),
+            document: before.id.clone(),
+            native: None,
+            id: ids[2].clone(),
+            revision: before.revision,
+            offset: 0.,
+            target: 0,
+            ids: vec![ids[2].clone()],
+            commands: vec![json!({"op":"layer.update", "layer":ids[2], "visible":false})],
+            drop_plan: None,
+        });
+        app.eye_sweep = Some(EyeSweep {
+            gesture: crate::engine::id(),
+            document: before.id.clone(),
+            native: None,
+            previous: pointer,
+            revision: before.revision,
+            visible: false,
+            ids: [ids[2].clone()].into_iter().collect(),
+        });
+        let replacement = {
+            let mut engine = app.shared.lock().unwrap();
+            engine.resident_state_mut().expect("resident fixture").document.id = crate::engine::id();
+            engine.resident_state().expect("resident fixture").document.clone()
+        };
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(500., 900.))),
+                events: vec![button(pointer, false)],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| app.layer_list(ui, &replacement, &HashSet::new()));
+            },
+        );
+        assert!(app.layer_drag.is_none());
+        assert!(app.eye_sweep.is_none());
+        assert!(app
+            .message
+            .contains("Layer gesture cancelled: document changed"));
+        let engine = app.shared.lock().unwrap();
+        assert_eq!(
+            serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap(),
+            serde_json::to_value(&replacement).unwrap()
+        );
+        assert!(engine.resident_state().expect("resident fixture").undo.is_empty());
+    }
+
+    #[test]
     fn shaped_layer_names_keep_inline_rename_selection_and_native_work() {
         for depth in [8, 16] {
             let (mut app, ctx, ids, _) = fixture(depth);
             let logical = "שלום مرحبا हिन्दी 漢字";
             let (before, undo_count) = {
                 let mut engine = app.shared.lock().unwrap();
-                engine.doc.layers[2].name = logical.into();
-                engine.doc.selection = Some([1, 1, 6, 6]);
+                engine.resident_state_mut().expect("resident fixture").document.layers[2].name = logical.into();
+                engine.resident_state_mut().expect("resident fixture").document.selection = Some([1, 1, 6, 6]);
                 (
-                    serde_json::to_value(&engine.doc).unwrap(),
-                    engine.undo.len(),
+                    serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap(),
+                    engine.resident_state().expect("resident fixture").undo.len(),
                 )
             };
             frame(&mut app, &ctx, vec![]);
@@ -1093,9 +1408,9 @@ mod tests {
             assert_eq!(edit.text, logical);
             assert_eq!(app.selected, ids[2]);
             let engine = app.shared.lock().unwrap();
-            assert_eq!(serde_json::to_value(&engine.doc).unwrap(), before);
-            assert_eq!(engine.undo.len(), undo_count);
-            assert_eq!(engine.doc.bit_depth, depth);
+            assert_eq!(serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap(), before);
+            assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), undo_count);
+            assert_eq!(engine.resident_state().expect("resident fixture").document.bit_depth, depth);
         }
     }
     #[test]
@@ -1132,12 +1447,12 @@ mod tests {
             assert_eq!(app.selection_layers, selected);
             assert!(app.mask);
             let e = app.shared.lock().unwrap();
-            assert!(e.undo.is_empty());
+            assert!(e.resident_state().expect("resident fixture").undo.is_empty());
             assert_eq!(
-                serde_json::to_value(&e.doc).unwrap(),
+                serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap(),
                 serde_json::to_value(&before).unwrap()
             );
-            assert_eq!(e.doc.export_png().unwrap(), before.export_png().unwrap());
+            assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), before.export_png().unwrap());
         }
     }
     #[test]
@@ -1180,12 +1495,12 @@ mod tests {
                     .iter()
                     .any(|c| c["op"] == "layer.parent" && c["parent"] == ids[1]));
                 let mut preview = crate::engine::Engine::new();
-                preview.doc = before.clone();
+                preview.resident_state_mut().expect("resident fixture").document = before.clone();
                 preview
                     .edit("human", &commands, None, None, "Preview")
                     .unwrap();
-                let expected = preview.doc.export_png().unwrap();
-                let rendered = preview.doc.preview(None, 1400, None, false).unwrap().2;
+                let expected = preview.resident_state().expect("resident fixture").document.export_png().unwrap();
+                let rendered = preview.resident_state().expect("resident fixture").document.preview(None, 8192, None, false).unwrap().2;
                 assert_ne!(expected, before.export_png().unwrap());
                 for _ in 0..50 {
                     if app
@@ -1203,19 +1518,19 @@ mod tests {
                     Some(&rendered),
                     "Actual canvas receives the shared-engine hierarchy preview"
                 );
-                assert!(app.shared.lock().unwrap().undo.is_empty());
-                assert_eq!(app.shared.lock().unwrap().doc.revision, before.revision);
+                assert!(app.shared.lock().unwrap().resident_state().expect("resident fixture").undo.is_empty());
+                assert_eq!(app.shared.lock().unwrap().resident_state().expect("resident fixture").document.revision, before.revision);
                 frame(&mut app, &ctx, vec![button(destination, false)]);
                 let mut e = app.shared.lock().unwrap();
                 if reserved {
-                    assert!(e.undo.is_empty());
-                    assert_eq!(e.doc.export_png().unwrap(), before.export_png().unwrap());
-                    assert_eq!(e.doc.layers[4].parent, None);
+                    assert!(e.resident_state().expect("resident fixture").undo.is_empty());
+                    assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), before.export_png().unwrap());
+                    assert_eq!(e.resident_state().expect("resident fixture").document.layers[4].parent, None);
                 } else {
-                    assert_eq!(e.undo.len(), 1);
-                    assert_eq!(e.doc.export_png().unwrap(), expected);
+                    assert_eq!(e.resident_state().expect("resident fixture").undo.len(), 1);
+                    assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), expected);
                     for original in &before.layers {
-                        let current = e.doc.layers.iter().find(|l| l.id == original.id).unwrap();
+                        let current = e.resident_state().expect("resident fixture").document.layers.iter().find(|l| l.id == original.id).unwrap();
                         assert_eq!(
                             serde_json::to_value(&current.pixels).unwrap(),
                             serde_json::to_value(&original.pixels).unwrap()
@@ -1226,10 +1541,86 @@ mod tests {
                         );
                     }
                     e.undo("human").unwrap();
-                    assert_eq!(e.doc.export_png().unwrap(), before.export_png().unwrap());
+                    assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), before.export_png().unwrap());
                 }
             }
         }
+    }
+
+    #[test]
+    fn drop_plan_reuses_the_destination_and_clears_commands_after_rejection() {
+        let (_, _, ids, doc) = fixture(16);
+        let view = DocumentView::from(&doc);
+        let mut drag = LayerDrag {
+            gesture: crate::engine::id(),
+            document: view.id().into(),
+            id: ids[1].clone(),
+            revision: view.revision(),
+            native: None,
+            offset: 0.,
+            target: 1,
+            ids: vec![ids[1].clone()],
+            commands: Vec::new(),
+            drop_plan: None,
+        };
+        let first = drag.plan_drop(view, None, Some(&ids[4])).unwrap();
+        let commands = drag.commands.as_ptr();
+        let same = drag.plan_drop(view, None, Some(&ids[4])).unwrap();
+        assert!(Arc::ptr_eq(&first, &same));
+        assert_eq!(drag.commands.as_ptr(), commands);
+        assert_eq!(first.hint, "Top level · before Loose paint");
+
+        let changed = drag.plan_drop(view, Some(&ids[5]), None).unwrap();
+        assert!(!Arc::ptr_eq(&first, &changed));
+        assert_eq!(drag.commands[0]["parent"], ids[5]);
+        assert!(drag.plan_drop(view, Some(&ids[1]), None).is_err());
+        assert!(drag.drop_plan.is_none() && drag.commands.is_empty());
+        let retried = drag.plan_drop(view, Some(&ids[5]), None).unwrap();
+        assert!(!Arc::ptr_eq(&changed, &retried));
+        assert_eq!(drag.commands[0]["parent"], ids[5]);
+    }
+
+    #[test]
+    fn folder_guides_follow_preview_parents_and_omit_hidden_rows() {
+        let (_, ctx, ids, doc) = fixture(16);
+        let view = DocumentView::from(&doc);
+        let moved = [ids[4].clone()];
+        let (order, _) = crate::tree::reparent_view(view, &moved, Some(&ids[1]), None).unwrap();
+        let tree = TreeInfo::ordered(view, &order, &moved.into_iter().collect(), None);
+        assert_eq!(
+            rows(view, tree.order, &HashSet::new()),
+            [(0, 0), (1, 1), (2, 2), (4, 2), (3, 1), (5, 0), (6, 1)],
+        );
+        assert_eq!(
+            rows(view, tree.order, &HashSet::from([ids[1].clone()])),
+            [(0, 0), (1, 1), (3, 1), (5, 0), (6, 1)],
+        );
+        assert_eq!(tree.path(&ids[4]), "Outer / Inner / Loose paint");
+        assert_eq!(
+            tree.tooltip(view.layer(1).unwrap()),
+            "Outer / Inner\n2 direct children · 2 total descendants\n1 selected inside"
+        );
+
+        let anchor = |x, y| TreeAnchor {
+            disclosure: Rect::from_min_size(Pos2::new(x, y), Vec2::splat(10.)),
+            ai: false,
+            opacity: 1.,
+        };
+        let anchors = HashMap::from([
+            (ids[1].as_str(), anchor(10., 10.)),
+            (ids[4].as_str(), anchor(30., 40.)),
+        ]);
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            paint_tree_guides(&ctx.layer_painter(egui::LayerId::background()), &tree, &anchors);
+        });
+        let guides = output.shapes.into_iter().filter_map(|shape| match shape.shape {
+            egui::Shape::LineSegment { points, .. } => Some(points),
+            _ => None,
+        }).collect::<Vec<_>>();
+        assert_eq!(guides, [
+            [Pos2::new(15., 20.), Pos2::new(15., 45.)],
+            [Pos2::new(15., 45.), Pos2::new(36., 45.)],
+        ]);
     }
 }
 
@@ -1248,7 +1639,7 @@ mod native_metadata_tests {
             doc.layers.insert(0, folder);
             doc.ensure_depth();
             let shared = Arc::new(std::sync::Mutex::new(crate::engine::Engine::new()));
-            shared.lock().unwrap().doc = doc.clone();
+            shared.lock().unwrap().resident_state_mut().expect("resident fixture").document = doc.clone();
             let mut app = PeerBrush::init(
                 &ctx,
                 shared,
@@ -1269,9 +1660,9 @@ mod native_metadata_tests {
             let owner = snapshot.clone();
             let view = owner.view();
             let admitted = pool.used();
-            let tree = TreeInfo::new(view, &app.selection_layers);
-            let mut visible = vec![];
-            rows(view, &tree.order, None, 0, &HashSet::new(), &mut visible);
+            let order = crate::tree::TreeOrder::original(view);
+            let tree = TreeInfo::ordered(view, &order, &app.selection_layers, None);
+            let visible = rows(view, tree.order, &HashSet::new());
             assert_eq!(visible, vec![(0, 0), (1, 1)]);
             assert_eq!(
                 tree.tooltip(view.layer(0).unwrap()),
@@ -1287,7 +1678,7 @@ mod native_metadata_tests {
             app.begin_rename(view, &child);
             assert_eq!(app.rename_edit.as_ref().unwrap().original, "Native child");
             app.rename_edit = None;
-            app.selection_gesture_source = Some(app.selection_source(view));
+            app.selection_gesture_source = Some(app.canvas_gesture_source(view).unwrap());
             assert!(!app.selection_gesture_stale(view));
             let foreign = Document::new_depth(9, 7, depth).unwrap();
             assert!(app.selection_gesture_stale(&foreign));
@@ -1312,17 +1703,50 @@ mod native_metadata_tests {
                             ui,
                             view.layer(index).unwrap(),
                             depth as f32 * TREE_INDENT,
+                            true,
                             None,
                             None,
                             &tree,
+                            false,
                         );
                     }
-                    app.layer_footer(ui, view.layer(1).unwrap());
+                    app.layer_footer(ui, view, view.layer(1).unwrap());
                 });
             });
             assert_eq!(pool.used(), admitted);
             assert_eq!(view.depth(), depth);
             assert_eq!(view.revision(), 0);
+            let before = serde_json::to_value(&app.shared.lock().unwrap().resident_state().expect("resident fixture").document).unwrap();
+            let output = ctx.run(egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(420., 1000.))),
+                ..Default::default()
+            }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| app.layers(ui, view, &HashSet::new()));
+            });
+            assert!(app.layer_rects.contains_key(&child));
+            assert!(app.opacity_rect.is_some());
+            assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.job.text == "Native child")));
+            assert_eq!(serde_json::to_value(&app.shared.lock().unwrap().resident_state().expect("resident fixture").document).unwrap(), before);
+            app.layer_drag = Some(LayerDrag {
+                gesture: crate::engine::id(), document: view.id().into(), id: child.clone(),
+                revision: view.revision(), native: view.native().map(|doc| doc.key()),
+                offset: 0., target: 1, ids: vec![child.clone()],
+                commands: vec![json!({"op":"layer.update","layer":child,"visible":false})],
+                drop_plan: None,
+            });
+            app.eye_sweep = Some(EyeSweep {
+                gesture: crate::engine::id(), document: view.id().into(), previous: Pos2::ZERO,
+                revision: view.revision(), native: view.native().map(|doc| doc.key()),
+                visible: false, ids: [child.clone()].into_iter().collect(),
+            });
+            let replacement = crate::tree::presentation_tests::native(&doc, &pool);
+            assert_eq!(replacement.metadata().revision(), view.revision());
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| app.layer_list(ui, &replacement, &HashSet::new()));
+            });
+            assert!(app.layer_drag.is_none() && app.eye_sweep.is_none());
+            assert_eq!(serde_json::to_value(&app.shared.lock().unwrap().resident_state().expect("resident fixture").document).unwrap(), before);
+            app.layer_thumbnails.stop();
         }
     }
 }

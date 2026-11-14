@@ -1,0 +1,121 @@
+{ lib, stdenv, rustPlatform, rustc, fetchurl, cmake, ninja, llvmPackages_18,
+  pkg-config, python3, unzip, makeWrapper, desktop-file-utils,
+  fontconfig, freetype, libGL, vulkan-loader, wayland, libxkbcommon, xorg }:
+
+let
+  runtimeLibraries = [
+    fontconfig freetype libGL vulkan-loader wayland libxkbcommon
+    xorg.libX11 xorg.libXcursor xorg.libXi xorg.libXrandr xorg.libxcb
+  ];
+in
+# shortcut: native x86_64-linux; other hosts need their own toolchain/runtime acceptance.
+assert lib.assertMsg (stdenv.hostPlatform.system == "x86_64-linux"
+  && stdenv.buildPlatform == stdenv.hostPlatform)
+  "PeerBrush's initial Nix candidate requires native x86_64-linux";
+assert lib.assertMsg (rustc.version == "@RUST_VERSION@")
+  "Select Nixpkgs with PeerBrush's exact reviewed Rust toolchain";
+rustPlatform.buildRustPackage (finalAttrs: {
+  pname = "peerbrush";
+  version = "@VERSION@";
+  src = fetchurl {
+    url = "@SOURCE_URL@";
+    hash = "@SOURCE_HASH@";
+  };
+  # The corresponding-source ZIP has a flat root, unlike a GitHub tree tarball.
+  sourceRoot = ".";
+  cargoLock.lockFile = ./Cargo.lock;
+  cargoBuildFlags = [ "--locked" "--bin" "peerbrush" ];
+  # CMake and Ninja serve Cargo's JPEG XL dependency, not the top-level phases.
+  dontUseCmakeConfigure = true;
+  dontUseNinjaBuild = true;
+  dontUseNinjaInstall = true;
+  dontUseNinjaCheck = true;
+  # Application tests run through the separately authorized essential/native gate.
+  doCheck = false;
+  nativeBuildInputs = [ cmake ninja llvmPackages_18.clang pkg-config python3 unzip makeWrapper desktop-file-utils ];
+  buildInputs = runtimeLibraries;
+  env = {
+    CC = "${llvmPackages_18.clang}/bin/clang";
+    CXX = "${llvmPackages_18.clang}/bin/clang++";
+    CMAKE = "${cmake}/bin/cmake";
+    CMAKE_MAKE_PROGRAM = "${ninja}/bin/ninja";
+    CMAKE_GENERATOR = "Ninja";
+  };
+  preBuild = ''
+    qualification=$(mktemp)
+    GITHUB_ENV="$qualification" ${python3.interpreter} scripts/jxl_build.py --github-env
+    while IFS='=' read -r name value; do
+      export "$name=$value"
+    done < "$qualification"
+    rm -f "$qualification"
+  '';
+  postInstall = ''
+    mkdir -p "$out/share/peerbrush" "$out/share/applications" "$out/share/mime/packages"
+    cp -r ${./support}/. "$out/share/peerbrush/"
+    # Retain complete corresponding inputs/licenses in the immutable Nix closure.
+    ln -s ${finalAttrs.src} "$out/share/peerbrush/PeerBrush-${finalAttrs.version}-source.zip"
+    ln -s ${finalAttrs.cargoDeps} "$out/share/peerbrush/cargo-dependencies"
+    install -m644 ${./source-inputs.json} "$out/share/peerbrush/source-inputs.json"
+    substitute packaging/linux/com.peerbrush.PeerBrush.desktop \
+      "$out/share/applications/com.peerbrush.PeerBrush.desktop" \
+      --replace-fail /usr/bin/peerbrush "$out/bin/peerbrush" \
+      --replace-fail /usr/share/peerbrush/peerbrush-logo.png "$out/share/peerbrush/assets/peerbrush-logo.png"
+    install -m644 packaging/linux/com.peerbrush.PeerBrush.xml \
+      "$out/share/mime/packages/com.peerbrush.PeerBrush.xml"
+    desktop-file-validate "$out/share/applications/com.peerbrush.PeerBrush.desktop"
+    ${python3.interpreter} - <<'PY'
+import json
+import os
+from pathlib import Path
+import sys
+import tomllib
+sys.path.insert(0, 'scripts')
+from package import active_rust_docs, copy_file, regular_file, upstream_notice_paths
+policy = json.loads(Path('scripts/package-files.json').read_bytes())
+support = Path(os.environ['out']) / 'share/peerbrush'
+packages = tomllib.loads(Path('Cargo.lock').read_text(encoding='utf-8'))['package']
+for name, target in upstream_notice_paths(packages).items():
+    if name not in policy['source']:
+        raise ValueError('Missing committed upstream crate notice')
+    copy_file(Path('.'), name, support / target)
+destination = support / 'licenses/rust-runtime'
+destination.mkdir(parents=True)
+for root in (active_rust_docs(), Path('${lib.getOutput "doc" rustc}') / 'share/doc/rust'):
+    try:
+        notices = [regular_file(root, name) for name in policy['rust_notices']]
+    except FileNotFoundError:
+        continue
+    break
+else:
+    raise ValueError('Selected Rust compiler lacks its complete runtime notices')
+for source in notices:
+    data = source.read_bytes()
+    if not data:
+        raise ValueError('Required Rust runtime notice is empty')
+    (destination / source.name).write_bytes(data)
+PY
+  '';
+  postFixup = ''
+    wrapProgram "$out/bin/peerbrush" \
+      --prefix LD_LIBRARY_PATH : "${lib.makeLibraryPath runtimeLibraries}"
+    ${python3.interpreter} - <<'PY'
+import os
+from pathlib import Path
+import sys
+sys.path.insert(0, 'scripts')
+from package import regular_file, validate_binary
+binary = regular_file(Path(os.environ['out']), 'bin/.peerbrush-wrapped')
+if not 0 < binary.stat().st_size <= 512 * 1024 * 1024:
+    raise ValueError('Nix native executable exceeds the package inspection bound')
+validate_binary(binary.read_bytes())
+PY
+  '';
+  passthru.sourceCommit = "@COMMIT@";
+  meta = {
+    description = "Native collaborative image editor";
+    homepage = "https://peerbrush.com/";
+    license = lib.licenses.gpl3Only;
+    platforms = [ "x86_64-linux" ];
+    mainProgram = "peerbrush";
+  };
+})

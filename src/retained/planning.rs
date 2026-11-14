@@ -76,9 +76,9 @@ fn lookup<'a>(document: &'a NativeDocument, id: &str) -> Result<LayerMetadata<'a
 fn plain_mask(layer: LayerMetadata<'_>) -> Result<(), String> {
     if layer.mask().is_some_and(|mask| {
         mask.steps()
-            .any(|step| !matches!(step.kind(), "fill" | "paint"))
+            .any(|step| !matches!(step.kind(), "fill" | "paint" | "density"))
     }) {
-        return Err("Independent or selected linked transforms require a fill/paint mask; mask effects are preserved unchanged. Unlink and choose a paint step for a mask-only transform.".into());
+        return Err("Independent or selected linked transforms support fill, paint and density steps. Unlink and choose a paint step for a mask-only transform.".into());
     }
     Ok(())
 }
@@ -129,7 +129,7 @@ fn union(a: Option<[f64; 4]>, b: [f64; 4]) -> Option<[f64; 4]> {
         ]
     }))
 }
-fn charged_planes(
+pub(crate) fn charged_planes(
     document: &NativeDocument,
     count: usize,
 ) -> Result<(Vec<Plane<'_>>, Reservation), String> {
@@ -409,32 +409,20 @@ fn layer_with_pivot<'a>(
         return Err("Transform is outside the coordinate limits".into());
     }
     let frame = [(right - left) as u32, (bottom - top) as u32];
-    crate::raster::check_size(frame[0], frame[1])?;
-    let mut populated = 0;
-    for plan in &masks {
-        if let Pixels::Native { input, .. } = &plan.pixels {
-            populated += usize::from(input.source()?.physical_tiles().next().is_some());
+    crate::raster::CanvasLimits::Native.check(frame[0], frame[1])?;
+    if layer.source().is_some() || matches!(&color, Some(Pixels::Fill { .. })) {
+        let mut populated = 0;
+        for plan in &masks {
+            if let Pixels::Native { input, .. } = &plan.pixels {
+                populated += usize::from(input.source()?.physical_tiles().next().is_some());
+            }
         }
+        crate::transform::work_budget(frame[0], frame[1], 1 + populated)?;
     }
-    crate::transform::work_budget(frame[0], frame[1], 1 + populated)?;
-    let stages = color
-        .as_ref()
-        .map_or(0, |p| match p {
-            Pixels::Native { pose, .. } | Pixels::Fill { pose, .. } => pose.warps().len(),
-            _ => 0,
-        })
-        .max(
-            masks
-                .iter()
-                .map(|p| match &p.pixels {
-                    Pixels::Native { pose, .. } => pose.warps().len(),
-                    _ => 0,
-                })
-                .max()
-                .unwrap_or(0),
-        );
-    if stages > 0 {
-        crate::warp::work_budget(frame[0], frame[1], 1 + populated, stages, 0)?;
+    if let Some(Pixels::Fill { pose, .. }) = &color {
+        if !pose.warps().is_empty() {
+            crate::warp::work_budget(frame[0], frame[1], 1, pose.warps().len(), 0)?;
+        }
     }
     let origin = [left as i32, top as i32];
     let local = [1., 0., 0., 1., -left, -top];
@@ -502,7 +490,7 @@ fn layer_with_pivot<'a>(
     }))
 }
 
-fn reframe<'a>(
+pub(crate) fn reframe<'a>(
     document: &'a NativeDocument,
     layer: LayerMetadata<'a>,
     frame: [u32; 2],
@@ -518,7 +506,6 @@ fn reframe<'a>(
         return Ok(());
     }
     if let Some(mask) = layer.mask() {
-        crate::transform::work_budget(frame[0], frame[1], mask.steps().len())?;
         let old = layer.origin();
         for step in mask.steps() {
             let (input, mut pose) = source(document, step.pixels())?;
@@ -610,7 +597,6 @@ fn mask<'a>(
     if !command["step"].is_null() && count == 0 {
         return Err("Select a paint mask step to transform".into());
     }
-    crate::transform::work_budget(frame[0], frame[1], count)?;
     let (mut masks, charge) = charged_planes(document, count)?;
     let (sin, cos) = angle.to_radians().sin_cos();
     let [a, b, c, d] = crate::transform::skewed(
@@ -656,17 +642,6 @@ fn mask<'a>(
             target: step.pixels().slot(),
             pixels: Pixels::Native { input, pose },
         });
-    }
-    let stages = masks
-        .iter()
-        .map(|p| match &p.pixels {
-            Pixels::Native { pose, .. } => pose.warps().len(),
-            _ => 0,
-        })
-        .max()
-        .unwrap_or(0);
-    if stages > 0 {
-        crate::warp::work_budget(frame[0], frame[1], count, stages, 0)?;
     }
     Ok(LayerPlan {
         layer,

@@ -20,10 +20,10 @@ impl Drop for Temp {
 
 fn shared(depth: u16) -> Shared {
     let mut engine = Engine::new();
-    engine.doc = Document::new_depth(260, 79, depth).unwrap();
+    engine.resident_state_mut().expect("resident fixture").document = Document::new_depth(260, 79, depth).unwrap();
     for y in 2..77 {
         for x in 3..257 {
-            engine.doc.layers[0].pixels.set16(
+            engine.resident_state_mut().expect("resident fixture").document.layers[0].pixels.set16(
                 x,
                 y,
                 [
@@ -39,7 +39,7 @@ fn shared(depth: u16) -> Shared {
 }
 fn state(shared: &Shared) -> Value {
     let engine = shared.lock().unwrap();
-    json!({"doc":engine.doc,"undo":engine.undo.len(),"redo":engine.redo.len(),"saved":engine.saved_revision,"path":engine.path})
+    json!({"doc":engine.resident_state().expect("resident fixture").document,"undo":engine.resident_state().expect("resident fixture").undo.len(),"redo":engine.resident_state().expect("resident fixture").redo.len(),"saved":engine.saved_revision,"path":engine.path})
 }
 
 #[test]
@@ -56,7 +56,7 @@ fn streaming_publication_keeps_late_failure_cancellation_source_destination_and_
             let temp = Temp::new();
             let shared = shared(depth);
             let path = temp.0.join("output.png");
-            let doc = shared.lock().unwrap().doc.clone();
+            let doc = shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
             let original = doc.export_png().unwrap();
             fs::write(&path, &original).unwrap();
             let before = state(&shared);
@@ -114,10 +114,10 @@ fn streaming_publication_keeps_late_failure_cancellation_source_destination_and_
             );
             if failure == "source" {
                 let engine = shared.lock().unwrap();
-                assert_eq!(engine.doc.revision, doc.revision + 1);
-                assert_eq!(engine.undo.len(), 1);
+                assert_eq!(engine.resident_state().expect("resident fixture").document.revision, doc.revision + 1);
+                assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), 1);
                 assert_eq!(
-                    engine.doc.layers[0].pixels.get16(1, 2),
+                    engine.resident_state().expect("resident fixture").document.layers[0].pixels.get16(1, 2),
                     [53 * 257, 97 * 257, 173 * 257, 65535]
                 );
             } else {
@@ -144,13 +144,13 @@ fn direct_native_png_stream_uses_exact_dimensions_overwrite_retention_and_loaded
         assert_eq!((image.width(), image.height()), (260, 79));
         assert_eq!(
             image.into_rgba16().into_raw(),
-            image::load_from_memory(&shared.lock().unwrap().doc.export_png().unwrap())
+            image::load_from_memory(&shared.lock().unwrap().resident_state().expect("resident fixture").document.export_png().unwrap())
                 .unwrap()
                 .into_rgba16()
                 .into_raw()
         );
         assert!(export(&shared, &path).unwrap_err().contains("exists"));
-        let doc = shared.lock().unwrap().doc.clone();
+        let doc = shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
         export_confirmed_source(&shared, &path, &doc.id, doc.revision).unwrap();
         assert_eq!(fs::read(&path).unwrap(), first);
         assert!(fs::read_dir(temp.0.join(".peerbrush-versions"))
@@ -162,7 +162,7 @@ fn direct_native_png_stream_uses_exact_dimensions_overwrite_retention_and_loaded
         fs::write(&loaded, &first).unwrap();
         open(&shared, &loaded).unwrap();
         let preserved = state(&shared);
-        let doc = shared.lock().unwrap().doc.clone();
+        let doc = shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
         assert!(export_confirmed_source(&shared, &loaded, &doc.id, doc.revision).is_err());
         assert_eq!(fs::read(&loaded).unwrap(), first);
         assert_eq!(state(&shared), preserved);
@@ -176,7 +176,7 @@ fn streaming_publication_rejects_a_temporary_alias_to_the_held_original_inode() 
         let temp = Temp::new();
         let shared = shared(depth);
         let path = temp.0.join("output.png");
-        let doc = shared.lock().unwrap().doc.clone();
+        let doc = shared.lock().unwrap().resident_state().unwrap().document.clone();
         let original = doc.export_png().unwrap();
         fs::write(&path, &original).unwrap();
         let before = state(&shared);

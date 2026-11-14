@@ -1,12 +1,45 @@
 pub mod backed;
+mod blend_color;
+pub(crate) use blend_color::{centered_at_luma, fit_luma, luma as rgb_luma};
+pub(crate) mod fill_blend;
+pub(crate) mod sampling;
 pub mod surface;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 pub use surface::{Surface, SurfaceKey, SurfaceRegion, SurfaceTile};
 
 pub const TILE: u32 = 256;
 pub const MAX_EDGE: u32 = 8192;
 pub const MAX_PIXELS: u64 = 32 * 1024 * 1024;
+pub(crate) const NATIVE_EDGE: u32 = 16000;
+
+#[derive(Clone, Copy)]
+pub(crate) enum CanvasLimits {
+    Resident,
+    Native,
+}
+impl CanvasLimits {
+    pub(crate) const fn edge(self) -> u32 {
+        match self {
+            Self::Resident => MAX_EDGE,
+            Self::Native => NATIVE_EDGE,
+        }
+    }
+    pub(crate) fn check(self, width: u32, height: u32) -> Result<(), String> {
+        match self {
+            Self::Resident => check_size(width, height),
+            Self::Native
+                if (1..=NATIVE_EDGE).contains(&width) && (1..=NATIVE_EDGE).contains(&height) =>
+            {
+                Ok(())
+            }
+            Self::Native => Err("Native canvas requires 1–16000 pixels per edge".into()),
+        }
+    }
+}
 pub type Pixel = [u8; 4];
 pub type Pixel16 = [u16; 4];
 pub fn default_depth() -> u16 {
@@ -321,36 +354,10 @@ impl Raster {
     }
     /// Bilinear premultiplied resampling keeps source precision until final storage.
     pub fn sample16(&self, x: f32, y: f32) -> Pixel16 {
-        if x.fract() == 0.0 && y.fract() == 0.0 {
-            return self.get16(x as i32, y as i32);
-        }
-        let ix = x.floor() as i32;
-        let iy = y.floor() as i32;
-        let fx = (x - x.floor()) as f64;
-        let fy = (y - y.floor()) as f64;
-        let mut sum = [0.0f64; 4];
-        for (dx, dy, w) in [
-            (0, 0, (1. - fx) * (1. - fy)),
-            (1, 0, fx * (1. - fy)),
-            (0, 1, (1. - fx) * fy),
-            (1, 1, fx * fy),
-        ] {
-            let p = self.get16(ix + dx, iy + dy);
-            let a = p[3] as f64 / 65535.;
-            for c in 0..3 {
-                sum[c] += p[c] as f64 * a * w;
-            }
-            sum[3] += a * w;
-        }
-        if sum[3] <= 0. {
-            return [0; 4];
-        }
-        [
-            (sum[0] / sum[3]).round().clamp(0., 65535.) as u16,
-            (sum[1] / sum[3]).round().clamp(0., 65535.) as u16,
-            (sum[2] / sum[3]).round().clamp(0., 65535.) as u16,
-            (sum[3] * 65535.).round().clamp(0., 65535.) as u16,
-        ]
+        sampling::sample16(x, y, |x, y| {
+            Ok::<_, std::convert::Infallible>(self.get16(x, y))
+        })
+        .unwrap()
     }
     /// Allocated support envelope, clipped to raster bounds without scanning pixels.
     pub fn tile_bounds(&self) -> Option<[i32; 4]> {
@@ -375,9 +382,33 @@ impl Raster {
         }
         (b[0] != i32::MAX).then_some(b)
     }
+    pub(crate) fn changed_tile_keys(&self, before: &Self) -> BTreeSet<(u32, u32)> {
+        fn changed<T>(
+            after: &BTreeMap<(u32, u32), Arc<T>>,
+            before: &BTreeMap<(u32, u32), Arc<T>>,
+        ) -> BTreeSet<(u32, u32)> {
+            after
+                .keys()
+                .chain(before.keys().filter(|key| !after.contains_key(*key)))
+                .copied()
+                .filter(|key| match (after.get(key), before.get(key)) {
+                    (Some(a), Some(b)) => !Arc::ptr_eq(a, b),
+                    _ => true,
+                })
+                .collect()
+        }
+        if self.is16() {
+            changed(&self.samples16, &before.samples16)
+        } else {
+            changed(&self.tiles, &before.tiles)
+        }
+    }
     pub fn validate_layout(&self) -> Result<(), String> {
+        self.validate_layout_with_limits(CanvasLimits::Resident)
+    }
+    pub(crate) fn validate_layout_with_limits(&self, limits: CanvasLimits) -> Result<(), String> {
         if let Some(original) = &self.retained {
-            original.validate(self.depth)?;
+            original.validate_with_limits(self.depth, limits)?;
         }
         if !matches!(self.depth, 8 | 16)
             || (self.is16() && !self.tiles.is_empty())
@@ -541,35 +572,10 @@ impl Raster {
     }
     /// Interpolate premultiplied color to keep transparent edges clean.
     pub fn sample(&self, x: f32, y: f32) -> Pixel {
-        if x.fract() == 0.0 && y.fract() == 0.0 {
-            return self.get(x as i32, y as i32);
-        }
-        let ix = x.floor() as i32;
-        let iy = y.floor() as i32;
-        let (fx, fy) = (x - x.floor(), y - y.floor());
-        let mut out = [0.0f32; 4];
-        for (dx, dy, weight) in [
-            (0, 0, (1.0 - fx) * (1.0 - fy)),
-            (1, 0, fx * (1.0 - fy)),
-            (0, 1, (1.0 - fx) * fy),
-            (1, 1, fx * fy),
-        ] {
-            let p = self.get(ix + dx, iy + dy);
-            let alpha = p[3] as f32 / 255.0;
-            for c in 0..3 {
-                out[c] += p[c] as f32 * alpha * weight;
-            }
-            out[3] += alpha * weight;
-        }
-        if out[3] <= 0.00001 {
-            return [0; 4];
-        }
-        [
-            (out[0] / out[3]).round() as u8,
-            (out[1] / out[3]).round() as u8,
-            (out[2] / out[3]).round() as u8,
-            (out[3] * 255.0).round() as u8,
-        ]
+        sampling::sample(x, y, |x, y| {
+            Ok::<_, std::convert::Infallible>(self.get(x, y))
+        })
+        .unwrap()
     }
     pub fn content_bounds(&self) -> Option<[i32; 4]> {
         self.data_bounds(false)
@@ -752,7 +758,49 @@ pub const BLENDS: &[(&str, &str)] = &[
     ("exclusion", "Exclusion"),
     ("subtract", "Subtract"),
     ("divide", "Divide"),
+    ("linear_light", "Linear Light"),
+    ("vivid_light", "Vivid Light"),
+    ("pin_light", "Pin Light"),
+    ("hard_mix", "Hard Mix"),
+    ("darker_color", "Darker Color"),
+    ("lighter_color", "Lighter Color"),
+    ("hue", "Hue"),
+    ("saturation", "Saturation"),
+    ("color", "Color"),
+    ("luminosity", "Luminosity"),
 ];
+
+fn vivid_light(dst: u32, src: u32, max: u32) -> u32 {
+    let midpoint = max.div_ceil(2);
+    if src == 0 || src == max {
+        return src;
+    }
+    if src < midpoint {
+        let ramp = (src * max + midpoint / 2) / midpoint;
+        let darkened = (dst + ramp).saturating_sub(max);
+        // Photoshop's burn ramp resolves exact halves toward black.
+        (darkened * max + (ramp - 1) / 2) / ramp
+    } else {
+        let half_span = max - midpoint;
+        let ramp = ((src - midpoint) * max + half_span / 2) / half_span;
+        let divisor = max - ramp;
+        ((dst * max + divisor / 2) / divisor).min(max)
+    }
+}
+
+fn pin_light(dst: u32, src: u32, midpoint: u32) -> u32 {
+    if src < midpoint {
+        dst.min(2 * src)
+    } else {
+        dst.max(2 * (src - midpoint))
+    }
+}
+
+fn hard_mix(dst: u32, src: u32, max: u32) -> bool {
+    // The midpoint switches the threshold by one native sample.
+    dst + src >= max + u32::from(src >= max.div_ceil(2))
+}
+
 /// Pass Through is a backdrop operation for folders, never a pixel blend mode.
 pub fn layer_blends(kind: &str) -> impl Iterator<Item = (&'static str, &'static str)> {
     (kind == "group")
@@ -760,7 +808,22 @@ pub fn layer_blends(kind: &str) -> impl Iterator<Item = (&'static str, &'static 
         .into_iter()
         .chain(BLENDS.iter().copied())
 }
-pub fn blend(dst: Pixel, src: Pixel, opacity: f32, mode: &str) -> Pixel {
+pub(crate) const PHOTOSHOP_RGB8_MULTIPLY: &str = "photoshop_rgb8_multiply";
+
+pub fn blend(dst: Pixel, src: Pixel, opacity: f32, mut mode: &str) -> Pixel {
+    if mode == PHOTOSHOP_RGB8_MULTIPLY {
+        if dst[3] == 255 && src[3] == 255 {
+            let coverage = (opacity.clamp(0., 1.) * 255.).round() as u32;
+            let mut out = dst;
+            for c in 0..3 {
+                let backdrop = u32::from(dst[c]);
+                let multiplied = (backdrop * u32::from(src[c]) + 127) / 255;
+                out[c] = ((backdrop * (255 - coverage) + multiplied * coverage + 127) / 255) as u8;
+            }
+            return out;
+        }
+        mode = "multiply";
+    }
     let sa = src[3] as f32 / 255.0 * opacity;
     let da = dst[3] as f32 / 255.0;
     let a = sa + da * (1.0 - sa);
@@ -768,6 +831,7 @@ pub fn blend(dst: Pixel, src: Pixel, opacity: f32, mode: &str) -> Pixel {
         return [0; 4];
     }
     let mut out = [0, 0, 0, (a * 255.0).round() as u8];
+    let color = blend_color::blend(dst, src, mode, 255.);
     for c in 0..3 {
         let s = src[c] as f32 / 255.0;
         let d = dst[c] as f32 / 255.0;
@@ -783,6 +847,11 @@ pub fn blend(dst: Pixel, src: Pixel, opacity: f32, mode: &str) -> Pixel {
             }
             "linear_dodge" => (s + d).min(1.),
             "linear_burn" => (s + d - 1.).max(0.),
+            // The neutral sample is 128, so the byte kernel subtracts 256.
+            "linear_light" => (d + 2. * s - 256. / 255.).clamp(0., 1.),
+            "vivid_light" => vivid_light(dst[c].into(), src[c].into(), 255) as f32 / 255.,
+            "pin_light" => pin_light(dst[c].into(), src[c].into(), 128) as f32 / 255.,
+            "hard_mix" => u8::from(hard_mix(dst[c].into(), src[c].into(), 255)) as f32,
             "color_dodge" => {
                 if d == 0. {
                     0.
@@ -834,7 +903,7 @@ pub fn blend(dst: Pixel, src: Pixel, opacity: f32, mode: &str) -> Pixel {
             }
             "darken" => s.min(d),
             "lighten" => s.max(d),
-            _ => s,
+            _ => color.map_or(s, |rgb| rgb[c] as f32 / 255.),
         };
         out[c] = (((1.0 - sa) * da * d + sa * ((1.0 - da) * s + da * b)) / a * 255.0)
             .round()
@@ -875,6 +944,7 @@ pub fn blend16(dst: Pixel16, src: Pixel16, opacity: f64, mode: &str) -> Pixel16 
         return [0; 4];
     }
     let mut out = [0, 0, 0, (a * 65535.).round().clamp(0., 65535.) as u16];
+    let color = blend_color::blend(dst, src, mode, 65535.);
     for c in 0..3 {
         let s = src[c] as f64 / 65535.;
         let d = dst[c] as f64 / 65535.;
@@ -890,6 +960,10 @@ pub fn blend16(dst: Pixel16, src: Pixel16, opacity: f64, mode: &str) -> Pixel16 
             }
             "linear_dodge" => (s + d).min(1.),
             "linear_burn" => (s + d - 1.).max(0.),
+            "linear_light" => (d + 2. * s - 65536. / 65535.).clamp(0., 1.),
+            "vivid_light" => vivid_light(dst[c].into(), src[c].into(), 65535) as f64 / 65535.,
+            "pin_light" => pin_light(dst[c].into(), src[c].into(), 32768) as f64 / 65535.,
+            "hard_mix" => u8::from(hard_mix(dst[c].into(), src[c].into(), 65535)) as f64,
             "color_dodge" => {
                 if d == 0. {
                     0.
@@ -941,7 +1015,7 @@ pub fn blend16(dst: Pixel16, src: Pixel16, opacity: f64, mode: &str) -> Pixel16 
             }
             "darken" => s.min(d),
             "lighten" => s.max(d),
-            _ => s,
+            _ => color.map_or(s, |rgb| rgb[c] / 65535.),
         };
         out[c] = (((1. - sa) * da * d + sa * ((1. - da) * s + da * b)) / a * 65535.)
             .round()
@@ -958,8 +1032,17 @@ pub fn png16_with_profile(
     rgba: &[u16],
     profile: Option<&[u8]>,
 ) -> Result<Vec<u8>, String> {
+    png16_with_limits(w, h, rgba, profile, CanvasLimits::Resident)
+}
+pub(crate) fn png16_with_limits(
+    w: u32,
+    h: u32,
+    rgba: &[u16],
+    profile: Option<&[u8]>,
+    limits: CanvasLimits,
+) -> Result<Vec<u8>, String> {
     use image::ImageEncoder;
-    check_size(w, h)?;
+    limits.check(w, h)?;
     if rgba.len() != w as usize * h as usize * 4 {
         return Err("Wrong16-bit PNG pixel length".into());
     }

@@ -24,6 +24,9 @@ impl<K: Ord + Clone, V: Clone> Index<K, V> {
             .ok()
             .map(|at| &self.entries[at].1)
     }
+    pub fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
+        self.entries.iter().map(|(key, value)| (key, value))
+    }
     pub fn retain(&mut self, mut keep: impl FnMut(&K, &V) -> bool) {
         self.entries.retain(|(key, value)| keep(key, value));
     }

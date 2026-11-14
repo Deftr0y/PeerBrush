@@ -11,7 +11,7 @@ fn main() {
         NSAppleEventDescriptor as Descriptor, NSAppleEventSendOptions, NSData, NSString,
         NSURLBookmarkCreationOptions, NSURL,
     };
-    use peerbrush::{activation, engine::Engine, server::Shared, workspace};
+    use peerbrush::{activation, engine::Engine, server::{self, Shared}, workspace};
     use serde_json::{json, Value};
     use std::{
         fs::{self, File},
@@ -63,12 +63,13 @@ fn main() {
     }
 
     fn snapshot(root: &Shared) -> Value {
-        let mut engine = root.lock().unwrap();
-        let mut state = engine.state();
+        let mut state = server::state(root).unwrap().as_ref().clone();
         // Rejection updates the presentation status, never document or history.
         state.as_object_mut().unwrap().remove("file_status");
-        json!({"state": state, "source": engine.doc, "undo": engine.undo.len(),
-               "redo": engine.redo.len(), "saved_revision": engine.saved_revision})
+        let engine = root.lock().unwrap();
+        let resident = engine.resident_state().unwrap();
+        json!({"state": state, "source": resident.document, "undo": resident.undo.len(),
+               "redo": resident.redo.len(), "saved_revision": engine.saved_revision})
     }
 
     fn rejected(event: &Descriptor, root: &Shared, before: &Value) {
@@ -102,7 +103,7 @@ fn main() {
 
     objc2::rc::autoreleasepool(|_| {
         let root = Arc::new(Mutex::new(Engine::new()));
-        root.lock().unwrap().doc.revision = 7;
+        root.lock().unwrap().resident_state_mut().unwrap().document.revision = 7;
         activation::enable(&root);
         let before = snapshot(&root);
         assert_eq!(before["state"]["dirty"], true);

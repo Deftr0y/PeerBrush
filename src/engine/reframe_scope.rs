@@ -33,7 +33,7 @@ fn bounds(origin: [i32; 2], shape: [u32; 2]) -> [i32; 4] {
         (i64::from(origin[1]) + i64::from(shape[1])).min(i64::from(i32::MAX)) as i32,
     ]
 }
-fn union(a: [i32; 4], b: [i32; 4]) -> [i32; 4] {
+pub(crate) fn union(a: [i32; 4], b: [i32; 4]) -> [i32; 4] {
     [
         a[0].min(b[0]),
         a[1].min(b[1]),

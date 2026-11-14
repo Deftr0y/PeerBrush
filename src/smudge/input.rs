@@ -1,19 +1,19 @@
 //! Session-owned ordered smudge. No working dab is a document/history commit.
 use super::native::{PreparedStrip, PreparedTile, WorkingSource};
 use crate::{
-    brush::{input::LocalStroke, Settings},
+    brush::{input::LocalStroke, native::TileChanges, Settings},
     edit_bounds::{
         input::{restrict_frame_tile, restrict_tile, InputFrame, RasterInput},
-        output::{stage_frame_seed, BuiltTiles, FrameSeed, TileOutput},
+        output::{prepare_frame_tile, stage_frame_seed, BuiltTiles, FrameSeed, TileOutput},
     },
     large_document::{PinnedBytes, ResidentBudget},
-    raster::TILE,
     workspace::source_runtime::SourceSession,
 };
 
 struct Working<'a, 'd, 's, 'g, 'c> {
     input: &'a RasterInput<'d>,
     output: WorkingOutput<'d, 's>,
+    changed: TileChanges,
     last_step: Option<usize>,
     guard: Option<&'g crate::edit_bounds::input::WriteGuard<'c>>,
     frame: Option<&'a InputFrame>,
@@ -142,6 +142,7 @@ impl WorkingSource for Working<'_, '_, '_, '_, '_> {
         crate::edit_bounds::input::check_proposal(
             self.guard, self.input, self.frame, key, &before, &bytes, check,
         )?;
+        self.changed.insert(key)?;
         self.output.replace_tile(self.input, key, bytes, check)
     }
 }
@@ -168,6 +169,7 @@ pub(crate) fn stage_in_frame<'d, 's>(
     session: &'s SourceSession,
     check: &mut dyn FnMut() -> Result<(), String>,
 ) -> Result<BuiltTiles<'d, 's>, String> {
+    let color = input.color(color).map(|value| u16::from(value) * 257);
     stage_impl(input, stroke, settings, color, frame, None, session, check)
 }
 pub(crate) fn stage_guarded<'d, 's>(
@@ -190,7 +192,7 @@ pub(crate) fn stage_guarded<'d, 's>(
         input,
         stroke,
         Settings::from_command(parameters)?,
-        crate::engine::color(parameters),
+        crate::engine::raster_color(parameters, input.depth())?,
         frame,
         Some(guard),
         session,
@@ -201,7 +203,7 @@ fn stage_impl<'d, 's>(
     input: &RasterInput<'d>,
     stroke: &LocalStroke,
     settings: Settings,
-    color: [u8; 4],
+    color: [u16; 4],
     frame: Option<&InputFrame>,
     guard: Option<&crate::edit_bounds::input::WriteGuard<'_>>,
     session: &'s SourceSession,
@@ -229,20 +231,17 @@ fn stage_impl<'d, 's>(
         session.check()?;
         check()
     };
-    let plan = stroke.smudge(input, settings, input.color(color), &mut guarded)?;
+    let plan = stroke.smudge(input, settings, color, &mut guarded)?;
+    let changed =
+        TileChanges::new(frame.map_or(input.shape(), |frame| frame.geometry().new_shape()))?;
     let mut working = Working {
         input,
         output: if let Some(frame) = frame {
-            WorkingOutput::Framed(stage_frame_seed(
-                input,
-                frame,
-                session,
-                &mut guarded,
-                |_, bytes, _| Ok(bytes.clone()),
-            )?)
+            WorkingOutput::Framed(stage_frame_seed(input, frame, session, &mut guarded)?)
         } else {
             WorkingOutput::Original(TileOutput::new(input, session)?)
         },
+        changed,
         last_step: None,
         guard,
         frame,
@@ -251,68 +250,54 @@ fn stage_impl<'d, 's>(
         plan.run_in_place(&mut working, &mut guarded)?;
         let selection = input.selection()?;
         if selection.has_coverage() {
-            let shape = working.frame();
-            for ty in 0..shape[1].div_ceil(TILE) {
-                for tx in 0..shape[0].div_ceil(TILE) {
-                    guarded()?;
-                    let key = (tx, ty);
-                    if matches!(&working.output,WorkingOutput::Original(output) if !output.has_replacement(key))
+            for key in working.changed.iter() {
+                guarded()?;
+                if matches!(&working.output,WorkingOutput::Original(output) if !output.has_replacement(key))
+                {
+                    continue;
+                }
+                let before = if let Some(frame) = frame {
+                    prepare_frame_tile(input, frame, key, &mut guarded)?
+                } else {
+                    input.prepare_tile(key, &mut guarded)?.bytes().clone()
+                };
+                let proposed = working.output.prepare_tile(key, &mut guarded)?;
+                let area = if let Some(frame) = frame {
+                    frame.tile_document_rect(key)?
+                } else {
+                    input.tile_document_rect(key)?
+                };
+                let coverage = selection.prepare(area, &mut guarded)?;
+                let after = if let Some(frame) = frame {
+                    restrict_frame_tile(
+                        input,
+                        frame,
+                        key,
+                        &before,
+                        &proposed,
+                        &coverage,
+                        &mut guarded,
+                    )?
+                } else {
+                    restrict_tile(input, key, &before, &proposed, &coverage, &mut guarded)?
+                };
+                working.output.replace_tile(
+                    input,
+                    key,
                     {
-                        continue;
-                    }
-                    let before = if let Some(frame) = frame {
-                        let prepared = frame
-                            .geometry()
-                            .source_reads(key)?
-                            .map(|area| input.prepare_region(area, &mut guarded))
-                            .transpose()?;
-                        frame.geometry().render_tile(key, &mut guarded, |x, y| {
-                            prepared
-                                .as_ref()
-                                .ok_or("Native smudge frame baseline source was not prepared")?
-                                .pixel16(x, y)
-                        })?
-                    } else {
-                        input.prepare_tile(key, &mut guarded)?.bytes().clone()
-                    };
-                    let proposed = working.output.prepare_tile(key, &mut guarded)?;
-                    let area = if let Some(frame) = frame {
-                        frame.tile_document_rect(key)?
-                    } else {
-                        input.tile_document_rect(key)?
-                    };
-                    let coverage = selection.prepare(area, &mut guarded)?;
-                    let after = if let Some(frame) = frame {
-                        restrict_frame_tile(
+                        crate::edit_bounds::input::check_proposal(
+                            guard,
                             input,
                             frame,
                             key,
                             &before,
-                            &proposed,
-                            &coverage,
+                            &after,
                             &mut guarded,
-                        )?
-                    } else {
-                        restrict_tile(input, key, &before, &proposed, &coverage, &mut guarded)?
-                    };
-                    working.output.replace_tile(
-                        input,
-                        key,
-                        {
-                            crate::edit_bounds::input::check_proposal(
-                                guard,
-                                input,
-                                frame,
-                                key,
-                                &before,
-                                &after,
-                                &mut guarded,
-                            )?;
-                            after
-                        },
-                        &mut guarded,
-                    )?;
-                }
+                        )?;
+                        after
+                    },
+                    &mut guarded,
+                )?;
             }
         }
         guarded()

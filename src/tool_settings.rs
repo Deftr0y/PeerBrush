@@ -17,25 +17,60 @@ struct Stored {
     tools: BTreeMap<String, Profile>,
 }
 pub(crate) fn read_owned(path: &Path) -> Result<Option<Vec<u8>>, String> {
-    if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
-        return Err("Symbolic tool preference files remain protected".into());
-    }
-    let file = match fs::File::open(path) {
+    read_owned_bounded(path, FILE_LIMIT, "Tool preferences exceed 128 KiB")
+}
+
+pub(crate) fn read_owned_bounded(
+    path: &Path,
+    limit: u64,
+    oversized: &str,
+) -> Result<Option<Vec<u8>>, String> {
+    let file = match crate::file_safety::open_native_read(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.to_string()),
     };
-    if !file.metadata().map_err(|e| e.to_string())?.is_file() {
-        return Err("Tool preferences need a regular file".into());
-    }
     let mut bytes = Vec::new();
-    file.take(FILE_LIMIT + 1)
+    file.take(limit + 1)
         .read_to_end(&mut bytes)
         .map_err(|e| e.to_string())?;
-    if bytes.len() as u64 > FILE_LIMIT {
-        return Err("Tool preferences exceed 128 KiB".into());
+    if bytes.len() as u64 > limit {
+        return Err(oversized.into());
     }
     Ok(Some(bytes))
+}
+
+pub(crate) fn write_owned(
+    path: &Path,
+    bytes: &[u8],
+    original: Option<&[u8]>,
+    changed: &str,
+) -> Result<(), String> {
+    write_owned_with_reader(path, bytes, original, changed, read_owned)
+}
+
+pub(crate) fn write_owned_with_reader(
+    path: &Path,
+    bytes: &[u8],
+    original: Option<&[u8]>,
+    changed: &str,
+    read_current: impl Fn(&Path) -> Result<Option<Vec<u8>>, String>,
+) -> Result<(), String> {
+    let check = || {
+        if read_current(path)?.as_deref() == original {
+            Ok(())
+        } else {
+            Err(changed.to_owned())
+        }
+    };
+    check()?;
+    let _lease = crate::file_safety::Lease::acquire(path)?;
+    check()?;
+    if original.is_some() {
+        crate::server::atomic_write_checked(path, bytes, |_| check())
+    } else {
+        crate::server::atomic_create(path, bytes, |_| check())
+    }
 }
 
 pub const TOOLS: &[&str] = &["brush", "eraser", "smudge", "clone", "heal", "liquify"];
@@ -238,24 +273,17 @@ impl Store {
             ));
         }
         if let Some(path) = &self.path {
-            let _lease = crate::file_safety::Lease::acquire(path)?;
-            if read_owned(path)? != self.original {
-                return Err(
-                    "Tool preferences changed on disk; restart to load them before saving".into(),
-                );
-            }
             let bytes = serde_json::to_vec_pretty(&Stored {
                 version: 1,
                 tools: profiles,
             })
             .map_err(|e| e.to_string())?;
-            crate::server::atomic_write_checked(path, &bytes, |_| {
-                if read_owned(path)? == self.original {
-                    Ok(())
-                } else {
-                    Err("Tool preferences changed while saving".into())
-                }
-            })?;
+            write_owned(
+                path,
+                &bytes,
+                self.original.as_deref(),
+                "Tool preferences changed on disk; restart to load them before saving",
+            )?;
             self.original = Some(bytes);
         }
         self.dirty = false;

@@ -10,6 +10,14 @@ pub(crate) mod check;
 #[cfg(any(target_os = "macos", test))]
 mod discovery;
 
+#[cfg(any(target_os = "macos", test))]
+fn bundle_version(version: &str) -> std::borrow::Cow<'_, str> {
+    match version.strip_prefix("0.4.") {
+        Some(patch) => format!("1.4.{patch}").into(),
+        None => version.into(),
+    }
+}
+
 pub const PROPOSED_FEED_URL: &str = "https://peerbrush.com/updates/macos/stable/appcast.xml";
 
 #[derive(Default, Debug, Clone, Serialize, Deserialize)]

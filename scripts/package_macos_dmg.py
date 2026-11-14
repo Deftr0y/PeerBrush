@@ -16,7 +16,7 @@ import sys
 import tempfile
 import zipfile
 
-from package import digest, git, regular_file
+from package import digest, git, regular_file, release_version_order
 from sign_macos import APP, extract_archive, outside_checkout, run, verify_native
 from verify_release import MACOS_SIGNING_KIND, inspect_archive
 
@@ -259,7 +259,7 @@ def inspect_final(root, archive, image, *, commit, version, archive_sha256, imag
             verify_native(stage / APP, team_id, notarized=True)
     verify_image(copied_image, mount, expected, verify_app=verify_mounted,
                  presentation_source=(root / 'packaging/macos/installer-background.png'
-                                      if tuple(map(int, version.split('.'))) >= (0, 30, 1) else None))
+                                      if release_version_order(version) >= release_version_order('0.30.1') else None))
     if mount.is_mount():
         raise ValueError('DMG remains mounted; preserve inspection work')
     for path, checksum in [(archive, archive_sha256), (image, image_sha256),
@@ -426,7 +426,7 @@ def prepare(archive, output, commit, version, expected_sha256, revision, source_
         else:
             shutil.copy2(path, destination)
     (payload / 'Applications').symlink_to('/Applications', target_is_directory=True)
-    if tuple(map(int, version.split('.'))) >= (0, 30, 1):
+    if release_version_order(version) >= release_version_order('0.30.1'):
         background = payload / '.background/installer.png'
         background.parent.mkdir()
         shutil.copyfile(root / 'packaging/macos/installer-background.png', background)
@@ -450,7 +450,7 @@ def prepare(archive, output, commit, version, expected_sha256, revision, source_
               or stat.S_IMODE(copied.stat().st_mode) != mode):
             raise ValueError('DMG staging changed original archive bytes or modes')
     expected = create_image(payload, image, work / 'mounted',
-                            'Install PeerBrush' if tuple(map(int, version.split('.'))) >= (0, 30, 1) else f'PeerBrush {version}',
+                            'Install PeerBrush' if release_version_order(version) >= release_version_order('0.30.1') else f'PeerBrush {version}',
                             verify_app=lambda mounted_app: verify_native(mounted_app, manifest['macos_signing']['team_id'], notarized=True))
     if digest(archive) != expected_sha256:
         raise ValueError('Signed archive changed during DMG preparation')

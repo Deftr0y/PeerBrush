@@ -69,6 +69,75 @@ fn value(doc: &Document) -> Value {
 }
 
 #[test]
+fn whole_layer_paste_protects_selection_and_every_wrapped_clip_member() {
+    let source = Document::new(2, 2).unwrap();
+    let snapshot = layer_clipboard::copy(&source, &[source.layers[0].id.clone()]).unwrap();
+    for nested in [false, true] {
+        let mut engine = engine::Engine::new();
+        engine.resident_state_mut().expect("resident fixture").document = Document::new_depth(8, 8, 16).unwrap();
+        engine.resident_state_mut().expect("resident fixture").document.layers[0].id = "base".into();
+        let mut clip = Layer::new("Clip", "paint", 8, 8);
+        clip.id = "clip".into();
+        clip.clip_to = Some("base".into());
+        clip.pixels = Raster::new_depth(8, 8, 16);
+        engine.resident_state_mut().expect("resident fixture").document.layers.insert(0, clip);
+        if nested {
+            for layer in &mut engine.resident_state_mut().expect("resident fixture").document.layers {
+                layer.parent = Some("folder".into());
+            }
+            let mut folder = Layer::new("Folder", "group", 8, 8);
+            folder.id = "folder".into();
+            folder.pixels = Raster::new_depth(8, 8, 16);
+            engine.resident_state_mut().expect("resident fixture").document.layers.insert(0, folder);
+        }
+        engine.resident_state_mut().expect("resident fixture").document.selection = Some([1, 1, 4, 4]);
+        let before = engine.resident_state().expect("resident fixture").document.clone();
+        for reserved in ["@selection", "base", "clip"] {
+            let lease = engine
+                .reserve("other", "Keep work", vec![engine::Scope::layer(reserved)])
+                .unwrap();
+            let reason = engine
+                .paste_layers("human", &snapshot, "base", None, None)
+                .unwrap_err();
+            assert!(reason.contains("Reserved"));
+            assert_eq!(value(&engine.resident_state().expect("resident fixture").document), value(&before));
+            engine.leases.retain(|l| l.id != lease.id);
+        }
+        if !nested {
+            engine.resident_state_mut().expect("resident fixture").document.layers[0].locked = true;
+            assert!(layer_clipboard::paste(&mut engine.resident_state_mut().expect("resident fixture").document, &snapshot, "base")
+                .unwrap_err()
+                .contains("Unlock"));
+            engine.resident_state_mut().expect("resident fixture").document.layers[0].locked = false;
+        }
+        let pasted = engine
+            .paste_layers("human", &snapshot, "base", None, None)
+            .unwrap();
+        let first = pasted["created_roots"][0].as_str().unwrap();
+        let at = engine
+            .resident_state().expect("resident fixture").document
+            .layers
+            .iter()
+            .position(|l| l.id == first)
+            .unwrap();
+        assert_eq!(engine.resident_state().expect("resident fixture").document.layers[at + 1].id, "clip");
+        assert_eq!(engine.resident_state().expect("resident fixture").document.layers[at + 2].id, "base");
+        assert_eq!(
+            engine.resident_state().expect("resident fixture").document.layers[at + 1].parent,
+            engine.resident_state().expect("resident fixture").document.layers[at + 2].parent
+        );
+        assert!(engine.resident_state().expect("resident fixture").document.selection.is_none() && engine.resident_state().expect("resident fixture").document.selection_coverage.is_none());
+        peerbrush::psd::validate(&engine.resident_state().expect("resident fixture").document).unwrap();
+        engine.undo("human").unwrap();
+        assert_eq!(
+            serde_json::to_value(&engine.resident_state().expect("resident fixture").document.layers).unwrap(),
+            serde_json::to_value(&before.layers).unwrap()
+        );
+        assert_eq!(engine.resident_state().expect("resident fixture").document.selection, before.selection);
+    }
+}
+
+#[test]
 fn copied_folders_include_descendants_once_share_tiles_and_roundtrip_metadata() {
     let (doc, folder, ink) = rich_tree();
     let copied = layer_clipboard::copy(&doc, &[ink.clone(), folder.clone()]).unwrap();

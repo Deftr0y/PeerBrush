@@ -512,13 +512,13 @@ impl Probe {
         };
         for depth in [8, 16] {
             let mut engine = crate::engine::Engine::new();
-            engine.doc = crate::engine::Document::new_depth(2, 2, depth).unwrap();
+            let resident = engine.resident_state_mut().unwrap();
+            resident.document = crate::engine::Document::new_depth(2, 2, depth).unwrap();
+            let pixels = &mut resident.document.layers[0].pixels;
             if depth == 16 {
-                engine.doc.layers[0]
-                    .pixels
-                    .set16(0, 0, [1001, 3003, 5007, 65535]);
+                pixels.set16(0, 0, [1001, 3003, 5007, 65535]);
             } else {
-                engine.doc.layers[0].pixels.set(0, 0, [17, 93, 207, 255]);
+                pixels.set(0, 0, [17, 93, 207, 255]);
             }
             let shared = std::sync::Arc::new(std::sync::Mutex::new(engine));
             let workspace = crate::workspace::attach(&shared);
@@ -550,19 +550,23 @@ impl Probe {
                 .is_err());
             for dirty in [false, true] {
                 if dirty {
-                    shared.lock().unwrap().doc.revision += 1;
+                    shared.lock().unwrap().resident_state_mut().unwrap().document.revision += 1;
                 }
-                let before = serde_json::to_value(&shared.lock().unwrap().doc).unwrap();
-                let undo = shared.lock().unwrap().undo.len();
+                let (before, undo) = {
+                    let engine = shared.lock().unwrap();
+                    let resident = engine.resident_state().unwrap();
+                    (serde_json::to_value(&resident.document).unwrap(), resident.undo.len())
+                };
                 for blocked in [true, false, false] {
                     assert!(application
                         .request_installation(&workspace, blocked, ContinuationKind::InstallOnQuit)
                         .is_err());
                     let engine = shared.lock().unwrap();
                     assert!(!engine.closed);
-                    assert_eq!(engine.doc.bit_depth, depth);
-                    assert_eq!(serde_json::to_value(&engine.doc).unwrap(), before);
-                    assert_eq!(engine.undo.len(), undo);
+                    let resident = engine.resident_state().unwrap();
+                    assert_eq!(resident.document.bit_depth, depth);
+                    assert_eq!(serde_json::to_value(&resident.document).unwrap(), before);
+                    assert_eq!(resident.undo.len(), undo);
                     assert_eq!(calls.get(), 0);
                 }
             }
@@ -575,7 +579,9 @@ impl Probe {
                         msg_send![&*owner.delegate, updater: &*updater, didAbortWithError: &*error];
                 }
             }
-            let before = serde_json::to_value(&shared.lock().unwrap().doc).unwrap();
+            let before = serde_json::to_value(
+                &shared.lock().unwrap().resident_state().unwrap().document,
+            ).unwrap();
             assert!(
                 application.pending_installation(),
                 "Aborted install callbacks must keep termination inhibited"
@@ -585,7 +591,9 @@ impl Probe {
                 .is_err());
             assert!(!shared.lock().unwrap().closed);
             assert_eq!(
-                serde_json::to_value(&shared.lock().unwrap().doc).unwrap(),
+                serde_json::to_value(
+                    &shared.lock().unwrap().resident_state().unwrap().document,
+                ).unwrap(),
                 before
             );
             assert_eq!(calls.get(), 0);
@@ -1180,20 +1188,24 @@ pub struct Application {
 
 impl Application {
     pub fn load() -> Self {
+        let owner = crate::updates::Owner::current();
+        let direct = owner == crate::updates::Owner::Direct;
         let supported = require_supported_macos(
             NSProcessInfo::processInfo()
                 .operatingSystemVersion()
                 .majorVersion,
         )
         .is_ok();
-        let configuration = if supported {
+        let configuration = if supported && direct {
             crate::sparkle::check::compiled().ok().flatten()
         } else {
             None
         };
         Self {
             controller: None,
-            message: if supported {
+            message: if !direct {
+                owner.description()
+            } else if supported {
                 ""
             } else {
                 "Automatic updates are unavailable on macOS 11. PeerBrush remains supported."
@@ -1500,6 +1512,9 @@ impl Application {
         if !self.startup_enabled() {
             return Err("App update checking is not available for this profile.".into());
         }
+        crate::packaged::homebrew::require_direct_app(&PathBuf::from(
+            NSBundle::mainBundle().bundlePath().to_string(),
+        ))?;
         if self.discovery.is_some() || self.verification.is_some() || self.pending_installation() {
             return Err("The current app update check must finish first".into());
         }

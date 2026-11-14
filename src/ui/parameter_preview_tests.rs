@@ -40,7 +40,7 @@ fn settle(app: &mut PeerBrush, ctx: &egui::Context) -> egui::FullOutput {
 fn settle_worker(app: &mut PeerBrush, ctx: &egui::Context) {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let source = app.shared.lock().unwrap().doc.clone();
+        let source = app.shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
         app.request_preview(ctx, &source);
         if !app.pending && app.canvas_preview.is_some() && app.canvas_preview == app.last_preview {
             return;
@@ -64,8 +64,49 @@ fn hold_worker(app: &mut PeerBrush) -> WorkerHold {
     app.parameter_worker_gate = Some(gate.clone());
     WorkerHold(gate)
 }
+
+#[test]
+fn blend_if_drag_commits_the_release_position_once() {
+    for depth in [8, 16] {
+        let (mut app, ctx) = workspace::fixture(depth);
+        let output = settle(&mut app, &ctx);
+        workspace::click(&mut app, &ctx, SIZE, workspace::label(&output, "Blend If"));
+        let output = frame(&mut app, &ctx, vec![]);
+        let label = workspace::label(&output, "This Layer");
+        let handle = |fill| {
+            output.shapes.iter().filter_map(|shape| match &shape.shape {
+                egui::Shape::Circle(circle) if circle.radius == 4. && circle.fill == fill
+                    && (0. ..105.).contains(&(circle.center.y - label.y)) => Some(circle.center),
+                _ => None,
+            }).max_by(|a, b| a.y.total_cmp(&b.y)).expect("This Layer range handle")
+        };
+        let start = handle(Color32::from_gray(24));
+        let width = handle(Color32::from_gray(238)).x - start.x;
+        assert!(width > 180.);
+        let held = start + Vec2::new(width * 0.2, 0.);
+        let release = start + Vec2::new(width * 0.6, 0.);
+        let later = start + Vec2::new(width * 0.8, 0.);
+        let history = app.shared.lock().unwrap().resident_state().unwrap().undo.len();
+        frame(&mut app, &ctx, vec![egui::Event::PointerMoved(start), pointer(start, true)]);
+        frame(&mut app, &ctx, vec![egui::Event::PointerMoved(held)]);
+        let draft = app.parameter_gesture.as_ref().expect("Live Blend If drag");
+        assert_eq!(draft.commands[0]["blend_if"][0][1], 51);
+        assert_eq!(app.shared.lock().unwrap().resident_state().unwrap().undo.len(), history);
+        frame(&mut app, &ctx, vec![pointer(release, false), egui::Event::PointerMoved(later)]);
+        assert!(app.parameter_gesture.is_none());
+        let mut engine = app.shared.lock().unwrap();
+        let state = engine.resident_state().unwrap();
+        assert_eq!(state.undo.len(), history + 1);
+        assert_eq!(crate::psd::blend_ranges::value(&state.document.layers[0].psd_metadata).unwrap()[0],
+            [0, 153, 255, 255, 0, 0, 255, 255]);
+        engine.undo("human").unwrap();
+        let layer = &engine.resident_state().unwrap().document.layers[0];
+        assert!(crate::psd::blend_ranges::value(&layer.psd_metadata).is_none());
+    }
+}
+
 fn wand_control(app: &mut PeerBrush, ctx: &egui::Context, events: Vec<egui::Event>) -> Rect {
-    let doc = app.shared.lock().unwrap().doc.clone();
+    let doc = app.shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
     let mut rect = Rect::NOTHING;
     let _ = ctx.run(
         egui::RawInput {
@@ -84,7 +125,7 @@ fn wand_control(app: &mut PeerBrush, ctx: &egui::Context, events: Vec<egui::Even
 }
 fn install(app: &mut PeerBrush, commands: Vec<Value>) -> Document {
     app.invalidate_parameter_preview();
-    let doc = app.shared.lock().unwrap().doc.clone();
+    let doc = app.shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
     app.parameter_gesture = Some(ParameterEdit {
         control: egui::Id::new("pending preview fixture"),
         gesture: crate::engine::id(),
@@ -113,7 +154,7 @@ fn held_wand_reuses_validated_document_in_real_panels_and_preserves_canvas_histo
                 let mut engine = app.shared.lock().unwrap();
                 for y in 0..24 {
                     for x in 0..32 {
-                        engine.doc.layers[0].pixels.set16(
+                        engine.resident_state_mut().expect("resident fixture").document.layers[0].pixels.set16(
                             x,
                             y,
                             if x < 10 {
@@ -137,9 +178,9 @@ fn held_wand_reuses_validated_document_in_real_panels_and_preserves_canvas_histo
                     .unwrap();
             }
             settle(&mut app, &ctx);
-            let before = app.shared.lock().unwrap().doc.clone();
+            let before = app.shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
             let unchanged = workspace::source(&app);
-            let history = app.shared.lock().unwrap().undo.len();
+            let history = app.shared.lock().unwrap().resident_state().expect("resident fixture").undo.len();
             let hold = hold_worker(&mut app);
             let at = wand_control(&mut app, &ctx, vec![]).center();
             wand_control(
@@ -276,26 +317,26 @@ fn held_wand_reuses_validated_document_in_real_panels_and_preserves_canvas_histo
                 assert_eq!(workspace::source(&app), unchanged);
             } else {
                 let mut engine = app.shared.lock().unwrap();
-                assert_eq!(engine.undo.len(), history + 1);
+                assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), history + 1);
                 assert_eq!(
-                    engine.doc.layers[0].pixels.rgba16(),
+                    engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(),
                     before.layers[0].pixels.rgba16()
                 );
-                let actual = engine.doc.selection_coverage.as_ref().unwrap();
+                let actual = engine.resident_state().expect("resident fixture").document.selection_coverage.as_ref().unwrap();
                 let expected = expected.selection_coverage.as_ref().unwrap();
                 assert_eq!(
                     (&actual.mask, actual.bounds, actual.origin),
                     (&expected.mask, expected.bounds, expected.origin)
                 );
-                let applied = engine.doc.selection_coverage.clone();
+                let applied = engine.resident_state().expect("resident fixture").document.selection_coverage.clone();
                 engine.undo("human").unwrap();
-                assert_eq!(engine.doc.selection_coverage, before.selection_coverage);
+                assert_eq!(engine.resident_state().expect("resident fixture").document.selection_coverage, before.selection_coverage);
                 assert_eq!(
-                    engine.doc.export_png().unwrap(),
+                    engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
                     before.export_png().unwrap()
                 );
                 engine.redo("human").unwrap();
-                assert_eq!(engine.doc.selection_coverage, applied);
+                assert_eq!(engine.resident_state().expect("resident fixture").document.selection_coverage, applied);
             }
         }
     }
@@ -363,7 +404,7 @@ fn provisional_numeric_text_reuses_preview_and_target_cancel_preserves_source() 
         );
         assert_eq!(app.parameter_gesture.as_ref().unwrap().commands, commands);
         assert_eq!(workspace::source(&app), before);
-        let effect = app.shared.lock().unwrap().doc.layers[0].effects[0]
+        let effect = app.shared.lock().unwrap().resident_state().expect("resident fixture").document.layers[0].effects[0]
             .id
             .clone();
         app.select_effect(&id, false, &effect);
@@ -399,7 +440,7 @@ fn current_engine_identity_revision_and_contention_are_checked_before_cache_reus
             {
                 let mut engine = app.shared.lock().unwrap();
                 if replacement {
-                    engine.doc.id = "replacement-at-identical-revision".into();
+                    engine.resident_state_mut().expect("resident fixture").document.id = "replacement-at-identical-revision".into();
                 } else {
                     engine
                         .edit(
@@ -484,10 +525,10 @@ fn replacing_the_shared_engine_at_identical_document_id_and_revision_cannot_reus
         let original = app.shared.clone();
         let original_state = workspace::source(&app);
         let mut replacement = Engine::new();
-        replacement.doc = source.clone();
-        replacement.doc.name = "Independent project at the same revision".into();
+        replacement.resident_state_mut().expect("resident fixture").document = source.clone();
+        replacement.resident_state_mut().expect("resident fixture").document.name = "Independent project at the same revision".into();
         assert_eq!(
-            (&replacement.doc.id, replacement.doc.revision),
+            (&replacement.resident_state().expect("resident fixture").document.id, replacement.resident_state().expect("resident fixture").document.revision),
             (&source.id, source.revision)
         );
         app.shared = Arc::new(std::sync::Mutex::new(replacement));
@@ -595,7 +636,7 @@ fn completed_worker_errors_cannot_cancel_newer_input_or_touch_other_projects() {
             );
             let before = workspace::source(&app);
             let pixels = app.canvas_pixels.clone();
-            let history = app.shared.lock().unwrap().undo.len();
+            let history = app.shared.lock().unwrap().resident_state().expect("resident fixture").undo.len();
             app.request_preview(&ctx, &source);
             let reply = app.preview_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             let old_error = reply
@@ -627,8 +668,8 @@ fn completed_worker_errors_cannot_cancel_newer_input_or_touch_other_projects() {
                 }
                 "replacement" => {
                     let mut replacement = Engine::new();
-                    replacement.doc = source.clone();
-                    replacement.doc.name = "Independent project at the same revision".into();
+                    replacement.resident_state_mut().expect("resident fixture").document = source.clone();
+                    replacement.resident_state_mut().expect("resident fixture").document.name = "Independent project at the same revision".into();
                     app.shared = Arc::new(std::sync::Mutex::new(replacement));
                 }
                 _ => unreachable!(),
@@ -636,7 +677,7 @@ fn completed_worker_errors_cannot_cancel_newer_input_or_touch_other_projects() {
             let retained = workspace::source(&app);
             app.message = "Newer input owns the workspace".into();
             app.preview_tx.send(reply).unwrap();
-            let current = app.shared.lock().unwrap().doc.clone();
+            let current = app.shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
             app.request_preview(&ctx, &current);
             assert_ne!(
                 app.message.as_str(),
@@ -661,16 +702,16 @@ fn completed_worker_errors_cannot_cancel_newer_input_or_touch_other_projects() {
                 .unwrap();
                 assert_eq!(
                     app.canvas_pixels.as_ref().unwrap().2,
-                    expected.preview(None, 1536, None, false).unwrap().2
+                    expected.preview(None, 8192, None, false).unwrap().2
                 );
                 assert_eq!(workspace::source(&app), before);
                 app.finish_parameter(false);
                 let mut engine = app.shared.lock().unwrap();
-                assert_eq!(engine.undo.len(), history + 1);
-                assert_eq!(engine.doc.layers[0].opacity, 0.35);
+                assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), history + 1);
+                assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].opacity, 0.35);
                 engine.undo("human").unwrap();
                 assert_eq!(
-                    engine.doc.export_png().unwrap(),
+                    engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
                     source.export_png().unwrap()
                 );
             } else {
@@ -699,8 +740,8 @@ fn real_relative_arrow_input_after_release_accumulates_while_the_old_worker_is_h
             )
             .unwrap();
         settle(&mut app, &ctx);
-        let source = app.shared.lock().unwrap().doc.clone();
-        let history = app.shared.lock().unwrap().undo.len();
+        let source = app.shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
+        let history = app.shared.lock().unwrap().resident_state().expect("resident fixture").undo.len();
         let at = app.opacity_rect.unwrap().center();
         let hold = hold_worker(&mut app);
         frame(
@@ -729,8 +770,8 @@ fn real_relative_arrow_input_after_release_accumulates_while_the_old_worker_is_h
             vec![pointer(at - Vec2::new(20., 0.), false)],
         );
         assert!(app.parameter_gesture.is_none());
-        assert_eq!(app.shared.lock().unwrap().doc.layers[0].opacity, desired);
-        assert_eq!(app.shared.lock().unwrap().undo.len(), history + 1);
+        assert_eq!(app.shared.lock().unwrap().resident_state().expect("resident fixture").document.layers[0].opacity, desired);
+        assert_eq!(app.shared.lock().unwrap().resident_state().expect("resident fixture").undo.len(), history + 1);
 
         // Slider keyboard edits intentionally retain their existing immediate
         // shared-engine path; they never wait for the obsolete preview to arrive.
@@ -740,7 +781,7 @@ fn real_relative_arrow_input_after_release_accumulates_while_the_old_worker_is_h
             &ctx,
             vec![key(egui::Key::ArrowRight, Default::default())],
         );
-        let first = app.shared.lock().unwrap().doc.layers[0].opacity;
+        let first = app.shared.lock().unwrap().resident_state().expect("resident fixture").document.layers[0].opacity;
         assert!(
             first > desired && first < 1.,
             "First arrow must increment the committed desired value"
@@ -750,7 +791,7 @@ fn real_relative_arrow_input_after_release_accumulates_while_the_old_worker_is_h
             &ctx,
             vec![key(egui::Key::ArrowRight, Default::default())],
         );
-        let second = app.shared.lock().unwrap().doc.layers[0].opacity;
+        let second = app.shared.lock().unwrap().resident_state().expect("resident fixture").document.layers[0].opacity;
         assert!(
             second > first,
             "A second real arrow before worker completion must accumulate"
@@ -761,9 +802,9 @@ fn real_relative_arrow_input_after_release_accumulates_while_the_old_worker_is_h
                 .load(std::sync::atomic::Ordering::Relaxed),
             0
         );
-        assert_eq!(app.shared.lock().unwrap().undo.len(), history + 3);
+        assert_eq!(app.shared.lock().unwrap().resident_state().expect("resident fixture").undo.len(), history + 3);
         assert_eq!(
-            app.shared.lock().unwrap().doc.layers[0].pixels.rgba16(),
+            app.shared.lock().unwrap().resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(),
             source.layers[0].pixels.rgba16()
         );
         let accepted = workspace::source(&app);
@@ -774,21 +815,21 @@ fn real_relative_arrow_input_after_release_accumulates_while_the_old_worker_is_h
             accepted,
             "An old worker must not change accepted keyboard edits or history"
         );
-        let current = app.shared.lock().unwrap().doc.clone();
-        let (w, h, bytes, _) = current.preview(None, 1536, None, false).unwrap();
+        let current = app.shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
+        let (w, h, bytes, _) = current.preview(None, 8192, None, false).unwrap();
         assert_eq!(app.canvas_pixels.as_ref(), Some(&(w, h, bytes)));
         let mut engine = app.shared.lock().unwrap();
         engine.undo("human").unwrap();
-        assert_eq!(engine.doc.layers[0].opacity, first);
+        assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].opacity, first);
         engine.undo("human").unwrap();
-        assert_eq!(engine.doc.layers[0].opacity, desired);
+        assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].opacity, desired);
         engine.undo("human").unwrap();
         assert_eq!(
-            engine.doc.export_png().unwrap(),
+            engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
             source.export_png().unwrap()
         );
         assert_eq!(
-            engine.doc.layers[0].pixels.rgba16(),
+            engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(),
             source.layers[0].pixels.rgba16()
         );
     }
@@ -829,9 +870,9 @@ fn begin_held_stroke(app: &mut PeerBrush, ctx: &egui::Context) -> (WorkerHold, R
 fn pending_long_stroke_frames_skip_full_variant_and_render_latest_native_input_before_one_commit() {
     for depth in [8, 16] {
         let (mut app, ctx) = workspace::fixture(depth);
-        let before = app.shared.lock().unwrap().doc.clone();
+        let before = app.shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
         let untouched = workspace::source(&app);
-        let history = app.shared.lock().unwrap().undo.len();
+        let history = app.shared.lock().unwrap().resident_state().expect("resident fixture").undo.len();
         let (hold, rect) = begin_held_stroke(&mut app, &ctx);
         let old_job = app.preview_job;
         let accepted = app.canvas_pixels.clone();
@@ -854,7 +895,7 @@ fn pending_long_stroke_frames_skip_full_variant_and_render_latest_native_input_b
         assert_eq!(app.points.len(), 1008);
         assert_eq!(app.stroke_pressures.len(), app.points.len());
         assert_eq!(app.stroke_pressures.last(), app.current_pressure.as_ref());
-        let command = app.stroke_command(app.points.clone(), app.color);
+        let command = app.stroke_command(&app.points, app.color);
         assert_eq!(command["points"].as_array().unwrap().len(), 1008);
         assert_eq!(command["pressures"].as_array().unwrap().len(), 1008);
         let expected = Engine::preview_edits(before.clone(), &[command]).unwrap();
@@ -881,19 +922,19 @@ fn pending_long_stroke_frames_skip_full_variant_and_render_latest_native_input_b
         frame(&mut app, &ctx, vec![pointer(at, false)]);
         assert!(app.points.is_empty());
         let mut engine = app.shared.lock().unwrap();
-        assert_eq!(engine.doc.bit_depth, depth);
-        assert_eq!(engine.doc.layers[0].pixels, expected.layers[0].pixels);
-        assert_eq!(engine.doc.layers[0].source, before.layers[0].source);
+        assert_eq!(engine.resident_state().expect("resident fixture").document.bit_depth, depth);
+        assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].pixels, expected.layers[0].pixels);
+        assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].source, before.layers[0].source);
         assert_eq!(
-            engine.doc.layers[0].pixels.get16(1, 1),
+            engine.resident_state().expect("resident fixture").document.layers[0].pixels.get16(1, 1),
             before.layers[0].pixels.get16(1, 1)
         );
-        assert_eq!(engine.undo.len(), history + 1);
-        assert!(engine.redo.is_empty());
+        assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), history + 1);
+        assert!(engine.resident_state().expect("resident fixture").redo.is_empty());
         engine.undo("human").unwrap();
-        assert_eq!(engine.doc.layers[0].pixels, before.layers[0].pixels);
+        assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].pixels, before.layers[0].pixels);
         engine.redo("human").unwrap();
-        assert_eq!(engine.doc.layers[0].pixels, expected.layers[0].pixels);
+        assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].pixels, expected.layers[0].pixels);
     }
 }
 
@@ -921,7 +962,7 @@ fn pending_long_stroke_still_cancels_and_rejects_obsolete_results_after_escape_o
             assert!(app.points.is_empty() && app.drag_start.is_none());
             assert!(app.live_gesture.is_none());
             assert!(app.pending);
-            assert_eq!(app.preview_variant_builds.get(), builds);
+            assert_eq!(app.preview_variant_builds.get(), builds + usize::from(interruption == "shared"));
             assert_eq!(app.canvas_pixels, accepted);
             let retained = workspace::source(&app);
             app.parameter_worker_gate = None;
@@ -947,12 +988,12 @@ fn pending_long_stroke_still_cancels_and_rejects_obsolete_results_after_escape_o
             assert_eq!(
                 pixels,
                 &engine
-                    .doc
+                    .resident_state().expect("resident fixture").document
                     .preview(None, (*w).max(*h), None, false)
                     .unwrap()
                     .2
             );
-            assert_eq!(engine.doc.bit_depth, depth);
+            assert_eq!(engine.resident_state().expect("resident fixture").document.bit_depth, depth);
         }
     }
 }
@@ -1010,6 +1051,7 @@ fn alt_sample_frame(
         },
         |ctx| app.draw(ctx),
     );
+    super::sampled_input::tests::settle(app, ctx);
 }
 fn alt_sample_button(at: Pos2, pressed: bool) -> egui::Event {
     egui::Event::PointerButton {
@@ -1029,18 +1071,20 @@ fn alt_sample_point(app: &PeerBrush, point: [f32; 2]) -> Pos2 {
 fn alt_sample_expected(app: &PeerBrush, point: [i32; 2]) -> Pixel {
     let engine = app.shared.lock().unwrap();
     if app.mask {
-        let layer = engine
-            .doc
-            .layers
-            .iter()
-            .find(|l| l.id == app.selected)
-            .unwrap();
-        let value =
-            (layer.mask_value_raw(point[0] - layer.x, point[1] - layer.y) * 255.).round() as u8;
+        let value = engine
+            .resident_state().expect("resident fixture").document
+            .preview(
+                Some([point[0], point[1], point[0] + 1, point[1] + 1]),
+                1,
+                Some(&app.selected),
+                true,
+            )
+            .unwrap()
+            .2[0];
         [value; 4]
     } else {
         engine
-            .doc
+            .resident_state().expect("resident fixture").document
             .preview(
                 Some([point[0], point[1], point[0] + 1, point[1] + 1]),
                 1,
@@ -1052,6 +1096,61 @@ fn alt_sample_expected(app: &PeerBrush, point: [i32; 2]) -> Pixel {
             .try_into()
             .unwrap()
     }
+}
+
+#[test]
+fn picker_uses_native_mask_preview_precision_and_rejects_invalid_cached_coordinates() {
+    let (mut app, _) = workspace::fixture(16);
+    let selected = app.selected.clone();
+    {
+        let mut engine = app.shared.lock().unwrap();
+        engine
+            .edit(
+                "human",
+                &[json!({"op":"mask.add","layer":selected,"value":0})],
+                None,
+                None,
+                "Native mask",
+            )
+            .unwrap();
+        let mask = engine
+            .resident_state_mut().expect("resident fixture").document
+            .layers
+            .iter_mut()
+            .find(|l| l.id == selected)
+            .unwrap()
+            .mask
+            .as_mut()
+            .unwrap();
+        mask.enabled = false;
+        mask.steps[1].weight = 0.5;
+        mask.steps[1]
+            .pixels
+            .set16(3, 4, [32638, 32638, 32638, 65535]);
+    }
+    app.mask = true;
+    let doc = app.shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
+    let before = serde_json::to_value(&doc).unwrap();
+    let history = app.shared.lock().unwrap().resident_state().expect("resident fixture").undo.len();
+    assert!(app.pick_color(&doc, [3.75, 4.25]));
+    assert_eq!(app.mask_value, 63);
+    assert_eq!(app.mask_value16, Some(16319));
+    let project = app.project_id.clone();
+    app.pick_alt_color(&doc, &project, [0., 0.]);
+    assert!(app.alt_sample.is_some());
+    app.mask_value = 201;
+    app.pick_alt_color(&doc, &project, [f32::NAN, 0.]);
+    assert_eq!(app.mask_value, 201);
+    assert!(app.alt_sample.is_none());
+    for point in [[-0.1, 0.], [f32::INFINITY, 0.], [doc.width as f32, 0.]] {
+        assert!(!app.pick_color(&doc, point));
+        assert_eq!(app.mask_value, 201);
+    }
+    assert_eq!(app.shared.lock().unwrap().resident_state().expect("resident fixture").undo.len(), history);
+    assert_eq!(
+        serde_json::to_value(&app.shared.lock().unwrap().resident_state().expect("resident fixture").document).unwrap(),
+        before
+    );
 }
 fn alt_sample_assert(app: &PeerBrush, point: [i32; 2]) {
     let expected = alt_sample_expected(app, point);
@@ -1091,7 +1190,7 @@ fn alt_sample_fixture(depth: u16) -> (PeerBrush, egui::Context) {
                 .unwrap();
         }
         engine.undo("human").unwrap();
-        assert!(!engine.undo.is_empty() && !engine.redo.is_empty());
+        assert!(!engine.resident_state().expect("resident fixture").undo.is_empty() && !engine.resident_state().expect("resident fixture").redo.is_empty());
     }
     settle(&mut app, &ctx);
     (app, ctx)
@@ -1150,7 +1249,7 @@ fn alt_held_identical_native_pixels_reapply_exact_samples_without_resampling_and
             if mask {
                 let engine = app.shared.lock().unwrap();
                 let layer = engine
-                    .doc
+                    .resident_state().expect("resident fixture").document
                     .layers
                     .iter()
                     .find(|l| l.id == app.selected)
@@ -1171,8 +1270,8 @@ fn alt_held_identical_native_pixels_reapply_exact_samples_without_resampling_and
             assert!(app.alt_sample.is_none());
             assert_eq!(json!(app.shared.lock().unwrap().leases), reservations);
             let destination = alt_sample_point(&app, [24.25, 16.25]);
-            let baseline = app.shared.lock().unwrap().doc.clone();
-            let history = app.shared.lock().unwrap().undo.len();
+            let baseline = app.shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
+            let history = app.shared.lock().unwrap().resident_state().expect("resident fixture").undo.len();
             let layer = app.selected.clone();
             let target_pixel = |doc: &Document| {
                 let layer = doc.layers.iter().find(|l| l.id == layer).unwrap();
@@ -1208,7 +1307,7 @@ fn alt_held_identical_native_pixels_reapply_exact_samples_without_resampling_and
             } else {
                 app.color
             };
-            let command = app.stroke_command(app.points.clone(), color);
+            let command = app.stroke_command(&app.points, color);
             let expected = Engine::preview_edits(baseline.clone(), &[command]).unwrap();
             assert_ne!(
                 target_pixel(&expected),
@@ -1217,17 +1316,17 @@ fn alt_held_identical_native_pixels_reapply_exact_samples_without_resampling_and
             );
             frame(&mut app, &ctx, vec![pointer(destination, false)]);
             let mut engine = app.shared.lock().unwrap();
-            assert_eq!(engine.undo.len(), history + 1);
-            assert_eq!(engine.doc.bit_depth, depth);
+            assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), history + 1);
+            assert_eq!(engine.resident_state().expect("resident fixture").document.bit_depth, depth);
             assert_ne!(
-                target_pixel(&engine.doc),
+                target_pixel(&engine.resident_state().expect("resident fixture").document),
                 native_before,
                 "Immediate paint must change native data"
             );
-            assert_eq!(target_pixel(&engine.doc), target_pixel(&expected));
+            assert_eq!(target_pixel(&engine.resident_state().expect("resident fixture").document), target_pixel(&expected));
             assert_eq!(
                 engine
-                    .doc
+                    .resident_state().expect("resident fixture").document
                     .layers
                     .iter()
                     .map(|l| json!([l.pixels, l.mask]))
@@ -1240,12 +1339,12 @@ fn alt_held_identical_native_pixels_reapply_exact_samples_without_resampling_and
             );
             engine.undo("human").unwrap();
             assert_eq!(
-                engine.doc.export_png().unwrap(),
+                engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
                 baseline.export_png().unwrap()
             );
             engine.redo("human").unwrap();
             assert_eq!(
-                engine.doc.export_png().unwrap(),
+                engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
                 expected.export_png().unwrap()
             );
         }
@@ -1288,7 +1387,7 @@ fn alt_sample_source_revision_selected_mask_and_step_changes_cannot_reuse_old_pi
                         app.shared
                             .lock()
                             .unwrap()
-                            .doc
+                            .resident_state().expect("resident fixture").document
                             .layers
                             .iter()
                             .find(|l| l.id == layer)
@@ -1306,7 +1405,7 @@ fn alt_sample_source_revision_selected_mask_and_step_changes_cannot_reuse_old_pi
                         .shared
                         .lock()
                         .unwrap()
-                        .doc
+                        .resident_state().expect("resident fixture").document
                         .layers
                         .iter()
                         .find(|l| l.id != layer)
@@ -1357,7 +1456,7 @@ fn alt_sample_runtime_restore_engine_project_focus_and_plain_picker_boundaries_s
             );
             let runs = app.color_pick_runs;
             let previous = app.shared.clone();
-            let original = previous.lock().unwrap().doc.clone();
+            let original = previous.lock().unwrap().resident_state().expect("resident fixture").document.clone();
             let original_id = original.id.clone();
             let mut events = vec![];
             let mut focused = true;
@@ -1368,24 +1467,24 @@ fn alt_sample_runtime_restore_engine_project_focus_and_plain_picker_boundaries_s
                         .unwrap()
                         .replace(original.clone(), None)
                         .unwrap();
-                    assert_ne!(app.shared.lock().unwrap().doc.id, original_id);
+                    assert_ne!(app.shared.lock().unwrap().resident_state().expect("resident fixture").document.id, original_id);
                 }
                 "engine" => {
                     // Same serialized identity in a new Engine is still a different owner.
                     let mut replacement = Engine::new();
                     replacement.project_id = previous.lock().unwrap().project_id.clone();
-                    replacement.doc = original.clone();
+                    replacement.resident_state_mut().expect("resident fixture").document = original.clone();
                     app.shared = Arc::new(std::sync::Mutex::new(replacement));
                 }
                 "project" => {
                     let mut replacement = Engine::new();
-                    replacement.doc = original.clone();
+                    replacement.resident_state_mut().expect("resident fixture").document = original.clone();
                     let added =
                         crate::workspace::register_in(&app.workspace, replacement, None).unwrap();
                     let id = added.lock().unwrap().project_id.clone();
                     crate::workspace::select_in(&app.workspace, &id).unwrap();
                     app.switch_project(&id);
-                    assert_ne!(app.shared.lock().unwrap().doc.id, original_id);
+                    assert_ne!(app.shared.lock().unwrap().resident_state().expect("resident fixture").document.id, original_id);
                 }
                 "focus" => {
                     focused = false;
@@ -1434,15 +1533,22 @@ fn alt_sample_runtime_restore_engine_project_focus_and_plain_picker_boundaries_s
             let at = alt_sample_point(&app, [6.25, 8.25]);
             let before = workspace::source(&app);
             let plain_runs = app.color_pick_runs;
-            workspace::click(&mut app, &ctx, SIZE, at);
-            workspace::click(&mut app, &ctx, SIZE, at);
+            for _ in 0..2 {
+                workspace::click(&mut app, &ctx, SIZE, at);
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while app.color_pick.is_some() {
+                    app.poll_color_pick(&ctx);
+                    assert!(std::time::Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
             assert_eq!(app.color_pick_runs, plain_runs + 2);
             assert!(app.alt_sample.is_none());
             alt_sample_assert(&app, [6, 8]);
             assert_eq!(workspace::source(&app), before);
             if matches!(boundary, "engine" | "project") {
                 assert_eq!(
-                    serde_json::to_value(&previous.lock().unwrap().doc).unwrap(),
+                    serde_json::to_value(&previous.lock().unwrap().resident_state().expect("resident fixture").document).unwrap(),
                     serde_json::to_value(original).unwrap()
                 );
             }
@@ -1454,8 +1560,8 @@ fn entering_alt_commits_existing_native_stroke_before_sampling_and_respects_late
     for depth in [8, 16] {
         let (mut app, ctx) = alt_sample_fixture(depth);
         app.color = [211, 43, 97, 255];
-        let before = app.shared.lock().unwrap().doc.clone();
-        let history = app.shared.lock().unwrap().undo.len();
+        let before = app.shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
+        let history = app.shared.lock().unwrap().resident_state().expect("resident fixture").undo.len();
         let start = alt_sample_point(&app, [14.25, 12.25]);
         frame(
             &mut app,
@@ -1467,7 +1573,7 @@ fn entering_alt_commits_existing_native_stroke_before_sampling_and_respects_late
         assert!(!app.points.is_empty());
         let expected = Engine::preview_edits(
             before.clone(),
-            &[app.stroke_command(app.points.clone(), app.color)],
+            &[app.stroke_command(&app.points, app.color)],
         )
         .unwrap();
         alt_sample_frame(&mut app, &ctx, vec![], true, true);
@@ -1475,11 +1581,11 @@ fn entering_alt_commits_existing_native_stroke_before_sampling_and_respects_late
         alt_sample_assert(&app, [16, 12]);
         {
             let engine = app.shared.lock().unwrap();
-            assert_eq!(engine.undo.len(), history + 1);
-            assert_eq!(engine.doc.bit_depth, depth);
+            assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), history + 1);
+            assert_eq!(engine.resident_state().expect("resident fixture").document.bit_depth, depth);
             assert_eq!(
                 engine
-                    .doc
+                    .resident_state().expect("resident fixture").document
                     .layers
                     .iter()
                     .map(|l| json!(l.pixels))
@@ -1492,7 +1598,7 @@ fn entering_alt_commits_existing_native_stroke_before_sampling_and_respects_late
             );
             assert_eq!(
                 app.alt_sample.as_ref().unwrap().revision,
-                engine.doc.revision
+                engine.resident_state().expect("resident fixture").document.revision
             );
         }
         let layer = app.selected.clone();
@@ -1523,6 +1629,160 @@ fn entering_alt_commits_existing_native_stroke_before_sampling_and_respects_late
         workspace::click(&mut app, &ctx, SIZE, destination);
         assert_eq!(workspace::source(&app), retained);
         assert_eq!(json!(app.shared.lock().unwrap().leases), reservations);
-        assert_eq!(app.shared.lock().unwrap().doc.bit_depth, depth);
+        assert_eq!(app.shared.lock().unwrap().resident_state().expect("resident fixture").document.bit_depth, depth);
     }
+}
+
+#[test]
+fn pending_edit_preserves_parameter_draft_and_refuses_new_control_commands() {
+    for cancel_other in [false, true] {
+        let (mut app, ctx) = workspace::fixture(16);
+        let id = app.selected.clone();
+        let source = install(
+            &mut app,
+            vec![json!({"op":"layer.update", "layer":id, "opacity":0.35})],
+        );
+        let control = app.parameter_gesture.as_ref().unwrap().control;
+        let commands = app.parameter_gesture.as_ref().unwrap().commands.clone();
+        let shared = app.shared.clone();
+        let guard = shared.lock().unwrap();
+        let history = guard.history_lengths();
+        app.submit_edit_job(
+            edit_job::Request {
+                project: app.project_id.clone(),
+                document: source.id.clone(),
+                revision: source.revision,
+                label: "Other edit".into(),
+                selection_edit: false,
+                origin: edit_job::Origin::Action,
+            },
+            edit_job::Commands::resident(vec![
+                json!({"op":"layer.update", "layer":id, "name":"Other completed edit"}),
+            ]),
+            &ctx,
+        )
+        .unwrap();
+        app.finish_parameter(false);
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let response = ui.button("Another parameter");
+                app.layer_parameter(json!({"opacity":0.9}), "Another parameter", &response);
+            });
+        });
+        assert_eq!(app.parameter_gesture.as_ref().unwrap().control, control);
+        assert_eq!(app.parameter_gesture.as_ref().unwrap().commands, commands);
+        assert_eq!(guard.resident_state().expect("resident fixture").document.revision, source.revision);
+        assert_eq!(guard.history_lengths(), history);
+        if cancel_other {
+            app.cancel_pending_edit();
+        }
+        drop(guard);
+        super::text_tests::wait_edit(&mut app);
+        app.finish_parameter(false);
+        assert!(app.parameter_gesture.is_none());
+        let engine = shared.lock().unwrap();
+        assert_eq!(engine.history_lengths(), [history[0] + 1, 0]);
+        assert_eq!(
+            engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(),
+            source.layers[0].pixels.rgba16()
+        );
+        if cancel_other {
+            assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].opacity, 0.35);
+            assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].name, source.layers[0].name);
+        } else {
+            assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].opacity, source.layers[0].opacity);
+            assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].name, "Other completed edit");
+            assert_eq!(app.cancelled_parameter, Some(control));
+        }
+    }
+}
+
+#[test]
+fn queued_parameter_terminal_result_updates_selection_failure_and_control_guard() {
+    for outcome in ["commit", "cancel", "reserved"] {
+        let (mut app, ctx) = workspace::fixture(16);
+        let shared = app.shared.clone();
+        {
+            let mut engine = shared.lock().unwrap();
+            engine
+                .edit(
+                    "human",
+                    &[json!({"op":"selection", "kind":"rectangle", "rect":[1,1,12,12]})],
+                    None,
+                    None,
+                    "Selection",
+                )
+                .unwrap();
+            if outcome == "reserved" {
+                engine
+                    .reserve("agent", "Selection draft", vec![Scope::layer("@selection")])
+                    .unwrap();
+            }
+        }
+        let guard = shared.lock().unwrap();
+        let source = guard.resident_state().expect("resident fixture").document.clone();
+        let history = guard.history_lengths();
+        let control = egui::Id::new("queued parameter control");
+        app.submit_edit_job(
+            edit_job::Request {
+                project: app.project_id.clone(),
+                document: source.id.clone(),
+                revision: source.revision,
+                label: "Selection feather".into(),
+                selection_edit: true,
+                origin: edit_job::Origin::Parameter(control),
+            },
+            edit_job::Commands::resident(vec![json!({"op":"selection.update", "feather":1})]),
+            &ctx,
+        )
+        .unwrap();
+        assert!(!app.selection_commit_failed);
+        assert_eq!(app.cancelled_parameter, None);
+        assert_eq!(guard.resident_state().expect("resident fixture").document.revision, source.revision);
+        if outcome == "cancel" {
+            app.cancel_pending_edit();
+        }
+        drop(guard);
+        super::text_tests::wait_edit(&mut app);
+        let engine = shared.lock().unwrap();
+        assert_eq!(
+            engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(),
+            source.layers[0].pixels.rgba16()
+        );
+        if outcome == "commit" {
+            assert_eq!(engine.resident_state().expect("resident fixture").document.revision, source.revision + 1);
+            assert_eq!(engine.history_lengths(), [history[0] + 1, 0]);
+            assert!(!app.selection_commit_failed);
+            assert_eq!(app.cancelled_parameter, None);
+        } else {
+            assert_eq!(
+                serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap(),
+                serde_json::to_value(&source).unwrap()
+            );
+            assert_eq!(engine.history_lengths(), history);
+            assert!(app.selection_commit_failed);
+            assert_eq!(app.cancelled_parameter, Some(control));
+        }
+    }
+}
+
+#[test]
+fn cancelled_parameter_allows_fresh_keyboard_input_but_not_key_repeat() {
+    let (mut app, ctx) = workspace::fixture(16);
+    let control = egui::Id::new("cancelled numeric control");
+    let event = |pressed, repeat| egui::Event::Key {
+        key: egui::Key::Tab,
+        physical_key: Some(egui::Key::Tab),
+        pressed,
+        repeat,
+        modifiers: Default::default(),
+    };
+    frame(&mut app, &ctx, vec![event(true, false)]);
+    app.cancelled_parameter = Some(control);
+    frame(&mut app, &ctx, vec![event(true, true)]);
+    assert_eq!(app.cancelled_parameter, Some(control));
+    frame(&mut app, &ctx, vec![event(false, false)]);
+    assert_eq!(app.cancelled_parameter, Some(control));
+    frame(&mut app, &ctx, vec![event(true, false)]);
+    assert_eq!(app.cancelled_parameter, None);
 }

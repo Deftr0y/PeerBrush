@@ -6,6 +6,8 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
+mod forest;
+pub(crate) use forest::Forest;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Layers {
@@ -16,63 +18,9 @@ pub struct Layers {
 }
 
 pub fn copy(doc: &Document, ids: &[String]) -> Result<Layers, String> {
-    if ids.is_empty() || ids.len() > 100 {
-        return Err("Choose 1–100 layers to copy".into());
-    }
-    let selected = ids.iter().cloned().collect::<HashSet<_>>();
-    if selected
-        .iter()
-        .any(|id| !doc.layers.iter().any(|l| l.id == *id))
-    {
-        return Err("A selected layer no longer exists".into());
-    }
-    let mut roots = crate::tree::roots(doc, &selected);
-    // Storage may place children before folders. Match the visible hierarchy's
-    // preorder so moving copied roots into one folder retains their visible order.
-    fn hierarchy_order(
-        doc: &Document,
-        parent: Option<&str>,
-        depth: usize,
-        order: &mut HashMap<String, usize>,
-    ) {
-        if depth > 16 {
-            return;
-        }
-        for layer in doc
-            .layers
-            .iter()
-            .filter(|layer| layer.parent.as_deref() == parent)
-        {
-            order.insert(layer.id.clone(), order.len());
-            if layer.kind == "group" {
-                hierarchy_order(doc, Some(&layer.id), depth + 1, order);
-            }
-        }
-    }
-    let mut order = HashMap::new();
-    hierarchy_order(doc, None, 0, &mut order);
-    roots.sort_by_key(|id| order.get(id).copied().unwrap_or(usize::MAX));
-    let mut included = roots.iter().cloned().collect::<HashSet<_>>();
-    loop {
-        let old = included.len();
-        for l in &doc.layers {
-            if l.parent.as_ref().is_some_and(|p| included.contains(p)) {
-                included.insert(l.id.clone());
-            }
-        }
-        if old == included.len() {
-            break;
-        }
-    }
-    if doc.layers.iter().any(|l| {
-        l.clip_to
-            .as_ref()
-            .is_some_and(|base| included.contains(&l.id) != included.contains(base))
-    }) {
-        return Err(
-            "Copy the base and its clipped layers together, or release clipping first".into(),
-        );
-    }
+    check_copy_source(doc.into())?;
+    let forest = Forest::new(doc.into(), ids)?;
+    let roots = forest.roots().map(|i| doc.layers[i].id.clone()).collect();
     let snapshot = Layers {
         width: doc.width,
         height: doc.height,
@@ -80,15 +28,27 @@ pub fn copy(doc: &Document, ids: &[String]) -> Result<Layers, String> {
         layers: doc
             .layers
             .iter()
-            .filter(|l| included.contains(&l.id))
-            .cloned()
+            .enumerate()
+            .filter(|(i, _)| forest.contains(*i))
+            .map(|(_, layer)| layer.clone())
             .collect(),
     };
     validate(&snapshot)?;
     Ok(snapshot)
 }
 
+pub(crate) fn check_copy_source(doc: crate::engine::view::DocumentView<'_>) -> Result<(), String> {
+    if doc.read_only() {
+        return Err("Protected Photoshop sources need an explicit compatible copy before copying editable layers".into());
+    }
+    Ok(())
+}
+
 pub fn validate(snapshot: &Layers) -> Result<(), String> {
+    validated_document(snapshot).map(drop)
+}
+
+pub(crate) fn validated_document(snapshot: &Layers) -> Result<Document, String> {
     check_size(snapshot.width, snapshot.height)?;
     if snapshot.layers.is_empty() || snapshot.layers.len() > 100 || snapshot.roots.is_empty() {
         return Err("Clipboard needs a valid layer tree within the 100-layer limit".into());
@@ -140,7 +100,8 @@ pub fn validate(snapshot: &Layers) -> Result<(), String> {
             layer.parent = None;
         }
     }
-    crate::psd::validate(&draft)
+    crate::psd::validate(&draft)?;
+    Ok(draft)
 }
 fn validate_raster(r: &Raster) -> Result<(), String> {
     check_size(r.width, r.height)?;
@@ -182,11 +143,19 @@ pub fn cut_commands(doc: &Document, ids: &[String]) -> Result<Vec<Value>, String
         .map(|root| json!({"op":"layer.delete","layer":root}))
         .collect())
 }
-fn cloned(snapshot: &Layers, parent: Option<&str>, keep_parent: bool) -> (Vec<Layer>, Vec<String>) {
+fn cloned(
+    snapshot: &Layers,
+    parent: Option<&str>,
+    keep_parent: bool,
+    root_ids: Option<&serde_json::Map<String, Value>>,
+) -> (Vec<Layer>, Vec<String>) {
     let mapping = snapshot
         .layers
         .iter()
-        .map(|l| (l.id.as_str(), id()))
+        .map(|l| {
+            let copied = root_ids.and_then(|ids| ids.get(&l.id)).and_then(Value::as_str);
+            (l.id.as_str(), copied.map_or_else(id, str::to_owned))
+        })
         .collect::<HashMap<_, _>>();
     let root_set = snapshot
         .roots
@@ -271,21 +240,59 @@ fn commit(doc: &mut Document, mut draft: Document) -> Result<(), String> {
 /// Duplicate the active selected image at its document coordinates, or its whole
 /// editable layer tree when no pixel selection is active. No OS clipboard is used.
 pub fn duplicate_selection(doc: &mut Document, command: &Value) -> Result<Vec<String>, String> {
+    let (target, mask) = duplicate_selection_target((&*doc).into(), command)?;
+    duplicate_selected_pixels(doc, target, mask)
+}
+
+pub(crate) fn duplicate_selection_target<'a>(
+    doc: crate::engine::view::DocumentView<'_>,
+    command: &'a Value,
+) -> Result<(&'a str, bool), String> {
     if command
         .get("document_id")
-        .is_some_and(|value| value.as_str() != Some(doc.id.as_str()))
+        .is_some_and(|value| value.as_str() != Some(doc.id()))
         || command
             .get("source_revision")
-            .is_some_and(|value| value.as_u64() != Some(doc.revision))
+            .is_some_and(|value| value.as_u64() != Some(doc.revision()))
     {
         return Err("The source document changed before duplication".into());
     }
-    if doc.read_only {
+    if doc.read_only() {
         return Err("This PSD is read-only".into());
     }
     let target = command["layer"]
         .as_str()
         .ok_or("Choose an active layer to duplicate")?;
+    let mask = command.get("mask").map_or(Ok(false), |value| {
+        value.as_bool().ok_or("Duplicate mask must be true or false")
+    })?;
+    if mask {
+        if doc.selection().is_none() {
+            return Err("Select pixels before duplicating a mask".into());
+        }
+        if doc.find_layer(target).and_then(|layer| layer.mask()).is_none() {
+            return Err("Choose a layer with a mask to duplicate".into());
+        }
+    }
+    Ok((target, mask))
+}
+
+pub(crate) fn duplicate_selection_index(
+    doc: crate::engine::view::DocumentView<'_>,
+    at: usize,
+    mask: bool,
+) -> usize {
+    let source = doc.layer(at).unwrap();
+    let base = match source.clip_to() {
+        Some(_) if !mask => return at,
+        clip_to => clip_to.unwrap_or(source.id()),
+    };
+    // Insert above the clipping unit whenever the new layer is an independent sibling.
+    doc.layers().position(|layer| layer.id() == base || layer.clip_to() == Some(base))
+        .unwrap_or(at)
+}
+
+fn duplicate_selected_pixels(doc: &mut Document, target: &str, mask: bool) -> Result<Vec<String>, String> {
     if doc.selection.is_none() {
         return duplicate(doc, &[target.into()]);
     }
@@ -299,10 +306,10 @@ pub fn duplicate_selection(doc: &mut Document, command: &Value) -> Result<Vec<St
         .position(|layer| layer.id == target)
         .ok_or("The active layer no longer exists")?;
     let source = &doc.layers[at];
-    if source.kind == "adjustment" {
+    if !mask && source.kind == "adjustment" {
         return Err("Choose a paint layer or folder to duplicate selected pixels".into());
     }
-    let image = crate::clipboard::Image::copy(doc, target, false, false)?;
+    let image = crate::clipboard::Image::copy_in_document(doc, target, mask)?;
     let pixels = if let Some(words) = &image.samples16 {
         Raster::from_rgba16(image.width, image.height, words)?
     } else {
@@ -319,7 +326,7 @@ pub fn duplicate_selection(doc: &mut Document, command: &Value) -> Result<Vec<St
         .origin
         .ok_or("Selected pixels need document coordinates")?;
     let mut layer = Layer::new(
-        &format!("{} selection", source.name),
+        &format!("{} {}", source.name, if mask { "mask selection" } else { "selection" }),
         "paint",
         image.width,
         image.height,
@@ -329,20 +336,10 @@ pub fn duplicate_selection(doc: &mut Document, command: &Value) -> Result<Vec<St
     layer.y = origin[1];
     layer.pixels = pixels;
     let created = layer.id.clone();
-    // A clipped source remains clipped to the same base. The base itself must
-    // stay adjacent to its followers, so insert a base selection above the unit.
-    layer.clip_to = source.clip_to.clone();
-    let insert = if source.clip_to.is_none() {
-        doc.layers
-            .iter()
-            .enumerate()
-            .filter(|(_, layer)| layer.clip_to.as_deref() == Some(target))
-            .map(|(index, _)| index)
-            .min()
-            .unwrap_or(at)
-    } else {
-        at
-    };
+    if !mask {
+        layer.clip_to = source.clip_to.clone();
+    }
+    let insert = duplicate_selection_index((&*doc).into(), at, mask);
     let mut draft = doc.clone();
     draft.layers.insert(insert, layer);
     commit(doc, draft)?;
@@ -351,6 +348,39 @@ pub fn duplicate_selection(doc: &mut Document, command: &Value) -> Result<Vec<St
 
 /// Duplicate each root immediately above its original, retaining its original parent.
 pub fn duplicate(doc: &mut Document, ids: &[String]) -> Result<Vec<String>, String> {
+    duplicate_with_ids(doc, ids, None)
+}
+
+pub(crate) fn checked_duplicate_ids<'a, 'b>(
+    doc: crate::engine::view::DocumentView<'_>,
+    roots: impl Iterator<Item = &'b str>,
+    requested: Option<&'a Value>,
+) -> Result<Option<&'a serde_json::Map<String, Value>>, String> {
+    let Some(requested) = requested else { return Ok(None) };
+    let requested = requested.as_object()
+        .filter(|ids| (1..=100).contains(&ids.len()))
+        .ok_or("Duplicate root IDs must map the copied roots to new layer UUIDs")?;
+    let mut used = HashSet::with_capacity(requested.len());
+    for root in roots {
+        let copied = requested.get(root).and_then(Value::as_str)
+            .filter(|value| value.len() == 36)
+            .filter(|value| uuid::Uuid::parse_str(value).is_ok_and(|id| id.to_string() == *value))
+            .ok_or("Each copied root needs a canonical new layer UUID")?;
+        if doc.find_layer(copied).is_some() || !used.insert(copied) {
+            return Err("A duplicate root UUID is already in use".into());
+        }
+    }
+    if used.len() != requested.len() {
+        return Err("Duplicate root IDs must match the copied roots".into());
+    }
+    Ok(Some(requested))
+}
+
+pub(crate) fn duplicate_with_ids(
+    doc: &mut Document,
+    ids: &[String],
+    requested: Option<&Value>,
+) -> Result<Vec<String>, String> {
     if doc.read_only {
         return Err("This PSD is read-only".into());
     }
@@ -361,7 +391,8 @@ pub fn duplicate(doc: &mut Document, ids: &[String]) -> Result<Vec<String>, Stri
     if doc.layers.len() + snapshot.layers.len() > 100 {
         return Err("Initial version supports up to 100 layers".into());
     }
-    let (clones, created) = cloned(&snapshot, None, true);
+    let root_ids = checked_duplicate_ids((&*doc).into(), snapshot.roots.iter().map(String::as_str), requested)?;
+    let (clones, created) = cloned(&snapshot, None, true, root_ids);
     let mut draft = doc.clone();
     let at = doc
         .layers
@@ -406,70 +437,69 @@ pub fn duplicate(doc: &mut Document, ids: &[String]) -> Result<Vec<String>, Stri
     Ok(created)
 }
 
-/// Paste into a folder/current sibling folder. Top-level paint destinations become a folder.
-pub fn paste(doc: &mut Document, snapshot: &Layers, target: &str) -> Result<Vec<String>, String> {
+pub(crate) fn plan_paste(
+    doc: &Document,
+    count: usize,
+    target: &str,
+) -> Result<crate::clipboard::paste::Plan, String> {
     if doc.read_only {
         return Err("This PSD is read-only".into());
     }
-    validate(snapshot)?;
-    let selected = doc.layers.iter().position(|l| l.id == target);
-    if selected.is_none() && !target.is_empty() && !doc.layers.is_empty() {
-        return Err("Paste destination no longer exists; choose a layer or folder again".into());
-    }
-    // An empty document after Cut has no destination. An omitted target uses the first layer.
-    let selected = selected.or_else(|| (!doc.layers.is_empty()).then_some(0));
-    if let Some(index) = selected {
-        unlocked(doc, &doc.layers[index].id)?;
-    }
-    let wrap = selected.is_some_and(|index| {
-        doc.layers[index].kind != "group" && doc.layers[index].parent.is_none()
-    });
-    if doc.layers.len() + snapshot.layers.len() + usize::from(wrap) > 100 {
-        return Err("Initial version supports up to 100 layers".into());
-    }
-    let mut draft = doc.clone();
-    let (at, parent) = if let Some(index) = selected {
-        let current = draft.layers[index].clone();
-        if wrap {
-            let base = current.clip_to.as_deref().unwrap_or(&current.id);
-            let members: Vec<_> = draft
-                .layers
-                .iter()
-                .enumerate()
-                .filter(|(_, l)| {
-                    l.parent == current.parent
-                        && (l.id == base || l.clip_to.as_deref() == Some(base))
-                })
-                .map(|(i, _)| i)
-                .collect();
-            let at = *members.iter().min().unwrap();
-            let base_at = draft.layers.iter().position(|l| l.id == base).unwrap();
-            let mut folder = Layer::new(
-                &format!("{} group", draft.layers[base_at].name),
-                "group",
-                doc.width,
-                doc.height,
-            );
-            folder.blend = draft.layers[base_at].blend.clone();
-            draft.layers[base_at].blend = "normal".into();
-            for member in members {
-                draft.layers[member].parent = Some(folder.id.clone());
+    crate::clipboard::paste::Plan::layers(
+        target,
+        doc.layers.len(),
+        count,
+        |i| {
+            let l = &doc.layers[i];
+            crate::clipboard::paste::Layer {
+                id: &l.id,
+                parent: l.parent.as_deref(),
+                kind: &l.kind,
+                clip_to: l.clip_to.as_deref(),
+                locked: l.locked,
             }
-            let parent = Some(folder.id.clone());
-            draft.layers.insert(at, folder);
-            (at + 1, parent)
-        } else if current.kind == "group" {
-            (index + 1, Some(current.id))
-        } else {
-            (index, current.parent)
+        },
+    )
+}
+
+/// Paste into a folder/current sibling folder. Top-level paint destinations become a folder.
+pub fn paste(doc: &mut Document, snapshot: &Layers, target: &str) -> Result<Vec<String>, String> {
+    let plan = plan_paste(doc, snapshot.layers.len(), target)?;
+    validate(snapshot)?;
+    let mut draft = doc.clone();
+    let parent = if let Some(base) = plan.wrap_base {
+        let current = &doc.layers[base];
+        let mut folder = Layer::new(
+            &format!("{} group", current.name),
+            "group",
+            doc.width,
+            doc.height,
+        );
+        folder.blend = current.blend.clone();
+        draft.layers[base].blend = "normal".into();
+        for layer in &mut draft.layers {
+            if layer.parent == current.parent
+                && (layer.id == current.id || layer.clip_to.as_deref() == Some(&current.id))
+            {
+                layer.parent = Some(folder.id.clone());
+            }
         }
+        let parent = Some(folder.id.clone());
+        draft.layers.insert(plan.index - 1, folder);
+        parent
     } else {
-        (0, None)
+        plan.parent
     };
-    let (clones, created) = cloned(snapshot, parent.as_deref(), false);
-    draft.layers.splice(at..at, clones);
+    let (mut clones, created) = cloned(snapshot, parent.as_deref(), false, None);
+    for effect in clones.iter_mut().flat_map(|layer| &mut layer.effects) {
+        if !crate::effects::styles::global_light_matches(&effect.settings, doc.psd_global_angle) {
+            crate::effects::styles::detach_global_light(std::sync::Arc::make_mut(&mut effect.settings));
+        }
+    }
+    draft.layers.splice(plan.index..plan.index, clones);
     draft.selection = None;
     draft.selection_polygon = None;
+    draft.selection_coverage = None;
     commit(doc, draft)?;
     Ok(created)
 }

@@ -40,6 +40,7 @@ impl<'a> Namespace<'a> {
         // Do not retain another file handle: verified retirement must close the
         // last physical owner before its persistent file charge can be released.
         drop(file);
+        let access = session.serialize_inventory_access()?;
         let mut state = session
             .runtime
             .inventory
@@ -58,6 +59,7 @@ impl<'a> Namespace<'a> {
             },
         );
         drop(state);
+        drop(access);
         let namespace = Namespace {
             session,
             id,
@@ -103,6 +105,7 @@ impl<'a> Namespace<'a> {
         {
             return Err("Operation spool ownership changed; inventory retained".into());
         }
+        let _check = self.session.serialize_inventory_access()?;
         let state = self
             .session
             .runtime
@@ -144,6 +147,7 @@ impl<'a> Namespace<'a> {
             return Err(error);
         }
         session.cleanup_check()?;
+        let _check = session.serialize_inventory_access()?;
         let mut state = session
             .runtime
             .inventory
@@ -203,6 +207,18 @@ impl SourceSession {
     }
 }
 impl<'a> SessionTemporary<'a> {
+    pub(crate) fn append(
+        &mut self,
+        bytes: &[u8],
+        check: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<(), String> {
+        let mut failure = None;
+        self.temporary
+            .append(bytes, &mut || {
+                self.namespace.io_check(check, &mut failure, false)
+            })
+            .map_err(|e| failure.unwrap_or_else(|| e.to_string()))
+    }
     /// Caller checks must also be supplied to writer/append; this reference
     /// grants no independent filesystem or editable-document authority.
     pub(crate) fn temporary(&mut self) -> &mut LargeSourceTemporary {
@@ -221,13 +237,37 @@ impl<'a> SessionTemporary<'a> {
             namespace,
         } = self;
         let mut failure = None;
-        let bytes = temporary
-            .finish(binding, &mut || {
-                namespace.io_check(check, &mut failure, false)
-            })
-            .map_err(|e| failure.unwrap_or_else(|| e.to_string()))?;
-        namespace.check()?;
-        Ok(SessionBytes { bytes, namespace })
+        let bytes = match temporary.finish_recoverable(binding, &mut || {
+            namespace.io_check(check, &mut failure, false)
+        }) {
+            Ok(bytes) => bytes,
+            Err((error, temporary)) => {
+                let reason = failure.unwrap_or_else(|| error.to_string());
+                let session = namespace.session;
+                return match (Self {
+                    temporary,
+                    namespace,
+                })
+                .abort(&mut || session.cleanup_check())
+                {
+                    Ok(()) => Err(reason),
+                    Err(cleanup) => Err(format!(
+                        "{reason}; byte seal retirement refused, inventory retained: {cleanup}"
+                    )),
+                };
+            }
+        };
+        let session = namespace.session;
+        let completed = SessionBytes { bytes, namespace };
+        if let Err(reason) = completed.check() {
+            return match completed.retire(&mut || session.cleanup_check()) {
+                Ok(()) => Err(reason),
+                Err(cleanup) => Err(format!(
+                    "{reason}; completed byte retirement refused, inventory retained: {cleanup}"
+                )),
+            };
+        }
+        Ok(completed)
     }
     pub(crate) fn abort(
         self,

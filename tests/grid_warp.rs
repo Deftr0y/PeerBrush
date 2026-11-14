@@ -9,22 +9,22 @@ use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 
 fn edit(e: &mut Engine, commands: &[Value]) {
-    e.edit("human", commands, Some(e.doc.revision), None, "Grid Warp")
+    e.edit("human", commands, Some(e.resident_state().expect("resident fixture").document.revision), None, "Grid Warp")
         .unwrap();
 }
 fn state(e: &Engine) -> Value {
     let history = |items: &[peerbrush::engine::History]| {
         items.iter().map(|h|json!({"before":h.before,"after":h.after,"actor":h.actor,"label":h.label,"task":h.task,"scopes":h.scopes,"gesture":h.gesture,"reverted":h.reverted})).collect::<Vec<_>>()
     };
-    json!({"doc":e.doc,"undo":history(&e.undo),"redo":history(&e.redo)})
+    json!({"doc":e.resident_state().expect("resident fixture").document,"undo":history(&e.resident_state().expect("resident fixture").undo),"redo":history(&e.resident_state().expect("resident fixture").redo)})
 }
 fn fixture(depth: u16) -> Engine {
     let mut e = Engine::new();
-    e.doc = Document::new_depth(64, 48, depth).unwrap();
-    let id = e.doc.layers[0].id.clone();
-    e.doc.layers[0].pixels = Raster::new_depth(16, 12, depth);
+    e.resident_state_mut().expect("resident fixture").document = Document::new_depth(64, 48, depth).unwrap();
+    let id = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
+    e.resident_state_mut().expect("resident fixture").document.layers[0].pixels = Raster::new_depth(16, 12, depth);
     edit(&mut e, &[json!({"op":"mask.add","layer":id})]);
-    let l = &mut e.doc.layers[0];
+    let l = &mut e.resident_state_mut().expect("resident fixture").document.layers[0];
     l.mask.as_mut().unwrap().linked = true;
     for y in 0..12 {
         for x in 0..16 {
@@ -48,11 +48,11 @@ fn fixture(depth: u16) -> Engine {
                 .set16(x, y, [v, v, v, 65535]);
         }
     }
-    e.undo.clear();
+    e.resident_state_mut().expect("resident fixture").undo.clear();
     e
 }
 fn command(e: &Engine, fields: Value) -> Value {
-    let mut c = json!({"op":"transform","layer":e.doc.layers[0].id,"selection_only":false,"warp":{"rect":[-2,-2,18,14],"preset":"arc","amount":0.2}});
+    let mut c = json!({"op":"transform","layer":e.resident_state().expect("resident fixture").document.layers[0].id,"selection_only":false,"warp":{"rect":[-2,-2,18,14],"preset":"arc","amount":0.2}});
     c.as_object_mut()
         .unwrap()
         .extend(fields.as_object().unwrap().clone());
@@ -313,15 +313,15 @@ fn storage(doc: &Document) {
 fn whole_grid_arc_uses_independent_native_inverse_masks_originals_history_and_standard_sources() {
     for depth in [8, 16] {
         let mut e = fixture(depth);
-        let before = e.doc.clone();
+        let before = e.resident_state().expect("resident fixture").document.clone();
         let saved = state(&e);
         let c = command(&e, json!({}));
-        let preview = Engine::preview_edits(e.doc.clone(), &[c.clone()]).unwrap();
+        let preview = Engine::preview_edits(e.resident_state().expect("resident fixture").document.clone(), &[c.clone()]).unwrap();
         assert_eq!(state(&e), saved);
         edit(&mut e, &[c]);
-        native_layers(&e.doc, &preview);
-        assert_eq!(e.undo.len(), 1);
-        let l = &e.doc.layers[0];
+        native_layers(&e.resident_state().expect("resident fixture").document, &preview);
+        assert_eq!(e.resident_state().expect("resident fixture").undo.len(), 1);
+        let l = &e.resident_state().expect("resident fixture").document.layers[0];
         for y in l.y..l.y + l.pixels.height as i32 {
             for x in l.x..l.x + l.pixels.width as i32 {
                 let shift = arc(x as f64 + 0.5, [-2., -2., 18., 14.], 0.2);
@@ -358,12 +358,12 @@ fn whole_grid_arc_uses_independent_native_inverse_masks_originals_history_and_st
                 .enumerate()
                 .any(|(i, v)| i % 4 < 3 && v % 257 != 0));
         }
-        storage(&e.doc);
-        let after = e.doc.clone();
+        storage(&e.resident_state().expect("resident fixture").document);
+        let after = e.resident_state().expect("resident fixture").document.clone();
         e.undo("human").unwrap();
-        native_layers(&e.doc, &before);
+        native_layers(&e.resident_state().expect("resident fixture").document, &before);
         e.redo("human").unwrap();
-        native_layers(&e.doc, &after);
+        native_layers(&e.resident_state().expect("resident fixture").document, &after);
     }
 }
 
@@ -371,7 +371,7 @@ fn whole_grid_arc_uses_independent_native_inverse_masks_originals_history_and_st
 fn successive_warps_then_affine_projective_preserve_one_original_and_reverse_exact_map_order() {
     for depth in [8, 16] {
         let mut e = fixture(depth);
-        let before = e.doc.clone();
+        let before = e.resident_state().expect("resident fixture").document.clone();
         let c = command(
             &e,
             json!({"warp":{"rect":[-2,-2,18,14],"preset":"arc","amount":0.125}}),
@@ -384,14 +384,14 @@ fn successive_warps_then_affine_projective_preserve_one_original_and_reverse_exa
             json!({"warp":{"rect":second,"preset":"arc","amount":-0.1}}),
         );
         edit(&mut e, &[c]);
-        let id = e.doc.layers[0].id.clone();
+        let id = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
         edit(
             &mut e,
             &[json!({"op":"transform","layer":id,"selection_only":false,"dx":3,"dy":2})],
         );
         let c = json!({"op":"transform","layer":id,"selection_only":false,"projective":{"rect":[0,0,64,48],"quad":[[0,0],[64./1.5,0],[64./1.5,48./1.5],[0,48]]}});
         edit(&mut e, &[c]);
-        let l = &e.doc.layers[0];
+        let l = &e.resident_state().expect("resident fixture").document.layers[0];
         let original = l.pixels.retained.as_ref().unwrap();
         assert_eq!(original.warps.len(), 2);
         assert_eq!(original.pixels.rgba16(), before.layers[0].pixels.rgba16());
@@ -416,7 +416,7 @@ fn successive_warps_then_affine_projective_preserve_one_original_and_reverse_exa
                 );
             }
         }
-        storage(&e.doc);
+        storage(&e.resident_state().expect("resident fixture").document);
     }
 }
 
@@ -424,7 +424,7 @@ fn successive_warps_then_affine_projective_preserve_one_original_and_reverse_exa
 fn one_mixed_command_and_canonical_preset_share_native_affine_projective_grid_sampling() {
     for depth in [8, 16] {
         let mut e = fixture(depth);
-        let before = e.doc.clone();
+        let before = e.resident_state().expect("resident fixture").document.clone();
         let saved = state(&e);
         let c = command(
             &e,
@@ -440,8 +440,8 @@ fn one_mixed_command_and_canonical_preset_share_native_affine_projective_grid_sa
         );
         assert_eq!(state(&e), saved);
         edit(&mut e, &[c]);
-        native_layers(&e.doc, &preview);
-        let l = &e.doc.layers[0];
+        native_layers(&e.resident_state().expect("resident fixture").document, &preview);
+        let l = &e.resident_state().expect("resident fixture").document.layers[0];
         assert_eq!(l.pixels.retained.as_ref().unwrap().warps.len(), 1);
         assert_eq!(
             l.pixels.retained.as_ref().unwrap().pixels.as_ref(),
@@ -467,7 +467,7 @@ fn one_mixed_command_and_canonical_preset_share_native_affine_projective_grid_sa
                 );
             }
         }
-        storage(&e.doc);
+        storage(&e.resident_state().expect("resident fixture").document);
     }
 }
 
@@ -475,16 +475,16 @@ fn one_mixed_command_and_canonical_preset_share_native_affine_projective_grid_sa
 fn independent_mask_warp_retains_off_frame_samples_and_reenters_without_an_eight_bit_copy() {
     for depth in [8, 16] {
         let mut e = fixture(depth);
-        e.doc.layers[0].mask.as_mut().unwrap().linked = false;
-        let before = e.doc.clone();
-        let id = e.doc.layers[0].id.clone();
-        let step = e.doc.layers[0].mask.as_ref().unwrap().steps[1].id.clone();
+        e.resident_state_mut().expect("resident fixture").document.layers[0].mask.as_mut().unwrap().linked = false;
+        let before = e.resident_state().expect("resident fixture").document.clone();
+        let id = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
+        let step = e.resident_state().expect("resident fixture").document.layers[0].mask.as_ref().unwrap().steps[1].id.clone();
         edit(
             &mut e,
             &[json!({"op":"move","layer":id,"mask":true,"step":step,"dx":24})],
         );
         assert_eq!(
-            e.doc.layers[0].mask.as_ref().unwrap().steps[1]
+            e.resident_state().expect("resident fixture").document.layers[0].mask.as_ref().unwrap().steps[1]
                 .pixels
                 .bytes(),
             0
@@ -495,18 +495,18 @@ fn independent_mask_warp_retains_off_frame_samples_and_reenters_without_an_eight
             json!({"mask":true,"step":step,"warp":{"rect":rect,"preset":"arc","amount":0.2}}),
         );
         edit(&mut e, &[c]);
-        assert_eq!(e.doc.layers[0].pixels, before.layers[0].pixels);
+        assert_eq!(e.resident_state().expect("resident fixture").document.layers[0].pixels, before.layers[0].pixels);
         for bytes in [
-            psd::encode(&e.doc).unwrap(),
-            psd::encode_psb(&e.doc).unwrap(),
+            psd::encode(&e.resident_state().expect("resident fixture").document).unwrap(),
+            psd::encode_psb(&e.resident_state().expect("resident fixture").document).unwrap(),
         ] {
             assert_eq!(embedded(&bytes)["format"], 33);
             let loaded = psd::decode(&bytes).unwrap();
             assert!(!loaded.read_only);
-            native_layers(&loaded, &e.doc);
-            assert_eq!(loaded.export_png().unwrap(), e.doc.export_png().unwrap());
+            native_layers(&loaded, &e.resident_state().expect("resident fixture").document);
+            assert_eq!(loaded.export_png().unwrap(), e.resident_state().expect("resident fixture").document.export_png().unwrap());
             let saved = composite(&bytes);
-            assert_eq!(saved, matte(&e.doc));
+            assert_eq!(saved, matte(&e.resident_state().expect("resident fixture").document));
             for format in [32, u32::MAX] {
                 protected(
                     &psd::decode(&rewrite(&bytes, |v| v["format"] = json!(format))).unwrap(),
@@ -524,7 +524,7 @@ fn independent_mask_warp_retains_off_frame_samples_and_reenters_without_an_eight
             &mut e,
             &[json!({"op":"move","layer":id,"mask":true,"step":step,"dx":-24})],
         );
-        let original = e.doc.layers[0].mask.as_ref().unwrap().steps[1]
+        let original = e.resident_state().expect("resident fixture").document.layers[0].mask.as_ref().unwrap().steps[1]
             .pixels
             .retained
             .as_ref()
@@ -540,7 +540,7 @@ fn independent_mask_warp_retains_off_frame_samples_and_reenters_without_an_eight
             for x in 0..16 {
                 let v = y as f64 - arc(x as f64 + 24.5, rect, 0.2);
                 assert_eq!(
-                    paint(&e.doc.layers[0], x, y),
+                    paint(&e.resident_state().expect("resident fixture").document.layers[0], x, y),
                     sample(
                         &before.layers[0].mask.as_ref().unwrap().steps[1].pixels,
                         x as f32,
@@ -556,8 +556,8 @@ fn independent_mask_warp_retains_off_frame_samples_and_reenters_without_an_eight
 fn grid_protocol_destination_selection_source_and_partial_batches_keep_existing_guards() {
     for depth in [8, 16] {
         let mut e = fixture(depth);
-        e.doc.selection = Some([2, 2, 10, 9]);
-        let before = e.doc.clone();
+        e.resident_state_mut().expect("resident fixture").document.selection = Some([2, 2, 10, 9]);
+        let before = e.resident_state().expect("resident fixture").document.clone();
         let c = command(
             &e,
             json!({"selection_only":true,"dx":24,"dy":4,"document_id":before.id,"source_revision":before.revision}),
@@ -587,12 +587,12 @@ fn grid_protocol_destination_selection_source_and_partial_batches_keep_existing_
         shared.lock().unwrap().leases.clear();
         let reply = server::dispatch(&shared, "edit", &request).unwrap();
         assert_eq!(reply["images"][0]["document_rect"], json!([0, 0, 64, 48]));
-        assert_eq!(shared.lock().unwrap().undo.len(), 1);
+        assert_eq!(shared.lock().unwrap().resident_state().expect("resident fixture").undo.len(), 1);
         assert!(server::dispatch(&shared, "edit", &request).is_err());
 
         let mut e = fixture(depth);
         let saved = state(&e);
-        let first = json!({"op":"layer.update","layer":e.doc.layers[0].id,"name":"Must roll back"});
+        let first = json!({"op":"layer.update","layer":e.resident_state().expect("resident fixture").document.layers[0].id,"name":"Must roll back"});
         let mut folded = Grid::identity([-2., -2., 18., 14.]).unwrap();
         folded.points[4] = [30., 4.];
         let mut huge = Grid::identity([-2., -2., 18., 14.]).unwrap();
@@ -620,11 +620,11 @@ fn grid_protocol_destination_selection_source_and_partial_batches_keep_existing_
                 )
                 .is_err());
             assert_eq!(state(&e), saved);
-            assert!(Engine::preview_edits(e.doc.clone(), &[c]).is_err());
+            assert!(Engine::preview_edits(e.resident_state().expect("resident fixture").document.clone(), &[c]).is_err());
         }
         let c = command(&e, json!({"op":"move"}));
         assert!(peerbrush::transform::resolve_command(&c).is_err());
-        e.doc.layers[0].locked = true;
+        e.resident_state_mut().expect("resident fixture").document.layers[0].locked = true;
         let saved = state(&e);
         let c = command(&e, json!({}));
         assert!(e.edit("human", &[c], None, None, "Locked").is_err());
@@ -636,14 +636,14 @@ fn grid_protocol_destination_selection_source_and_partial_batches_keep_existing_
 fn polygon_seam_vertices_multiple_roots_hidden_children_and_clipboard_preserve_native_state() {
     for depth in [8, 16] {
         let mut e = fixture(depth);
-        let mut second = e.doc.layers[0].clone();
+        let mut second = e.resident_state().expect("resident fixture").document.layers[0].clone();
         second.id = peerbrush::engine::id();
         second.visible = false;
-        e.doc.layers.push(second);
+        e.resident_state_mut().expect("resident fixture").document.layers.push(second);
         let polygon = vec![[2., 2.], [10., 2.], [8., 9.], [3., 7.]];
-        e.doc.selection = Some(selection::bounds(&polygon).unwrap());
-        e.doc.selection_polygon = Some(polygon.clone());
-        let before = e.doc.clone();
+        e.resident_state_mut().expect("resident fixture").document.selection = Some(selection::bounds(&polygon).unwrap());
+        e.resident_state_mut().expect("resident fixture").document.selection_polygon = Some(polygon.clone());
+        let before = e.resident_state().expect("resident fixture").document.clone();
         let commands = before
             .layers
             .iter()
@@ -655,9 +655,9 @@ fn polygon_seam_vertices_multiple_roots_hidden_children_and_clipboard_preserve_n
             .collect::<Vec<_>>();
         let preview = Engine::preview_edits(before.clone(), &commands).unwrap();
         edit(&mut e, &commands);
-        native_layers(&e.doc, &preview);
-        assert_eq!(e.undo.len(), 1);
-        let projected = e.doc.selection_polygon.as_ref().unwrap();
+        native_layers(&e.resident_state().expect("resident fixture").document, &preview);
+        assert_eq!(e.resident_state().expect("resident fixture").undo.len(), 1);
+        let projected = e.resident_state().expect("resident fixture").document.selection_polygon.as_ref().unwrap();
         assert!(projected.len() > polygon.len());
         assert!(projected
             .iter()
@@ -677,17 +677,17 @@ fn polygon_seam_vertices_multiple_roots_hidden_children_and_clipboard_preserve_n
             }));
         }
         for (i, single) in singles.iter().enumerate() {
-            assert_eq!(e.doc.layers[i].pixels, single.layers[i].pixels);
+            assert_eq!(e.resident_state().expect("resident fixture").document.layers[i].pixels, single.layers[i].pixels);
         }
         e.undo("human").unwrap();
-        native_layers(&e.doc, &before);
-        assert_eq!(e.doc.selection_polygon, before.selection_polygon);
-        e.doc.selection = None;
-        e.doc.selection_polygon = None;
+        native_layers(&e.resident_state().expect("resident fixture").document, &before);
+        assert_eq!(e.resident_state().expect("resident fixture").document.selection_polygon, before.selection_polygon);
+        e.resident_state_mut().expect("resident fixture").document.selection = None;
+        e.resident_state_mut().expect("resident fixture").document.selection_polygon = None;
         let c = command(&e, json!({}));
         edit(&mut e, &[c]);
         let copied =
-            peerbrush::layer_clipboard::copy(&e.doc, &[e.doc.layers[0].id.clone()]).unwrap();
+            peerbrush::layer_clipboard::copy(&e.resident_state().expect("resident fixture").document, &[e.resident_state().expect("resident fixture").document.layers[0].id.clone()]).unwrap();
         peerbrush::layer_clipboard::validate(&copied).unwrap();
         let mut pasted = Document::new_depth(64, 48, depth).unwrap();
         peerbrush::layer_clipboard::paste(&mut pasted, &copied, "").unwrap();
@@ -696,10 +696,10 @@ fn polygon_seam_vertices_multiple_roots_hidden_children_and_clipboard_preserve_n
             .iter()
             .find(|l| l.pixels.retained.is_some())
             .unwrap();
-        assert_eq!(l.pixels.retained, e.doc.layers[0].pixels.retained);
+        assert_eq!(l.pixels.retained, e.resident_state().expect("resident fixture").document.layers[0].pixels.retained);
         let (a, b) = (
             l.mask.as_ref().unwrap(),
-            e.doc.layers[0].mask.as_ref().unwrap(),
+            e.resident_state().expect("resident fixture").document.layers[0].mask.as_ref().unwrap(),
         );
         assert_eq!(
             (a.linked, a.enabled, a.steps.len()),
@@ -727,31 +727,31 @@ fn polygon_seam_vertices_multiple_roots_hidden_children_and_clipboard_preserve_n
         let mut group = Layer::new("Folder", "group", 64, 48);
         let root = group.id.clone();
         group.pixels = Raster::new_depth(64, 48, depth);
-        e.doc.layers[0].parent = Some(root.clone());
-        let mut hidden = e.doc.layers[0].clone();
+        e.resident_state_mut().expect("resident fixture").document.layers[0].parent = Some(root.clone());
+        let mut hidden = e.resident_state().expect("resident fixture").document.layers[0].clone();
         hidden.id = peerbrush::engine::id();
         hidden.visible = false;
-        e.doc.layers.push(hidden);
-        e.doc.layers.insert(0, group);
-        let before = e.doc.clone();
+        e.resident_state_mut().expect("resident fixture").document.layers.push(hidden);
+        e.resident_state_mut().expect("resident fixture").document.layers.insert(0, group);
+        let before = e.resident_state().expect("resident fixture").document.clone();
         let c = command(&e, json!({"layer":root}));
         let preview = Engine::preview_edits(before.clone(), &[c.clone()]).unwrap();
         edit(&mut e, &[c.clone()]);
-        native_layers(&e.doc, &preview);
-        assert!(!e.doc.layers[2].visible);
-        assert_eq!(e.doc.layers[1].pixels, e.doc.layers[2].pixels);
-        assert_eq!(e.undo.len(), 1);
+        native_layers(&e.resident_state().expect("resident fixture").document, &preview);
+        assert!(!e.resident_state().expect("resident fixture").document.layers[2].visible);
+        assert_eq!(e.resident_state().expect("resident fixture").document.layers[1].pixels, e.resident_state().expect("resident fixture").document.layers[2].pixels);
+        assert_eq!(e.resident_state().expect("resident fixture").undo.len(), 1);
         e.undo("human").unwrap();
-        native_layers(&e.doc, &before);
+        native_layers(&e.resident_state().expect("resident fixture").document, &before);
         edit(
             &mut e,
             &[
                 json!({"op":"source.add","source":{"width":16,"height":12,"content":{"kind":"shape","shape":"rectangle","bounds":[1,1,10,10],"points":[],"closed":true,"fill":[12347,23459,34571,65535],"stroke":[0,0,0,0],"stroke_width":0}}}),
             ],
         );
-        let source = e.doc.layers[0].id.clone();
-        e.doc.layers[0].parent = Some(root.clone());
-        e.doc.layers[0].visible = false;
+        let source = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
+        e.resident_state_mut().expect("resident fixture").document.layers[0].parent = Some(root.clone());
+        e.resident_state_mut().expect("resident fixture").document.layers[0].visible = false;
         let saved = state(&e);
         let error = e
             .edit("human", &[c], None, None, "Hidden source")
@@ -765,8 +765,8 @@ fn polygon_seam_vertices_multiple_roots_hidden_children_and_clipboard_preserve_n
             .to_lowercase()
             .contains("rasterize"));
         assert_eq!(state(&e), saved);
-        e.doc.layers[0].source = None;
-        e.doc.layers[0].kind = "adjustment".into();
+        e.resident_state_mut().expect("resident fixture").document.layers[0].source = None;
+        e.resident_state_mut().expect("resident fixture").document.layers[0].kind = "adjustment".into();
         let saved = state(&e);
         let c = command(&e, json!({"layer":root}));
         assert!(e
@@ -785,9 +785,9 @@ fn exact_identity_grid_keeps_old_affine_projective_scopes_native_samples_and_ser
             for projected in [false, true] {
                 let mut e = fixture(depth);
                 if selected {
-                    e.doc.selection = Some([2, 2, 10, 9]);
+                    e.resident_state_mut().expect("resident fixture").document.selection = Some([2, 2, 10, 9]);
                 }
-                let mut c = json!({"op":"transform","layer":e.doc.layers[0].id,"selection_only":selected,"angle":17.,"scale_x":1.3,"scale_y":0.7,"skew_x":-15.,"mirror_y":true,"dx":7.,"dy":5.});
+                let mut c = json!({"op":"transform","layer":e.resident_state().expect("resident fixture").document.layers[0].id,"selection_only":selected,"angle":17.,"scale_x":1.3,"scale_y":0.7,"skew_x":-15.,"mirror_y":true,"dx":7.,"dy":5.});
                 if projected {
                     c["projective"] =
                         json!({"rect":[0,0,16,12],"quad":[[0,0],[14,0],[14,10],[0,12]]});
@@ -795,8 +795,8 @@ fn exact_identity_grid_keeps_old_affine_projective_scopes_native_samples_and_ser
                 let mut identity = c.clone();
                 identity["warp"] = json!(Grid::identity([-2., -2., 18., 14.]).unwrap());
                 assert_eq!(e.scopes(&c), e.scopes(&identity));
-                let a = Engine::preview_edits(e.doc.clone(), &[c]).unwrap();
-                let b = Engine::preview_edits(e.doc.clone(), &[identity]).unwrap();
+                let a = Engine::preview_edits(e.resident_state().expect("resident fixture").document.clone(), &[c]).unwrap();
+                let b = Engine::preview_edits(e.resident_state().expect("resident fixture").document.clone(), &[identity]).unwrap();
                 native_layers(&a, &b);
                 assert_eq!(a.selection_polygon, b.selection_polygon);
                 assert_eq!(a.export_png().unwrap(), b.export_png().unwrap());
@@ -815,7 +815,7 @@ fn sixteen_retained_stages_are_exact_metadata_and_the_seventeenth_is_an_atomic_a
 {
     for depth in [8, 16] {
         let mut e = fixture(depth);
-        let original = e.doc.layers[0].pixels.clone();
+        let original = e.resident_state().expect("resident fixture").document.layers[0].pixels.clone();
         for i in 0..16 {
             let c = command(
                 &e,
@@ -823,7 +823,7 @@ fn sixteen_retained_stages_are_exact_metadata_and_the_seventeenth_is_an_atomic_a
             );
             edit(&mut e, &[c]);
         }
-        let l = &e.doc.layers[0];
+        let l = &e.resident_state().expect("resident fixture").document.layers[0];
         assert_eq!(l.pixels.retained.as_ref().unwrap().warps.len(), 16);
         assert_eq!(
             l.pixels.retained.as_ref().unwrap().pixels.as_ref(),
@@ -832,7 +832,7 @@ fn sixteen_retained_stages_are_exact_metadata_and_the_seventeenth_is_an_atomic_a
         let c = json!({"op":"transform","layer":l.id,"selection_only":false,"dx":1});
         edit(&mut e, &[c]);
         assert_eq!(
-            e.doc.layers[0]
+            e.resident_state().expect("resident fixture").document.layers[0]
                 .pixels
                 .retained
                 .as_ref()
@@ -851,7 +851,7 @@ fn sixteen_retained_stages_are_exact_metadata_and_the_seventeenth_is_an_atomic_a
             .unwrap_err();
         assert!(error.contains("undo") && error.contains("cancel"));
         assert_eq!(state(&e), saved);
-        assert!(Engine::preview_edits(e.doc.clone(), &[c]).is_err());
+        assert!(Engine::preview_edits(e.resident_state().expect("resident fixture").document.clone(), &[c]).is_err());
         assert_eq!(
             server::capabilities()["retained_transforms"]["warp"]["source_format"],
             33
@@ -864,7 +864,7 @@ fn selected_grid_scalar_halo_color_center_clip_holes_and_every_original_remainde
     for depth in [8, 16] {
         for target in ["linked", "color", "mask", "step"] {
             let mut e = fixture(depth);
-            e.doc.layers[0].mask.as_mut().unwrap().linked = target == "linked";
+            e.resident_state_mut().expect("resident fixture").document.layers[0].mask.as_mut().unwrap().linked = target == "linked";
             let mut m = Raster::new(16, 12);
             for y in 2..9 {
                 for x in 2..10 {
@@ -884,9 +884,9 @@ fn selected_grid_scalar_halo_color_center_clip_holes_and_every_original_remainde
                 }
             }
             let coverage = selection::from_mask(m).unwrap();
-            e.doc.selection = Some(coverage.bounds);
-            e.doc.selection_coverage = Some(coverage.clone());
-            let before = e.doc.clone();
+            e.resident_state_mut().expect("resident fixture").document.selection = Some(coverage.bounds);
+            e.resident_state_mut().expect("resident fixture").document.selection_coverage = Some(coverage.clone());
+            let before = e.resident_state().expect("resident fixture").document.clone();
             let mut cut = before.layers[0].pixels.clone();
             let mut masked = before.layers[0].mask.as_ref().unwrap().steps[1]
                 .pixels
@@ -909,9 +909,9 @@ fn selected_grid_scalar_halo_color_center_clip_holes_and_every_original_remainde
             }
             let preview = Engine::preview_edits(before.clone(), &[c.clone()]).unwrap();
             edit(&mut e, &[c]);
-            native_layers(&e.doc, &preview);
-            assert_eq!(e.undo.len(), 1);
-            let after = selection::current(&e.doc).unwrap();
+            native_layers(&e.resident_state().expect("resident fixture").document, &preview);
+            assert_eq!(e.resident_state().expect("resident fixture").undo.len(), 1);
+            let after = selection::current(&e.resident_state().expect("resident fixture").document).unwrap();
             let mut halo = 0;
             let mut moved = 0;
             for y in after.bounds[1]..after.bounds[3] {
@@ -929,7 +929,7 @@ fn selected_grid_scalar_halo_color_center_clip_holes_and_every_original_remainde
                         }
                     };
                     assert_eq!(
-                        color(&e.doc.layers[0], x, y),
+                        color(&e.resident_state().expect("resident fixture").document.layers[0], x, y),
                         if matches!(target, "linked" | "color") {
                             expected(&cut)
                         } else {
@@ -937,7 +937,7 @@ fn selected_grid_scalar_halo_color_center_clip_holes_and_every_original_remainde
                         }
                     );
                     assert_eq!(
-                        paint(&e.doc.layers[0], x, y),
+                        paint(&e.resident_state().expect("resident fixture").document.layers[0], x, y),
                         if target != "color" {
                             expected(&masked)
                         } else {
@@ -983,21 +983,21 @@ fn selected_grid_scalar_halo_color_center_clip_holes_and_every_original_remainde
                         p
                     };
                     assert_eq!(
-                        color(&e.doc.layers[0], x, y),
+                        color(&e.resident_state().expect("resident fixture").document.layers[0], x, y),
                         remainder(
                             color(&before.layers[0], x, y),
                             matches!(target, "linked" | "color")
                         )
                     );
                     assert_eq!(
-                        paint(&e.doc.layers[0], x, y),
+                        paint(&e.resident_state().expect("resident fixture").document.layers[0], x, y),
                         remainder(paint(&before.layers[0], x, y), target != "color")
                     );
                 }
             }
             e.undo("human").unwrap();
-            native_layers(&e.doc, &before);
-            assert_eq!(e.doc.selection_coverage, before.selection_coverage);
+            native_layers(&e.resident_state().expect("resident fixture").document, &before);
+            assert_eq!(e.resident_state().expect("resident fixture").document.selection_coverage, before.selection_coverage);
         }
     }
 }

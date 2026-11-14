@@ -30,6 +30,8 @@ This slice does not invoke Store install APIs, which can terminate the app; a fu
 
 Linux system installation paths and Flatpak context conservatively defer to the package manager. This does not claim a configured APT/Flatpak update repository. Direct distributions and local builds can check releases but have no direct installer configured. No channel competes with its Store or package manager.
 
+The Updates panel shows the update command for recognized Scoop and Homebrew installs. For Nix it shows how to list and upgrade a package in a profile. A custom profile needs its own profile path, and system-managed Nix installs follow the system configuration. The Stable and Preview choices control the GitHub release check.
+
 ## Shared restart protection
 
 `workspace::lifecycle::update_readiness` is a read-only status check. A future verified native installer must recheck exact project/document/revision snapshots through `finish_update_exit`, alongside native UI gesture checks. This path rejects discard decisions, unsaved or externally conflicting sources, active file operations, loading and procedural code. It verifies the complete project set again and closes all projects atomically only after every check succeeds. A failed check leaves every project open. Ordinary human Save / Don't Save / Cancel close behavior is unchanged.
@@ -150,6 +152,18 @@ Prepared real egui/shared-engine fixtures retain joint native8/native16 artwork,
 
 The final-close component also refuses a live Windows preparation/reconciliation worker until its retained operation actually completes, and any Mac verification worker while its receiver owner remains present, including canceled work awaiting completion. Export-preset MCP writers use their existing workspace admission guard; active export-output and recovery workers retain the existing engine/workspace operation counters. The default profile manifest/migration writers run before the workspace UI exists. Shortcuts and public update-preference writes remain in the serialized UI; theme is fixed and AI animation/canvas orientation are presentation state. No new profile file or native authority is introduced.
 
+
+### Reserved Windows update history (unreleased source)
+
+Windows update preparation checks retained history capacity before starting the
+native owner. The owner reserves and holds a specific history directory before
+it creates the update intent or tells the workspace it can close. Cancellation,
+successful installation and rollback use that same slot for their records.
+
+A full history stops the update while the workspace is still open. The owner
+checks the reserved slot before deployment and retirement. Foreign contents or
+interrupted attempts retain the recovery hold and the existing archives. Native
+qualification remains pending.
 
 ### Authenticated current signed archive (unreleased; source only)
 

@@ -1,5 +1,6 @@
 //! Owned native editor metadata. Mutable draft bytes and command copies are
 //! admitted before allocation; command consumers retain the Admitted owner.
+use crate::ui::native_dispatch::SharedCommand;
 use crate::{
     engine::{
         native::{DocumentKey, NativeDocument},
@@ -21,7 +22,7 @@ pub(super) struct Native {
     pub(super) widgets: Option<super::widgets::Widgets>,
     original: Option<Source36>,
     draft_taken: bool,
-    command: Option<([u8; 32], Admitted<Value>)>,
+    command: Option<([u8; 32], SharedCommand)>,
     pub(super) pool: ResidentBudget,
     // Editor declares its actual Source payload before this Native field.
     pub(super) draft: Reservation,
@@ -142,7 +143,7 @@ impl Native {
         }
         if let Some((key, command)) = &self.command {
             if *key == signature {
-                return Ok(command.clone());
+                return Ok(command.value().clone());
             }
         }
         let working = self
@@ -153,10 +154,10 @@ impl Native {
         let command = doc.copy_value_metadata(&value, &|| Ok(()))?;
         drop(value);
         drop(working);
-        self.command = Some((signature, command.clone()));
+        self.command = Some((signature, SharedCommand::new(command.clone())?));
         Ok(command)
     }
-    pub fn owned_command(&self, signature: [u8; 32]) -> Option<Admitted<Value>> {
+    pub fn owned_command(&self, signature: [u8; 32]) -> Option<SharedCommand> {
         self.command
             .as_ref()
             .filter(|(key, _)| *key == signature)

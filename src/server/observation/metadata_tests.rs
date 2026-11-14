@@ -176,8 +176,8 @@ fn native_metadata_preserves_legacy_fields_definitions_paths_masks_and_honest_re
         }));
         doc.layers.push(text);
         let mut legacy = Engine::new();
-        legacy.doc = doc.clone();
-        let expected = legacy.state();
+        legacy.resident_state_mut().expect("resident fixture").document = doc.clone();
+        let expected = legacy.capture_state().unwrap().project().unwrap();
         let (native, scene, path) = fixture::capture(&doc);
         let pool = native.budget().clone();
         let profile = crate::color_profile::summary(None);

@@ -7,23 +7,23 @@ use serde_json::json;
 #[test]
 fn engine_paste_and_duplicate_keep_all_roots_in_one_shared_history_entry() {
     let mut e = Engine::new();
-    e.doc = Document::new(8, 8).unwrap();
+    e.resident_state_mut().expect("resident fixture").document = Document::new(8, 8).unwrap();
     let mut a = Layer::new("A", "paint", 8, 8);
     a.pixels.set(2, 2, [200, 50, 20, 255]);
     let b = Layer::new("B", "paint", 8, 8);
     let originals = vec![a.id.clone(), b.id.clone()];
-    e.doc.layers = vec![a, b];
-    let snapshot = layer_clipboard::copy(&e.doc, &originals).unwrap();
+    e.resident_state_mut().expect("resident fixture").document.layers = vec![a, b];
+    let snapshot = layer_clipboard::copy(&e.resident_state().expect("resident fixture").document, &originals).unwrap();
     let result = e
         .paste_layers("artist", &snapshot, &originals[0], Some(0), None)
         .unwrap();
     assert_eq!(result["created"].as_array().unwrap().len(), 3);
     assert_eq!(result["created_roots"].as_array().unwrap().len(), 2);
-    assert_eq!(e.undo.len(), 1);
-    assert_eq!(e.doc.revision, 1);
+    assert_eq!(e.resident_state().expect("resident fixture").undo.len(), 1);
+    assert_eq!(e.resident_state().expect("resident fixture").document.revision, 1);
     for root in result["created_roots"].as_array().unwrap() {
         assert_eq!(
-            e.doc
+            e.resident_state().expect("resident fixture").document
                 .layers
                 .iter()
                 .find(|l| l.id == root.as_str().unwrap())
@@ -33,9 +33,9 @@ fn engine_paste_and_duplicate_keep_all_roots_in_one_shared_history_entry() {
         );
     }
     e.undo("artist").unwrap();
-    assert_eq!(e.doc.layers.len(), 2);
+    assert_eq!(e.resident_state().expect("resident fixture").document.layers.len(), 2);
     e.redo("artist").unwrap();
-    assert_eq!(e.doc.layers.len(), 5);
+    assert_eq!(e.resident_state().expect("resident fixture").document.layers.len(), 5);
     let roots = result["created_roots"]
         .as_array()
         .unwrap()
@@ -46,21 +46,21 @@ fn engine_paste_and_duplicate_keep_all_roots_in_one_shared_history_entry() {
         .edit(
             "artist",
             &[json!({"op":"layer.duplicate","layers":roots})],
-            Some(e.doc.revision),
+            Some(e.resident_state().expect("resident fixture").document.revision),
             None,
             "Duplicate",
         )
         .unwrap();
     assert_eq!(result["created_roots"].as_array().unwrap().len(), 2);
-    assert_eq!(e.undo.len(), 2);
-    assert_eq!(e.doc.layers.len(), 7);
+    assert_eq!(e.resident_state().expect("resident fixture").undo.len(), 2);
+    assert_eq!(e.resident_state().expect("resident fixture").document.layers.len(), 7);
 }
 #[test]
 fn typed_paste_obeys_reservations_and_rejects_stale_structural_edits() {
     let mut e = Engine::new();
-    e.doc = Document::new(8, 8).unwrap();
-    let id = e.doc.layers[0].id.clone();
-    let snapshot = layer_clipboard::copy(&e.doc, &[id.clone()]).unwrap();
+    e.resident_state_mut().expect("resident fixture").document = Document::new(8, 8).unwrap();
+    let id = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
+    let snapshot = layer_clipboard::copy(&e.resident_state().expect("resident fixture").document, &[id.clone()]).unwrap();
     let lease = e
         .reserve("artist", "Editing", vec![Scope::layer(&id)])
         .unwrap();
@@ -68,8 +68,8 @@ fn typed_paste_obeys_reservations_and_rejects_stale_structural_edits() {
         .paste_layers("human", &snapshot, &id, Some(0), None)
         .unwrap_err()
         .contains("Reserved"));
-    assert_eq!(e.doc.layers.len(), 1);
-    assert!(e.undo.is_empty());
+    assert_eq!(e.resident_state().expect("resident fixture").document.layers.len(), 1);
+    assert!(e.resident_state().expect("resident fixture").undo.is_empty());
     e.leases.retain(|l| l.id != lease.id);
     e.edit(
         "human",
@@ -83,6 +83,6 @@ fn typed_paste_obeys_reservations_and_rejects_stale_structural_edits() {
         .paste_layers("human", &snapshot, &id, Some(0), None)
         .unwrap_err()
         .contains("Conflicting"));
-    assert_eq!(e.doc.layers.len(), 1);
-    assert_eq!(e.undo.len(), 1);
+    assert_eq!(e.resident_state().expect("resident fixture").document.layers.len(), 1);
+    assert_eq!(e.resident_state().expect("resident fixture").undo.len(), 1);
 }

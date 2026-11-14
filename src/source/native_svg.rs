@@ -8,7 +8,7 @@ use crate::{
     engine::native::{Cancellation, NativeDocument, StagedOutput},
     large_document::ScratchBytes,
     raster::TILE,
-    workspace::source_runtime::SourceSession,
+    retained::transaction::Session,
 };
 
 // Explicit operation admission, independent of output band/tile counts. Failure
@@ -134,7 +134,7 @@ pub(super) fn render(
     frame: [u32; 2],
     depth: u16,
     base: &NativeDocument,
-    session: &SourceSession,
+    session: &impl Session,
     cancellation: &Cancellation,
     check: &mut dyn FnMut() -> Result<(), String>,
 ) -> Result<StagedOutput, String> {

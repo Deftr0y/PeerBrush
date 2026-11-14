@@ -1,6 +1,8 @@
 //! Raster edits use document coordinates, independently of transformed content bounds.
 #[path = "edit_bounds/input.rs"]
 pub(crate) mod input;
+#[path = "edit_bounds/mask_original.rs"]
+pub(crate) mod mask_original;
 #[path = "edit_bounds/native.rs"]
 pub(crate) mod native;
 #[path = "edit_bounds/output.rs"]
@@ -49,10 +51,8 @@ pub(crate) fn prepare(doc: &mut Document, c: &Value) -> Result<(), String> {
     let mut area = if ["paint", "smudge", "clone", "heal"].contains(&op) {
         let (points, _) = crate::brush::points_from_command(c)?;
         let settings = crate::brush::Settings::from_command(c)?;
-        if settings.opacity == 0.
-            || settings.flow == 0.
-            || (op == "paint" && crate::engine::color(c)[3] == 0)
-        {
+        let transparent = op == "paint" && crate::engine::raster_color(c, doc.bit_depth)?[3] == 0;
+        if settings.opacity == 0. || settings.flow == 0. || transparent {
             return Ok(());
         }
         // Match the rasterizer's dab envelope, including its one-pixel edge.
@@ -111,22 +111,25 @@ pub(crate) fn prepare(doc: &mut Document, c: &Value) -> Result<(), String> {
     );
     check_size(w, h)?;
     let (dx, dy) = (old[0] - bounds[0], old[1] - bounds[1]);
-    let shift = |source: &crate::raster::Raster| {
+    let shift = |source: &crate::raster::Raster, reveal_mask: bool| -> Result<_, String> {
         let mut pixels = crate::transform::copy_shift(source, w, h, dx, dy);
+        if reveal_mask {
+            mask_original::reveal_resident(source, &mut pixels, [dx, dy])?;
+        }
         pixels.retained = source.retained.clone();
         if let Some(original) = &mut pixels.retained {
             original.matrix =
                 crate::retained::compose([1., 0., 0., 1., dx as f64, dy as f64], original.matrix);
         }
-        pixels
+        Ok(pixels)
     };
     crate::fill::materialize_visual_layer(&mut doc.layers[index])?;
     let layer = &mut doc.layers[index];
-    layer.pixels = shift(&layer.pixels);
+    layer.pixels = shift(&layer.pixels, false)?;
     if let Some(mask) = &mut layer.mask {
         mask.cache_key = crate::engine::id();
         for step in &mut mask.steps {
-            step.pixels = shift(&step.pixels);
+            step.pixels = shift(&step.pixels, step.kind == "paint")?;
         }
     }
     if let Some(source) = &mut layer.source {

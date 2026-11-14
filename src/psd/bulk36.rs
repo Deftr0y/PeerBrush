@@ -407,7 +407,16 @@ fn u32_at(bytes: &[u8], at: usize) -> u32 {
     u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap())
 }
 
+pub(super) fn standard_hasher(layer_bytes: u64, composite_bytes: u64) -> Context {
+    let mut hash = Context::new(&SHA256);
+    hash.update(b"PeerBrushSource36Standard\0");
+    hash.update(&layer_bytes.to_be_bytes());
+    hash.update(&composite_bytes.to_be_bytes());
+    hash
+}
+
 /// Exact length-delimited original standard bytes; FNV is deliberately absent.
+#[cfg(test)]
 pub(crate) fn standard_digest<L: Read, C: Read>(
     layer: &mut L,
     layer_bytes: u64,
@@ -415,10 +424,7 @@ pub(crate) fn standard_digest<L: Read, C: Read>(
     composite_bytes: u64,
     check: &dyn Fn() -> Result<(), String>,
 ) -> Result<Digest, String> {
-    let mut hash = Context::new(&SHA256);
-    hash.update(b"PeerBrushSource36Standard\0");
-    hash.update(&layer_bytes.to_be_bytes());
-    hash.update(&composite_bytes.to_be_bytes());
+    let mut hash = standard_hasher(layer_bytes, composite_bytes);
     let mut buffer = [0; TRANSFER];
     for (input, length) in [
         (layer as &mut dyn Read, layer_bytes),
