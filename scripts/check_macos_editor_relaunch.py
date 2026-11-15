@@ -8,8 +8,9 @@ import sys
 import time
 
 from package import digest
+from package_macos_dmg import attached_image_device
 from prepare_site_release import DOWNLOAD, public_get
-from sign_macos import verify_native
+from sign_macos import verify_native, verify_native_image
 from test_deb_version_upgrade import PROJECT_SIZE, png_samples
 
 
@@ -66,24 +67,39 @@ def exercise(app, work, executable_sha256, manual_upgrade=False, signed_team=Non
                 raise ValueError('The real editor refused the fixture operation.')
             time.sleep(0.2)
 
-    legacy = None
+    previous_profile = None
     if manual_upgrade:
-        print('Prepare published macOS 0.26 for the first manual upgrade', flush=True)
-        old_name = 'PeerBrush-0.26.0-macOS-arm64-apple-signed-r1.zip'
-        archive = work / old_name
-        public_get(DOWNLOAD + 'v0.26.0/' + old_name, 27402539, destination=archive)
-        if digest(archive) != 'db59d281163e6c7223d924ee134bf149d3551d41f2fdcb2438d2f1332762f17c':
-            raise ValueError('Published Mac app differs from the pinned signed 0.26 archive.')
-        old = work / 'published'
-        subprocess.run(['/usr/bin/ditto', '-x', '-k', archive, old], check=True, timeout=90, **options)
+        print('Prepare the published macOS 0.30.1 app for a manual upgrade', flush=True)
+        old_name = 'PeerBrush-0.30.1-macOS-arm64-apple-signed-r1-dmg-signed-r1.dmg'
+        image = work / old_name
+        public_get(DOWNLOAD + 'v0.30.1/' + old_name, 66042942, destination=image)
+        if digest(image) != '3eb1155c30b46ca5a64e4b2f40d58e73bf022167865a33911ff0e9322d05c24c':
+            raise ValueError('Published Mac installer differs from the pinned signed 0.30.1 DMG.')
+        verify_native_image(image, 'KU3Q7F9Q84', notarized=True)
+        mount = work.resolve() / 'published'
+        mount.mkdir()
         applications = home / 'Applications'
         applications.mkdir(mode=0o700)
         installed = applications / 'PeerBrush.app'
-        (old / 'PeerBrush-0.26.0-macOS-arm64/PeerBrush.app').rename(installed)
+        if attached_image_device(image.resolve()) is not None:
+            raise ValueError('Published DMG must be detached before the exercise.')
+        try:
+            subprocess.run(['/usr/bin/hdiutil', 'attach', image, '-mountpoint', mount,
+                            '-readonly', '-nobrowse', '-noautoopen'], check=True, timeout=90, **options)
+            if not mount.is_mount():
+                raise ValueError('Published DMG did not mount in the disposable workspace.')
+            subprocess.run(['/usr/bin/ditto', mount / 'PeerBrush.app', installed], check=True,
+                           timeout=90, **options)
+        finally:
+            device = attached_image_device(image.resolve())
+            if device is not None:
+                subprocess.run(['/usr/bin/hdiutil', 'detach', device], check=True, timeout=90, **options)
+            if mount.is_mount():
+                raise ValueError('Published DMG remains mounted.')
         verify_native(installed, 'KU3Q7F9Q84', notarized=True)
         exe = installed / 'Contents/MacOS/peerbrush'
-        if subprocess.check_output([exe, '--version'], timeout=12, **options).strip() != b'PeerBrush 0.26.0':
-            raise ValueError('The historical editor did not identify as 0.26.0.')
+        if subprocess.check_output([exe, '--version'], timeout=12, **options).strip() != b'PeerBrush 0.30.1':
+            raise ValueError('The published editor did not identify as 0.30.1.')
         previous = subprocess.Popen([exe, '--headless'], stdout=subprocess.DEVNULL, **options)
         try:
             deadline = time.monotonic() + 45
@@ -93,10 +109,10 @@ def exercise(app, work, executable_sha256, manual_upgrade=False, signed_team=Non
                 time.sleep(0.2)
             else:
                 raise ValueError('The historical editor did not open the disposable workspace.')
-            legacy = rpc('tool_settings', action='set', tool='brush',
-                         settings=dict(radius=31.5, opacity=0.375))['profile']
-            legacy_file = connection.parent / 'tool-settings.json'
-            legacy_bytes = legacy_file.read_bytes()
+            previous_profile = rpc('tool_settings', action='set', tool='brush',
+                                   settings=dict(radius=31.5, opacity=0.375))['profile']
+            profile_file = home / 'Library/Application Support/PeerBrush/Config/settings-v1/tool-settings.json'
+            previous_bytes = profile_file.read_bytes()
         finally:
             if previous.poll() is None:
                 previous.terminate()
@@ -136,13 +152,11 @@ def exercise(app, work, executable_sha256, manual_upgrade=False, signed_team=Non
             if png_samples(output) != (width, height, 16, pixels) or artwork.read_bytes() != source:
                 raise ValueError('The packaged editor changed the original PSD or its native samples.')
             if launch == 'first':
-                if legacy is not None:
-                    preferences = home / 'Library/Application Support/PeerBrush/Config/settings-v1'
-                    if (rpc('tool_settings', action='get', tool='brush')['profile'] != legacy
-                            or (preferences / 'migration-backup/tool-settings.json').read_bytes() != legacy_bytes
-                            or legacy_file.read_bytes() != legacy_bytes):
-                        raise ValueError('The manual upgrade lost the 0.26 preferences or their backup.')
-                    print('0.26 brush settings migrated and the original and backup match byte-for-byte.', flush=True)
+                if previous_profile is not None:
+                    if (rpc('tool_settings', action='get', tool='brush')['profile'] != previous_profile
+                            or profile_file.read_bytes() != previous_bytes):
+                        raise ValueError('The manual upgrade changed the saved 0.30.1 brush profile.')
+                    print('The published 0.30.1 brush profile is unchanged after the update.', flush=True)
                 profile = rpc('tool_settings', action='set', tool='brush',
                               settings=dict(radius=19.25, opacity=0.625))['profile']
             elif rpc('tool_settings', action='get', tool='brush')['profile'] != profile:

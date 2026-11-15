@@ -13,6 +13,7 @@ from package import git, macos_bundle_version, release_version_order, source_fil
 from package_macos_dmg import MAX_IMAGE_BYTES, bounded_file, inspect_final, private_inspection_directory
 from prepare_site_release import DOWNLOAD, STABLE
 from sparkle_bundle import check_pins
+from sparkle_upgrade_evidence import BASELINE_VERSION, TARGET_VERSION
 
 # bin/sign_update in the official Sparkle 2.10.0 release (not the SPM framework ZIP).
 SIGNER = ('43c249771bafc3aa581228abae00731a012d324691b8292860896635050be76b', 1358624)
@@ -100,7 +101,7 @@ def prepare(args, key_input, *, private_loopback=False):
         verify(image, signature)
         content = feed_bytes(args.version, record, notes, signature)
         if private_loopback:
-            if (args.version not in ('0.29.99', '0.30.0') or os.environ.get('GITHUB_JOB') != 'sign'
+            if (args.version not in (BASELINE_VERSION, TARGET_VERSION) or os.environ.get('GITHUB_JOB') != 'sign'
                     or os.environ.get('GITHUB_REF') != 'refs/heads/main'
                     or os.environ.get('GITHUB_WORKFLOW_REF') != 'Deftr0y/PeerBrush/.github/workflows/macos-release-signing.yml@refs/heads/main'
                     or os.environ.get('SELECTED_COMMIT') != os.environ.get('GITHUB_WORKFLOW_SHA')

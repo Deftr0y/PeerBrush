@@ -14,12 +14,11 @@ import threading
 import time
 
 from package import digest
-from sparkle_upgrade_evidence import CASES, validate
+from sparkle_upgrade_evidence import BASELINE_VERSION as START, CASES, TARGET_VERSION as FINAL, validate
 from test_deb_version_upgrade import PROJECT_SIZE, png_samples
 
 
 TEMP = Path(os.environ.get('RUNNER_TEMP', '.')).resolve()
-START, FINAL = '0.29.99', '0.30.0'
 
 
 def wait(label, predicate, seconds=90):
