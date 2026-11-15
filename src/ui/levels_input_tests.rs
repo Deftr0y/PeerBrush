@@ -17,7 +17,7 @@ fn viewing_each_levels_channel_preserves_source_settings_and_history_intent() {
                 |ctx| {
                     egui::CentralPanel::default().show(ctx, |ui| {
                         let id = ui.id().with(("levels", "channel"));
-                        assert!(settings(ui, "levels", &mut value).is_none());
+                        assert!(settings(ui, "levels", &mut value, 8).is_none());
                         selected = ctx.data(|data| data.get_temp::<usize>(id));
                     });
                 },

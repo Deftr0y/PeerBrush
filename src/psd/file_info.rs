@@ -301,7 +301,7 @@ pub(crate) fn fixture() -> Vec<u8> {
     transfer[24..26].copy_from_slice(&1000i16.to_be_bytes());
     transfer[26..].copy_from_slice(&1u16.to_be_bytes());
     for (id, name, data) in [
-        (LEGACY_MAC_PRINT_INFO, b"".as_slice(), &[0, 1, 0xff]),
+        (LEGACY_MAC_PRINT_INFO, b"".as_slice(), [0, 1, 0xff].as_slice()),
         (CAPTION, b"caption".as_slice(), b"\x04Test".as_slice()),
         (BORDER, b"".as_slice(), &[0, 2, 128, 0, 0, 3]),
         (BACKGROUND_COLOR, b"".as_slice(), &[0, 0, 48, 59, 91, 163, 135, 11, 0, 0]),

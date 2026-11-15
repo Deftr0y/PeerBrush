@@ -1258,7 +1258,7 @@ fn real_corner_crossing_previews_one_native_flip_then_commits_and_roundtrips_onc
         open(&mut app, &ctx);
         settle(&mut app, &ctx);
         let editor = app.free_transform.as_ref().unwrap();
-        assert_eq!(editor.mode(), Some(Tool::Move));
+        assert!(matches!(editor.mode(), Some(Tool::Move)));
         let corner = editor.corners()[2];
         let center = editor.reference_point();
         let reflected = [2. * center[0] - corner[0], corner[1]];
@@ -3047,7 +3047,7 @@ fn actual_grid_presets_nodes_and_mixed_modes_preview_then_apply_native_targets_o
             let key = app.free_transform.as_ref().unwrap().key().unwrap();
             warp_click(&mut app, &ctx, SIZE, "Back to Transform");
             let editor = app.free_transform.as_ref().unwrap();
-            assert_eq!(editor.mode(), Some(Tool::Move));
+            assert!(matches!(editor.mode(), Some(Tool::Move)));
             assert_eq!(editor.key().unwrap(), key);
             warp_click(&mut app, &ctx, SIZE, "Grid Warp");
             assert_eq!(app.free_transform.as_ref().unwrap().key().unwrap(), key);

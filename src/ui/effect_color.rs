@@ -562,7 +562,7 @@ mod tests {
                         Some("invalid"),
                         "{depth}: invalid text must reach the actual focused editor"
                     );
-                    app.parameter_gesture.as_mut().unwrap().preview = Some(Ok(draft.clone()));
+                    app.parameter_gesture.as_mut().unwrap().preview = Some(Arc::new(draft.clone()));
                     let output = draw(&mut app, vec![]);
                     assert!(
                         output.shapes.iter().any(|shape| matches!(
