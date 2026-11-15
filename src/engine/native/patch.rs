@@ -127,7 +127,11 @@ pub(super) fn unlocked(metadata: &Document36, target: &str) -> Result<()> {
         }
         current = layer.parent.as_deref();
     }
-    Err("Native group nesting limit exceeded".into())
+    if current.is_some() {
+        Err("Native group nesting limit exceeded".into())
+    } else {
+        Ok(())
+    }
 }
 
 /// Legacy retained reconciliation permits an unshifted, nonshrinking frame
@@ -159,6 +163,36 @@ mod tests {
     use super::super::output::tests::{draft, Session};
     use super::*;
     use crate::raster::backed::Region;
+    #[test]
+    fn native_unlock_checks_the_sixteenth_ancestor_without_refusing_valid_depth() {
+        let pool = ResidentBudget::new(8 * 1024 * 1024).unwrap();
+        let base = super::super::tests::document(&pool);
+        let mut metadata: Document36 =
+            serde_json::from_value(serde_json::to_value(&base.core.metadata).unwrap()).unwrap();
+        metadata.layers[0].id = "leaf".into();
+        for i in 0..16 {
+            let mut group: crate::engine::scene::Layer36 =
+                serde_json::from_value(serde_json::to_value(&metadata.layers[0]).unwrap()).unwrap();
+            group.id = format!("g{i}");
+            group.kind = "group".into();
+            group.parent = None;
+            metadata.layers.last_mut().unwrap().parent = Some(group.id.clone());
+            metadata.layers.push(group);
+        }
+        assert!(unlocked(&metadata, "leaf").is_ok());
+        metadata.layers[16].locked = true;
+        assert!(unlocked(&metadata, "leaf").unwrap_err().contains("Unlock"));
+        metadata.layers[16].locked = false;
+        metadata.layers[16].parent = Some("leaf".into());
+        assert!(unlocked(&metadata, "leaf").unwrap_err().contains("nesting"));
+        let mut extra: crate::engine::scene::Layer36 =
+            serde_json::from_value(serde_json::to_value(&metadata.layers[16]).unwrap()).unwrap();
+        extra.id = "extra".into();
+        extra.parent = None;
+        metadata.layers[16].parent = Some(extra.id.clone());
+        metadata.layers.push(extra);
+        assert!(unlocked(&metadata, "leaf").unwrap_err().contains("nesting"));
+    }
     fn patch(base: &NativeDocument) -> (RasterPatch, std::path::PathBuf) {
         let target = base.metadata().layers().next().unwrap().pixels().slot();
         let (draft, path) = draft(base);

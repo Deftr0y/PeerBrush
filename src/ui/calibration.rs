@@ -11,6 +11,15 @@ pub(super) struct Pad {
     rendered: Option<(usize, crate::brush::Settings)>,
 }
 impl Pad {
+    fn clear_stroke(&mut self) {
+        self.frozen = None;
+        self.gesture_force = None;
+        self.points.clear();
+        self.forces.clear();
+        self.texture = None;
+        self.rendered = None;
+    }
+
     fn draw(&mut self, ui: &mut egui::Ui, settings: crate::brush::Settings, depth: u16) -> Rect {
         if self
             .document
@@ -18,12 +27,11 @@ impl Pad {
             .is_none_or(|doc| doc.bit_depth != depth)
         {
             self.document = Document::new_depth(360, 120, depth).ok();
-            self.frozen = None;
-            self.gesture_force = None;
-            self.points.clear();
-            self.forces.clear();
-            self.texture = None;
-            self.rendered = None;
+            self.clear_stroke();
+        }
+        let cancelled = PeerBrush::pointer_contact_cancelled(ui.ctx());
+        if cancelled && self.frozen.is_some() {
+            self.clear_stroke();
         }
         let force = PeerBrush::pointer_pressure(ui);
         if let Some(force) = force {
@@ -45,7 +53,10 @@ impl Pad {
         );
         ui.painter()
             .rect_filled(rect, 0., Color32::from_rgb(35, 33, 38));
-        if response.is_pointer_button_down_on() {
+        if !cancelled
+            && (response.clicked_by(egui::PointerButton::Primary)
+                || response.is_pointer_button_down_on() && ui.input(|i| i.pointer.primary_down()))
+        {
             if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
                 if self.frozen.is_none() {
                     self.frozen = Some(settings);
@@ -119,18 +130,88 @@ impl Pad {
                 .color(MUTED),
         );
         if ui.small_button("Clear test").clicked() {
-            self.points.clear();
-            self.forces.clear();
-            self.texture = None;
-            self.rendered = None;
-            self.frozen = None;
-            self.gesture_force = None;
+            self.clear_stroke();
         }
         rect
     }
 }
 
+fn response_curve(
+    ui: &mut egui::Ui,
+    id: &str,
+    settings: &mut crate::brush::Settings,
+    mut display: crate::brush::Settings,
+    ai: bool,
+) -> egui::Response {
+    ui.horizontal(|ui| {
+        let (area, graph) = ui.allocate_exact_size(Vec2::new(118., 61.), egui::Sense::hover());
+        graph.on_hover_text("Device force increases to the right. Brush response increases upward. Drag the point to reshape the curve.");
+        let plot = Rect::from_min_max(area.min + Vec2::new(8., 5.), area.max - Vec2::new(8., 15.));
+        let sample = |force: f32, display: crate::brush::Settings| {
+            egui::pos2(
+                plot.left() + force * plot.width(),
+                plot.bottom() - display.pressure_response(force) * plot.height(),
+            )
+        };
+        let middle = (display.pressure_min + display.pressure_max) * 0.5;
+        let (handle, position) = controls::point_handle(
+            ui,
+            ui.make_persistent_id((id, "curve point")),
+            sample(middle, display),
+            "Pressure response at half calibrated force",
+        );
+        if let Some(position) = position {
+            let response = (plot.bottom() - position.y) / plot.height();
+            let gamma = -response.clamp(0.5_f32.powf(4.), 0.5_f32.powf(0.1)).log2();
+            settings.pressure_gamma = gamma.clamp(0.1, 4.);
+            display.pressure_gamma = settings.pressure_gamma;
+        }
+        let number = tool_settings::number(
+            ui, id, &mut settings.pressure_gamma, display.pressure_gamma,
+            0.1..=4., 66., "", 2, false, ai,
+        );
+        if number.changed() {
+            display.pressure_gamma = settings.pressure_gamma;
+        }
+        number.widget_info(|| egui::WidgetInfo::labeled(
+            egui::WidgetType::Slider, ui.is_enabled(),
+            format!("Pressure response exponent {}", display.pressure_gamma),
+        ));
+        let axis = ui.visuals().weak_text_color();
+        let color = if ai { AI_BLUE } else { ui.visuals().selection.stroke.color };
+        let painter = ui.painter();
+        painter.line_segment([plot.left_top(), plot.left_bottom()], Stroke::new(1., axis));
+        painter.line_segment([plot.left_bottom(), plot.right_bottom()], Stroke::new(1., axis));
+        painter.text(
+            egui::pos2(plot.center().x, area.bottom()), egui::Align2::CENTER_BOTTOM,
+            "Device force", egui::FontId::proportional(10.), axis,
+        );
+        let mut points = Vec::with_capacity(35);
+        points.push(sample(0., display));
+        points.extend((0..=32).map(|i| {
+            let t = i as f32 / 32.;
+            sample(display.pressure_min + t * (display.pressure_max - display.pressure_min), display)
+        }));
+        points.push(sample(1., display));
+        painter.add(egui::Shape::line(points, Stroke::new(1.5, color)));
+        painter.circle_filled(sample(middle, display), if handle.hovered() { 4. } else { 3. }, color);
+        handle
+    }).inner
+}
+
 impl PeerBrush {
+    pub(super) fn pressure_curve(&mut self, ui: &mut egui::Ui, id: &str) {
+        let time = ui.input(|input| input.time);
+        let ai = self.tool_preferences_ai(time);
+        let display = crate::brush::Settings {
+            pressure_gamma: self.tool_display_number("pressure_gamma", self.brush.pressure_gamma, time),
+            pressure_min: self.tool_display_number("pressure_min", self.brush.pressure_min, time),
+            pressure_max: self.tool_display_number("pressure_max", self.brush.pressure_max, time),
+            ..self.brush
+        };
+        response_curve(ui, id, &mut self.brush, display, ai);
+    }
+
     pub(super) fn pressure_calibration(&mut self, ctx: &egui::Context) {
         if !self.show_calibration {
             return;
@@ -183,23 +264,7 @@ impl PeerBrush {
                 }
                 ui.horizontal(|ui| {
                     controls::label(ui, "Response curve");
-                    let shown = self.tool_display_number(
-                        "pressure_gamma",
-                        self.brush.pressure_gamma,
-                        ui.input(|i| i.time),
-                    );
-                    tool_settings::number(
-                        ui,
-                        "calibration curve",
-                        &mut self.brush.pressure_gamma,
-                        shown,
-                        0.1..=4.,
-                        200.,
-                        "",
-                        2,
-                        false,
-                        ai,
-                    );
+                    self.pressure_curve(ui, "calibration curve");
                 });
                 ui.horizontal(|ui| {
                     let force = self.calibration.latest_force;
@@ -231,7 +296,7 @@ impl PeerBrush {
                 });
                 let mut settings = self.brush;
                 settings.radius = self.radius;
-                let depth = self.shared.lock().unwrap().doc.bit_depth;
+                let depth = crate::engine::view::current(&self.shared.lock().unwrap()).depth();
                 self.calibration.draw(ui, settings, depth);
                 let state = self.tool_settings_store.lock().unwrap().state();
                 let note = if state["error"].is_string() || state["save_error"].is_string() {
@@ -250,6 +315,52 @@ impl PeerBrush {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pressure_curve_drag_uses_release_force_and_keeps_the_calibrated_endpoints() {
+        let ctx = egui::Context::default();
+        let mut settings = crate::brush::Settings {
+            pressure_min: 0.18,
+            pressure_max: 0.82,
+            ..Default::default()
+        };
+        let frame = |settings: &mut crate::brush::Settings, display, ai, events| {
+            let mut center = None;
+            let _ = ctx.run(egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(400., 180.))),
+                focused: true,
+                events,
+                ..Default::default()
+            }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    center = Some(response_curve(ui, "curve", settings, display, ai).rect.center());
+                });
+            });
+            center.unwrap()
+        };
+        let pointer = |pos, pressed| egui::Event::PointerButton {
+            pos, pressed, button: egui::PointerButton::Primary, modifiers: Default::default(),
+        };
+        let initial = settings;
+        let animated = crate::brush::Settings { pressure_gamma: 0.6, ..settings };
+        frame(&mut settings, animated, true, vec![]);
+        assert_eq!(settings, initial);
+        let center = frame(&mut settings, initial, false, vec![]);
+        frame(&mut settings, initial, false, vec![egui::Event::PointerMoved(center), pointer(center, true)]);
+        let held = center + Vec2::new(0., 8.);
+        frame(&mut settings, initial, false, vec![egui::Event::PointerMoved(held)]);
+        let during_drag = settings;
+        let release = center + Vec2::new(0., 12.);
+        frame(&mut settings, during_drag, false, vec![
+            egui::Event::PointerMoved(release), pointer(release, false),
+        ]);
+        assert!(settings.pressure_gamma > during_drag.pressure_gamma);
+        assert!(during_drag.pressure_gamma > initial.pressure_gamma);
+        assert_eq!(settings.pressure_min, initial.pressure_min);
+        assert_eq!(settings.pressure_max, initial.pressure_max);
+        assert!((settings.pressure_response(0.5) - (0.5 - 12. / 41.)).abs() < 0.0001);
+    }
+
     #[test]
     fn genuine_force_test_pad_freezes_the_shared_brush_without_touching_artwork() {
         for depth in [8, 16] {
@@ -345,6 +456,40 @@ mod tests {
             assert!(pad.frozen.is_none());
             draw(&mut pad, changed, vec![]);
             assert_eq!(pad.rendered.unwrap().1, changed);
+            draw(
+                &mut pad,
+                changed,
+                vec![
+                    force(start, egui::TouchPhase::Start, 0.4),
+                    egui::Event::PointerMoved(start),
+                    button(start, true),
+                    force(start, egui::TouchPhase::End, 0.),
+                    button(start, false),
+                    egui::Event::PointerGone,
+                ],
+            );
+            assert_eq!(pad.forces, vec![0.4]);
+            assert_eq!(pad.latest_force, Some(0.4));
+            assert_eq!(pad.rendered, Some((1, changed)));
+            assert!(pad.frozen.is_none());
+            draw(
+                &mut pad,
+                changed,
+                vec![
+                    force(start, egui::TouchPhase::Start, 0.3),
+                    egui::Event::PointerMoved(start),
+                    button(start, true),
+                ],
+            );
+            assert!(pad.texture.is_some() && pad.frozen.is_some());
+            draw(
+                &mut pad,
+                changed,
+                vec![force(start, egui::TouchPhase::Cancel, 0.), egui::Event::PointerGone],
+            );
+            assert!(pad.points.is_empty() && pad.forces.is_empty());
+            assert!(pad.texture.is_none() && pad.frozen.is_none());
+            assert_eq!(pad.latest_force, Some(0.3));
         }
     }
     #[test]
@@ -355,8 +500,12 @@ mod tests {
             app.show_calibration = true;
             {
                 let mut e = app.shared.lock().unwrap();
-                e.doc = Document::new_depth(64, 48, depth).unwrap();
-                e.undo.clear();
+                e.resident_state_mut().expect("resident fixture").document =
+                    Document::new_depth(64, 48, depth).unwrap();
+                e.resident_state_mut()
+                    .expect("resident fixture")
+                    .undo
+                    .clear();
             }
             let frame = |app: &mut PeerBrush, events| {
                 let time = ctx.input(|i| i.time) + 0.1;
@@ -387,7 +536,15 @@ mod tests {
                     _ => None,
                 })
                 .expect("Visible pressure pad missing");
-            let before = app.shared.lock().unwrap().doc.export_png().unwrap();
+            let before = app
+                .shared
+                .lock()
+                .unwrap()
+                .resident_state()
+                .expect("resident fixture")
+                .document
+                .export_png()
+                .unwrap();
             let start = rect.left_center() + Vec2::new(35., 0.);
             let end = start + Vec2::new(90., 0.);
             let button = |pos, pressed| egui::Event::PointerButton {
@@ -424,8 +581,25 @@ mod tests {
             );
             assert!(app.points.is_empty());
             assert_eq!(app.calibration.forces, vec![0.2, 0.8]);
-            assert_eq!(app.shared.lock().unwrap().doc.export_png().unwrap(), before);
-            assert!(app.shared.lock().unwrap().undo.is_empty());
+            assert_eq!(
+                app.shared
+                    .lock()
+                    .unwrap()
+                    .resident_state()
+                    .expect("resident fixture")
+                    .document
+                    .export_png()
+                    .unwrap(),
+                before
+            );
+            assert!(app
+                .shared
+                .lock()
+                .unwrap()
+                .resident_state()
+                .expect("resident fixture")
+                .undo
+                .is_empty());
         }
     }
 }

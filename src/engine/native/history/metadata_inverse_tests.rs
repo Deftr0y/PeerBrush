@@ -405,8 +405,8 @@ fn disjoint_metadata_and_native_pixels_match_legacy_compensation_at_both_depths(
         current.layers[0].y = 9;
         current.revision = 19;
         let mut oracle = Engine::new();
-        oracle.doc = current.clone();
-        oracle.undo = vec![History {
+        oracle.resident_state_mut().expect("resident fixture").document = current.clone();
+        oracle.resident_state_mut().expect("resident fixture").undo = vec![History {
             before: before.clone(),
             after: after.clone(),
             actor: "agent".into(),
@@ -429,10 +429,10 @@ fn disjoint_metadata_and_native_pixels_match_legacy_compensation_at_both_depths(
         assert_eq!(result.candidate.layers[0].name, b.layers[0].name);
         assert_eq!(result.candidate.layers[0].opacity, 0.31);
         assert_eq!(result.candidate.layers[0].x, 7);
-        assert_eq!(result.candidate.layers[0].name, oracle.doc.layers[0].name);
+        assert_eq!(result.candidate.layers[0].name, oracle.resident_state().expect("resident fixture").document.layers[0].name);
         assert_eq!(
             result.candidate.layers[0].opacity,
-            oracle.doc.layers[0].opacity
+            oracle.resident_state().expect("resident fixture").document.layers[0].opacity
         );
         assert!(result
             .report
@@ -455,7 +455,7 @@ fn disjoint_metadata_and_native_pixels_match_legacy_compensation_at_both_depths(
             for x in 0..4 {
                 assert_eq!(
                     region.pixel16(x, y).unwrap(),
-                    oracle.doc.layers[0].pixels.get16(x, y)
+                    oracle.resident_state().expect("resident fixture").document.layers[0].pixels.get16(x, y)
                 );
             }
         }

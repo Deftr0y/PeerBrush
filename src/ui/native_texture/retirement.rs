@@ -2,32 +2,42 @@
 use super::*;
 use std::{
     io,
-    sync::{Condvar, Mutex},
+    sync::{atomic::{AtomicBool, Ordering}, Condvar, Mutex},
     thread,
     time::Duration,
 };
 
 const MAX_PENDING: usize = 4096;
+pub(super) fn image_bytes(pixels: usize) -> Result<usize> {
+    pixels
+        .checked_mul(std::mem::size_of::<egui::Color32>())
+        .and_then(|n| n.checked_add(128))
+        .ok_or_else(|| "Native upload footprint overflow".into())
+}
 struct Pending {
     image: Option<Arc<egui::ColorImage>>,
     _charge: Reservation,
+    finished: Arc<AtomicBool>,
 }
 struct State {
     pending: Vec<Pending>,
     reserved: usize,
     limit: usize,
+    owners: usize,
 }
 struct Queue {
     state: Mutex<State>,
     wake: Condvar,
     _index: Reservation,
 }
-#[derive(Clone)]
 pub(crate) struct Retirement {
     queue: Arc<Queue>,
     pool: ResidentBudget,
 }
 impl Retirement {
+    pub(crate) fn uses_budget(&self, pool: &ResidentBudget) -> bool {
+        self.pool.same_pool(pool)
+    }
     /// Start before conversion/upload. No context, source or profile is retained.
     pub(crate) fn new(pool: &ResidentBudget) -> Result<Self> {
         Self::start(pool, MAX_PENDING, |queue| {
@@ -61,6 +71,7 @@ impl Retirement {
                 pending,
                 reserved: 0,
                 limit,
+                owners: 1,
             }),
             wake: Condvar::new(),
             _index: charge,
@@ -75,10 +86,7 @@ impl Retirement {
         &self.pool
     }
     pub(super) fn admit(&self, pixels: usize) -> Result<Ticket> {
-        let bytes = pixels
-            .checked_mul(std::mem::size_of::<egui::Color32>())
-            .and_then(|n| n.checked_add(128))
-            .ok_or("Native upload footprint overflow")?;
+        let bytes = image_bytes(pixels)?;
         {
             let mut state = self.queue.state.lock().unwrap_or_else(|e| e.into_inner());
             reap(&mut state);
@@ -104,9 +112,16 @@ impl Retirement {
         reap(&mut self.queue.state.lock().unwrap_or_else(|e| e.into_inner()));
     }
 }
+impl Clone for Retirement {
+    fn clone(&self) -> Self {
+        self.queue.state.lock().unwrap_or_else(|e| e.into_inner()).owners += 1;
+        Self { queue: self.queue.clone(), pool: self.pool.clone() }
+    }
+}
 impl Drop for Retirement {
     fn drop(&mut self) {
-        self.queue.wake.notify_one();
+        self.queue.state.lock().unwrap_or_else(|e| e.into_inner()).owners -= 1;
+        self.queue.wake.notify_all();
     }
 }
 pub(super) struct Ticket {
@@ -115,7 +130,8 @@ pub(super) struct Ticket {
     reserved: bool,
 }
 impl Ticket {
-    pub(super) fn track(mut self, image: &Arc<egui::ColorImage>) {
+    pub(super) fn track(mut self, image: &Arc<egui::ColorImage>) -> Fence {
+        let finished = Arc::new(AtomicBool::new(false));
         {
             let mut state = self.queue.state.lock().unwrap_or_else(|e| e.into_inner());
             debug_assert!(self.reserved && state.reserved > 0);
@@ -124,10 +140,33 @@ impl Ticket {
             state.pending.push(Pending {
                 image: Some(image.clone()),
                 _charge: self.charge.take().unwrap(),
+                finished: finished.clone(),
             });
             self.reserved = false;
         }
-        self.queue.wake.notify_one();
+        self.queue.wake.notify_all();
+        Fence { queue: self.queue.clone(), finished }
+    }
+}
+pub(super) struct Fence {
+    queue: Arc<Queue>,
+    finished: Arc<AtomicBool>,
+}
+impl Fence {
+    /// Worker-only backpressure. Cancellation remains observable while a
+    /// minimized or busy renderer retains its actual image/delta owners.
+    pub(super) fn wait(&self, check: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+        loop {
+            check()?;
+            let mut state = self.queue.state.lock().unwrap_or_else(|e| e.into_inner());
+            reap(&mut state);
+            if self.finished.load(Ordering::Acquire) {
+                drop(state);
+                return check();
+            }
+            let _guard = self.queue.wake.wait_timeout(state, Duration::from_millis(20))
+                .unwrap_or_else(|e| e.into_inner());
+        }
     }
 }
 impl Drop for Ticket {
@@ -137,7 +176,7 @@ impl Drop for Ticket {
             debug_assert!(state.reserved > 0);
             state.reserved -= 1;
         }
-        self.queue.wake.notify_one();
+        self.queue.wake.notify_all();
     }
 }
 fn reap(state: &mut State) {
@@ -155,7 +194,10 @@ fn reap(state: &mut State) {
                 // This proves Vec<Color32>'s actual destructor completed before
                 // its allocation charge is freed; weak-count polling cannot.
                 drop(image);
-                drop(state.pending.swap_remove(i));
+                let pending = state.pending.swap_remove(i);
+                let finished = pending.finished.clone();
+                drop(pending);
+                finished.store(true, Ordering::Release);
             }
             Err(image) => {
                 state.pending[i].image = Some(image);
@@ -168,13 +210,18 @@ fn run(queue: Arc<Queue>) {
     loop {
         let mut state = queue.state.lock().unwrap_or_else(|e| e.into_inner());
         reap(&mut state);
-        if state.pending.is_empty() && state.reserved == 0 && Arc::strong_count(&queue) == 1 {
-            break;
+        if state.pending.is_empty() {
+            if state.reserved == 0 && state.owners == 0 {
+                break;
+            }
+            let _guard = queue.wake.wait(state).unwrap_or_else(|e| e.into_inner());
+        } else {
+            // egui image owners can drop on another thread without a queue notification.
+            let _guard = queue
+                .wake
+                .wait_timeout(state, Duration::from_millis(20))
+                .unwrap_or_else(|e| e.into_inner());
         }
-        let _guard = queue
-            .wake
-            .wait_timeout(state, Duration::from_millis(20))
-            .unwrap_or_else(|e| e.into_inner());
     }
 }
 

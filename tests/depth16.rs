@@ -13,6 +13,103 @@ fn image(pixels: &[[u16; 4]]) -> Image16 {
         words: pixels.iter().flatten().copied().collect(),
     }
 }
+
+#[test]
+fn resident_display_projects_the_same_native_words_for_cpu_composites_layers_and_masks() {
+    let mut doc = Document::new_depth(11, 7, 16).unwrap();
+    let layer = &mut doc.layers[0];
+    layer.x = 2;
+    layer.y = 1;
+    layer.pixels = Raster::new_depth(6, 4, 16);
+    layer.pixels.set16(0, 0, [54123, 139, 42347, 127]);
+    layer.pixels.set16(2, 1, [31137, 1549, 51003, 50003]);
+    layer.pixels.set16(4, 3, [12347, 23459, 51237, 65535]);
+    let mut mask = Raster::new_depth(6, 4, 16);
+    mask.set16(0, 0, [17891, 17891, 17891, 43117]);
+    mask.set16(4, 2, [4193, 4193, 4193, 65535]);
+    layer.mask = Some(Mask {
+        enabled: false, linked: false, cache_key: id(),
+        steps: vec![
+            MaskStep {
+                id: id(), kind: "paint".into(), enabled: true, weight: 1., value: 0., pixels: mask,
+                settings: json!({}),
+            },
+            MaskStep {
+                id: id(), kind: "gaussian".into(), enabled: true, weight: 1., value: 0.,
+                pixels: Raster::new_depth(6, 4, 16), settings: json!({"radius":2.}),
+            },
+        ],
+    });
+    let target = layer.id.clone();
+    let source = layer.pixels.clone();
+    let check = |doc: &Document, target, mask| {
+        for rect in [None, Some([1, 1, 10, 6])] {
+            for edge in [8192, 5] {
+                let (w, h, words, grid) = depth16::preview16(doc, rect, edge, target, mask).unwrap();
+                let expected: Vec<_> = words.chunks_exact(4)
+                    .flat_map(|pixel| depth16::display_pixel(pixel.try_into().unwrap())).collect();
+                assert_eq!(doc.preview(rect, edge, target, mask).unwrap(), (w, h, expected, grid));
+            }
+        }
+    };
+    check(&doc, Some(&target), false);
+    check(&doc, Some(&target), true);
+    check(&doc, None, false);
+    doc.filters.push(effects::Effect {
+        id: id(), kind: "invert".into(), enabled: true, weight: 0.65, settings: json!({}).into(),
+    });
+    check(&doc, None, false);
+    doc.icc_profile = Some(Arc::new(vec![0; 128]));
+    check(&doc, None, false);
+    check(&doc, Some(&target), true);
+    assert_eq!(doc.layers[0].pixels, source);
+}
+
+#[test]
+fn levels_channels_keep_native_words_and_account_for_three_tables() {
+    let settings = json!({"input_mapping":"exact","output_black":0.125,"output_white":0.625,
+        "channels":[{"output_black":1.,"output_white":0.},{"output_black":0.25,"output_white":0.25},{}]});
+    let source = [[0,32768,65535,123], [12345,23456,34567,0], [12345,12346,12347,65535]];
+    let mut im = image(&source);
+    color::apply(&mut im, "levels", &settings).unwrap();
+    assert_eq!(im.get(0,0), [40959,16384,40959,123]);
+    assert_eq!(im.get(1,0), source[1]);
+    assert_eq!(im.get(2,0), [34787,16384,14365,65535]);
+    assert_eq!(color::working_bytes(3,1,"levels",&settings).unwrap(), 3*65536*2);
+}
+
+#[test]
+fn exact_levels_keep_native_samples_at_narrow_high_gamma_boundaries() {
+    let black = 17 * 257;
+    let white = 18 * 257;
+    let source = [[black, black + 1, black + 2, 123], [white - 1, white, white + 1, 65535], [1, 2, 3, 0]];
+    let mut im = image(&source);
+    color::apply(&mut im, "levels", &json!({"input_mapping":"exact","black":17./255.,"white":18./255.,"gamma":9.99})).unwrap();
+    assert_eq!(im.get(0, 0)[0], 0);
+    assert!(im.get(0, 0)[1] > 0 && im.get(0, 0)[1] < im.get(0, 0)[2]);
+    assert!(im.get(1, 0)[0] < 65535);
+    assert_eq!(&im.get(1, 0)[1..], &[65535,65535,65535]);
+    assert_eq!(im.get(0, 0)[3], 123);
+    assert_eq!(im.get(2, 0), source[2]);
+    assert!(im.words.chunks_exact(4).take(2).flat_map(|p| &p[..3]).any(|word| word % 257 != 0));
+}
+
+#[test]
+fn levels_output_range_keeps_native_precision_alpha_and_hidden_rgb() {
+    let source = [[0, 32768, 65535, 123], [12345, 12346, 23457, 65535], [17, 29, 43, 0]];
+    let mut im = image(&source);
+    color::apply(&mut im, "levels", &json!({"output_black":0.25,"output_white":0.75})).unwrap();
+    assert_eq!(im.get(0, 0), [16384, 32768, 49151, 123]);
+    assert_eq!(im.get(1, 0), [22556, 22557, 28112, 65535]);
+    assert_eq!(im.get(2, 0), source[2]);
+    let mut reversed = image(&source);
+    color::apply(&mut reversed, "levels", &json!({"output_black":1.,"output_white":0.})).unwrap();
+    assert_eq!(reversed.get(0, 0), [65535, 32767, 0, 123]);
+    assert_eq!(reversed.get(1, 0), [53190, 53189, 42078, 65535]);
+    let mut flat = image(&source);
+    color::apply(&mut flat, "levels", &json!({"output_black":0.25,"output_white":0.25})).unwrap();
+    assert_eq!(flat.get(1, 0), [16384, 16384, 16384, 65535]);
+}
 fn paint_mask(width: u32, height: u32, value: u16) -> Mask {
     let words: Vec<u16> = (0..width * height)
         .flat_map(|_| [value, value, value, 65535])
@@ -244,8 +341,8 @@ fn native_cpu_spatial_passes_match_reference_across_rows_columns_and_tile_edges(
 fn native_spatial_preparation_keeps_masked_clipped_folder_preview_and_history() {
     let (width, height) = (19, 13);
     let mut engine = Engine::new();
-    engine.doc = Document::new_depth(width, height, 16).unwrap();
-    let mut base = engine.doc.layers.remove(0);
+    engine.resident_state_mut().expect("resident fixture").document = Document::new_depth(width, height, 16).unwrap();
+    let mut base = engine.resident_state_mut().expect("resident fixture").document.layers.remove(0);
     for y in 0..height {
         for x in 0..width {
             base.pixels.set16(
@@ -294,14 +391,14 @@ fn native_spatial_preparation_keeps_masked_clipped_folder_preview_and_history() 
     background.pixels.promote16();
     background.color = [31, 43, 59, 255];
     let target = base.id.clone();
-    engine.doc.layers = vec![group, clip, base, background];
-    let original = engine.doc.layers[2].pixels.rgba16();
-    let baseline = depth16::render(&engine.doc).unwrap().words;
+    engine.resident_state_mut().expect("resident fixture").document.layers = vec![group, clip, base, background];
+    let original = engine.resident_state().expect("resident fixture").document.layers[2].pixels.rgba16();
+    let baseline = depth16::render(&engine.resident_state().expect("resident fixture").document).unwrap().words;
     engine.edit("human", &[
         json!({"op":"effect.add","layer":target,"kind":"blur","settings":{"radius":4},"weight":0.7}),
         json!({"op":"effect.add","layer":target,"kind":"invert"}),
     ], None, None, "Spatial preview").unwrap();
-    let mut reference = engine.doc.clone();
+    let mut reference = engine.resident_state().expect("resident fixture").document.clone();
     let mut prepared = Image16 {
         width,
         height,
@@ -332,20 +429,20 @@ fn native_spatial_preparation_keeps_masked_clipped_folder_preview_and_history() 
     reference.layers[2].effects.clear();
     reference.layers[2].pixels = Raster::from_rgba16(width, height, &prepared.words).unwrap();
     let expected = depth16::render(&reference).unwrap().words;
-    let actual = depth16::render(&engine.doc).unwrap().words;
+    let actual = depth16::render(&engine.resident_state().expect("resident fixture").document).unwrap().words;
     assert_eq!(actual, expected);
     assert!(actual.iter().any(|value| value % 257 != 0));
     assert_eq!(
-        depth16::preview16(&engine.doc, None, width, None, false)
+        depth16::preview16(&engine.resident_state().expect("resident fixture").document, None, width, None, false)
             .unwrap()
             .2,
         actual
     );
-    assert_eq!(engine.doc.layers[2].pixels.rgba16(), original);
-    assert_eq!(engine.undo.len(), 1);
+    assert_eq!(engine.resident_state().expect("resident fixture").document.layers[2].pixels.rgba16(), original);
+    assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), 1);
     engine.undo("human").unwrap();
-    assert_eq!(engine.doc.layers[2].pixels.rgba16(), original);
-    assert_eq!(depth16::render(&engine.doc).unwrap().words, baseline);
+    assert_eq!(engine.resident_state().expect("resident fixture").document.layers[2].pixels.rgba16(), original);
+    assert_eq!(depth16::render(&engine.resident_state().expect("resident fixture").document).unwrap().words, baseline);
 }
 
 #[test]
@@ -429,10 +526,10 @@ fn clipped_adjustments_apply_native_base_mask_opacity_and_folder_scope_once() {
 #[test]
 fn native_effect_cache_distinguishes_live_drafts_and_keeps_history_sources_untouched() {
     let mut engine = Engine::new();
-    engine.doc = Document::new_depth(4, 1, 16).unwrap();
-    let id = engine.doc.layers[0].id.clone();
+    engine.resident_state_mut().expect("resident fixture").document = Document::new_depth(4, 1, 16).unwrap();
+    let id = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
     for x in 0..4 {
-        engine.doc.layers[0]
+        engine.resident_state_mut().expect("resident fixture").document.layers[0]
             .pixels
             .set16(x, 0, [12345 + x as u16, 30001, 50003, 65535]);
     }
@@ -445,27 +542,27 @@ fn native_effect_cache_distinguishes_live_drafts_and_keeps_history_sources_untou
             "Levels",
         )
         .unwrap();
-    let source = engine.doc.layers[0].pixels.rgba16();
-    let baseline = depth16::render(&engine.doc).unwrap().words;
-    let cached = depth16::prepare(&engine.doc).unwrap()[0]
+    let source = engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16();
+    let baseline = depth16::render(&engine.resident_state().expect("resident fixture").document).unwrap().words;
+    let cached = depth16::prepare(&engine.resident_state().expect("resident fixture").document).unwrap()[0]
         .as_ref()
         .unwrap()
         .clone();
-    let effect = engine.doc.layers[0].effects[0].id.clone();
+    let effect = engine.resident_state().expect("resident fixture").document.layers[0].effects[0].id.clone();
     let draft = Engine::preview_edits(
-        engine.doc.clone(),
+        engine.resident_state().expect("resident fixture").document.clone(),
         &[json!({"op":"effect.update","layer":id,"effect":effect,"settings":{"gamma":2.1}})],
     )
     .unwrap();
-    assert_eq!(draft.revision, engine.doc.revision);
+    assert_eq!(draft.revision, engine.resident_state().expect("resident fixture").document.revision);
     assert_ne!(depth16::render(&draft).unwrap().words, baseline);
-    assert_eq!(depth16::render(&engine.doc).unwrap().words, baseline);
-    let again = depth16::prepare(&engine.doc).unwrap()[0]
+    assert_eq!(depth16::render(&engine.resident_state().expect("resident fixture").document).unwrap().words, baseline);
+    let again = depth16::prepare(&engine.resident_state().expect("resident fixture").document).unwrap()[0]
         .as_ref()
         .unwrap()
         .clone();
     assert!(Arc::ptr_eq(&cached, &again));
-    assert_eq!(engine.doc.layers[0].pixels.rgba16(), source);
+    assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(), source);
 }
 #[test]
 fn native_liquify_and_bloom_never_round_sources_through_bytes() {

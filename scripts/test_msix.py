@@ -257,6 +257,12 @@ class Msix(unittest.TestCase):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 msix.package_version(invalid, development=True)
 
+    def test_04_series_advances_the_installed_package_version(self):
+        self.assertEqual(msix.package_version('0.4.0', previous='1.30.1.0'), '2.4.0.0')
+        self.assertEqual(msix.package_version('0.4.1', previous='2.4.0.0'), '2.4.1.0')
+        with self.assertRaises(ValueError):
+            msix.package_version('0.30.1', previous='2.4.0.0')
+
     def test_optional_image_types_are_opt_in_and_only_supported_types(self):
         data=msix.manifest_bytes(self.template,self.identity,'0.2.0',['.png','.jpg','.png'])
         root=ET.fromstring(data)

@@ -1,19 +1,21 @@
 //! Place agent-generated or edited pixels using document coordinates and ordinary history.
 use crate::{
     engine::{Document, Layer},
-    raster::{blend, check_size, Raster},
+    raster::{blend, Raster},
     transform::copy_shift,
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde_json::Value;
 use std::path::Path;
 
-fn decode(command: &Value, depth: u16) -> Result<Raster, String> {
+pub(crate) mod input;
+
+pub(crate) fn decode(command: &Value, depth: u16, budget: usize) -> Result<Raster, String> {
     let mut pixels = match (command.get("path"), command.get("png")) {
         (Some(path), None) => crate::image_import::decode_file(
             Path::new(path.as_str().ok_or("Image path must be a string")?),
             command,
-            crate::image_import::BUDGET,
+            budget,
         )?,
         (None, Some(png)) => {
             let png = png.as_str().ok_or("png must contain base64 PNG bytes")?;
@@ -21,7 +23,7 @@ fn decode(command: &Value, depth: u16) -> Result<Raster, String> {
                 return Err("Encoded image is too large".into());
             }
             crate::image_import::Encoded::png(STANDARD.decode(png).map_err(|e| e.to_string())?)?
-                .decode(command, crate::image_import::BUDGET)?
+                .decode(command, budget)?
         }
         _ => return Err("Provide exactly one absolute path or base64 png".into()),
     };
@@ -45,100 +47,58 @@ pub(crate) fn unlocked(doc: &Document, target: &str) -> Result<(), String> {
         }
         current = layer.parent.as_deref();
     }
-    Err("Group nesting limit exceeded".into())
+    if current.is_some() {
+        Err("Group nesting limit exceeded".into())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::*;
+    #[test]
+    fn sixteen_ancestors_are_valid_but_locks_cycles_and_seventeen_are_not() {
+        let mut doc = Document::new(1, 1).unwrap();
+        doc.layers[0].id = "leaf".into();
+        for i in 0..16 {
+            let mut group = crate::engine::Layer::new(&format!("Folder {i}"), "group", 1, 1);
+            group.id = format!("g{i}");
+            doc.layers.last_mut().unwrap().parent = Some(group.id.clone());
+            doc.layers.push(group);
+        }
+        assert!(unlocked(&doc, "leaf").is_ok());
+        doc.layers[16].locked = true;
+        assert!(unlocked(&doc, "leaf").unwrap_err().contains("Unlock"));
+        doc.layers[16].locked = false;
+        doc.layers[16].parent = Some("leaf".into());
+        assert!(unlocked(&doc, "leaf").unwrap_err().contains("nesting"));
+        let mut extra = crate::engine::Layer::new("Extra", "group", 1, 1);
+        extra.id = "extra".into();
+        doc.layers[16].parent = Some(extra.id.clone());
+        doc.layers.push(extra);
+        assert!(unlocked(&doc, "leaf").unwrap_err().contains("nesting"));
+    }
 }
 
 pub fn place(doc: &mut Document, command: &Value) -> Result<(), String> {
-    let new_layer = match command.get("new_layer") {
-        None => true,
-        Some(value) => value.as_bool().ok_or("new_layer must be true or false")?,
-    };
-    let context = command
-        .get("layer")
-        .map(|value| value.as_str().ok_or("layer must be a layer or folder ID"))
-        .transpose()?;
-    if let Some(context) = context {
-        unlocked(doc, context)?;
-    }
-    let context_index = context.and_then(|id| doc.layers.iter().position(|l| l.id == id));
-    let parent = if new_layer {
-        if let Some(value) = command.get("parent") {
-            if value.is_null() {
-                None
-            } else {
-                let id = value.as_str().ok_or("Parent must be a folder ID or null")?;
-                unlocked(doc, id)?;
-                if !doc.layers.iter().any(|l| l.id == id && l.kind == "group") {
-                    return Err("Parent must be a folder".into());
-                }
-                Some(id.to_owned())
-            }
-        } else {
-            context_index.and_then(|index| {
-                let layer = &doc.layers[index];
-                if layer.kind == "group" {
-                    Some(layer.id.clone())
-                } else {
-                    layer.parent.clone()
-                }
-            })
+    let plan = input::Plan::new(command, doc.layers.len(), |i| {
+        let l = &doc.layers[i];
+        input::Layer {
+            id: &l.id,
+            parent: l.parent.as_deref(),
+            kind: &l.kind,
+            locked: l.locked,
+            source: l.source.is_some(),
         }
-    } else {
-        if command.get("parent").is_some() {
-            return Err("parent is only used for new layers".into());
-        }
-        let index =
-            context_index.ok_or("Choose the current layer with layer and new_layer:false")?;
-        if doc.layers[index].source.is_some() {
-            return Err(
-                "Rasterize the editable text/vector layer before placing pixels into it".into(),
-            );
-        }
-        if doc.layers[index].kind == "group" {
-            return Err("Place into a paint layer or create a new child layer".into());
-        }
-        None
-    };
-    if new_layer && doc.layers.len() >= 100 {
-        return Err("Initial version supports up to 100 layers".into());
-    }
-    let mode = command
-        .get("mode")
-        .and_then(Value::as_str)
-        .unwrap_or("over");
-    if !["over", "replace"].contains(&mode) {
-        return Err("Image mode must be over or replace".into());
-    }
-    let source = decode(command, doc.bit_depth)?;
+    })?;
+    let source = decode(command, doc.bit_depth, crate::image_import::BUDGET)?;
     if source.depth == 16 && doc.bit_depth != 16 {
         doc.bit_depth = 16;
         doc.ensure_depth();
     }
-    let bounds = if let Some(value) = command.get("rect") {
-        let area = crate::engine::rect(value).ok_or("Invalid destination rectangle")?;
-        if area[0] == area[2] || area[1] == area[3] {
-            return Err("Image rectangle must have positive size".into());
-        }
-        area
-    } else {
-        let coordinate = |key: &str| -> Result<i32, String> {
-            match command.get(key) {
-                None => Ok(0),
-                Some(value) => value
-                    .as_i64()
-                    .filter(|n| (-100000..=100000).contains(n))
-                    .map(|n| n as i32)
-                    .ok_or_else(|| format!("Invalid image {key}")),
-            }
-        };
-        let (x, y) = (coordinate("x")?, coordinate("y")?);
-        [x, y, x + source.width as i32, y + source.height as i32]
-    };
-    let (width, height) = (
-        (bounds[2] - bounds[0]) as u32,
-        (bounds[3] - bounds[1]) as u32,
-    );
-    check_size(width, height)?;
+    let bounds = input::bounds(command, [source.width, source.height], crate::raster::CanvasLimits::Resident)?;
+    let [width, height] = input::shape(bounds, crate::raster::CanvasLimits::Resident)?;
     let natural_size = (width, height) == (source.width, source.height);
     // Premultiplied interpolation prevents transparent generated edges acquiring black fringes.
     let sample = |x: u32, y: u32| {
@@ -146,10 +106,8 @@ pub fn place(doc: &mut Document, command: &Value) -> Result<(), String> {
             return source.get(x as i32, y as i32);
         }
         source.sample(
-            ((x as f32 + 0.5) * source.width as f32 / width as f32 - 0.5)
-                .clamp(0.0, source.width as f32 - 1.0),
-            ((y as f32 + 0.5) * source.height as f32 / height as f32 - 0.5)
-                .clamp(0.0, source.height as f32 - 1.0),
+            input::coordinate(x, source.width, width),
+            input::coordinate(y, source.height, height),
         )
     };
     let sample16 = |x: u32, y: u32| {
@@ -157,13 +115,11 @@ pub fn place(doc: &mut Document, command: &Value) -> Result<(), String> {
             return source.get16(x as i32, y as i32);
         }
         source.sample16(
-            ((x as f32 + 0.5) * source.width as f32 / width as f32 - 0.5)
-                .clamp(0., source.width as f32 - 1.),
-            ((y as f32 + 0.5) * source.height as f32 / height as f32 - 0.5)
-                .clamp(0., source.height as f32 - 1.),
+            input::coordinate(x, source.width, width),
+            input::coordinate(y, source.height, height),
         )
     };
-    if new_layer {
+    if plan.target.is_none() {
         let name = command
             .get("name")
             .and_then(Value::as_str)
@@ -171,7 +127,7 @@ pub fn place(doc: &mut Document, command: &Value) -> Result<(), String> {
         let mut layer = Layer::new(name, "paint", width, height);
         layer.x = bounds[0];
         layer.y = bounds[1];
-        layer.parent = parent.clone();
+        layer.parent = plan.parent.clone();
         layer.pixels = Raster::new_depth(width, height, doc.bit_depth);
         if natural_size {
             layer.pixels = source.clone();
@@ -186,25 +142,17 @@ pub fn place(doc: &mut Document, command: &Value) -> Result<(), String> {
                 }
             }
         }
-        let at = context_index
-            .filter(|i| doc.layers[*i].parent == parent && doc.layers[*i].kind != "group")
-            .unwrap_or_else(|| {
-                parent
-                    .as_deref()
-                    .and_then(|id| doc.layers.iter().position(|l| l.id == id))
-                    .map(|i| i + 1)
-                    .unwrap_or(0)
-            });
-        doc.layers.insert(at, layer);
+        doc.layers.insert(plan.index, layer);
     } else {
-        let layer = &mut doc.layers[context_index.unwrap()];
+        let layer = &mut doc.layers[plan.target.unwrap()];
         let (old_x, old_y) = (layer.x, layer.y);
-        let left = old_x.min(bounds[0]);
-        let top = old_y.min(bounds[1]);
-        let right = (old_x + layer.pixels.width as i32).max(bounds[2]);
-        let bottom = (old_y + layer.pixels.height as i32).max(bounds[3]);
-        let (w, h) = ((right - left) as u32, (bottom - top) as u32);
-        check_size(w, h)?;
+        let [left, top, right, bottom] = input::frame(
+            [old_x, old_y],
+            [layer.pixels.width, layer.pixels.height],
+            bounds,
+            crate::raster::CanvasLimits::Resident,
+        )?;
+        let [w, h] = input::shape([left, top, right, bottom], crate::raster::CanvasLimits::Resident)?;
         let unchanged_bounds =
             (left, top, w, h) == (old_x, old_y, layer.pixels.width, layer.pixels.height);
         let mut pixels = if layer.kind == "fill" {
@@ -228,7 +176,7 @@ pub fn place(doc: &mut Document, command: &Value) -> Result<(), String> {
                     pixels.set16(
                         tx,
                         ty,
-                        if mode == "replace" {
+                        if plan.replace {
                             pixel
                         } else {
                             crate::raster::blend16(pixels.get16(tx, ty), pixel, 1., "normal")
@@ -240,7 +188,7 @@ pub fn place(doc: &mut Document, command: &Value) -> Result<(), String> {
                 pixels.set(
                     tx,
                     ty,
-                    if mode == "replace" {
+                    if plan.replace {
                         pixel
                     } else {
                         blend(pixels.get(tx, ty), pixel, 1.0, "normal")
@@ -261,6 +209,8 @@ pub fn place(doc: &mut Document, command: &Value) -> Result<(), String> {
         layer.x = left;
         layer.y = top;
     }
-    doc.srgb_tagged = true;
+    if !doc.psd_intentionally_untagged {
+        doc.srgb_tagged = true;
+    }
     Ok(())
 }

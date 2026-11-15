@@ -92,3 +92,11 @@ The private `PeerBrushInstalledGuiV1` record and thirteen synthetic window captu
 
 
 Disposable installed-GUI failures retain only bounded diagnostic facts: fixed phase names, reviewed script names/line numbers, allowlisted exception categories and process exit status. The GUI entry emits a fixed marker before optional imports, so bootstrap failures can be distinguished from later fixture/window/project checks. Child-reported progress or a sanitized traceback is diagnostic evidence only; it never replaces package identity, real rendered/native/history/settings or graceful-close assertions, and never establishes release readiness. Unknown wrapper/display failures still fail acceptance without guessing their cause. Actual Xvfb/desktop acceptance must be replayed for the selected source; these diagnostic changes alone do not establish a successful GUI run.
+
+## APT repository source preparation (PB-158, unreleased)
+
+The unsigned repository producer now reuses the exact final-DEB/portable/source inspector to create bounded, hash-linked `noble/main` amd64 indexes and expiring Release metadata. It preserves the original native dependencies and copies only the selected verified DEB. See [repository candidate preparation](packaging.md#apt-repository-candidate-preparation-unreleased) for the contributor command and exact output contract.
+
+The [signature attachment producer](packaging.md#apt-signature-attachment-unreleased-native-execution-pending) prepares a signed repository candidate from externally signed Release metadata. It verifies the signatures against the selected publisher certificate in an isolated GnuPG home, produces a Deb822 client entry with a dedicated keyring, and carries forward immutable by-hash indexes and versioned packages from the verified previous candidate.
+
+Publisher approval and signing, hosted publication, public HTTPS readback, and native apt installation and upgrade acceptance remain pending.

@@ -22,8 +22,8 @@ fn native(doc: &Document) -> Vec<u16> {
 }
 fn fixture(depth: u16) -> Engine {
     let mut e = Engine::new();
-    e.doc = Document::new_depth(64, 64, depth).unwrap();
-    let l = &mut e.doc.layers[0];
+    e.resident_state_mut().expect("resident fixture").document = Document::new_depth(64, 64, depth).unwrap();
+    let l = &mut e.resident_state_mut().expect("resident fixture").document.layers[0];
     l.x = 20;
     l.y = 18;
     l.pixels = Raster::new_depth(24, 24, depth);
@@ -58,9 +58,9 @@ fn strip(bytes: &[u8]) -> Vec<u8> {
 fn gradient_color_smoothness_keeps_native_sources_alpha_history_and_standard_output() {
     for depth in [8, 16] {
         let mut engine = Engine::new();
-        engine.doc = Document::new_depth(8, 1, depth).unwrap();
+        engine.resident_state_mut().expect("resident fixture").document = Document::new_depth(8, 1, depth).unwrap();
         for x in 0..8 {
-            engine.doc.layers[0].pixels.set16(
+            engine.resident_state_mut().expect("resident fixture").document.layers[0].pixels.set16(
                 x,
                 0,
                 [
@@ -71,8 +71,8 @@ fn gradient_color_smoothness_keeps_native_sources_alpha_history_and_standard_out
                 ],
             );
         }
-        let source = engine.doc.layers[0].pixels.rgba16();
-        let layer = engine.doc.layers[0].id.clone();
+        let source = engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16();
+        let layer = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
         let values = [
             0.123456789012345,
             0.912345678901234,
@@ -86,17 +86,17 @@ fn gradient_color_smoothness_keeps_native_sources_alpha_history_and_standard_out
             .collect::<Vec<_>>();
         let settings = json!({"pixel_grid":true,"angle":0.,"opacity":1.,"color_stops":stops});
         engine.edit("human",&[json!({"op":"effect.add","layer":layer,"kind":"gradient_overlay","settings":settings})],None,None,"Native linear stops").unwrap();
-        engine.undo.clear();
-        let original = engine.doc.export_png().unwrap();
-        let effect = engine.doc.layers[0].effects[0].id.clone();
+        engine.resident_state_mut().expect("resident fixture").undo.clear();
+        let original = engine.resident_state().expect("resident fixture").document.export_png().unwrap();
+        let effect = engine.resident_state().expect("resident fixture").document.layers[0].effects[0].id.clone();
         for strength in [0.375, 1.] {
-            let mut settings = engine.doc.layers[0].effects[0].settings.as_ref().clone();
+            let mut settings = engine.resident_state().expect("resident fixture").document.layers[0].effects[0].settings.as_ref().clone();
             settings["smoothness"] = json!(strength);
             let command =
                 json!({"op":"effect.update","layer":layer,"effect":effect,"settings":settings});
-            let draft = Engine::preview_edits(engine.doc.clone(), &[command.clone()]).unwrap();
-            assert_eq!(engine.doc.export_png().unwrap(), original);
-            assert!(engine.undo.is_empty());
+            let draft = Engine::preview_edits(engine.resident_state().expect("resident fixture").document.clone(), &[command.clone()]).unwrap();
+            assert_eq!(engine.resident_state().expect("resident fixture").document.export_png().unwrap(), original);
+            assert!(engine.resident_state().expect("resident fixture").undo.is_empty());
             assert_ne!(draft.export_png().unwrap(), original);
             let rendered = native(&draft);
             for x in 0..8usize {
@@ -147,15 +147,15 @@ fn gradient_color_smoothness_keeps_native_sources_alpha_history_and_standard_out
             engine
                 .edit("human", &[command], None, None, "Color smoothness")
                 .unwrap();
-            assert_eq!(engine.undo.len(), 1);
+            assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), 1);
             assert_eq!(
-                engine.doc.export_png().unwrap(),
+                engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
                 draft.export_png().unwrap()
             );
-            assert_eq!(engine.doc.layers[0].pixels.rgba16(), source);
-            let current = engine.doc.export_png().unwrap();
+            assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(), source);
+            let current = engine.resident_state().expect("resident fixture").document.export_png().unwrap();
             for enabled in [false, true] {
-                let doc=Engine::preview_edits(engine.doc.clone(),&[json!({"op":"effect.update","layer":layer,"effect":effect,"enabled":enabled})]).unwrap();
+                let doc=Engine::preview_edits(engine.resident_state().expect("resident fixture").document.clone(),&[json!({"op":"effect.update","layer":layer,"effect":effect,"enabled":enabled})]).unwrap();
                 let current = doc.export_png().unwrap();
                 for bytes in [psd::encode(&doc).unwrap(), psd::encode_psb(&doc).unwrap()] {
                     use std::io::Read;
@@ -183,10 +183,10 @@ fn gradient_color_smoothness_keeps_native_sources_alpha_history_and_standard_out
                 }
             }
             engine.undo("human").unwrap();
-            assert_eq!(engine.doc.export_png().unwrap(), original);
-            assert_eq!(engine.doc.layers[0].pixels.rgba16(), source);
+            assert_eq!(engine.resident_state().expect("resident fixture").document.export_png().unwrap(), original);
+            assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(), source);
             engine.redo("human").unwrap();
-            assert_eq!(engine.doc.export_png().unwrap(), current);
+            assert_eq!(engine.resident_state().expect("resident fixture").document.export_png().unwrap(), current);
             engine.undo("human").unwrap();
         }
         let mut alpha_settings = settings.clone();
@@ -200,12 +200,12 @@ fn gradient_color_smoothness_keeps_native_sources_alpha_history_and_standard_out
                 effects::gradient::opacity_at(&smooth, t).to_bits()
             );
         }
-        let before = serde_json::to_value(&engine.doc).unwrap();
-        let history = engine.undo.len();
+        let before = serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap();
+        let history = engine.resident_state().expect("resident fixture").undo.len();
         for invalid in [json!(-0.1), json!(1.1), json!(true), json!("smooth")] {
             assert!(engine.edit("human",&[json!({"op":"effect.update","layer":layer,"effect":effect,"settings":{"smoothness":invalid}})],None,None,"Invalid smoothness").is_err());
-            assert_eq!(serde_json::to_value(&engine.doc).unwrap(), before);
-            assert_eq!(engine.undo.len(), history);
+            assert_eq!(serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap(), before);
+            assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), history);
         }
         for kind in ["color_overlay", "inner_shadow", "pattern_overlay"] {
             assert!(effects::validate(kind, &json!({"smoothness":1.})).is_err());
@@ -305,11 +305,11 @@ fn gradient_pixel_grid_matches_calibrated_knots_at_native_precision() {
     for depth in [8, 16] {
         for (style, angle, scale, bounds, knots) in &cases {
             let mut engine = Engine::new();
-            engine.doc = Document::new_depth(200, 140, depth).unwrap();
-            let layer = engine.doc.layers[0].id.clone();
+            engine.resident_state_mut().expect("resident fixture").document = Document::new_depth(200, 140, depth).unwrap();
+            let layer = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
             for y in 0..140 {
                 for x in 0..200 {
-                    engine.doc.layers[0].pixels.set16(
+                    engine.resident_state_mut().expect("resident fixture").document.layers[0].pixels.set16(
                         x,
                         y,
                         [
@@ -327,7 +327,7 @@ fn gradient_pixel_grid_matches_calibrated_knots_at_native_precision() {
                     );
                 }
             }
-            let source = engine.doc.layers[0].pixels.rgba16();
+            let source = engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16();
             let quarter = if *style == "angle" {
                 [255., 0., 0.]
             } else {
@@ -342,8 +342,8 @@ fn gradient_pixel_grid_matches_calibrated_knots_at_native_precision() {
             ];
             let stops=colors.into_iter().enumerate().map(|(i,color)|json!({"position":i as f64/4.,"midpoint":0.5,"color":color.map(|v|v/255.)})).collect::<Vec<_>>();
             let command = json!({"op":"effect.add","layer":layer,"kind":"gradient_overlay","settings":{"style":style,"angle":angle,"scale":scale,"opacity":1.,"pixel_grid":true,"align_layer":true,"color_stops":stops}});
-            let draft = Engine::preview_edits(engine.doc.clone(), &[command.clone()]).unwrap();
-            assert!(engine.undo.is_empty());
+            let draft = Engine::preview_edits(engine.resident_state().expect("resident fixture").document.clone(), &[command.clone()]).unwrap();
+            assert!(engine.resident_state().expect("resident fixture").undo.is_empty());
             engine
                 .edit(
                     "human",
@@ -354,15 +354,15 @@ fn gradient_pixel_grid_matches_calibrated_knots_at_native_precision() {
                 )
                 .unwrap();
             assert_eq!(
-                engine.doc.export_png().unwrap(),
+                engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
                 draft.export_png().unwrap()
             );
-            assert_eq!(engine.doc.layers[0].pixels.rgba16(), source);
+            assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(), source);
             let words = if depth == 16 {
-                depth16::render(&engine.doc).unwrap().words
+                depth16::render(&engine.resident_state().expect("resident fixture").document).unwrap().words
             } else {
                 engine
-                    .doc
+                    .resident_state().expect("resident fixture").document
                     .preview(None, 200, None, false)
                     .unwrap()
                     .2
@@ -386,10 +386,10 @@ fn gradient_pixel_grid_matches_calibrated_knots_at_native_precision() {
 fn gradient_pixel_grid_retains_legacy_sources_history_and_current_standard_saves() {
     for depth in [8, 16] {
         let mut engine = Engine::new();
-        engine.doc = Document::new_depth(4, 2, depth).unwrap();
+        engine.resident_state_mut().expect("resident fixture").document = Document::new_depth(4, 2, depth).unwrap();
         for y in 0..2 {
             for x in 0..4 {
-                engine.doc.layers[0].pixels.set16(
+                engine.resident_state_mut().expect("resident fixture").document.layers[0].pixels.set16(
                     x,
                     y,
                     [
@@ -407,36 +407,36 @@ fn gradient_pixel_grid_retains_legacy_sources_history_and_current_standard_saves
                 );
             }
         }
-        let layer = engine.doc.layers[0].id.clone();
+        let layer = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
         engine.edit("human",&[json!({"op":"effect.add","layer":layer,"kind":"gradient_overlay","settings":{"angle":0.,"color":[0.,0.,0.],"color2":[1.,1.,1.],"opacity":1.}})],None,None,"Legacy gradient").unwrap();
-        engine.undo.clear();
-        let source = engine.doc.layers[0].pixels.rgba16();
-        let original = engine.doc.export_png().unwrap();
-        let effect = engine.doc.layers[0].effects[0].id.clone();
-        let mut settings = engine.doc.layers[0].effects[0].settings.as_ref().clone();
+        engine.resident_state_mut().expect("resident fixture").undo.clear();
+        let source = engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16();
+        let original = engine.resident_state().expect("resident fixture").document.export_png().unwrap();
+        let effect = engine.resident_state().expect("resident fixture").document.layers[0].effects[0].id.clone();
+        let mut settings = engine.resident_state().expect("resident fixture").document.layers[0].effects[0].settings.as_ref().clone();
         settings["pixel_grid"] = json!(true);
         settings["align_layer"] = json!(false);
         let command =
             json!({"op":"effect.update","layer":layer,"effect":effect,"settings":settings});
-        let draft = Engine::preview_edits(engine.doc.clone(), &[command.clone()]).unwrap();
+        let draft = Engine::preview_edits(engine.resident_state().expect("resident fixture").document.clone(), &[command.clone()]).unwrap();
         assert_ne!(draft.export_png().unwrap(), original);
-        assert_eq!(engine.doc.export_png().unwrap(), original);
-        assert!(engine.undo.is_empty());
+        assert_eq!(engine.resident_state().expect("resident fixture").document.export_png().unwrap(), original);
+        assert!(engine.resident_state().expect("resident fixture").undo.is_empty());
         engine
             .edit("human", &[command], None, None, "Native grid placement")
             .unwrap();
-        assert_eq!(engine.undo.len(), 1);
+        assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), 1);
         assert_eq!(
-            engine.doc.export_png().unwrap(),
+            engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
             draft.export_png().unwrap()
         );
-        let current = engine.doc.export_png().unwrap();
-        let words = native(&engine.doc);
+        let current = engine.resident_state().expect("resident fixture").document.export_png().unwrap();
+        let words = native(&engine.resident_state().expect("resident fixture").document);
         for enabled in [false, true] {
             for grid in [false, true] {
-                let mut settings = engine.doc.layers[0].effects[0].settings.as_ref().clone();
+                let mut settings = engine.resident_state().expect("resident fixture").document.layers[0].effects[0].settings.as_ref().clone();
                 settings["pixel_grid"] = json!(grid);
-                let doc = Engine::preview_edits(engine.doc.clone(), &[json!({"op":"effect.update","layer":layer,"effect":effect,"enabled":enabled,"settings":settings})]).unwrap();
+                let doc = Engine::preview_edits(engine.resident_state().expect("resident fixture").document.clone(), &[json!({"op":"effect.update","layer":layer,"effect":effect,"enabled":enabled,"settings":settings})]).unwrap();
                 let current = doc.export_png().unwrap();
                 for bytes in [psd::encode(&doc).unwrap(), psd::encode_psb(&doc).unwrap()] {
                     use std::io::Read;
@@ -475,12 +475,12 @@ fn gradient_pixel_grid_retains_legacy_sources_history_and_current_standard_saves
             assert_eq!(words[x * 4], expected);
         }
         engine.undo("human").unwrap();
-        assert_eq!(engine.doc.export_png().unwrap(), original);
-        assert_eq!(engine.doc.layers[0].pixels.rgba16(), source);
+        assert_eq!(engine.resident_state().expect("resident fixture").document.export_png().unwrap(), original);
+        assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(), source);
         engine.redo("human").unwrap();
-        assert_eq!(engine.doc.export_png().unwrap(), current);
-        let before = serde_json::to_value(&engine.doc).unwrap();
-        let history = engine.undo.len();
+        assert_eq!(engine.resident_state().expect("resident fixture").document.export_png().unwrap(), current);
+        let before = serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap();
+        let history = engine.resident_state().expect("resident fixture").undo.len();
         for invalid in [
             json!({"pixel_grid":1}),
             json!({"align_layer":true}),
@@ -488,13 +488,13 @@ fn gradient_pixel_grid_retains_legacy_sources_history_and_current_standard_saves
             json!({"pixel_grid":true,"align_layer":1}),
         ] {
             assert!(engine.edit("human",&[json!({"op":"effect.update","layer":layer,"effect":effect,"settings":invalid})],None,None,"Invalid grid").is_err());
-            assert_eq!(serde_json::to_value(&engine.doc).unwrap(), before);
-            assert_eq!(engine.undo.len(), history);
+            assert_eq!(serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap(), before);
+            assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), history);
         }
         for kind in ["color_overlay", "pattern_overlay", "drop_shadow"] {
             assert!(effects::validate(kind, &json!({"pixel_grid":true})).is_err());
         }
-        let legacy = engine.doc.layers[0].effects[0].settings.as_ref().clone();
+        let legacy = engine.resident_state().expect("resident fixture").document.layers[0].effects[0].settings.as_ref().clone();
         let mut disabled = legacy.clone();
         disabled["pixel_grid"] = json!(false);
         let mut removed = disabled.clone();
@@ -515,8 +515,8 @@ fn drop_shadow_source_knockout_preserves_native_sources_previews_undo_and_standa
             [(0., 1f64, 1i32, 0i32), (45., 2., 1, -1), (-135., 2., -1, 1)]
         {
             let mut engine = Engine::new();
-            engine.doc = Document::new_depth(4, 4, depth).unwrap();
-            engine.doc.layers[0].psd_metadata.push(psd::LayerMetadata {
+            engine.resident_state_mut().expect("resident fixture").document = Document::new_depth(4, 4, depth).unwrap();
+            engine.resident_state_mut().expect("resident fixture").document.layers[0].psd_metadata.push(psd::LayerMetadata {
                 key: "lyvr".into(),
                 data: 160u32.to_be_bytes().to_vec(),
             });
@@ -525,7 +525,7 @@ fn drop_shadow_source_knockout_preserves_native_sources_previews_undo_and_standa
                 51347, 22371, 65535,
             ];
             for i in 0..16 {
-                engine.doc.layers[0].pixels.set16(
+                engine.resident_state_mut().expect("resident fixture").document.layers[0].pixels.set16(
                     i % 4,
                     i / 4,
                     [
@@ -536,19 +536,19 @@ fn drop_shadow_source_knockout_preserves_native_sources_previews_undo_and_standa
                     ],
                 );
             }
-            let source = engine.doc.layers[0].pixels.rgba16();
-            let layer = engine.doc.layers[0].id.clone();
+            let source = engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16();
+            let layer = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
             let tint = [11111u16, 22223, 55555];
             engine.edit("human", &[json!({"op":"effect.add","layer":layer,"kind":"drop_shadow","settings":{"size":0.,"distance":distance,"angle":angle,"opacity":0.37,"color":tint.map(|v|f64::from(v)/65535.),"pixel_snap":true,"source_knockout":false}})], None, None, "Legacy cast").unwrap();
-            let original = engine.doc.export_png().unwrap();
-            let effect = engine.doc.layers[0].effects[0].id.clone();
-            let mut settings = engine.doc.layers[0].effects[0].settings.as_ref().clone();
+            let original = engine.resident_state().expect("resident fixture").document.export_png().unwrap();
+            let effect = engine.resident_state().expect("resident fixture").document.layers[0].effects[0].id.clone();
+            let mut settings = engine.resident_state().expect("resident fixture").document.layers[0].effects[0].settings.as_ref().clone();
             settings["source_knockout"] = json!(true);
             let command =
                 json!({"op":"effect.update","layer":layer,"effect":effect,"settings":settings});
-            let draft = Engine::preview_edits(engine.doc.clone(), &[command.clone()]).unwrap();
-            assert_eq!(engine.undo.len(), 1);
-            assert_eq!(engine.doc.export_png().unwrap(), original);
+            let draft = Engine::preview_edits(engine.resident_state().expect("resident fixture").document.clone(), &[command.clone()]).unwrap();
+            assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), 1);
+            assert_eq!(engine.resident_state().expect("resident fixture").document.export_png().unwrap(), original);
             let reference = |knockout: bool| {
                 let mut output = vec![];
                 for i in 0..16 {
@@ -587,19 +587,19 @@ fn drop_shadow_source_knockout_preserves_native_sources_previews_undo_and_standa
                 }
                 output
             };
-            assert_eq!(native(&engine.doc), reference(false));
+            assert_eq!(native(&engine.resident_state().expect("resident fixture").document), reference(false));
             assert_eq!(native(&draft), reference(true));
             assert_ne!(draft.export_png().unwrap(), original);
             engine
                 .edit("human", &[command], None, None, "Source knockout")
                 .unwrap();
             assert_eq!(
-                engine.doc.export_png().unwrap(),
+                engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
                 draft.export_png().unwrap()
             );
-            assert_eq!(engine.doc.layers[0].pixels.rgba16(), source);
+            assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(), source);
             for enabled in [false, true] {
-                let mut doc = engine.doc.clone();
+                let mut doc = engine.resident_state().expect("resident fixture").document.clone();
                 doc.layers[0].effects[0].enabled = enabled;
                 let current = doc.export_png().unwrap();
                 for bytes in [psd::encode(&doc).unwrap(), psd::encode_psb(&doc).unwrap()] {
@@ -625,9 +625,9 @@ fn drop_shadow_source_knockout_preserves_native_sources_previews_undo_and_standa
                 }
             }
             engine.undo("human").unwrap();
-            assert_eq!(engine.doc.export_png().unwrap(), original);
-            assert_eq!(engine.doc.layers[0].pixels.rgba16(), source);
-            let mut legacy = engine.doc.clone();
+            assert_eq!(engine.resident_state().expect("resident fixture").document.export_png().unwrap(), original);
+            assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(), source);
+            let mut legacy = engine.resident_state().expect("resident fixture").document.clone();
             Arc::make_mut(&mut legacy.layers[0].effects[0].settings)
                 .as_object_mut()
                 .unwrap()
@@ -642,7 +642,7 @@ fn drop_shadow_source_knockout_preserves_native_sources_previews_undo_and_standa
 #[test]
 fn drop_shadow_source_knockout_validation_reservations_and_protocol_are_atomic() {
     let shared = Arc::new(Mutex::new(fixture(16)));
-    let before = shared.lock().unwrap().doc.clone();
+    let before = shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
     let layer = before.layers[0].id.clone();
     for (kind, value) in [
         ("drop_shadow", json!(null)),
@@ -654,11 +654,11 @@ fn drop_shadow_source_knockout_validation_reservations_and_protocol_are_atomic()
         assert!(server::dispatch(&shared,"edit",&json!({"actor":"human","commands":[{"op":"layer.update","layer":layer,"opacity":0.3},{"op":"effect.add","layer":layer,"kind":kind,"settings":{"source_knockout":value}}]})).is_err());
         let engine = shared.lock().unwrap();
         assert_eq!(
-            engine.doc.export_png().unwrap(),
+            engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
             before.export_png().unwrap()
         );
-        assert_eq!(engine.doc.revision, before.revision);
-        assert!(engine.undo.is_empty());
+        assert_eq!(engine.resident_state().expect("resident fixture").document.revision, before.revision);
+        assert!(engine.resident_state().expect("resident fixture").undo.is_empty());
     }
     {
         let mut engine = shared.lock().unwrap();
@@ -674,23 +674,23 @@ fn drop_shadow_source_knockout_validation_reservations_and_protocol_are_atomic()
             .unwrap();
         assert!(engine.edit("human",&[json!({"op":"effect.add","layer":layer,"kind":"drop_shadow","settings":{"source_knockout":true}})],None,None,"Reserved knockout").is_err());
         engine.leases.clear();
-        engine.doc.layers[0].locked = true;
+        engine.resident_state_mut().expect("resident fixture").document.layers[0].locked = true;
         assert!(engine.edit("human",&[json!({"op":"effect.add","layer":layer,"kind":"drop_shadow","settings":{"source_knockout":true}})],None,None,"Locked knockout").is_err());
-        engine.doc.layers[0].locked = false;
+        engine.resident_state_mut().expect("resident fixture").document.layers[0].locked = false;
     }
     let reply=server::dispatch(&shared,"edit",&json!({"actor":"human","document_id":before.id,"expected_revision":before.revision,"commands":[{"op":"effect.add","layer":layer,"kind":"drop_shadow","settings":{"source_knockout":true,"size":0.,"distance":1.}}],"max_edge":64})).unwrap();
     assert!(!reply["images"][0]["data"].as_str().unwrap().is_empty());
     assert_eq!(reply["images"][0]["document_rect"], json!([0, 0, 64, 64]));
     let engine = shared.lock().unwrap();
     assert_eq!(
-        engine.doc.layers[0].effects[0].settings["source_knockout"],
+        engine.resident_state().expect("resident fixture").document.layers[0].effects[0].settings["source_knockout"],
         true
     );
     assert_eq!(
-        engine.doc.layers[0].pixels.rgba16(),
+        engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(),
         before.layers[0].pixels.rgba16()
     );
-    assert_eq!(engine.undo.len(), 1);
+    assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), 1);
 }
 
 #[test]
@@ -699,8 +699,8 @@ fn pixel_aligned_shadows_preserve_native_samples_previews_undo_and_standard_save
         for kind in ["drop_shadow", "inner_shadow"] {
             for (angle, dx, dy) in [(-135., -1, 1), (-45., 1, 1), (45., 1, -1), (135., -1, -1)] {
                 let mut e = Engine::new();
-                e.doc = Document::new_depth(7, 7, depth).unwrap();
-                e.doc.layers[0].psd_metadata.push(psd::LayerMetadata {
+                e.resident_state_mut().expect("resident fixture").document = Document::new_depth(7, 7, depth).unwrap();
+                e.resident_state_mut().expect("resident fixture").document.layers[0].psd_metadata.push(psd::LayerMetadata {
                     key: "lyvr".into(),
                     data: 160u32.to_be_bytes().to_vec(),
                 });
@@ -712,16 +712,16 @@ fn pixel_aligned_shadows_preserve_native_samples_previews_undo_and_standard_save
                             } else {
                                 0
                             };
-                        e.doc.layers[0].pixels.set16(
+                        e.resident_state_mut().expect("resident fixture").document.layers[0].pixels.set16(
                             x,
                             y,
                             [12345 + x as u16 * 137, 23457 + y as u16 * 193, 45679, alpha],
                         );
                     }
                 }
-                let source = e.doc.layers[0].pixels.rgba16();
-                let layer = e.doc.layers[0].id.clone();
-                let base = e.doc.export_png().unwrap();
+                let source = e.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16();
+                let layer = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
+                let base = e.resident_state().expect("resident fixture").document.export_png().unwrap();
                 let mut settings = json!({"size":0.,"distance":2.,"angle":angle,"opacity":0.37,"color":[11111f64/65535.,22223f64/65535.,55555f64/65535.],"pixel_snap":false});
                 if kind == "inner_shadow" {
                     settings["blend"] = json!("normal");
@@ -734,20 +734,20 @@ fn pixel_aligned_shadows_preserve_native_samples_previews_undo_and_standard_save
                     "Fractional shadow",
                 )
                 .unwrap();
-                let fractional = e.doc.export_png().unwrap();
-                let effect = e.doc.layers[0].effects[0].id.clone();
-                let mut settings = e.doc.layers[0].effects[0].settings.as_ref().clone();
+                let fractional = e.resident_state().expect("resident fixture").document.export_png().unwrap();
+                let effect = e.resident_state().expect("resident fixture").document.layers[0].effects[0].id.clone();
+                let mut settings = e.resident_state().expect("resident fixture").document.layers[0].effects[0].settings.as_ref().clone();
                 settings["pixel_snap"] = json!(true);
                 let command =
                     json!({"op":"effect.update","layer":layer,"effect":effect,"settings":settings});
-                let preview = Engine::preview_edits(e.doc.clone(), &[command.clone()]).unwrap();
-                assert_eq!(e.undo.len(), 1);
-                assert_eq!(e.doc.export_png().unwrap(), fractional);
+                let preview = Engine::preview_edits(e.resident_state().expect("resident fixture").document.clone(), &[command.clone()]).unwrap();
+                assert_eq!(e.resident_state().expect("resident fixture").undo.len(), 1);
+                assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), fractional);
                 e.edit("human", &[command], None, None, "Pixel aligned shadow")
                     .unwrap();
-                assert_eq!(e.doc.export_png().unwrap(), preview.export_png().unwrap());
-                assert_ne!(e.doc.export_png().unwrap(), fractional);
-                assert_eq!(e.doc.layers[0].pixels.rgba16(), source);
+                assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), preview.export_png().unwrap());
+                assert_ne!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), fractional);
+                assert_eq!(e.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(), source);
                 let mut expected = vec![];
                 let weight = (0.37f64 * 65535.).round() / 65535.;
                 for y in 0..7i32 {
@@ -781,10 +781,10 @@ fn pixel_aligned_shadows_preserve_native_samples_previews_undo_and_standard_save
                         expected.extend(pixel);
                     }
                 }
-                assert_eq!(native(&e.doc), expected, "{depth} {kind} {angle}");
-                let current = e.doc.export_png().unwrap();
+                assert_eq!(native(&e.resident_state().expect("resident fixture").document), expected, "{depth} {kind} {angle}");
+                let current = e.resident_state().expect("resident fixture").document.export_png().unwrap();
                 for enabled in [false, true] {
-                    let mut document = e.doc.clone();
+                    let mut document = e.resident_state().expect("resident fixture").document.clone();
                     document.layers[0].effects[0].enabled = enabled;
                     let appearance = document.export_png().unwrap();
                     for bytes in [
@@ -807,11 +807,11 @@ fn pixel_aligned_shadows_preserve_native_samples_previews_undo_and_standard_save
                         assert_eq!(reopened.layers[0].pixels.rgba16(), source);
                         assert_eq!(
                             reopened.layers[0].effects[0].settings,
-                            e.doc.layers[0].effects[0].settings
+                            e.resident_state().expect("resident fixture").document.layers[0].effects[0].settings
                         );
                         assert_eq!(
                             reopened.layers[0].psd_metadata,
-                            e.doc.layers[0].psd_metadata
+                            e.resident_state().expect("resident fixture").document.layers[0].psd_metadata
                         );
                         assert_eq!(reopened.export_png().unwrap(), appearance);
                         let standard = psd::decode(&strip(&bytes)).unwrap();
@@ -819,13 +819,13 @@ fn pixel_aligned_shadows_preserve_native_samples_previews_undo_and_standard_save
                         assert_eq!(standard.export_png().unwrap(), appearance);
                     }
                 }
-                assert_eq!(e.doc.export_png().unwrap(), current);
-                assert_eq!(e.undo.len(), 2);
+                assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), current);
+                assert_eq!(e.resident_state().expect("resident fixture").undo.len(), 2);
                 e.undo("human").unwrap();
-                assert_eq!(e.doc.export_png().unwrap(), fractional);
+                assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), fractional);
                 e.undo("human").unwrap();
-                assert_eq!(e.doc.export_png().unwrap(), base);
-                assert_eq!(e.doc.layers[0].pixels.rgba16(), source);
+                assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), base);
+                assert_eq!(e.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(), source);
             }
         }
     }
@@ -834,7 +834,7 @@ fn pixel_aligned_shadows_preserve_native_samples_previews_undo_and_standard_save
 #[test]
 fn pixel_aligned_shadow_validation_reservations_and_protocol_remain_atomic() {
     let shared = Arc::new(Mutex::new(fixture(16)));
-    let source = shared.lock().unwrap().doc.clone();
+    let source = shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
     let layer = source.layers[0].id.clone();
     for (kind, value) in [
         ("inner_shadow", json!(null)),
@@ -850,9 +850,9 @@ fn pixel_aligned_shadow_validation_reservations_and_protocol_remain_atomic() {
         );
         assert!(result.is_err());
         let e = shared.lock().unwrap();
-        assert_eq!(e.doc.revision, source.revision);
-        assert_eq!(e.doc.export_png().unwrap(), source.export_png().unwrap());
-        assert!(e.undo.is_empty());
+        assert_eq!(e.resident_state().expect("resident fixture").document.revision, source.revision);
+        assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), source.export_png().unwrap());
+        assert!(e.resident_state().expect("resident fixture").undo.is_empty());
     }
     {
         let mut e = shared.lock().unwrap();
@@ -866,29 +866,29 @@ fn pixel_aligned_shadow_validation_reservations_and_protocol_remain_atomic() {
         )
         .unwrap();
         assert!(e.edit("human",&[json!({"op":"effect.add","layer":layer,"kind":"drop_shadow","settings":{"pixel_snap":true}})],None,None,"Reserved pixel shadow").is_err());
-        assert_eq!(e.doc.revision, source.revision);
+        assert_eq!(e.resident_state().expect("resident fixture").document.revision, source.revision);
         e.leases.clear();
-        e.doc.layers[0].locked = true;
+        e.resident_state_mut().expect("resident fixture").document.layers[0].locked = true;
         assert!(e.edit("human",&[json!({"op":"effect.add","layer":layer,"kind":"inner_shadow","settings":{"pixel_snap":true}})],None,None,"Locked pixel shadow").is_err());
-        e.doc.layers[0].locked = false;
+        e.resident_state_mut().expect("resident fixture").document.layers[0].locked = false;
     }
     let reply=server::dispatch(&shared,"edit",&json!({"actor":"human","commands":[{"op":"effect.add","layer":layer,"kind":"drop_shadow","settings":{"pixel_snap":true,"size":0.,"angle":45.,"distance":2.}}],"max_edge":64})).unwrap();
     assert!(!reply["images"][0]["data"].as_str().unwrap().is_empty());
     assert_eq!(reply["images"][0]["document_rect"], json!([0, 0, 64, 64]));
     assert_eq!(
-        shared.lock().unwrap().doc.layers[0].pixels.rgba16(),
+        shared.lock().unwrap().resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(),
         source.layers[0].pixels.rgba16()
     );
-    assert_eq!(shared.lock().unwrap().undo.len(), 1);
+    assert_eq!(shared.lock().unwrap().resident_state().expect("resident fixture").undo.len(), 1);
 }
 #[test]
 fn every_style_renders_native_sources_preserves_source_and_roundtrips_actual_standard_pixels() {
     for depth in [8, 16] {
         for kind in effects::styles::KINDS {
             let mut e = fixture(depth);
-            let source = e.doc.layers[0].pixels.rgba16();
-            let before = native(&e.doc);
-            let layer = e.doc.layers[0].id.clone();
+            let source = e.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16();
+            let before = native(&e.resident_state().expect("resident fixture").document);
+            let layer = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
             e.edit(
                 "human",
                 &[json!({"op":"effect.add","layer":layer,"kind":kind})],
@@ -897,12 +897,12 @@ fn every_style_renders_native_sources_preserves_source_and_roundtrips_actual_sta
                 "Layer style",
             )
             .unwrap();
-            let after = native(&e.doc);
+            let after = native(&e.resident_state().expect("resident fixture").document);
             assert_ne!(after, before, "{kind} depth {depth}");
-            assert_eq!(e.doc.layers[0].pixels.rgba16(), source);
-            assert_eq!(e.undo.len(), 1);
-            let saved = psd::encode(&e.doc).unwrap();
-            let large = psd::encode_psb(&e.doc).unwrap();
+            assert_eq!(e.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(), source);
+            assert_eq!(e.resident_state().expect("resident fixture").undo.len(), 1);
+            let saved = psd::encode(&e.resident_state().expect("resident fixture").document).unwrap();
+            let large = psd::encode_psb(&e.resident_state().expect("resident fixture").document).unwrap();
             let large_loaded = psd::decode(&large).unwrap();
             assert!(!large_loaded.read_only);
             assert_eq!(native(&large_loaded), after, "{kind} PSB reopen");
@@ -920,7 +920,7 @@ fn every_style_renders_native_sources_preserves_source_and_roundtrips_actual_sta
                 after,
                 "{kind} standard rendered channels"
             );
-            let id = e.doc.layers[0].effects[0].id.clone();
+            let id = e.resident_state().expect("resident fixture").document.layers[0].effects[0].id.clone();
             e.edit(
                 "human",
                 &[json!({"op":"effect.update","layer":layer,"effect":id,"enabled":false})],
@@ -929,13 +929,13 @@ fn every_style_renders_native_sources_preserves_source_and_roundtrips_actual_sta
                 "Bypass style",
             )
             .unwrap();
-            assert_eq!(native(&e.doc), before, "{kind} bypass");
+            assert_eq!(native(&e.resident_state().expect("resident fixture").document), before, "{kind} bypass");
             e.undo("human").unwrap();
-            assert_eq!(native(&e.doc), after);
+            assert_eq!(native(&e.resident_state().expect("resident fixture").document), after);
             e.undo("human").unwrap();
-            assert_eq!(native(&e.doc), before);
+            assert_eq!(native(&e.resident_state().expect("resident fixture").document), before);
             e.redo("human").unwrap();
-            assert_eq!(native(&e.doc), after);
+            assert_eq!(native(&e.resident_state().expect("resident fixture").document), after);
         }
     }
 }
@@ -957,9 +957,9 @@ fn overlay_and_circular_outline_have_analytic_native_color_alpha_and_extent() {
     depth16::color::apply(&mut image, "drop_shadow", &json!({"opacity":0.})).unwrap();
     assert_eq!(image.words, before);
     let mut e = fixture(16);
-    let layer = e.doc.layers[0].id.clone();
+    let layer = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
     e.edit("human",&[json!({"op":"effect.add","layer":layer,"kind":"stroke","settings":{"size":3.,"opacity":1.,"color":[1.,0.,0.]}})],None,None,"Outline").unwrap();
-    let render = depth16::render(&e.doc).unwrap();
+    let render = depth16::render(&e.resident_state().expect("resident fixture").document).unwrap();
     assert_eq!(render.get(18, 24), [65535, 0, 0, 65535]);
     assert_eq!(render.get(16, 24)[3], 0);
     assert_eq!(
@@ -968,7 +968,7 @@ fn overlay_and_circular_outline_have_analytic_native_color_alpha_and_extent() {
         "Circular distance must not produce square corners"
     );
     assert_eq!(
-        e.doc.layers[0].pixels.width, 24,
+        e.resident_state().expect("resident fixture").document.layers[0].pixels.width, 24,
         "Derived expansion must not replace source pixels"
     );
 }
@@ -976,19 +976,19 @@ fn overlay_and_circular_outline_have_analytic_native_color_alpha_and_extent() {
 fn style_stack_preview_order_masks_weight_locks_and_reservations_share_the_engine() {
     for depth in [8, 16] {
         let mut e = fixture(depth);
-        let layer = e.doc.layers[0].id.clone();
+        let layer = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
         e.edit("human",&[json!({"op":"mask.add","layer":layer}),json!({"op":"effect.add","layer":layer,"kind":"color_overlay","settings":{"color":[1.,0.,0.],"opacity":1.}}),json!({"op":"effect.add","layer":layer,"kind":"color_overlay","settings":{"color":[0.,0.,1.],"opacity":1.}})],None,None,"Stack").unwrap();
-        let blue = native(&e.doc);
+        let blue = native(&e.resident_state().expect("resident fixture").document);
         let at = (25 * 64 + 25) * 4;
         assert_eq!(&blue[at..at + 3], &[0, 0, 65535]);
-        let first = e.doc.layers[0].effects[0].id.clone();
-        let second = e.doc.layers[0].effects[1].id.clone();
+        let first = e.resident_state().expect("resident fixture").document.layers[0].effects[0].id.clone();
+        let second = e.resident_state().expect("resident fixture").document.layers[0].effects[1].id.clone();
         let commands = [json!({"op":"effect.reorder","layer":layer,"effect":first,"index":1})];
-        let rendered = Engine::preview_edits(e.doc.clone(), &commands).unwrap();
+        let rendered = Engine::preview_edits(e.resident_state().expect("resident fixture").document.clone(), &commands).unwrap();
         assert_eq!(&native(&rendered)[at..at + 3], &[65535, 0, 0]);
-        assert_eq!(native(&e.doc), blue, "Preview must not commit");
+        assert_eq!(native(&e.resident_state().expect("resident fixture").document), blue, "Preview must not commit");
         e.edit("human", &commands, None, None, "Reorder").unwrap();
-        assert_eq!(native(&e.doc), native(&rendered));
+        assert_eq!(native(&e.resident_state().expect("resident fixture").document), native(&rendered));
         e.edit(
             "human",
             &[json!({"op":"effect.update","layer":layer,"effect":first,"weight":0.})],
@@ -997,8 +997,8 @@ fn style_stack_preview_order_masks_weight_locks_and_reservations_share_the_engin
             "Weight",
         )
         .unwrap();
-        assert_eq!(native(&e.doc), blue);
-        let before = psd::encode(&e.doc).unwrap();
+        assert_eq!(native(&e.resident_state().expect("resident fixture").document), blue);
+        let before = psd::encode(&e.resident_state().expect("resident fixture").document).unwrap();
         e.reserve(
             "other",
             "Protected exterior",
@@ -1017,9 +1017,9 @@ fn style_stack_preview_order_masks_weight_locks_and_reservations_share_the_engin
                 "Reserved"
             )
             .is_err());
-        assert_eq!(psd::encode(&e.doc).unwrap(), before);
+        assert_eq!(psd::encode(&e.resident_state().expect("resident fixture").document).unwrap(), before);
         e.leases.clear();
-        e.doc.layers[0].locked = true;
+        e.resident_state_mut().expect("resident fixture").document.layers[0].locked = true;
         assert!(e
             .edit(
                 "human",
@@ -1034,7 +1034,7 @@ fn style_stack_preview_order_masks_weight_locks_and_reservations_share_the_engin
 #[test]
 fn invalid_style_parameters_masks_and_work_budgets_reject_atomically_and_protocol_returns_pixels() {
     let shared = Arc::new(Mutex::new(fixture(16)));
-    let source = shared.lock().unwrap().doc.clone();
+    let source = shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
     let layer = source.layers[0].id.clone();
     for (kind, settings) in [
         ("stroke", json!({"size":65})),
@@ -1049,7 +1049,7 @@ fn invalid_style_parameters_masks_and_work_budgets_reject_atomically_and_protoco
             &json!({"actor":"human","commands":[{"op":"effect.add","layer":layer,"kind":kind,"settings":settings}]}),
         );
         assert!(result.is_err(), "{kind}");
-        assert_eq!(shared.lock().unwrap().doc.revision, source.revision);
+        assert_eq!(shared.lock().unwrap().resident_state().expect("resident fixture").document.revision, source.revision);
     }
     assert!(effects::styles::working_bytes(4096, 4096) > effects::WORKING_BUDGET as u64);
     let mut e = shared.lock().unwrap();
@@ -1061,7 +1061,7 @@ fn invalid_style_parameters_masks_and_work_budgets_reject_atomically_and_protoco
         "Mask",
     )
     .unwrap();
-    let rev = e.doc.revision;
+    let rev = e.resident_state().expect("resident fixture").document.revision;
     assert!(e
         .edit(
             "human",
@@ -1071,7 +1071,7 @@ fn invalid_style_parameters_masks_and_work_budgets_reject_atomically_and_protoco
             "Unsupported mask style"
         )
         .is_err());
-    assert_eq!(e.doc.revision, rev);
+    assert_eq!(e.resident_state().expect("resident fixture").document.revision, rev);
     drop(e);
     let result=server::dispatch(&shared,"edit",&json!({"actor":"human","commands":[{"op":"effect.add","layer":layer,"kind":"drop_shadow"}],"max_edge":64})).unwrap();
     assert!(!result["images"][0]["data"].as_str().unwrap().is_empty());
@@ -1082,10 +1082,10 @@ fn invalid_style_parameters_masks_and_work_budgets_reject_atomically_and_protoco
 fn styled_masks_copy_merge_and_zero_opacity_prefix_keep_actual_canvas_pixels() {
     for depth in [8, 16] {
         let mut e = fixture(depth);
-        let layer = e.doc.layers[0].id.clone();
+        let layer = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
         e.edit("human",&[json!({"op":"mask.add","layer":layer}),json!({"op":"mask.step.add","layer":layer,"kind":"fill","value":127}),json!({"op":"effect.add","layer":layer,"kind":"drop_shadow","settings":{"size":4,"distance":8}})],None,None,"Masked shadow").unwrap();
-        let expected = native(&e.doc);
-        let copied = peerbrush::clipboard::Image::copy(&e.doc, &layer, false, false).unwrap();
+        let expected = native(&e.resident_state().expect("resident fixture").document);
+        let copied = peerbrush::clipboard::Image::copy(&e.resident_state().expect("resident fixture").document, &layer, false, false).unwrap();
         let words = if depth == 16 {
             copied.samples16.unwrap()
         } else {
@@ -1101,11 +1101,11 @@ fn styled_masks_copy_merge_and_zero_opacity_prefix_keep_actual_canvas_pixels() {
                 assert_eq!(a, b, "Masked exterior copy samples");
             }
         }
-        let standard = psd::decode(&strip(&psd::encode(&e.doc).unwrap())).unwrap();
+        let standard = psd::decode(&strip(&psd::encode(&e.resident_state().expect("resident fixture").document).unwrap())).unwrap();
         assert_eq!(native(&standard), expected, "Standard expanded mask frame");
         let mut blank = peerbrush::engine::Layer::new("Empty lower layer", "paint", 64, 64);
         blank.pixels = Raster::new_depth(64, 64, depth);
-        e.doc.layers.push(blank);
+        e.resident_state_mut().expect("resident fixture").document.layers.push(blank);
         e.edit(
             "human",
             &[json!({"op":"layer.merge","layers":[layer]})],
@@ -1115,14 +1115,14 @@ fn styled_masks_copy_merge_and_zero_opacity_prefix_keep_actual_canvas_pixels() {
         )
         .unwrap();
         assert_eq!(
-            native(&e.doc),
+            native(&e.resident_state().expect("resident fixture").document),
             expected,
             "Merge must retain exterior effect pixels"
         );
         e.undo("human").unwrap();
-        assert_eq!(native(&e.doc), expected);
+        assert_eq!(native(&e.resident_state().expect("resident fixture").document), expected);
         let mut e = fixture(depth);
-        let layer = e.doc.layers[0].id.clone();
+        let layer = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
         e.edit(
             "human",
             &[json!({"op":"effect.add","layer":layer,"kind":"blur","settings":{"radius":3}})],
@@ -1131,10 +1131,10 @@ fn styled_masks_copy_merge_and_zero_opacity_prefix_keep_actual_canvas_pixels() {
             "Prefix",
         )
         .unwrap();
-        let before = native(&e.doc);
+        let before = native(&e.resident_state().expect("resident fixture").document);
         e.edit("human",&[json!({"op":"effect.add","layer":layer,"kind":"color_overlay","settings":{"opacity":0}})],None,None,"Zero opacity style").unwrap();
         assert_eq!(
-            native(&e.doc),
+            native(&e.resident_state().expect("resident fixture").document),
             before,
             "Expanding before the first style must not rerun preceding effects on another frame"
         );
@@ -1144,11 +1144,11 @@ fn styled_masks_copy_merge_and_zero_opacity_prefix_keep_actual_canvas_pixels() {
 #[test]
 fn oversized_style_document_frame_rejects_before_mutating_cropped_sources() {
     let mut e = fixture(16);
-    e.doc.width = 4096;
-    e.doc.height = 4096;
-    let layer = e.doc.layers[0].id.clone();
-    let source = e.doc.layers[0].pixels.rgba16();
-    let revision = e.doc.revision;
+    e.resident_state_mut().expect("resident fixture").document.width = 4096;
+    e.resident_state_mut().expect("resident fixture").document.height = 4096;
+    let layer = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
+    let source = e.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16();
+    let revision = e.resident_state().expect("resident fixture").document.revision;
     assert!(e
         .edit(
             "human",
@@ -1160,17 +1160,17 @@ fn oversized_style_document_frame_rejects_before_mutating_cropped_sources() {
         .unwrap_err()
         .to_lowercase()
         .contains("budget"));
-    assert!(e.doc.layers[0].effects.is_empty());
-    assert_eq!(e.doc.layers[0].pixels.rgba16(), source);
-    assert_eq!(e.doc.revision, revision);
-    assert!(e.undo.is_empty());
+    assert!(e.resident_state().expect("resident fixture").document.layers[0].effects.is_empty());
+    assert_eq!(e.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(), source);
+    assert_eq!(e.resident_state().expect("resident fixture").document.revision, revision);
+    assert!(e.resident_state().expect("resident fixture").undo.is_empty());
 }
 
 #[test]
 fn isolated_folder_styles_render_children_and_adjustments_reject_unsupported_alpha_sources() {
     for depth in [8, 16] {
         let mut e = fixture(depth);
-        let layer = e.doc.layers[0].id.clone();
+        let layer = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
         e.edit(
             "human",
             &[json!({"op":"group.create_selected","layers":[layer]})],
@@ -1180,14 +1180,14 @@ fn isolated_folder_styles_render_children_and_adjustments_reject_unsupported_alp
         )
         .unwrap();
         let group = e
-            .doc
+            .resident_state().expect("resident fixture").document
             .layers
             .iter()
             .find(|l| l.kind == "group")
             .unwrap()
             .id
             .clone();
-        let before = native(&e.doc);
+        let before = native(&e.resident_state().expect("resident fixture").document);
         e.edit(
             "human",
             &[json!({"op":"effect.add","layer":group,"kind":"drop_shadow"})],
@@ -1196,18 +1196,18 @@ fn isolated_folder_styles_render_children_and_adjustments_reject_unsupported_alp
             "Folder shadow",
         )
         .unwrap();
-        let expected = native(&e.doc);
+        let expected = native(&e.resident_state().expect("resident fixture").document);
         assert_ne!(expected, before);
-        let saved = psd::encode(&e.doc).unwrap();
+        let saved = psd::encode(&e.resident_state().expect("resident fixture").document).unwrap();
         assert_eq!(native(&psd::decode(&saved).unwrap()), expected);
         assert_eq!(native(&psd::decode(&strip(&saved)).unwrap()), expected);
         e.undo("human").unwrap();
-        assert_eq!(native(&e.doc), before);
+        assert_eq!(native(&e.resident_state().expect("resident fixture").document), before);
         let mut adjustment = peerbrush::engine::Layer::new("Adjustment", "adjustment", 64, 64);
         adjustment.pixels = Raster::new_depth(64, 64, depth);
         let id = adjustment.id.clone();
-        e.doc.layers.insert(0, adjustment);
-        let revision = e.doc.revision;
+        e.resident_state_mut().expect("resident fixture").document.layers.insert(0, adjustment);
+        let revision = e.resident_state().expect("resident fixture").document.revision;
         assert!(e
             .edit(
                 "human",
@@ -1217,8 +1217,8 @@ fn isolated_folder_styles_render_children_and_adjustments_reject_unsupported_alp
                 "Unsupported adjustment style"
             )
             .is_err());
-        assert_eq!(e.doc.revision, revision);
-        assert!(e.doc.layers[0].effects.is_empty());
+        assert_eq!(e.resident_state().expect("resident fixture").document.revision, revision);
+        assert!(e.resident_state().expect("resident fixture").document.layers[0].effects.is_empty());
     }
 }
 
@@ -1230,9 +1230,9 @@ fn inapplicable_style_settings_reject_instead_of_exposing_no_op_controls() {
         ("outer_glow", "source", json!("center")),
     ] {
         let mut e = fixture(16);
-        let source = e.doc.layers[0].pixels.rgba16();
-        let revision = e.doc.revision;
-        let layer = e.doc.layers[0].id.clone();
+        let source = e.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16();
+        let revision = e.resident_state().expect("resident fixture").document.revision;
+        let layer = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
         let mut settings = json!({});
         settings[key] = value;
         assert!(e
@@ -1244,10 +1244,10 @@ fn inapplicable_style_settings_reject_instead_of_exposing_no_op_controls() {
                 "Invalid control"
             )
             .is_err());
-        assert_eq!(e.doc.revision, revision);
-        assert_eq!(e.doc.layers[0].pixels.rgba16(), source);
-        assert!(e.doc.layers[0].effects.is_empty());
-        assert!(e.undo.is_empty());
+        assert_eq!(e.resident_state().expect("resident fixture").document.revision, revision);
+        assert_eq!(e.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(), source);
+        assert!(e.resident_state().expect("resident fixture").document.layers[0].effects.is_empty());
+        assert!(e.resident_state().expect("resident fixture").undo.is_empty());
     }
 }
 
@@ -1309,10 +1309,10 @@ fn legacy_bevel_settings_inherit_common_blend_and_opacity_without_changed_source
         for style in ["inner", "outer", "emboss", "pillow"] {
             for blend in ["normal", "multiply"] {
                 let mut e = fixture(depth);
-                let layer = e.doc.layers[0].id.clone();
+                let layer = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
                 let legacy = json!({"style":style,"blend":blend,"opacity":0.35});
                 e.edit("human",&[json!({"op":"effect.add","layer":layer,"kind":"bevel_emboss","settings":legacy})],None,None,"Legacy relief").unwrap();
-                let effect = e.doc.layers[0].effects[0].id.clone();
+                let effect = e.resident_state().expect("resident fixture").document.layers[0].effects[0].id.clone();
                 // Old editable sources did not contain independent channel properties.
                 for key in [
                     "highlight_opacity",
@@ -1320,22 +1320,22 @@ fn legacy_bevel_settings_inherit_common_blend_and_opacity_without_changed_source
                     "highlight_blend",
                     "shadow_blend",
                 ] {
-                    Arc::make_mut(&mut e.doc.layers[0].effects[0].settings)
+                    Arc::make_mut(&mut e.resident_state_mut().expect("resident fixture").document.layers[0].effects[0].settings)
                         .as_object_mut()
                         .unwrap()
                         .remove(key);
                 }
-                let before = native(&e.doc);
-                let source = e.doc.layers[0].pixels.rgba16();
+                let before = native(&e.resident_state().expect("resident fixture").document);
+                let source = e.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16();
                 let mut explicit = legacy.clone();
                 explicit["highlight_opacity"] = json!(1.);
                 explicit["shadow_opacity"] = json!(1.);
                 explicit["highlight_blend"] = json!("inherit");
                 explicit["shadow_blend"] = json!("inherit");
-                let preview=Engine::preview_edits(e.doc.clone(),&[json!({"op":"effect.update","layer":layer,"effect":effect,"settings":explicit})]).unwrap();
+                let preview=Engine::preview_edits(e.resident_state().expect("resident fixture").document.clone(),&[json!({"op":"effect.update","layer":layer,"effect":effect,"settings":explicit})]).unwrap();
                 assert_eq!(native(&preview), before);
                 assert_eq!(preview.layers[0].pixels.rgba16(), source);
-                assert!(e.doc.layers[0].effects[0]
+                assert!(e.resident_state().expect("resident fixture").document.layers[0].effects[0]
                     .settings
                     .get("highlight_opacity")
                     .is_none());
@@ -1348,15 +1348,15 @@ fn independent_bevel_settings_preview_commit_once_and_roundtrip_current_native_s
     for depth in [8, 16] {
         for disabled in [false, true] {
             let mut e = fixture(depth);
-            let layer = e.doc.layers[0].id.clone();
-            let source = e.doc.layers[0].pixels.rgba16();
-            let before = e.doc.export_png().unwrap();
+            let layer = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
+            let source = e.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16();
+            let before = e.resident_state().expect("resident fixture").document.export_png().unwrap();
             let settings = json!({"highlight_opacity":0.35,"shadow_opacity":0.7,"highlight_blend":"screen","shadow_blend":"multiply"});
             let command = json!({"op":"effect.add","layer":layer,"kind":"bevel_emboss","settings":settings,"enabled":!disabled});
             // Add uses the normal enabled default; bypass is a separate definition property.
             e.edit("human", &[command], None, None, "Bevel channels")
                 .unwrap();
-            let effect = e.doc.layers[0].effects[0].id.clone();
+            let effect = e.resident_state().expect("resident fixture").document.layers[0].effects[0].id.clone();
             if disabled {
                 e.edit(
                     "human",
@@ -1367,23 +1367,23 @@ fn independent_bevel_settings_preview_commit_once_and_roundtrip_current_native_s
                 )
                 .unwrap();
             }
-            e.undo.clear();
-            let baseline = e.doc.clone();
+            e.resident_state_mut().expect("resident fixture").undo.clear();
+            let baseline = e.resident_state().expect("resident fixture").document.clone();
             let command = json!({"op":"effect.update","layer":layer,"effect":effect,"settings":{"highlight_opacity":0.61,"shadow_opacity":0.42,"highlight_blend":"overlay","shadow_blend":"darken"}});
             let preview =
                 Engine::preview_edits(baseline.clone(), std::slice::from_ref(&command)).unwrap();
             e.edit("human", &[command], None, None, "Independent relief")
                 .unwrap();
-            assert_eq!(e.undo.len(), 1);
-            assert_eq!(native(&e.doc), native(&preview));
-            assert_eq!(e.doc.layers[0].pixels.rgba16(), source);
-            let current = e.doc.export_png().unwrap();
+            assert_eq!(e.resident_state().expect("resident fixture").undo.len(), 1);
+            assert_eq!(native(&e.resident_state().expect("resident fixture").document), native(&preview));
+            assert_eq!(e.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(), source);
+            let current = e.resident_state().expect("resident fixture").document.export_png().unwrap();
             if !disabled {
                 assert_ne!(current, before);
             }
             for bytes in [
-                psd::encode(&e.doc).unwrap(),
-                psd::encode_psb(&e.doc).unwrap(),
+                psd::encode(&e.resident_state().expect("resident fixture").document).unwrap(),
+                psd::encode_psb(&e.resident_state().expect("resident fixture").document).unwrap(),
             ] {
                 let at = 30 + u32::from_be_bytes(bytes[26..30].try_into().unwrap()) as usize;
                 let resources = &bytes[at + 4..];
@@ -1406,7 +1406,7 @@ fn independent_bevel_settings_preview_commit_once_and_roundtrip_current_native_s
                 assert_eq!(reopened.layers[0].pixels.rgba16(), source);
                 assert_eq!(
                     reopened.layers[0].effects[0].settings,
-                    e.doc.layers[0].effects[0].settings
+                    e.resident_state().expect("resident fixture").document.layers[0].effects[0].settings
                 );
                 assert_eq!(reopened.layers[0].effects[0].enabled, !disabled);
                 let standard = psd::decode(&strip(&bytes)).unwrap();
@@ -1414,17 +1414,17 @@ fn independent_bevel_settings_preview_commit_once_and_roundtrip_current_native_s
                 assert_eq!(standard.export_png().unwrap(), current);
             }
             e.undo("human").unwrap();
-            assert_eq!(native(&e.doc), native(&baseline));
+            assert_eq!(native(&e.resident_state().expect("resident fixture").document), native(&baseline));
             e.redo("human").unwrap();
-            assert_eq!(e.doc.export_png().unwrap(), current);
+            assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), current);
         }
     }
 }
 #[test]
 fn invalid_or_inapplicable_bevel_channel_settings_rollback_native_work_and_history() {
     let mut e = fixture(16);
-    let layer = e.doc.layers[0].id.clone();
-    let before = serde_json::to_value(&e.doc).unwrap();
+    let layer = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
+    let before = serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap();
     for settings in [
         json!({"highlight_opacity":-0.1}),
         json!({"shadow_opacity":1.1}),
@@ -1433,8 +1433,8 @@ fn invalid_or_inapplicable_bevel_channel_settings_rollback_native_work_and_histo
         json!({"shadow_blend":17}),
     ] {
         assert!(e.edit("human",&[json!({"op":"paint.fill","layer":layer,"rect":[0,0,1,1],"color":[255,0,0,255]}),json!({"op":"effect.add","layer":layer,"kind":"bevel_emboss","settings":settings})],None,None,"Invalid bevel channel").is_err());
-        assert_eq!(serde_json::to_value(&e.doc).unwrap(), before);
-        assert!(e.undo.is_empty());
+        assert_eq!(serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap(), before);
+        assert!(e.resident_state().expect("resident fixture").undo.is_empty());
     }
     for kind in ["levels", "drop_shadow", "contour", "stroke"] {
         assert!(effects::validate(kind, &json!({"highlight_opacity":0.5})).is_err());

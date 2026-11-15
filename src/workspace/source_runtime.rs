@@ -12,17 +12,27 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, TryLockError,
     },
 };
+#[path = "source_runtime/scalars.rs"]
+mod scalars;
 #[path = "source_runtime/segments.rs"]
 mod segments;
 #[path = "source_runtime/staging.rs"]
 mod staging;
+pub(crate) use scalars::{SessionScalar, SessionScalarScratch};
 pub(crate) use segments::{SessionJxlOutput, SessionSegmentLog, SessionSegments};
 pub(crate) use staging::{SessionBytes, SessionTemporary};
+#[path = "source_runtime/collection.rs"]
+mod collection;
+#[path = "source_runtime/maintenance.rs"]
+mod maintenance;
 mod read_session;
-pub(crate) use read_session::SourceReadSession;
+#[cfg(test)]
+pub(crate) use collection::CollectionFault;
+pub(crate) use collection::{Collection, SourceRetirement};
+pub(crate) use read_session::{ReadChecks, SourceReadSession};
 #[path = "source_runtime/destination.rs"]
 mod destination;
 pub(crate) use destination::SourceDestination;
@@ -30,13 +40,18 @@ pub(crate) use destination::SourceDestination;
 mod checkpoints;
 #[path = "source_runtime/recovery_marker.rs"]
 mod recovery_marker;
-pub(crate) use checkpoints::CheckpointCensus;
-pub(crate) use recovery_marker::{NativeMarker, NativeMarkerIds};
+#[cfg(test)]
+pub(crate) use checkpoints::RetirementFault;
+pub(crate) use checkpoints::{CheckpointCensus, RetiredMarker};
+pub(crate) use recovery_marker::{NativeMarker, NativeMarkerIds, RetiredPendingMarker};
 #[path = "source_runtime/publication.rs"]
 mod publication;
 pub(crate) use publication::{
-    ArmedPublication, CommittedPublication, PublicationIntent, PublicationPlan, RegisteredCreation,
+    ArmedPublication, CommittedPublication, PublicationIntent, PublicationPlan, RefusedPublication,
+    RegisteredCreation,
 };
+
+pub(crate) const INVENTORY_CHECK_BUSY: &str = "Source inventory validation is busy";
 
 pub(crate) struct Limits {
     pub resident_bytes: usize,
@@ -80,12 +95,9 @@ impl HeldFile {
             .file
             .metadata()
             .map_err(|_| "Source inventory metadata unavailable")?;
-        if !metadata.is_file()
-            || metadata.file_type().is_symlink()
-            || crate::file_safety::identity(&named)? != self.identity
-            || crate::file_safety::identity(&self.file)? != self.identity
-            || crate::file_safety::link_count(&named)? != 1
-            || crate::file_safety::link_count(&self.file)? != 1
+        let expected = (self.identity, 1);
+        if crate::file_safety::file_identity_and_links(&named)? != expected
+            || crate::file_safety::file_identity_and_links(&self.file)? != expected
             || actual.len() != self.bytes
             || actual.modified().ok() != Some(self.modified)
         {
@@ -128,6 +140,10 @@ pub(crate) struct SourceRuntime {
     limits: Limits,
     inventory: Mutex<Option<Inventory>>,
     tainted: AtomicBool,
+    access: Arc<crate::large_document::SourceAccess>,
+    maintenance: maintenance::Control,
+    foreground: Arc<crate::large_document::SourceAccess>,
+    checkpoints: maintenance::Control,
     // Close inventory handles before releasing the actual default profile lease.
     context: Arc<PersistentRootContext>,
 }
@@ -147,6 +163,10 @@ impl SourceRuntime {
             limits,
             inventory: Mutex::new(None),
             tainted: AtomicBool::new(false),
+            access: Arc::new(Default::default()),
+            maintenance: Default::default(),
+            foreground: Arc::new(Default::default()),
+            checkpoints: Default::default(),
         }))
     }
     pub(crate) fn resident(&self) -> ResidentBudget {
@@ -156,27 +176,116 @@ impl SourceRuntime {
         self.disk.clone()
     }
     pub(crate) fn begin(self: &Arc<Self>) -> Result<SourceSession, String> {
-        let operation = self.context.begin()?;
-        let mut state = self
+        self.begin_mode(false)
+    }
+    /// Called off-lock by active source work that can yield background checkpoints.
+    pub(crate) fn begin_foreground(self: &Arc<Self>) -> Result<SourceSession, String> {
+        let foreground = self.foreground_activity()?;
+        let mut session = self.begin()?;
+        session.foreground = Some(foreground);
+        Ok(session)
+    }
+    pub(crate) fn foreground_activity(&self) -> Result<crate::large_document::SourceRead, String> {
+        self.checkpoints
+            .read(&self.foreground)
+            .map_err(|e| e.to_string())
+    }
+    pub(crate) fn try_checkpoint(&self) -> Result<Option<CheckpointScope<'_>>, String> {
+        match self.checkpoints.start_exclusive(&self.foreground) {
+            Ok(operation) => Ok(Some(CheckpointScope(operation))),
+            Err(crate::large_document::Error::Busy) => Ok(None),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+    pub(crate) fn begin_existing(self: &Arc<Self>) -> Result<SourceSession, String> {
+        self.begin_mode(true)
+    }
+    pub(crate) fn begin_existing_if_present(
+        self: &Arc<Self>,
+    ) -> Result<Option<SourceSession>, String> {
+        let _observation = self
+            .maintenance
+            .read(&self.access)
+            .map_err(|e| e.to_string())?;
+        let present = self
             .inventory
             .try_lock()
-            .map_err(|_| "Source inventory is busy")?;
-        if state.is_none() {
-            *state = Some(self.inventory_owned(&operation)?);
+            .map_err(|_| "Source inventory is busy")?
+            .is_some();
+        if present {
+            return self.begin_existing().map(Some);
         }
+        let Some(operation) = self.context.begin_existing_sources()? else {
+            return Ok(None);
+        };
+        self.begin_operation(operation, true).map(Some)
+    }
+    fn begin_mode(self: &Arc<Self>, existing_only: bool) -> Result<SourceSession, String> {
+        let operation = if existing_only {
+            self.context.begin_existing()?
+        } else {
+            self.context.begin()?
+        };
+        self.begin_operation(operation, existing_only)
+    }
+    fn begin_operation(
+        self: &Arc<Self>,
+        operation: RootOperation,
+        existing_only: bool,
+    ) -> Result<SourceSession, String> {
+        let access = Arc::new(
+            self.maintenance
+                .read(&self.access)
+                .map_err(|e| e.to_string())?,
+        );
+        let mut state = self
+            .inventory
+            .lock()
+            .map_err(|_| "Source inventory is unavailable")?;
+        if state.is_none() {
+            *state = Some(self.inventory_owned(&operation, existing_only)?);
+        }
+        // Admission runs off-lock. Serialize the complete inventory validation
+        // so readers woken together cannot lose requests to transient contention.
+        operation.check()?;
+        self.validate_inventory(state.as_ref().unwrap())?;
         let directory = state.as_ref().unwrap().directory.path().to_owned();
+        operation.check()?;
         drop(state);
         let session = SourceSession {
             runtime: self.clone(),
             operation: Arc::new(operation),
             directory,
             id: *uuid::Uuid::new_v4().as_bytes(),
+            inventory_check: Mutex::new(()),
+            access: Some(access),
+            foreground: None,
         };
-        session.check()?;
         Ok(session)
     }
-    fn inventory_owned(&self, operation: &RootOperation) -> Result<Inventory, String> {
-        let directory = operation.source_directory()?;
+    fn validate_inventory(&self, inventory: &Inventory) -> Result<(), String> {
+        if self.tainted.load(Ordering::Acquire) {
+            return Err(
+                "Source inventory ownership changed; fresh admission required and bytes retained"
+                    .into(),
+            );
+        }
+        inventory.directory.check()?;
+        for held in &inventory.files {
+            held.check()?;
+        }
+        Ok(())
+    }
+    fn inventory_owned(
+        &self,
+        operation: &RootOperation,
+        existing_only: bool,
+    ) -> Result<Inventory, String> {
+        let directory = if existing_only {
+            operation.existing_source_directory()?
+        } else {
+            operation.source_directory()?
+        };
         let per_entry = directory
             .path()
             .as_os_str()
@@ -207,6 +316,11 @@ impl SourceRuntime {
         let owner_path = directory.path().join("owner.pbr");
         let mut owner = match fs::symlink_metadata(&owner_path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if existing_only {
+                    return Err(
+                        "Existing native source namespace has no owner; recovery retained".into(),
+                    );
+                }
                 if fs::read_dir(directory.path())
                     .map_err(|_| "Cannot inspect fresh source namespace")?
                     .next()
@@ -401,11 +515,28 @@ impl SourceRuntime {
     }
 }
 
+pub(crate) struct CheckpointScope<'a>(maintenance::ExclusiveOperation<'a>);
+impl CheckpointScope<'_> {
+    pub(crate) fn interrupted(&self) -> bool {
+        self.0.interrupted()
+    }
+}
+
 pub(crate) struct SourceSession {
     runtime: Arc<SourceRuntime>,
     operation: Arc<RootOperation>,
     directory: PathBuf,
     id: [u8; 16],
+    // A codec supervisor and its pump share a session. Their read checks
+    // must not reject each other as a competing inventory operation.
+    inventory_check: Mutex<()>,
+    access: Option<Arc<crate::large_document::SourceRead>>,
+    foreground: Option<crate::large_document::SourceRead>,
+}
+#[must_use = "Retain the returned fragment for retry, or report unreconciled disk debt"]
+pub(crate) struct RefusedFragmentRetirement {
+    pub(crate) reason: String,
+    pub(crate) fragment: Option<FreshFragment>,
 }
 /// Nominal lifetime only. The worker owner parks this with an uncertain child
 /// until known exit; it grants no source I/O or publication capability.
@@ -414,8 +545,68 @@ pub(crate) struct SessionRetention {
     // Close retained inventory handles before the final operation/profile owner.
     _runtime: Arc<SourceRuntime>,
     _operation: Arc<RootOperation>,
+    _access: Arc<crate::large_document::SourceRead>,
 }
 impl SourceSession {
+    pub(crate) fn park_activity(session: &mut Arc<Self>) -> Result<(), String> {
+        let session =
+            Arc::get_mut(session).ok_or("Proposal preparation still has active session owners")?;
+        let operation = Arc::get_mut(&mut session.operation)
+            .ok_or("Proposal preparation still has active child work")?;
+        operation.park_activity();
+        drop(session.foreground.take());
+        Ok(())
+    }
+    pub(crate) fn activity(&self) -> Option<crate::server::FileOperation> {
+        self.operation.activity()
+    }
+    /// Retained proposals may reacquire activity off-lock for a live operation.
+    pub(crate) fn foreground_activity(&self) -> Result<crate::large_document::SourceRead, String> {
+        self.runtime.foreground_activity()
+    }
+    pub(crate) fn uses_runtime(&self, runtime: &Arc<SourceRuntime>) -> bool {
+        Arc::ptr_eq(&self.runtime, runtime)
+    }
+    #[cfg(test)]
+    pub(crate) fn owned_file_bytes_for_test(&self, path: &Path) -> Result<Vec<u8>, String> {
+        use std::io::{Seek, SeekFrom};
+        self.check()?;
+        let (store, held) = {
+            let state = self
+                .runtime
+                .inventory
+                .try_lock()
+                .map_err(|_| "Source inventory is busy")?;
+            let inventory = state.as_ref().ok_or("Source inventory unavailable")?;
+            let store = inventory
+                .locations
+                .values()
+                .find(|location| location.path.join("blocks.pbt") == path)
+                .and_then(|location| location.weak.as_ref())
+                .map(WeakStore::resume)
+                .transpose()
+                .map_err(|e| e.to_string())?;
+            let held = inventory
+                .files
+                .iter()
+                .find(|file| file.path == path)
+                .map(|held| held.file.try_clone().map_err(|e| e.to_string()))
+                .transpose()?;
+            (store, held)
+        };
+        if let Some(store) = store {
+            return store.file_bytes_for_test().map_err(|e| e.to_string());
+        }
+        let mut held = held.ok_or("Test read is outside the actual source inventory")?;
+        if held.metadata().map_err(|e| e.to_string())?.len() > 64 * 1024 * 1024 {
+            return Err("Test read exceeds fixture bound".into());
+        }
+        held.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+        let mut bytes = Vec::new();
+        held.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+        self.check()?;
+        Ok(bytes)
+    }
     pub(crate) fn with_live_fence<T>(&self, commit: impl FnOnce() -> T) -> Result<T, String> {
         self.operation.with_live_fence(commit)
     }
@@ -424,6 +615,10 @@ impl SourceSession {
         Ok(SessionRetention {
             _runtime: self.runtime.clone(),
             _operation: self.operation.clone(),
+            _access: self
+                .access
+                .clone()
+                .ok_or("Source session is in exclusive cleanup")?,
         })
     }
 
@@ -431,11 +626,25 @@ impl SourceSession {
         self.operation.check()?;
         self.check_inventory()
     }
+    /// Only for memory work over already pinned pixels or immutable metadata.
+    /// Source I/O and publication still need the full inventory check.
+    pub(crate) fn check_pinned_work(&self) -> Result<(), String> {
+        self.operation.check_active()?;
+        if self.runtime.tainted.load(Ordering::Acquire) {
+            return Err("Source inventory ownership changed; fresh admission required and bytes retained".into());
+        }
+        Ok(())
+    }
     /// Existing permits remain held. This admits only explicit proven cleanup,
     /// never a new writer, publication, checkpoint or source allocation.
     pub(crate) fn cleanup_check(&self) -> Result<(), String> {
         self.operation.check_retirement()?;
         self.check_inventory()
+    }
+    fn serialize_inventory_access(&self) -> Result<std::sync::MutexGuard<'_, ()>, String> {
+        self.inventory_check
+            .lock()
+            .map_err(|_| "Source inventory check unavailable".into())
     }
     fn check_inventory(&self) -> Result<(), String> {
         if self.runtime.tainted.load(Ordering::Acquire) {
@@ -444,17 +653,17 @@ impl SourceSession {
                     .into(),
             );
         }
+        let _check = self.serialize_inventory_access()?;
         let state = self
             .runtime
             .inventory
             .try_lock()
-            .map_err(|_| "Source inventory is busy")?;
+            .map_err(|error| match error {
+                TryLockError::WouldBlock => INVENTORY_CHECK_BUSY,
+                TryLockError::Poisoned(_) => "Source inventory is unavailable",
+            })?;
         let inventory = state.as_ref().ok_or("Source inventory is unavailable")?;
-        inventory.directory.check()?;
-        for held in &inventory.files {
-            held.check()?;
-        }
-        Ok(())
+        self.runtime.validate_inventory(inventory)
     }
     pub(crate) fn resident(&self) -> ResidentBudget {
         self.runtime.resident()
@@ -484,10 +693,19 @@ impl SourceSession {
         fragment: FreshFragment,
         cleanup: &mut dyn FnMut() -> Result<(), String>,
     ) -> Result<(), String> {
-        self.cleanup_check()?;
-        cleanup()?;
+        self.try_abort_fragment(fragment, cleanup)
+            .map_err(|refused| refused.reason)
+    }
+    pub(crate) fn try_abort_fragment(
+        &self,
+        fragment: FreshFragment,
+        cleanup: &mut dyn FnMut() -> Result<(), String>,
+    ) -> std::result::Result<(), RefusedFragmentRetirement> {
         let identity = fragment.store().identity();
-        let path = {
+        let filesystem = fragment.store().filesystem_identity();
+        let mut prepare = || -> Result<_, String> {
+            self.cleanup_check()?;
+            cleanup()?;
             let state = self
                 .runtime
                 .inventory
@@ -497,6 +715,11 @@ impl SourceSession {
                 .as_ref()
                 .and_then(|inventory| inventory.locations.get(&identity))
                 .ok_or("Fragment is outside the owned inventory")?;
+            if (location.directory_identity, location.file_identity) != filesystem {
+                return Err(
+                    "Fragment filesystem owner differs from its registered inventory".into(),
+                );
+            }
             if !location
                 .weak
                 .as_ref()
@@ -505,52 +728,85 @@ impl SourceSession {
             {
                 return Err("Fragment differs from its registered owner".into());
             }
-            location.path.clone()
+            let path = location.path.clone();
+            drop(state);
+            let directory = Directory::open(&path)?;
+            if directory.identity() != filesystem.0 {
+                return Err("Fragment directory differs from its registered owner".into());
+            }
+            Ok((path, directory))
         };
-        let directory = Directory::open(&path)?;
+        let (path, directory) = match prepare() {
+            Ok(prepared) => prepared,
+            Err(reason) => {
+                return Err(RefusedFragmentRetirement {
+                    reason,
+                    fragment: Some(fragment),
+                })
+            }
+        };
+        let mut failure = None;
         fragment
-            .abort(&mut || {
-                cleanup().map_err(|_| crate::large_document::Error::Cancelled)?;
-                self.cleanup_check()
-                    .map_err(|_| crate::large_document::Error::Changed)
+            .try_abort(&mut || {
+                cleanup()
+                    .and_then(|_| self.cleanup_check())
+                    .map_err(|reason| {
+                        failure = Some(reason);
+                        crate::large_document::Error::Cancelled
+                    })
             })
-            .map_err(|e| e.to_string())?;
-        if let Err(error) = directory.retire_empty(&mut || {
-            cleanup()?;
-            self.cleanup_check()
-        }) {
-            self.runtime.tainted.store(true, Ordering::Release);
-            return Err(error);
-        }
-        self.cleanup_check()?;
-        let mut state = self
-            .runtime
-            .inventory
-            .try_lock()
-            .map_err(|_| "Source inventory is busy")?;
-        let inventory = state.as_mut().ok_or("Source inventory is unavailable")?;
-        let location = inventory
-            .locations
-            .get(&identity)
-            .ok_or("Retired fragment inventory changed")?;
-        if location.path != path
-            || location
-                .weak
-                .as_ref()
-                .and_then(WeakStore::upgrade)
-                .is_some()
-        {
-            return Err("Retired fragment gained an unexpected owner".into());
-        }
-        inventory.locations.remove(&identity);
-        inventory.lineages.retain(|_, store| *store != identity);
-        inventory.directories = inventory
-            .directories
-            .checked_sub(1)
-            .ok_or("Retired fragment directory count differs")?;
-        Ok(())
+            .map_err(
+                |refused: crate::large_document::RefusedFragmentRetirement| {
+                    RefusedFragmentRetirement {
+                        reason: failure.unwrap_or_else(|| refused.error.to_string()),
+                        fragment: refused.fragment,
+                    }
+                },
+            )?;
+        let finish = || -> Result<(), String> {
+            if let Err(error) = directory.retire_empty(&mut || {
+                cleanup()?;
+                self.cleanup_check()
+            }) {
+                self.runtime.tainted.store(true, Ordering::Release);
+                return Err(error);
+            }
+            self.cleanup_check()?;
+            let mut state = self
+                .runtime
+                .inventory
+                .try_lock()
+                .map_err(|_| "Source inventory is busy")?;
+            let inventory = state.as_mut().ok_or("Source inventory is unavailable")?;
+            let location = inventory
+                .locations
+                .get(&identity)
+                .ok_or("Retired fragment inventory changed")?;
+            if location.path != path
+                || (location.directory_identity, location.file_identity) != filesystem
+                || location
+                    .weak
+                    .as_ref()
+                    .and_then(WeakStore::upgrade)
+                    .is_some()
+            {
+                return Err("Retired fragment gained an unexpected owner".into());
+            }
+            inventory.locations.remove(&identity);
+            inventory.lineages.retain(|_, store| *store != identity);
+            inventory.directories = inventory
+                .directories
+                .checked_sub(1)
+                .ok_or("Retired fragment directory count differs")?;
+            Ok(())
+        };
+        finish().map_err(|reason| RefusedFragmentRetirement {
+            reason,
+            fragment: None,
+        })
     }
     fn reserve_directory(&self) -> Result<(), String> {
+        let _check = self.serialize_inventory_access()?;
         let mut state = self
             .runtime
             .inventory
@@ -572,6 +828,7 @@ impl SourceSession {
         if store.filesystem_identity() != (directory_identity, held.identity) {
             return Err("New source differs from its inventoried filesystem owner".into());
         }
+        let weak = store.downgrade().map_err(|e| e.to_string())?;
         let mut state = self
             .runtime
             .inventory
@@ -592,7 +849,7 @@ impl SourceSession {
                 path: path.to_owned(),
                 directory_identity,
                 file_identity: held.identity,
-                weak: Some(store.downgrade()),
+                weak: Some(weak),
                 selected: None,
             },
         );
@@ -614,18 +871,16 @@ impl SourceSession {
                 .lineages
                 .get(&lineage)
                 .and_then(|id| inventory.locations.get(id))
-                .map(|location| {
-                    (
-                        location.weak.as_ref().and_then(WeakStore::upgrade),
-                        location.selected,
-                    )
-                })
+                .and_then(|location| location.weak.as_ref())
+                .map(WeakStore::resume)
+                .transpose()
+                .map_err(|e| e.to_string())?
         };
-        if let Some((Some(store), _)) = existing {
+        if let Some(store) = existing {
             return Ok(store);
         }
-        // A dropped unselected mirror has no authority to infer a newest commit.
-        // Its bytes stay charged; a fresh mirror is admitted independently.
+        // Only a new lineage creates a file. Retained custody above resumes the
+        // actual known state without inferring a newest checkpoint from disk.
         self.reserve_directory()?;
         let path = self
             .directory
@@ -656,6 +911,19 @@ impl SourceSession {
         blocks: &[BlockRef],
         metadata: &[u8],
     ) -> Result<Snapshot, String> {
+        self.try_seal_store(store, blocks, metadata)?
+            .ok_or_else(|| {
+                "Readonly source prefix does not cover every required reference; bytes retained"
+                    .into()
+            })
+    }
+    /// None requires a new physical copy; it grants no selected-prefix authority.
+    pub(crate) fn try_seal_store(
+        &self,
+        store: &Store,
+        blocks: &[BlockRef],
+        metadata: &[u8],
+    ) -> Result<Option<Snapshot>, String> {
         self.check()?;
         if !store.uses_disk_budget(&self.disk())
             || !store.resident_budget().same_pool(&self.resident())
@@ -731,10 +999,14 @@ impl SourceSession {
                 .map_err(|e| e.to_string())?;
             if needed.iter().all(|(_, covered)| *covered) {
                 self.record_selected(store, snapshot.reference())?;
-                return Ok(snapshot);
+                return Ok(Some(snapshot));
             }
             if snapshot.has_unconfirmed_tail().map_err(|e| e.to_string())? {
-                return Err("Readonly source prefix does not cover every required reference; bytes retained".into());
+                if let Some(retained) = self.retained_checkpoint_source(store, &mut needed)? {
+                    self.record_selected(store, retained.reference())?;
+                    return Ok(Some(retained));
+                }
+                return Ok(None);
             }
         }
         let source = head.map_or(store.identity(), |head| head.source());
@@ -748,7 +1020,7 @@ impl SourceSession {
             })
             .map_err(|e| e.to_string())?;
         self.record_selected(store, snapshot.reference())?;
-        Ok(snapshot)
+        Ok(Some(snapshot))
     }
     fn record_selected(&self, store: &Store, selected: CommitRef) -> Result<(), String> {
         self.check()?;
@@ -790,7 +1062,12 @@ impl SourceSession {
                 .and_then(|inventory| inventory.locations.get(&identity))
                 .ok_or("Recovery source is outside the owned inventory")?;
             (
-                location.weak.as_ref().and_then(WeakStore::upgrade),
+                location
+                    .weak
+                    .as_ref()
+                    .map(WeakStore::resume)
+                    .transpose()
+                    .map_err(|e| e.to_string())?,
                 location.path.clone(),
                 location.directory_identity,
                 location.file_identity,
@@ -849,6 +1126,7 @@ impl SourceSession {
             return Err("Recovery source filesystem identity changed during admission".into());
         }
         self.check()?;
+        let weak = snapshot.store().downgrade().map_err(|e| e.to_string())?;
         let mut state = self
             .runtime
             .inventory
@@ -860,7 +1138,7 @@ impl SourceSession {
             .locations
             .get_mut(&identity)
             .unwrap();
-        location.weak = Some(snapshot.store().downgrade());
+        location.weak = Some(weak);
         location.selected = Some(selected);
         // Transfer the startup observation to the actual Store's held handle.
         // A duplicate inventory handle must not survive later owned retirement.
@@ -1320,6 +1598,135 @@ mod tests {
         drop(connection);
     }
     #[test]
+    fn inventory_validation_reports_contention_until_the_lock_is_released() {
+        let fixture = Fixture::new();
+        let (_shared, connection) = fixture.connection();
+        let context = PersistentRootContext::from_explicit_state(&connection).unwrap();
+        let runtime = SourceRuntime::new(context, limits()).unwrap();
+        let session = SourceReadSession::from(Arc::new(runtime.begin().unwrap()));
+        let held = runtime.inventory.lock().unwrap();
+        session.check_pinned_work().unwrap();
+        assert_eq!(session.check().unwrap_err(), INVENTORY_CHECK_BUSY);
+        drop(held);
+        session.check().unwrap();
+        runtime.tainted.store(true, Ordering::Release);
+        assert!(session.check_pinned_work().is_err());
+    }
+
+    #[test]
+    fn fragment_retirement_refusal_returns_owned_tokens_for_retry_before_unlink() {
+        let f = Fixture::new();
+        let (_shared, connection) = f.connection();
+        let context = PersistentRootContext::from_explicit_state(&connection).unwrap();
+        let runtime = SourceRuntime::new(context, limits()).unwrap();
+        let session = runtime.begin().unwrap();
+        for mode in ["busy", "reader", "cancel", "inventory"] {
+            let fragment = session.fresh_fragment().unwrap();
+            let identity = fragment.store().identity();
+            let filesystem = fragment.store().filesystem_identity();
+            let reader = (mode == "reader").then(|| fragment.store().clone());
+            let busy = (mode == "busy").then(|| runtime.inventory.lock().unwrap());
+            if mode == "inventory" {
+                runtime
+                    .inventory
+                    .lock()
+                    .unwrap()
+                    .as_mut()
+                    .unwrap()
+                    .locations
+                    .get_mut(&identity)
+                    .unwrap()
+                    .file_identity
+                    .0 ^= 1;
+            }
+            let before = runtime.disk().used().unwrap();
+            let refused = session
+                .try_abort_fragment(fragment, &mut || {
+                    if mode == "cancel" {
+                        Err("Stop proposal cleanup".into())
+                    } else {
+                        Ok(())
+                    }
+                })
+                .err()
+                .unwrap();
+            if mode == "cancel" {
+                assert_eq!(refused.reason, "Stop proposal cleanup");
+            }
+            let fragment = refused.fragment.expect("No unlink was attempted");
+            assert_eq!(fragment.store().identity(), identity);
+            assert_eq!(fragment.store().filesystem_identity(), filesystem);
+            assert_eq!(runtime.disk().used().unwrap(), before);
+            drop((busy, reader));
+            if mode == "inventory" {
+                runtime
+                    .inventory
+                    .lock()
+                    .unwrap()
+                    .as_mut()
+                    .unwrap()
+                    .locations
+                    .get_mut(&identity)
+                    .unwrap()
+                    .file_identity = filesystem.1;
+            }
+            session
+                .try_abort_fragment(fragment, &mut || Ok(()))
+                .unwrap_or_else(|refused| panic!("{}", refused.reason));
+            assert!(!runtime
+                .inventory
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .locations
+                .contains_key(&identity));
+            assert_eq!(runtime.disk().used().unwrap(), 56);
+        }
+    }
+    #[test]
+    fn namespace_retirement_failure_after_unlink_does_not_return_a_retry_token() {
+        let f = Fixture::new();
+        let (_shared, connection) = f.connection();
+        let context = PersistentRootContext::from_explicit_state(&connection).unwrap();
+        let runtime = SourceRuntime::new(context, limits()).unwrap();
+        let session = runtime.begin().unwrap();
+        let fragment = session.fresh_fragment().unwrap();
+        let identity = fragment.store().identity();
+        let path = runtime
+            .inventory
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .locations[&identity]
+            .path
+            .clone();
+        let refused = session
+            .try_abort_fragment(fragment, &mut || {
+                if path.join("blocks.pbt").exists() {
+                    Ok(())
+                } else {
+                    Err("Stop after file unlink".into())
+                }
+            })
+            .err()
+            .unwrap();
+        assert_eq!(refused.reason, "Stop after file unlink");
+        assert!(refused.fragment.is_none());
+        assert!(runtime.tainted.load(Ordering::Acquire));
+        assert!(!path.join("blocks.pbt").exists());
+        assert!(path.is_dir());
+        assert!(runtime
+            .inventory
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .locations
+            .contains_key(&identity));
+    }
+    #[test]
     fn foreign_directory_after_file_abort_is_preserved_and_slot_remains_conservative() {
         let f = Fixture::new();
         let (_shared, connection) = f.connection();
@@ -1375,6 +1782,32 @@ mod tests {
         drop(connection);
     }
     #[test]
+    fn held_inventory_file_refuses_extra_links_replaced_names_and_changed_bytes() {
+        let f = Fixture::new();
+        let path = f.base.join("owned.pbr");
+        let moved = f.base.join("retained.pbr");
+        fs::write(&path, b"source").unwrap();
+        let held = HeldFile::new(path.clone(), open_read(&path).unwrap()).unwrap();
+        held.check().unwrap();
+
+        fs::hard_link(&path, &moved).unwrap();
+        assert!(held.check().is_err());
+        fs::remove_file(&moved).unwrap();
+        held.check().unwrap();
+
+        fs::rename(&path, &moved).unwrap();
+        fs::write(&path, b"source").unwrap();
+        assert!(held.check().is_err());
+        fs::remove_file(&path).unwrap();
+        fs::rename(&moved, &path).unwrap();
+        held.check().unwrap();
+
+        fs::write(&path, b"changed source").unwrap();
+        assert!(held.check().is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"changed source");
+    }
+
+    #[test]
     #[cfg(unix)]
     fn native_inventory_fifo_replacement_refuses_without_stalling_retirement() {
         use std::{ffi::CString, os::unix::ffi::OsStrExt, sync::mpsc, time::Duration};
@@ -1400,11 +1833,61 @@ mod tests {
         assert_eq!(runtime.disk().used().unwrap(), 56);
     }
     #[test]
+    fn warm_lineage_resumes_exact_custody_without_another_file_or_checkpoint() {
+        for depth in [8, 16] {
+            let f = Fixture::new();
+            let (_shared, connection) = f.connection();
+            let context = PersistentRootContext::from_explicit_state(&connection).unwrap();
+            let runtime = SourceRuntime::new(context, limits()).unwrap();
+            let session = runtime.begin().unwrap();
+            let store = session.store_for_lineage([0x71; 16]).unwrap();
+            let spec = crate::large_document::TileSpec::new(2, 2, depth).unwrap();
+            let bytes = vec![47; spec.bytes()];
+            let reference = store.put(spec, &bytes, &mut || Ok(())).unwrap();
+            let snapshot = session
+                .seal_store(&store, &[reference], b"retained lineage")
+                .unwrap();
+            let selected = snapshot.reference();
+            let identity = store.identity();
+            let filesystem = store.filesystem_identity();
+            let original = store.file_bytes_for_test().unwrap();
+            let charged = runtime.disk().used().unwrap();
+            let (locations, directories) = {
+                let state = runtime.inventory.lock().unwrap();
+                let inventory = state.as_ref().unwrap();
+                (inventory.locations.len(), inventory.directories)
+            };
+            drop((snapshot, store));
+            for _ in 0..3 {
+                let store = session.store_for_lineage([0x71; 16]).unwrap();
+                assert_eq!(store.identity(), identity);
+                assert_eq!(store.filesystem_identity(), filesystem);
+                assert_eq!(store.checkpoint_reference().unwrap(), Some(selected));
+                assert_eq!(store.put(spec, &bytes, &mut || Ok(())).unwrap(), reference);
+                let snapshot = session
+                    .seal_store(&store, &[reference], b"different capture metadata")
+                    .unwrap();
+                assert_eq!(snapshot.reference(), selected);
+                assert_eq!(store.pin(reference, &mut || Ok(())).unwrap().bytes(), bytes);
+                assert_eq!(store.file_bytes_for_test().unwrap(), original);
+                assert_eq!(runtime.disk().used().unwrap(), charged);
+                let state = runtime.inventory.lock().unwrap();
+                let inventory = state.as_ref().unwrap();
+                assert_eq!(
+                    (inventory.locations.len(), inventory.directories),
+                    (locations, directories)
+                );
+                drop(state);
+                drop((snapshot, store));
+            }
+        }
+    }
+    #[test]
     fn readonly_selected_source_reuses_only_a_complete_covering_original_prefix() {
         let f = Fixture::new();
         let (_shared, connection) = f.connection();
         let context = PersistentRootContext::from_explicit_state(&connection).unwrap();
-        let runtime = SourceRuntime::new(context, limits()).unwrap();
+        let runtime = SourceRuntime::new(context.clone(), limits()).unwrap();
         let session = runtime.begin().unwrap();
         let store = session.store_for_lineage([3; 16]).unwrap();
         let spec = crate::large_document::TileSpec::new(1, 1, 8).unwrap();
@@ -1426,17 +1909,19 @@ mod tests {
             .join("blocks.pbt");
         drop(original);
         drop(store);
+        drop(session);
+        drop(runtime);
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
             .append(true)
             .open(&path)
             .unwrap();
-        let charge = runtime.disk().retain_file(&path, &file).unwrap();
-        charge.grow(4).unwrap();
         file.write_all(b"tail").unwrap();
         file.sync_all().unwrap();
         drop(file);
+        let runtime = SourceRuntime::new(context, limits()).unwrap();
+        let session = runtime.begin_existing().unwrap();
         let recovered = session.resolve_store(identity, selected).unwrap();
         assert!(recovered.has_unconfirmed_tail().unwrap());
         let source = recovered.store();
@@ -1541,7 +2026,10 @@ mod tests {
             )
             .is_err());
         assert!(session.open_recovery_marker(snapshot).is_err());
-        assert_eq!(runtime.disk().used().unwrap(), 56 + 32);
+        assert_eq!(
+            runtime.disk().used().unwrap(),
+            if cfg!(windows) { 56 } else { 56 + 32 }
+        );
         let stale = std::cell::Cell::new(false);
         let other = *uuid::Uuid::new_v4().as_bytes();
         let bytes = b"stale";
@@ -1567,10 +2055,13 @@ mod tests {
             )
             .is_err());
         assert!(session.open_recovery_marker(other).is_err());
-        assert!(session
-            .directory
-            .join(format!("pending-{}", uuid::Uuid::from_bytes(other)))
-            .is_file());
+        assert_eq!(
+            session
+                .directory
+                .join(format!("pending-{}", uuid::Uuid::from_bytes(other)))
+                .is_file(),
+            !cfg!(windows)
+        );
         assert!(!session
             .directory
             .join(format!("recovery-v3-{}.pbr", uuid::Uuid::from_bytes(other)))
@@ -1610,6 +2101,14 @@ mod tests {
             .unwrap()
             .finish([4; 32], &mut || Ok(()))
             .unwrap();
+        let scalar_spec = crate::large_document::ScalarSpec::new(1, 1).unwrap();
+        let partial_scalar = session.scalar_temporary(scalar_spec).unwrap();
+        partial_scalar.check().unwrap();
+        let mut scalar = session.scalar_temporary(scalar_spec).unwrap();
+        scalar
+            .append_rows(0, &0.37f64.to_be_bytes(), &mut || Ok(()))
+            .unwrap();
+        let scalar = scalar.finish([5; 32], &mut || Ok(())).unwrap();
         let (finished, done) = mpsc::channel();
         let dropper = thread::spawn(move || {
             drop(connection);
@@ -1625,6 +2124,8 @@ mod tests {
         assert!(session
             .byte_temporary(0, crate::large_document::ByteRole::LayerData)
             .is_err());
+        assert!(session.scalar_temporary(scalar_spec).is_err());
+        assert!(scalar.check().is_err());
         let workspace = crate::workspace::attach(&shared);
         let mut cleanup = || {
             assert!(session.check().is_err());
@@ -1642,6 +2143,8 @@ mod tests {
         };
         partial.abort(&mut cleanup).unwrap();
         completed.retire(&mut cleanup).unwrap();
+        partial_scalar.abort(&mut cleanup).unwrap();
+        scalar.retire(&mut cleanup).unwrap();
         session.abort_fragment(fragment, &mut cleanup).unwrap();
         assert_eq!(runtime.disk().used().unwrap(), 56);
         assert_eq!(
@@ -1667,6 +2170,691 @@ mod tests {
             .open(state_dir.join("instance.lock"))
             .unwrap();
         next.try_lock().unwrap();
+    }
+    #[test]
+    fn captured_global_style_dependencies_match_native_layers_and_preview_before_retirement() {
+        use crate::{
+            compositor::native::{Native16, Native8, Plan, Stored, Topology},
+            effects::Effect,
+            engine::scene::{CapturedScene, LegacyTileCache},
+            raster::backed::Region,
+            render::native_preview::Request,
+        };
+        for depth in [8, 16] {
+            for kind in [
+                "drop_shadow",
+                "inner_shadow",
+                "outer_glow",
+                "inner_glow",
+                "satin",
+                "bevel_emboss",
+                "gradient_overlay",
+                "liquify",
+                "liquify_after_style",
+            ] {
+                let f = Fixture::new();
+                let (_shared, connection) = f.connection();
+                let context = PersistentRootContext::from_explicit_state(&connection).unwrap();
+                let mut limits = limits();
+                limits.resident_bytes = 128 * 1024 * 1024;
+                limits.disk_bytes = 128 * 1024 * 1024;
+                limits.max_files = 64;
+                let runtime = SourceRuntime::new(context, limits).unwrap();
+                let mut doc = crate::compositor::native::tests::doc(depth, false, "screen");
+                // Editable metadata supplements this captured current raster;
+                // global effects must not replace it with a fresh vector render.
+                doc.layers[0].source = Some(Arc::new(crate::source::Source {
+                    width: doc.layers[0].pixels.width,
+                    height: doc.layers[0].pixels.height,
+                    matrix: [1., 0., 0., 1., 0., 0.],
+                    content: crate::source::Content::Shape {
+                        shape: "rectangle".into(),
+                        bounds: [0., 0., 3., 2.],
+                        points: vec![],
+                        closed: true,
+                        fill: [12347, 23459, 34571, 45679],
+                        stroke: [0; 4],
+                        stroke_width: 0.,
+                    },
+                }));
+                let effect = |kind: &str, weight| Effect {
+                    id: crate::engine::id(),
+                    kind: kind.into(),
+                    enabled: true,
+                    weight,
+                    settings: crate::effects::defaults(kind).into(),
+                };
+                doc.layers[0].effects.push(effect("blur", 0.57));
+                let after_style = kind == "liquify_after_style";
+                if after_style {
+                    doc.layers[0].effects.push(effect("stroke", 0.53));
+                }
+                let mut style = effect(if after_style { "liquify" } else { kind }, 0.67);
+                if kind == "gradient_overlay" {
+                    let settings = Arc::make_mut(&mut style.settings);
+                    settings["pixel_grid"] = serde_json::json!(true);
+                    settings["align_layer"] = serde_json::json!(true);
+                    settings["angle"] = serde_json::json!(37.);
+                }
+                if style.kind == "liquify" {
+                    let mut mask = crate::raster::Raster::new(11, 9);
+                    for y in 0..9 {
+                        for x in 0..11 {
+                            mask.set(x, y, [((x * 37 + y * 51) % 256) as u8, 255, 173, 0]);
+                        }
+                    }
+                    let coverage = crate::selection::Coverage {
+                        mask,
+                        bounds: [1, 2, 3, 4],
+                        origin: [-2, 1],
+                        contours: vec![],
+                    };
+                    let mut settings = serde_json::json!({"radius":2.75,"strength":0.83,"strokes":[
+                        {"mode":"push","points":[[-1.25,1.5],[4.5,3.25],[8.5,5.5]],"selection":[0,0,9,7],"polygon":[[0.,0.],[9.,0.],[7.5,7.],[1.5,7.]],"coverage":coverage},
+                        {"mode":"expand","radius":3.25,"points":[[4.25,3.5]],"coverage":coverage},
+                        {"mode":"restore","radius":1.75,"points":[[4.25,3.5]]}
+                    ]});
+                    if !after_style {
+                        settings["strokes"][2]["selection"] = serde_json::json!([0, 0, 9, 7]);
+                    }
+                    style.settings = settings.into();
+                }
+                doc.layers[0].effects.push(style);
+                if kind.starts_with("liquify") {
+                    doc.layers[0].effects.push(effect("stroke", 0.59));
+                }
+                doc.layers[0].effects.push(effect("blur", 0.63));
+                doc.layers[1].effects.push(effect("outer_glow", 0.47));
+                crate::adjustment::add(&mut doc, &serde_json::json!({"kind":"invert"})).unwrap();
+                doc.layers[0].effects.push(effect("inner_shadow", 0.61));
+                doc.layers[0].opacity = 0.37;
+                doc.filters.push(effect("blur", 0.43));
+                let cache = LegacyTileCache::new(&runtime.resident(), 32).unwrap();
+                let staged = CapturedScene::from_parts(
+                    doc.clone(),
+                    "stored-style-test".into(),
+                    vec![],
+                    None,
+                    None,
+                )
+                .stage(&runtime, &cache, &|| Ok(()))
+                .unwrap();
+                let scene = Arc::new(staged.scene);
+                let session = Arc::new(staged.session.unwrap());
+                let baseline = runtime.disk().used().unwrap();
+                let topology = Topology::new(&scene).unwrap();
+                assert!(Stored::needed(&topology));
+                let stored = Stored::prepare(topology.clone(), &session, &mut || Ok(())).unwrap();
+                let region = Region::new([-2, -1, 11, 9]).unwrap();
+                {
+                    let window = stored.window(region, &mut || Ok(())).unwrap();
+                    if depth == 8 {
+                        let masks: Vec<_> = doc
+                            .layers
+                            .iter()
+                            .map(|layer| {
+                                layer.mask.as_ref().and_then(|mask| {
+                                    mask.prepare(layer.pixels.width, layer.pixels.height)
+                                })
+                            })
+                            .collect();
+                        let colors = crate::effects::prepare(&doc, &masks).unwrap();
+                        let legacy = crate::compositor::Plan::new(&doc, &masks, &colors);
+                        let native =
+                            Plan::<Native8, _>::with_topology(topology.clone(), &window, region)
+                                .unwrap();
+                        for y in -1..9 {
+                            for x in -2..11 {
+                                assert_eq!(
+                                    native.pixel(x, y).unwrap(),
+                                    legacy.sample(legacy.group(None), x, y),
+                                    "{depth} {kind} {x},{y}"
+                                );
+                                for i in 0..doc.layers.len() {
+                                    assert_eq!(
+                                        native.layer(i, x, y).unwrap(),
+                                        legacy.layer(i, x, y),
+                                        "{depth} {kind} layer{i} {x},{y}"
+                                    );
+                                }
+                            }
+                        }
+                    } else {
+                        let legacy = crate::depth16::Plan16::new(&doc).unwrap();
+                        let native =
+                            Plan::<Native16, _>::with_topology(topology.clone(), &window, region)
+                                .unwrap();
+                        for y in -1..9 {
+                            for x in -2..11 {
+                                assert_eq!(
+                                    native.pixel(x, y).unwrap(),
+                                    legacy.pixel(x, y),
+                                    "{depth} {kind} {x},{y}"
+                                );
+                                for i in 0..doc.layers.len() {
+                                    assert_eq!(
+                                        native.layer(i, x, y).unwrap(),
+                                        legacy.layer(i, x, y),
+                                        "{depth} {kind} layer{i} {x},{y}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                {
+                    use crate::{
+                        production_export::{native_rows, Format, Output, Resampling},
+                        psd::{
+                            native_rows36::Rows36,
+                            standard36::{NativeRows, RowRequest, RowSource},
+                        },
+                    };
+                    let filtered8 = if depth == 8 {
+                        Some(crate::filters::prepare8(&doc).unwrap())
+                    } else {
+                        None
+                    };
+                    let filtered16 = if depth == 16 {
+                        Some(crate::filters::prepare16(&doc).unwrap())
+                    } else {
+                        None
+                    };
+                    let expected = |x, y| {
+                        if let Some(image) = &filtered16 {
+                            image.get(x, y)
+                        } else {
+                            filtered8.as_ref().unwrap().get(x, y).map(u16::from)
+                        }
+                    };
+                    let output = Output {
+                        target: None,
+                        target_name: String::new(),
+                        variant: String::new(),
+                        filename: "style.png".into(),
+                        document_rect: [0, 0, 9, 7],
+                        width: 9,
+                        height: 7,
+                        format: Format::Png,
+                        native_source_depth: depth,
+                        bit_depth: depth,
+                        scale_xy: [1., 1.],
+                    };
+                    let rows =
+                        native_rows::Rows::with_prepared(&scene, None, &stored, &|| Ok(()))
+                            .unwrap();
+                    let mut bytes = vec![0; 9 * 7 * usize::from(depth / 2)];
+                    rows.fill(
+                        &output,
+                        depth,
+                        Resampling::Nearest,
+                        0,
+                        7,
+                        &mut bytes,
+                        &|| Ok(()),
+                    )
+                    .unwrap();
+                    for y in 0..7 {
+                        for x in 0..9 {
+                            let stride = usize::from(depth / 2);
+                            let at = (y * 9 + x) as usize * stride;
+                            let actual: Vec<u16> = if depth == 8 {
+                                bytes[at..at + 4].iter().map(|v| u16::from(*v)).collect()
+                            } else {
+                                bytes[at..at + 8]
+                                    .chunks_exact(2)
+                                    .map(|v| u16::from_be_bytes(v.try_into().unwrap()))
+                                    .collect()
+                            };
+                            assert_eq!(actual, expected(x, y), "{depth} {kind} export{x},{y}");
+                        }
+                    }
+                    let legacy8 = if depth == 8 {
+                        let masks: Vec<_> = doc
+                            .layers
+                            .iter()
+                            .map(|layer| {
+                                layer.mask.as_ref().and_then(|mask| {
+                                    mask.prepare(layer.pixels.width, layer.pixels.height)
+                                })
+                            })
+                            .collect();
+                        Some(crate::effects::prepare(&doc, &masks).unwrap())
+                    } else {
+                        None
+                    };
+                    let legacy16 = if depth == 16 {
+                        Some(crate::depth16::prepare(&doc).unwrap())
+                    } else {
+                        None
+                    };
+                    let mut psd = Rows36::with_prepared(&scene, &stored).unwrap();
+                    for source in [RowSource::Layer(1), RowSource::BakedComposite] {
+                        for channel in [-1, 0, 1, 2] {
+                            let request = RowRequest {
+                                provenance: psd.provenance(),
+                                source,
+                                channel,
+                                bounds: [0, 0, 9, 7],
+                                first_row: 0,
+                                rows: 7,
+                                depth,
+                            };
+                            let mut bytes = vec![0; 9 * 7 * usize::from(depth / 8)];
+                            psd.fill(request, &mut bytes, &|| Ok(())).unwrap();
+                            let c = if channel == -1 { 3 } else { channel as usize };
+                            for y in 0..7 {
+                                for x in 0..9 {
+                                    let at = (y * 9 + x) as usize * usize::from(depth / 8);
+                                    let actual = if depth == 8 {
+                                        u16::from(bytes[at])
+                                    } else {
+                                        u16::from_be_bytes(bytes[at..at + 2].try_into().unwrap())
+                                    };
+                                    let wanted = if source == RowSource::BakedComposite {
+                                        expected(x, y)[c]
+                                    } else if let Some(colors) = &legacy16 {
+                                        colors[1].as_ref().unwrap().get(x, y)[c]
+                                    } else {
+                                        u16::from(
+                                            legacy8.as_ref().unwrap()[1]
+                                                .as_ref()
+                                                .unwrap()
+                                                .get(x, y)[c],
+                                        )
+                                    };
+                                    assert_eq!(
+                                        actual, wanted,
+                                        "{depth} {kind} PSD {source:?} channel{channel} {x},{y}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                stored.retire(&mut || Ok(())).unwrap();
+                assert_eq!(runtime.disk().used().unwrap(), baseline);
+                for target in [
+                    None,
+                    Some(doc.layers[0].id.as_str()),
+                    Some(doc.layers[1].id.as_str()),
+                ] {
+                    for mask in [false, true] {
+                        let request = Request::capture(
+                            scene.clone(),
+                            session.clone(),
+                            Some([1, 1, 8, 6]),
+                            5,
+                            target,
+                            mask,
+                        )
+                        .unwrap();
+                        let frame = request.render(&mut || Ok(())).unwrap();
+                        assert_eq!(
+                            &*frame.copy_rgba8(&mut || Ok(())).unwrap(),
+                            &doc.preview(Some([1, 1, 8, 6]), 5, target, mask).unwrap().2,
+                            "{depth} {kind} {target:?} mask{mask}"
+                        );
+                        assert_eq!(runtime.disk().used().unwrap(), baseline);
+                    }
+                }
+                let request =
+                    Request::capture(scene.clone(), session.clone(), None, 48, None, false)
+                        .unwrap();
+                let mut checks = 0;
+                assert!(request
+                    .render(&mut || {
+                        checks += 1;
+                        if checks > 1000 {
+                            Err("stored preview cancelled".into())
+                        } else {
+                            Ok(())
+                        }
+                    })
+                    .is_err());
+                assert_eq!(runtime.disk().used().unwrap(), baseline);
+                assert!(runtime
+                    .inventory
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .staging
+                    .is_empty());
+            }
+        }
+    }
+    #[test]
+    fn stored_weighted_liquify_keeps_native_samples_across_tiles_and_output_bands() {
+        use crate::{
+            effects::{regional, stored, Effect},
+            raster::backed::Region,
+        };
+        for depth in [8, 16] {
+            let f = Fixture::new();
+            let (_shared, connection) = f.connection();
+            let context = PersistentRootContext::from_explicit_state(&connection).unwrap();
+            let mut limits = limits();
+            limits.resident_bytes = 96 * 1024 * 1024;
+            limits.disk_bytes = 32 * 1024 * 1024;
+            let runtime = SourceRuntime::new(context, limits).unwrap();
+            let session = runtime.begin().unwrap();
+            let baseline = (runtime.resident().used(), runtime.disk().used().unwrap());
+            let size = [769, 521];
+            let effect = Effect {
+                id: crate::engine::id(),
+                kind: "liquify".into(),
+                enabled: true,
+                weight: 0.67,
+                settings: serde_json::json!({"radius":47.25,"strength":0.85,"strokes":[
+                    {"mode":"push","points":[[231.25,158.5],[282.75,185.25],[517.5,348.75]]},
+                    {"mode":"pinch","radius":61.5,"points":[[511.5,341.25]]}
+                ]})
+                .into(),
+            };
+            let pixel = |x: i32, y: i32| {
+                let value = [
+                    ((x * 739 + y * 811 + 12347) % 65536) as u16,
+                    ((x * 509 + y * 317 + 33559) % 65536) as u16,
+                    51237,
+                    if (x + y) % 9 == 0 {
+                        0
+                    } else {
+                        ((x * 137 + y * 797 + 719) % 65536) as u16
+                    },
+                ];
+                if depth == 8 {
+                    value.map(|v| u16::from(crate::raster::project16(v)) * 257)
+                } else {
+                    value
+                }
+            };
+            let mappings = std::cell::Cell::new(0);
+            let prepare = |crop| stored::stack(
+                &session,
+                [81; 32],
+                stored::Frame {
+                    size,
+                    origin: [-3, 2],
+                },
+                size,
+                depth,
+                std::slice::from_ref(&effect),
+                crop,
+                |index, frame, check| {
+                    assert_eq!(index, 0);
+                    mappings.set(mappings.get() + 1);
+                    crate::liquify::regional::Plan::new(
+                        frame,
+                        &effect.settings,
+                        &[None; 2],
+                        &runtime.resident(),
+                        check,
+                    )?
+                    .prepare(check, |_, _| {
+                        panic!("Unclipped fixture must not request a clip")
+                    })
+                },
+                &mut || Ok(()),
+                |region, check| {
+                    let bytes = crate::render::region::native(
+                        region,
+                        depth,
+                        &runtime.resident(),
+                        check,
+                        |x, y| Ok(pixel(x, y)),
+                    )?;
+                    regional::RegionalImage::from_native(region, depth, bytes)
+                },
+            );
+            let image = prepare(None).unwrap();
+            assert_eq!(mappings.get(), 1);
+            assert_eq!(
+                image.frame(),
+                stored::Frame {
+                    size,
+                    origin: [-3, 2]
+                }
+            );
+            let mut eight = crate::effects::Image {
+                width: size[0],
+                height: size[1],
+                bytes: Vec::new(),
+            };
+            let mut sixteen = crate::depth16::Image16 {
+                width: size[0],
+                height: size[1],
+                words: Vec::new(),
+            };
+            for y in 0..size[1] as i32 {
+                for x in 0..size[0] as i32 {
+                    if depth == 8 {
+                        eight
+                            .bytes
+                            .extend(pixel(x, y).map(crate::raster::project16));
+                    } else {
+                        sixteen.words.extend(pixel(x, y));
+                    }
+                }
+            }
+            if depth == 8 {
+                crate::effects::apply_cpu(&mut eight, "liquify", &effect.settings).unwrap();
+            } else {
+                crate::depth16::color::apply_cpu(&mut sixteen, "liquify", &effect.settings)
+                    .unwrap();
+            }
+            for bounds in [[249, 165, 521, 349], [0, 0, 1, 521], [512, 510, 769, 521]] {
+                let actual = image
+                    .read(&session, Region::new(bounds).unwrap(), &mut || Ok(()))
+                    .unwrap();
+                let crop = [bounds[0] - 3, bounds[1] + 2, bounds[2] - 3, bounds[3] + 2];
+                let cropped = prepare(Some(crop)).unwrap();
+                assert_eq!(cropped.frame().origin, [crop[0], crop[1]]);
+                assert_eq!(cropped.frame().size, [(crop[2] - crop[0]) as u32, (crop[3] - crop[1]) as u32]);
+                let window = cropped.read_document(&session, Region::new(crop).unwrap(), &mut || Ok(())).unwrap();
+                assert_eq!(window.bytes(), actual.bytes());
+                drop(window);
+                cropped.retire(&mut || Ok(())).unwrap();
+                for y in bounds[1]..bounds[3] {
+                    for x in bounds[0]..bounds[2] {
+                        let expected = if depth == 16 {
+                            crate::effects::weighted_pixel(
+                                pixel(x, y),
+                                sixteen.get(x, y),
+                                effect.weight,
+                            )
+                        } else {
+                            crate::effects::weighted_pixel(
+                                pixel(x, y).map(|v| u16::from(crate::raster::project16(v))),
+                                eight.get(x, y).map(u16::from),
+                                effect.weight,
+                            )
+                            .map(|v| v * 257)
+                        };
+                        assert_eq!(actual.pixel16(x, y).unwrap(), expected, "{depth} {x},{y}");
+                    }
+                }
+            }
+            image.retire(&mut || Ok(())).unwrap();
+            assert_eq!(
+                (runtime.resident().used(), runtime.disk().used().unwrap()),
+                baseline
+            );
+            assert!(runtime
+                .inventory
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .staging
+                .is_empty());
+        }
+    }
+    #[test]
+    fn session_style_fields_match_full_origin_and_read_only_the_needed_prefix() {
+        use crate::{
+            effects::{field, regional::RegionalImage},
+            large_document::ScratchBytes,
+            raster::backed::{Region, MAX_REGION_PIXELS},
+        };
+        let f = Fixture::new();
+        let (_shared, connection) = f.connection();
+        let context = PersistentRootContext::from_explicit_state(&connection).unwrap();
+        let runtime = SourceRuntime::new(context, limits()).unwrap();
+        let session = runtime.begin().unwrap();
+        let foreign = runtime.begin().unwrap();
+        let frame = [129, 1031];
+        let initial_disk = runtime.disk().used().unwrap();
+        let initial_memory = runtime.resident().used();
+        for depth in [8, 16] {
+            let source = |region: Region| -> Result<RegionalImage, String> {
+                let length = region.pixels() * usize::from(depth / 2);
+                let mut bytes = ScratchBytes::new(&runtime.resident(), length, length)
+                    .map_err(|e| e.to_string())?;
+                let [l, t, r, b] = region.bounds();
+                let mut at = 0;
+                for y in t..b {
+                    for x in l..r {
+                        let alpha = if (x == 11 && y == 9) || (x == 119 && y == 1027) {
+                            1u16
+                        } else if (96..118).contains(&x) && (596..632).contains(&y) {
+                            let range = if depth == 16 { 65535 } else { 255 };
+                            ((x * 739 + y * 811) % range + 1) as u16
+                        } else {
+                            0
+                        };
+                        if depth == 16 {
+                            for value in [12347, 33559, 51237, alpha] {
+                                bytes[at..at + 2].copy_from_slice(&value.to_be_bytes());
+                                at += 2;
+                            }
+                        } else {
+                            bytes[at..at + 4].copy_from_slice(&[37, 91, 173, alpha as u8]);
+                            at += 4;
+                        }
+                    }
+                }
+                RegionalImage::from_native(region, depth, bytes.freeze())
+            };
+            let mut reads = 0;
+            let prepared = field::prepare_session(
+                &session,
+                [73; 32],
+                frame,
+                [0, 0, frame[0] as i32, frame[1] as i32],
+                &[3, 3, 3],
+                depth,
+                &mut || Ok(()),
+                |region, _| {
+                    reads += 1;
+                    source(region)
+                },
+            )
+            .unwrap();
+            let full_disk = runtime.disk().used().unwrap();
+            assert_eq!(
+                reads,
+                (frame[1] as usize).div_ceil(MAX_REGION_PIXELS / frame[0] as usize)
+            );
+            assert_eq!(
+                runtime
+                    .inventory
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .staging
+                    .len(),
+                1
+            );
+            for bounds in [[0, 0, 29, 31], [100, 1000, 129, 1031], [11, 9, 120, 10]] {
+                let actual = prepared
+                    .tile(&session, [73; 32], bounds, &mut || Ok(()))
+                    .unwrap();
+                let expected = field::prepare(
+                    frame,
+                    bounds,
+                    &[3, 3, 3],
+                    depth,
+                    &runtime.resident(),
+                    &mut || Ok(()),
+                    source,
+                )
+                .unwrap();
+                for y in bounds[1]..bounds[3] {
+                    for x in bounds[0]..bounds[2] {
+                        assert_eq!(
+                            actual.value(x, y).unwrap().to_bits(),
+                            expected.value(x, y).unwrap().to_bits()
+                        );
+                    }
+                }
+            }
+            assert!(prepared
+                .tile(&foreign, [73; 32], [0, 0, 1, 1], &mut || Ok(()))
+                .is_err());
+            assert!(prepared
+                .tile(&session, [74; 32], [0, 0, 1, 1], &mut || Ok(()))
+                .is_err());
+            assert_eq!(
+                prepared
+                    .tile(&session, [73; 32], [0, 0, 1, 1], &mut || Err(
+                        "style read cancelled".into()
+                    ))
+                    .err()
+                    .unwrap(),
+                "style read cancelled"
+            );
+            let crop = [97, 598, 119, 631];
+            let mut read_pixels = 0;
+            let cropped = field::prepare_session(
+                &session, [75; 32], frame, crop, &[3, 3, 3], depth,
+                &mut || Ok(()), |region, _| {
+                    let [left, top, right, bottom] = region.bounds();
+                    assert_eq!([left, right], [0, 128]);
+                    assert!(top >= 0 && bottom <= 640);
+                    read_pixels += region.pixels();
+                    source(region)
+                },
+            ).unwrap();
+            assert_eq!(read_pixels, 128 * 640);
+            let cropped_bytes = runtime.disk().used().unwrap() - full_disk;
+            assert!(cropped_bytes > 0 && cropped_bytes < full_disk - initial_disk);
+            let bounds = [100, 600, 118, 631];
+            let actual = cropped.tile(&session, [75; 32], bounds, &mut || Ok(())).unwrap();
+            let expected = prepared.tile(&session, [73; 32], bounds, &mut || Ok(())).unwrap();
+            assert_eq!(actual.frame(), frame);
+            assert_eq!(actual.bounds(), bounds);
+            for y in bounds[1]..bounds[3] {
+                for x in bounds[0]..bounds[2] {
+                    assert_eq!(actual.value(x, y).unwrap().to_bits(), expected.value(x, y).unwrap().to_bits());
+                }
+            }
+            assert!(actual.value(108, 617).unwrap() > 0.);
+            assert!(cropped.tile(&session, [75; 32], [96, 598, 99, 600], &mut || Ok(())).is_err());
+            drop((actual, expected));
+            cropped.retire(&mut || Ok(())).unwrap();
+            assert_eq!(runtime.disk().used().unwrap(), full_disk);
+            prepared.retire(&mut || Ok(())).unwrap();
+            assert_eq!(runtime.disk().used().unwrap(), initial_disk);
+            assert_eq!(runtime.resident().used(), initial_memory);
+            let failed = field::prepare_session(
+                &session,
+                [73; 32],
+                frame,
+                crop,
+                &[3, 3, 3],
+                depth,
+                &mut || Ok(()),
+                |_, _| Err("style source cancelled".into()),
+            );
+            assert_eq!(failed.err().unwrap(), "style source cancelled");
+            assert_eq!(runtime.disk().used().unwrap(), initial_disk);
+            assert_eq!(runtime.resident().used(), initial_memory);
+            let state = runtime.inventory.lock().unwrap();
+            assert_eq!(state.as_ref().unwrap().directories, 0);
+            assert!(state.as_ref().unwrap().staging.is_empty());
+        }
     }
     #[test]
     fn session_byte_spools_register_before_append_and_reclaim_only_after_verified_retirement() {
@@ -1784,21 +2972,21 @@ mod tests {
         session.operation.check().unwrap();
     }
     #[test]
-    fn byte_wrapper_preserves_specific_callback_failure_and_retains_uncertain_debt() {
+    fn byte_wrapper_preserves_specific_callback_failure_and_retires_verified_spool() {
         let f = Fixture::new();
         let (_shared, connection) = f.connection();
         let context = PersistentRootContext::from_explicit_state(&connection).unwrap();
         let runtime = SourceRuntime::new(context, limits()).unwrap();
         let session = runtime.begin().unwrap();
+        let baseline = runtime.disk().used().unwrap();
         let staged = session
             .byte_temporary(0, crate::large_document::ByteRole::LayerData)
             .unwrap();
-        let charged = runtime.disk().used().unwrap();
         let error = staged.finish([1; 32], &mut || {
             Err("Captured source revision changed".into())
         });
         assert!(matches!(error, Err(ref message) if message == "Captured source revision changed"));
-        assert_eq!(runtime.disk().used().unwrap(), charged);
+        assert_eq!(runtime.disk().used().unwrap(), baseline);
         assert_eq!(
             runtime
                 .inventory
@@ -1808,7 +2996,7 @@ mod tests {
                 .unwrap()
                 .staging
                 .len(),
-            1
+            0
         );
     }
     #[test]
@@ -1874,22 +3062,22 @@ mod tests {
             .locations[&identity]
             .path
             .join("blocks.pbt");
+        let original = store.file_bytes_for_test().unwrap();
         drop(snapshot);
         drop(store);
-        let original = fs::read(&path).unwrap();
         let charged = runtime.disk().used().unwrap();
         fs::rename(&path, path.with_file_name("retained.pbt")).unwrap();
         fs::write(&path, &original).unwrap();
         assert!(session.resolve_store(identity, selected).is_err());
         assert!(session.fresh_fragment().is_err());
         assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(runtime.disk().used().unwrap(), charged);
+        drop(session);
+        drop(runtime);
         assert_eq!(
             fs::read(path.with_file_name("retained.pbt")).unwrap(),
             original
         );
-        assert_eq!(runtime.disk().used().unwrap(), charged);
-        drop(session);
-        drop(runtime);
         drop(context);
         drop(connection);
     }

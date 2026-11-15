@@ -5,7 +5,6 @@ binary; this does not establish an application-version/settings migration or GUI
 acceptance. No signed repository, update service or public package is created.
 """
 import argparse
-import hashlib
 import json
 import os
 import pathlib
@@ -17,7 +16,7 @@ import sys
 import tempfile
 
 from package import digest
-from package_deb import deb_version
+from package_deb import deb_filename, deb_version
 
 
 APP_ID = 'com.peerbrush.PeerBrush'
@@ -69,7 +68,7 @@ def validate_expected(expected):
 
 def selected_package(package, expected):
     validate_expected(expected)
-    if (package.name != f'peerbrush_{deb_version(expected["version"])}_amd64.deb'
+    if (package.name != deb_filename(expected["version"])
             or package.is_symlink() or not package.is_file() or digest(package) != expected['package_sha256']):
         raise ValueError('DEB filename or bytes differ from the selected candidate')
     for field, value in [('Package', 'peerbrush'), ('Architecture', 'amd64'), ('Version', deb_version(expected['version']))]:
@@ -97,6 +96,7 @@ def installed_identity(expected, user, package_version):
                 commit=expected['commit'], tree='clean', end='PeerBrushBuildInfoEnd')
     if user([str(binary), '--build-info']) != json.dumps(info, separators=(',', ':')):
         raise ValueError('Installed build provenance differs from the clean selected source')
+    return info
 
 
 def receipt_path(output):
@@ -119,6 +119,41 @@ def write_receipt(output, receipt):
         stream.write(json.dumps(receipt, sort_keys=True, separators=(',', ':')) + '\n')
 
 
+def preservation_fixture():
+    run(['useradd', '--create-home', '--shell', '/bin/sh', 'peerbrush-qa'])
+    home = pathlib.Path('/home/peerbrush-qa')
+    environment = dict(os.environ, HOME=str(home), XDG_CONFIG_HOME=str(home / '.config'),
+                       XDG_DATA_HOME=str(home / '.local/share'), XDG_CACHE_HOME=str(home / '.cache'))
+
+    def user(command):
+        return run(['runuser', '-u', 'peerbrush-qa', '--', *command], env=environment)
+
+    applications = home / '.local/share/applications'
+    applications.mkdir(parents=True)
+    existing = applications / 'peerbrush-qa-existing.desktop'
+    existing.write_text('[Desktop Entry]\nType=Application\nName=Existing QA editor\nExec=/bin/true %F\nMimeType=' + MIME + ';\n')
+    config = home / '.config'
+    config.mkdir()
+    defaults = config / 'mimeapps.list'
+    defaults.write_text('[Default Applications]\n' + MIME + '=peerbrush-qa-existing.desktop\n')
+    preserved = [home / 'PeerBrush QA state/tool-settings.json',
+                 config / 'peerbrush/settings-v1/tool-settings.json', home / 'Artwork 作品.psd']
+    for path in preserved:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b'SYNTHETIC_USER_OWNED_RETENTION_FIXTURE\n')
+    run(['chown', '-R', 'peerbrush-qa:peerbrush-qa', str(home)])
+    original = {path: digest(path) for path in [defaults, existing, *preserved]}
+
+    def retained():
+        for path, checksum in original.items():
+            if path.is_symlink() or not path.is_file() or digest(path) != checksum:
+                raise ValueError('Installation lifecycle changed user defaults, settings or artwork')
+        if user(['xdg-mime', 'query', 'default', MIME]) != existing.name:
+            raise ValueError('Installation lifecycle changed the existing default editor')
+
+    return home, user, retained
+
+
 def check(package, expected, output):
     require_disposable()  # Must precede user creation, package changes or fixture writes.
     validate_expected(expected)
@@ -133,36 +168,8 @@ def check(package, expected, output):
         selected = work / package.name
         shutil.copyfile(package, selected)
         selected_package(selected, expected)
-        run(['useradd', '--create-home', '--shell', '/bin/sh', 'peerbrush-qa'])
-        home = pathlib.Path('/home/peerbrush-qa')
-        environment = dict(os.environ, HOME=str(home), XDG_CONFIG_HOME=str(home / '.config'),
-                           XDG_DATA_HOME=str(home / '.local/share'), XDG_CACHE_HOME=str(home / '.cache'))
-        def user(command):
-            return run(['runuser', '-u', 'peerbrush-qa', '--', *command], env=environment)
-        applications = home / '.local/share/applications'
-        applications.mkdir(parents=True)
-        existing = applications / 'peerbrush-qa-existing.desktop'
-        existing.write_text('[Desktop Entry]\nType=Application\nName=Existing QA editor\nExec=/bin/true %F\nMimeType=' + MIME + ';\n')
-        config = home / '.config'
-        config.mkdir()
-        defaults = config / 'mimeapps.list'
-        defaults.write_text('[Default Applications]\n' + MIME + '=peerbrush-qa-existing.desktop\n')
-        # Include legacy explicit state and XDG preferences/document artwork.
-        # Package lifecycle must not remove either, regardless of migration.
-        preserved = [home / 'PeerBrush QA state/tool-settings.json',
-                     config / 'peerbrush/settings-v1/tool-settings.json', home / 'Artwork 作品.psd']
-        for path in preserved:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(b'SYNTHETIC_USER_OWNED_RETENTION_FIXTURE\n')
-        run(['chown', '-R', 'peerbrush-qa:peerbrush-qa', str(home)])
-        original = {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in [defaults, existing, *preserved]}
+        home, user, retained = preservation_fixture()
         original_package = expected['package_sha256']
-        def retained():
-            for path, checksum in original.items():
-                if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != checksum:
-                    raise ValueError('Installation lifecycle changed user defaults, settings or artwork')
-            if user(['xdg-mime', 'query', 'default', MIME]) != existing.name:
-                raise ValueError('Installation lifecycle changed the existing default editor')
         def installed(package_version):
             retained()
             installed_identity(expected, user, package_version)

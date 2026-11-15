@@ -62,13 +62,7 @@ fn word(value: f64) -> u16 {
 }
 pub(crate) fn map(kind: &str, settings: &Value, value: f64) -> f64 {
     match kind {
-        "levels" => {
-            let black = number(settings, "black", 0.0);
-            let white = number(settings, "white", 1.0);
-            ((value - black) / (white - black).max(0.01))
-                .clamp(0.0, 1.0)
-                .powf(1.0 / number(settings, "gamma", 1.0))
-        }
+        "levels" => effects::levels::map64(settings, value),
         "curves" => effects::curve_value64(settings, value),
         "adjust" => ((value - 0.5) * number(settings, "contrast", 1.0)
             + 0.5
@@ -160,7 +154,7 @@ fn balance(rgb: [f64; 3], settings: &Value) -> [f64; 3] {
 }
 pub fn working_bytes(width: u32, height: u32, kind: &str, settings: &Value) -> Result<u64, String> {
     let pixels = u64::from(width) * u64::from(height);
-    if effects::styles::contains(kind) {
+    if effects::styles::contains(kind) || kind == effects::color_lookup::KIND {
         return effects::working_bytes(kind, width, height, settings);
     }
     if matches!(kind, "blur" | "bloom") {
@@ -168,7 +162,7 @@ pub fn working_bytes(width: u32, height: u32, kind: &str, settings: &Value) -> R
     } else if kind == "liquify" {
         liquify::working_bytes16(width, height, settings).map(|bytes| bytes as u64)
     } else {
-        Ok(65536 * 2)
+        Ok(65536 * 2 * if effects::has_channel_mapping(kind, settings) { 3 } else { 1 })
     }
 }
 fn validated(image: &Image16, kind: &str, settings: &Value) -> Result<Value, String> {
@@ -222,14 +216,93 @@ fn apply_cpu_prepared(image: &mut Image16, kind: &str, settings: Value) -> Resul
             return Ok(());
         }
         "posterize" => {
-            let levels = effects::posterize::levels(&settings)?;
+            let mapping = effects::posterize::Quantizer::new(&settings)?;
             let mut table = allocation(65536)?;
-            table.extend((0..=65535u16).map(|v| effects::posterize::sample(v, 65535, levels)));
+            table.extend((0..=65535u16).map(|v| mapping.sample(v, 65535)));
             for pixel in image.words.chunks_exact_mut(4) {
                 for channel in &mut pixel[..3] {
                     *channel = table[*channel as usize];
                 }
             }
+            return Ok(());
+        }
+        "threshold" => {
+            effects::threshold::apply16(&mut image.words, effects::threshold::level(&settings)?);
+            return Ok(());
+        }
+        effects::legacy_brightness::KIND => {
+            let mapping = effects::legacy_brightness::Mapping::new(&settings)?;
+            for pixel in image.words.chunks_exact_mut(4) {
+                for channel in &mut pixel[..3] {
+                    *channel = mapping.sample(*channel, u16::MAX);
+                }
+            }
+            return Ok(());
+        }
+        effects::modern_brightness::KIND => {
+            let mapping = effects::modern_brightness::Prepared::new(&settings)?;
+            for pixel in image.words.chunks_exact_mut(4) {
+                for channel in &mut pixel[..3] {
+                    *channel = mapping.sample(*channel, u16::MAX);
+                }
+            }
+            return Ok(());
+        }
+        effects::exposure::KIND => {
+            let mapping = effects::exposure::Prepared::new(&settings)?;
+            for pixel in image.words.chunks_exact_mut(4) {
+                for channel in &mut pixel[..3] {
+                    *channel = mapping.sample(*channel, u16::MAX);
+                }
+            }
+            return Ok(());
+        }
+        effects::channel_mixer::KIND => {
+            let mixer = effects::channel_mixer::Mixer::new(&settings)?.prepare();
+            for pixel in image.words.chunks_exact_mut(4) {
+                let sample = [pixel[0], pixel[1], pixel[2]];
+                pixel[..3].copy_from_slice(&mixer.sample(sample, u16::MAX));
+            }
+            return Ok(());
+        }
+        effects::black_white::KIND => {
+            let adjustment = effects::black_white::Settings::new(&settings)?.prepare(u16::MAX);
+            for pixel in image.words.chunks_exact_mut(4) {
+                let sample = [pixel[0], pixel[1], pixel[2]];
+                pixel[..3].copy_from_slice(&adjustment.sample(sample));
+            }
+            return Ok(());
+        }
+        effects::selective_color::KIND => {
+            let adjustment = effects::selective_color::Settings::new(&settings)?.prepare();
+            for pixel in image.words.chunks_exact_mut(4) {
+                let sample = [pixel[0], pixel[1], pixel[2]];
+                pixel[..3].copy_from_slice(&adjustment.sample(sample, u16::MAX));
+            }
+            return Ok(());
+        }
+        effects::vibrance::KIND => {
+            effects::vibrance::Prepared::new(&settings)?.apply16(&mut image.words);
+            return Ok(());
+        }
+        effects::photo_filter::KIND => {
+            effects::photo_filter::Settings::new(&settings)?.prepare(u16::MAX).apply16(&mut image.words);
+            return Ok(());
+        }
+        effects::gradient_map::KIND => {
+            effects::gradient_map::Settings::new(&settings)?.prepare().apply16(&mut image.words);
+            return Ok(());
+        }
+        effects::photoshop_color_balance::KIND => {
+            effects::photoshop_color_balance::Settings::new(&settings)?.prepare().apply16(&mut image.words);
+            return Ok(());
+        }
+        effects::photoshop_hue_saturation::KIND => {
+            effects::photoshop_hue_saturation::Settings::new(&settings)?.prepare(16).apply16(&mut image.words);
+            return Ok(());
+        }
+        effects::color_lookup::KIND => {
+            if let Some(lookup) = effects::color_lookup::prepare(&settings)? { lookup.apply16(&mut image.words); }
             return Ok(());
         }
         "blur" => return blur(image, number(&settings, "radius", 8.0) as f32),
@@ -263,8 +336,16 @@ fn apply_cpu_prepared(image: &mut Image16, kind: &str, settings: Value) -> Resul
         }
         _ => {}
     }
-    let mut table = allocation(65536)?;
-    table.extend((0..65536).map(|v| word(map(kind, &settings, v as f64 / MAX) * MAX)));
+    let per_channel = effects::has_channel_mapping(kind, &settings);
+    let natural = effects::curves::Prepared::new(kind, &settings);
+    let mut table = allocation(65536 * if per_channel { 3 } else { 1 })?;
+    for channel in 0..if per_channel { 3 } else { 1 } {
+        table.extend((0..65536).map(|v| word(if let Some(natural) = &natural {
+            natural.value(channel, v as f64 / MAX) * MAX
+        } else if per_channel {
+            effects::map_channel64(kind, &settings, channel, v as f64 / MAX) * MAX
+        } else { map(kind, &settings, v as f64 / MAX) * MAX })));
+    }
     let saturation = number(&settings, "saturation", 1.0);
     for p in image.words.chunks_exact_mut(4) {
         if p[3] == 0 {
@@ -295,7 +376,7 @@ fn apply_cpu_prepared(image: &mut Image16, kind: &str, settings: Value) -> Resul
             }
             _ => {
                 for c in 0..3 {
-                    p[c] = table[p[c] as usize];
+                    p[c] = table[(if per_channel { c * 65536 } else { 0 }) + p[c] as usize];
                 }
                 if kind == "adjust" {
                     let gray = luma([p[0] as f64, p[1] as f64, p[2] as f64]);

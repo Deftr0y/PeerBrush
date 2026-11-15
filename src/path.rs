@@ -86,47 +86,67 @@ pub fn flatten(nodes: &[Anchor], closed: bool) -> Result<Vec<[f32; 2]>, String> 
     Ok(out)
 }
 pub fn document_point(layer: &Layer, p: [f32; 2]) -> [f32; 2] {
-    let m = layer
-        .source
-        .as_ref()
-        .map(|s| s.matrix)
-        .unwrap_or([1., 0., 0., 1., 0., 0.]);
+    document_point_view(layer.into(), p)
+}
+pub(crate) fn document_point_view(
+    layer: crate::engine::view::LayerView<'_>,
+    p: [f32; 2],
+) -> [f32; 2] {
+    point_in_document(
+        layer.origin(),
+        layer
+            .source()
+            .map(|s| s.matrix())
+            .unwrap_or([1., 0., 0., 1., 0., 0.]),
+        p,
+    )
+}
+pub(crate) fn point_in_document(origin: [i32; 2], m: [f32; 6], p: [f32; 2]) -> [f32; 2] {
     [
-        m[0] * p[0] + m[2] * p[1] + m[4] + layer.x as f32,
-        m[1] * p[0] + m[3] * p[1] + m[5] + layer.y as f32,
+        m[0] * p[0] + m[2] * p[1] + m[4] + origin[0] as f32,
+        m[1] * p[0] + m[3] * p[1] + m[5] + origin[1] as f32,
     ]
 }
-fn local(layer: &Layer, p: [f32; 2]) -> Result<[f32; 2], String> {
+fn local(origin: [i32; 2], m: [f32; 6], p: [f32; 2]) -> Result<[f32; 2], String> {
     if p.iter().any(|v| !v.is_finite() || v.abs() > 100000.) {
         return Err(
             "Path coordinates must be finite document pixels within coordinate limits".into(),
         );
     }
-    let m = layer
-        .source
-        .as_ref()
-        .ok_or("Layer has no path source")?
-        .matrix;
-    let x = p[0] - layer.x as f32 - m[4];
-    let y = p[1] - layer.y as f32 - m[5];
+    let x = p[0] - origin[0] as f32 - m[4];
+    let y = p[1] - origin[1] as f32 - m[5];
     let det = m[0] * m[3] - m[1] * m[2];
     Ok([(m[3] * x - m[2] * y) / det, (-m[1] * x + m[0] * y) / det])
 }
 fn point(c: &Value, key: &str) -> Result<[f32; 2], String> {
-    serde_json::from_value(c[key].clone())
-        .map_err(|_| format!("{key} needs [x,y] in document pixels"))
+    <[f32; 2]>::deserialize(&c[key]).map_err(|_| format!("{key} needs [x,y] in document pixels"))
 }
 pub fn create(doc: &mut Document, c: &Value) -> Result<(), String> {
+    let frame = creation_frame([doc.width, doc.height], c)?;
+    let nodes = Vec::<Anchor>::deserialize(&c["nodes"])
+        .map_err(|_| "Path creation needs a nodes array in document pixels")?;
+    let source = creation_source(frame, c, nodes)?;
+    crate::source::add(
+        doc,
+        &json!({"op":"source.add","source":source,"name":c["name"].as_str().unwrap_or("Pen path"),"x":frame[0],"y":frame[1],"parent":c.get("parent").unwrap_or(&Value::Null)}),
+    )
+}
+pub(crate) fn creation_frame(canvas: [u32; 2], c: &Value) -> Result<[i32; 4], String> {
     let frame = if c.get("frame").is_some() {
         crate::engine::rect(&c["frame"]).ok_or("Invalid path frame")?
     } else {
-        [0, 0, doc.width as i32, doc.height as i32]
+        [0, 0, canvas[0] as i32, canvas[1] as i32]
     };
     if frame[0] >= frame[2] || frame[1] >= frame[3] {
         return Err("Path frame must have positive dimensions".into());
     }
-    let mut nodes: Vec<Anchor> = serde_json::from_value(c["nodes"].clone())
-        .map_err(|_| "Path creation needs a nodes array in document pixels")?;
+    Ok(frame)
+}
+pub(crate) fn creation_source(
+    frame: [i32; 4],
+    c: &Value,
+    mut nodes: Vec<Anchor>,
+) -> Result<Source, String> {
     for n in &mut nodes {
         for p in std::iter::once(&mut n.point)
             .chain(n.in_handle.iter_mut())
@@ -136,7 +156,7 @@ pub fn create(doc: &mut Document, c: &Value) -> Result<(), String> {
             p[1] -= frame[1] as f32;
         }
     }
-    let source = Source {
+    Ok(Source {
         width: (frame[2] - frame[0]) as u32,
         height: (frame[3] - frame[1]) as u32,
         matrix: [1., 0., 0., 1., 0., 0.],
@@ -147,11 +167,7 @@ pub fn create(doc: &mut Document, c: &Value) -> Result<(), String> {
             stroke: color(c, "stroke", [59881, 21588, 8224, 65535])?,
             stroke_width: number(c, "stroke_width", 2.)?,
         },
-    };
-    crate::source::add(
-        doc,
-        &json!({"op":"source.add","source":source,"name":c["name"].as_str().unwrap_or("Pen path"),"x":frame[0],"y":frame[1],"parent":c.get("parent").unwrap_or(&Value::Null)}),
-    )
+    })
 }
 fn bool_field(c: &Value, key: &str, default: bool) -> Result<bool, String> {
     c.get(key)
@@ -171,8 +187,7 @@ fn number(c: &Value, key: &str, default: f32) -> Result<f32, String> {
 fn color(c: &Value, key: &str, default: [u16; 4]) -> Result<[u16; 4], String> {
     c.get(key)
         .map(|v| {
-            serde_json::from_value(v.clone())
-                .map_err(|_| format!("{key} needs four native RGBA16 values"))
+            <[u16; 4]>::deserialize(v).map_err(|_| format!("{key} needs four native RGBA16 values"))
         })
         .unwrap_or(Ok(default))
 }
@@ -182,6 +197,18 @@ pub fn update(layer: &mut Layer, c: &Value) -> Result<(), String> {
         .as_deref()
         .cloned()
         .ok_or("Choose an editable Pen path")?;
+    update_definition(&mut source, [layer.x, layer.y], c)?;
+    layer.pixels = source.render(layer.pixels.width, layer.pixels.height, layer.pixels.depth)?;
+    layer.source = Some(source.into());
+    layer.effect_key = id();
+    Ok(())
+}
+pub(crate) fn update_definition(
+    source: &mut Source,
+    origin: [i32; 2],
+    c: &Value,
+) -> Result<(), String> {
+    let local = |p| local(origin, source.matrix, p);
     let Content::Bezier {
         nodes,
         closed,
@@ -193,6 +220,17 @@ pub fn update(layer: &mut Layer, c: &Value) -> Result<(), String> {
         return Err("Choose an editable Pen path".into());
     };
     let op = c["op"].as_str().unwrap_or("");
+    if nodes.len() > 128 {
+        return Err("Paths require at most 128 anchors".into());
+    }
+    if matches!(op, "path.node.add" | "path.node.split") {
+        if nodes.len() == 128 {
+            return Err("Paths require at most 128 anchors".into());
+        }
+        nodes
+            .try_reserve_exact(1)
+            .map_err(|_| "Path anchor allocation refused")?;
+    }
     if op == "path.update" {
         *closed = bool_field(c, "closed", *closed)?;
         *fill = color(c, "fill", *fill)?;
@@ -217,7 +255,7 @@ pub fn update(layer: &mut Layer, c: &Value) -> Result<(), String> {
         }
         let handle = |key: &str| -> Result<Option<[f32; 2]>, String> {
             if c.get(key).is_some_and(|v| !v.is_null()) {
-                Ok(Some(local(layer, point(c, key)?)?))
+                Ok(Some(local(point(c, key)?)?))
             } else {
                 Ok(None)
             }
@@ -225,7 +263,7 @@ pub fn update(layer: &mut Layer, c: &Value) -> Result<(), String> {
         nodes.insert(
             index,
             Anchor {
-                point: local(layer, point(c, "point")?)?,
+                point: local(point(c, "point")?)?,
                 in_handle: handle("in_handle")?,
                 out_handle: handle("out_handle")?,
                 smooth: bool_field(c, "smooth", false)?,
@@ -275,7 +313,7 @@ pub fn update(layer: &mut Layer, c: &Value) -> Result<(), String> {
                 *closed = false;
             }
         } else if op == "path.node.move" {
-            let p = local(layer, point(c, "point")?)?;
+            let p = local(point(c, "point")?)?;
             let n = &mut nodes[index];
             let delta = [p[0] - n.point[0], p[1] - n.point[1]];
             for h in n.in_handle.iter_mut().chain(n.out_handle.iter_mut()) {
@@ -284,7 +322,7 @@ pub fn update(layer: &mut Layer, c: &Value) -> Result<(), String> {
             }
             n.point = p;
         } else if op == "path.handle.move" {
-            let p = local(layer, point(c, "point")?)?;
+            let p = local(point(c, "point")?)?;
             let n = &mut nodes[index];
             let (handle, other) = match c["handle"].as_str() {
                 Some("in") => (&mut n.in_handle, &mut n.out_handle),
@@ -333,9 +371,6 @@ pub fn update(layer: &mut Layer, c: &Value) -> Result<(), String> {
             return Err("Unknown path operation".into());
         }
     }
-    layer.pixels = source.render(layer.pixels.width, layer.pixels.height, layer.pixels.depth)?;
-    layer.source = Some(source.into());
-    layer.effect_key = id();
     Ok(())
 }
 pub fn polygon(layer: &Layer) -> Result<Vec<[f32; 2]>, String> {
@@ -351,10 +386,24 @@ pub fn polygon(layer: &Layer) -> Result<Vec<[f32; 2]>, String> {
     else {
         return Err("Close an editable Pen path before converting its area".into());
     };
-    let points = flatten(nodes, true)?
-        .into_iter()
-        .map(|p| document_point(layer, p))
-        .collect::<Vec<_>>();
+    transformed_polygon(
+        nodes,
+        layer.source.as_ref().unwrap().matrix,
+        [layer.x, layer.y],
+    )
+}
+pub(crate) fn transformed_polygon(
+    nodes: &[Anchor],
+    m: [f32; 6],
+    origin: [i32; 2],
+) -> Result<Vec<[f32; 2]>, String> {
+    let mut points = flatten(nodes, true)?;
+    for point in &mut points {
+        *point = [
+            m[0] * point[0] + m[2] * point[1] + m[4] + origin[0] as f32,
+            m[1] * point[0] + m[3] * point[1] + m[5] + origin[1] as f32,
+        ];
+    }
     crate::selection::bounds(&points)?;
     Ok(points)
 }
@@ -370,13 +419,14 @@ pub fn observe(layer: &Layer) -> Value {
 }
 /// Bounded shared hit testing; segment insertion uses exact de Casteljau geometry.
 pub fn nearest_segment(layer: &Layer, point: [f32; 2], tolerance: f32) -> Option<(usize, f32)> {
-    let Some(Source {
-        content: Content::Bezier { nodes, closed, .. },
-        ..
-    }) = layer.source.as_deref()
-    else {
-        return None;
-    };
+    nearest_segment_view(layer.into(), point, tolerance)
+}
+pub(crate) fn nearest_segment_view(
+    layer: crate::engine::view::LayerView<'_>,
+    point: [f32; 2],
+    tolerance: f32,
+) -> Option<(usize, f32)> {
+    let (nodes, closed) = layer.source()?.path_nodes()?;
     let count = nodes.len().saturating_sub(usize::from(!closed));
     let mut best = (tolerance * tolerance, None);
     for i in 0..count {
@@ -388,7 +438,7 @@ pub fn nearest_segment(layer: &Layer, point: [f32; 2], tolerance: f32) -> Option
             b.in_handle.unwrap_or(b.point),
             b.point,
         ]
-        .map(|p| document_point(layer, p));
+        .map(|p| document_point_view(layer, p));
         let distance = |t: f32| {
             let u = 1. - t;
             let v = std::array::from_fn::<_, 2, _>(|axis| {
@@ -420,6 +470,109 @@ pub fn nearest_segment(layer: &Layer, point: [f32; 2], tolerance: f32) -> Option
         }
     }
     best.1
+}
+/// Bounded path metadata for control handles; artwork stays in the shared renderer.
+pub(crate) fn preview_controls(
+    doc: crate::engine::view::DocumentView<'_>,
+    target: Option<crate::engine::view::LayerView<'_>>,
+    commands: &[Value],
+) -> Result<Option<([i32; 2], Source)>, String> {
+    use crate::engine::{scene::Content36, view::SourceView};
+    if commands.len() > 100 {
+        return Err("Path preview command limit exceeded".into());
+    }
+    let mut current = target
+        .map(|layer| -> Result<_, String> {
+            let source = layer.source().ok_or("Choose an editable Pen path")?;
+            let (nodes, _) = source.path_nodes().ok_or("Choose an editable Pen path")?;
+            if nodes.len() > 128 {
+                return Err("Paths require at most 128 anchors".into());
+            }
+            let definition = match source {
+                SourceView::Resident(source) => source.clone(),
+                SourceView::Native(source) => {
+                    let Content36::Bezier {
+                        nodes,
+                        closed,
+                        fill,
+                        stroke,
+                        stroke_width,
+                    } = source.definition()
+                    else {
+                        unreachable!()
+                    };
+                    Source {
+                        width: source.width,
+                        height: source.height,
+                        matrix: source.matrix,
+                        content: Content::Bezier {
+                            nodes: nodes.clone(),
+                            closed: *closed,
+                            fill: *fill,
+                            stroke: *stroke,
+                            stroke_width: *stroke_width,
+                        },
+                    }
+                }
+            };
+            Ok((layer.origin(), definition))
+        })
+        .transpose()?;
+    for command in commands {
+        if command["document_id"]
+            .as_str()
+            .is_some_and(|id| id != doc.id())
+            || command["source_revision"]
+                .as_u64()
+                .is_some_and(|revision| revision != doc.revision())
+        {
+            return Err("Path preview source changed".into());
+        }
+        if command["op"] == "path.create" && current.is_none() {
+            let nodes = command["nodes"]
+                .as_array()
+                .ok_or("Path creation needs a nodes array")?;
+            if nodes.len() > 128 {
+                return Err("Paths require at most 128 anchors".into());
+            }
+            let nodes =
+                Vec::<Anchor>::deserialize(&command["nodes"]).map_err(|error| error.to_string())?;
+            let frame = creation_frame([doc.width(), doc.height()], command)?;
+            current = Some((
+                [frame[0], frame[1]],
+                creation_source(frame, command, nodes)?,
+            ));
+        } else {
+            let layer = target.ok_or("Choose an editable Pen path")?;
+            if command["layer"].as_str() != Some(layer.id()) {
+                return Err("Path preview target changed".into());
+            }
+            let (origin, source) = current.as_mut().ok_or("Choose an editable Pen path")?;
+            update_definition(source, *origin, command)?;
+        }
+        if let Some((_, source)) = &current {
+            validate_controls(doc, source)?;
+        }
+    }
+    if commands.is_empty() {
+        if let Some((_, source)) = &current {
+            validate_controls(doc, source)?;
+        }
+    }
+    Ok(current)
+}
+
+fn validate_controls(doc: crate::engine::view::DocumentView<'_>, source: &Source) -> Result<(), String> {
+    let Some(native) = doc.native() else {
+        return source.validate_structure();
+    };
+    let Content::Bezier { nodes, closed, stroke_width, .. } = &source.content else {
+        return Err("Choose an editable Pen path".into());
+    };
+    crate::raster::CanvasLimits::Native.check(source.width, source.height)?;
+    use crate::source::prepared::validation;
+    validation::matrix(source.matrix)?;
+    validation::bezier(nodes, *closed, *stroke_width, native.budget())
 }
 fn selection_command(doc: &Document, c: &Value) -> Result<Value, String> {
     let target = c["path"].as_str().ok_or("Supply the source path ID")?;
@@ -461,4 +614,91 @@ pub(crate) fn to_mask(doc: &mut Document, index: usize, c: &Value) -> Result<(),
         doc.wand_source,
     ) = before;
     result
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::*;
+    use crate::engine::{view::DocumentView, Engine};
+
+    #[test]
+    fn metadata_controls_match_engine_path_commands_at_both_depths() {
+        for depth in [8, 16] {
+            let mut doc = Document::new_depth(32, 24, depth).unwrap();
+            create(&mut doc, &json!({"op":"path.create","nodes":[{"point":[2,3]},{"point":[14,11]},{"point":[20,6]}],
+                "stroke":[12345,23457,34569,65535]})).unwrap();
+            let layer = doc.layers.first_mut().unwrap();
+            layer.x = -3;
+            layer.y = 5;
+            std::sync::Arc::make_mut(layer.source.as_mut().unwrap()).matrix =
+                [1.1, 0.25, -0.1, 0.9, 2., -1.];
+            let id = layer.id.clone();
+            let before = serde_json::to_value(&doc).unwrap();
+            for mut command in [
+                json!({"op":"path.node.move","index":1,"point":[17,12]}),
+                json!({"op":"path.handle.move","index":0,"handle":"out","point":[5,8]}),
+                json!({"op":"path.node.add","point":[22,13]}),
+                json!({"op":"path.node.split","index":0,"t":0.4}),
+                json!({"op":"path.node.delete","index":1}),
+                json!({"op":"path.node.convert","index":1,"smooth":true}),
+                json!({"op":"path.update","closed":true,"fill":[12347,23459,34571,45679]}),
+            ] {
+                command["layer"] = json!(id);
+                command["document_id"] = json!(doc.id);
+                command["source_revision"] = json!(doc.revision);
+                let view = DocumentView::from(&doc);
+                let target = view.layers().find(|layer| layer.id() == id).unwrap();
+                let (origin, controls) = preview_controls(view, Some(target), &[command.clone()])
+                    .unwrap()
+                    .unwrap();
+                let expected = Engine::preview_edits(doc.clone(), &[command]).unwrap();
+                let expected = expected.layers.iter().find(|layer| layer.id == id).unwrap();
+                assert_eq!(origin, [expected.x, expected.y]);
+                assert_eq!(
+                    serde_json::to_value(&controls).unwrap(),
+                    serde_json::to_value(&expected.source).unwrap()
+                );
+                assert_eq!(serde_json::to_value(&doc).unwrap(), before);
+            }
+            let command = json!({"op":"path.create","frame":[-4,2,20,18],"nodes":[{"point":[5,6],"in_handle":[2,4],"out_handle":[8,8],"smooth":true}]});
+            let (origin, controls) = preview_controls((&doc).into(), None, &[command.clone()])
+                .unwrap()
+                .unwrap();
+            let expected = Engine::preview_edits(doc.clone(), &[command]).unwrap();
+            let expected = expected.layers.first().unwrap();
+            assert_eq!(origin, [expected.x, expected.y]);
+            assert_eq!(
+                serde_json::to_value(controls).unwrap(),
+                serde_json::to_value(&expected.source).unwrap()
+            );
+        }
+    }
+    #[test]
+    fn control_preview_rejects_stale_targets_invalid_intermediates_and_unbounded_paths() {
+        let mut doc = Document::new(32, 24).unwrap();
+        create(
+            &mut doc,
+            &json!({"op":"path.create","nodes":[{"point":[2,3]},{"point":[14,11]}]}),
+        )
+        .unwrap();
+        let target = doc.layers.first().unwrap();
+        let command = json!({"op":"path.node.move","layer":target.id,"index":0,"point":[4,5]});
+        for field in ["document_id", "source_revision", "layer"] {
+            let mut changed = command.clone();
+            changed[field] = if field == "source_revision" {
+                json!(doc.revision + 1)
+            } else {
+                json!("other")
+            };
+            assert!(preview_controls((&doc).into(), Some(target.into()), &[changed]).is_err());
+        }
+        let invalid = json!({"op":"path.update","layer":target.id,"stroke_width":-1});
+        let repaired = json!({"op":"path.update","layer":target.id,"stroke_width":2});
+        assert!(
+            preview_controls((&doc).into(), Some(target.into()), &[invalid, repaired]).is_err()
+        );
+        assert!(preview_controls((&doc).into(), Some(target.into()), &vec![command; 101]).is_err());
+        let oversized = json!({"op":"path.create","nodes":vec![json!({"point":[1,1]});129]});
+        assert!(preview_controls((&doc).into(), None, &[oversized]).is_err());
+    }
 }

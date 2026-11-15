@@ -194,6 +194,86 @@ fn durable_pending_drop_and_restart_rebuild_exact_debt_without_resuming_a_writer
     drop(connection);
 }
 #[test]
+fn relocated_original_restart_restores_pending_and_closed_debt_without_resuming_a_writer() {
+    for close in [false, true] {
+        let f = Fixture::new();
+        let (_engine, connection) = f.connection();
+        let context = PersistentRootContext::from_explicit_state(&connection).unwrap();
+        let runtime = SourceRuntime::new(context.clone(), limits()).unwrap();
+        let session = runtime.begin().unwrap();
+        let path = f.base.join("external.psb");
+        fs::write(&path, b"original with filesystem metadata").unwrap();
+        let lease = NativeLease::acquire(&path, || Ok(())).unwrap();
+        let inventory = lease
+            .freeze_inventory(&session.resident(), &|| Ok(()))
+            .unwrap();
+        let observed = inventory.observe_external(&|| Ok(())).unwrap();
+        let intent = session
+            .persist_pending(quota_frame(&session, &observed), &observed, &|| Ok(()))
+            .unwrap();
+        let plan = intent.plan(&observed, &|| Ok(())).unwrap();
+        let retained = plan
+            .backup_directory()
+            .join(plan.retained_original_name().unwrap());
+        let expected = plan.expected_version().unwrap();
+        // Transport/restart fixture only; fs::rename grants no Root writer receipt.
+        fs::rename(&path, &retained).unwrap();
+        let named = crate::file_safety::open_native_identity(&retained).unwrap();
+        assert_eq!(
+            crate::file_safety::identity(&named).unwrap(),
+            expected.identity
+        );
+        drop(named);
+        drop(plan);
+        if close {
+            let proof = unchanged_outcome(&intent, &observed);
+            intent.abort(&proof, &|| Ok(())).unwrap();
+        } else {
+            drop(intent);
+        }
+        let debt = runtime.disk().admitted().unwrap();
+        drop(observed);
+        drop(inventory);
+        drop(lease);
+        drop(session);
+        drop(runtime);
+        let restored = SourceRuntime::new(context, limits()).unwrap();
+        let session = restored.begin().unwrap();
+        assert_eq!(restored.disk().admitted().unwrap(), debt);
+        assert!(!path.exists());
+        assert_eq!(
+            fs::read(&retained).unwrap(),
+            b"original with filesystem metadata"
+        );
+        let state = restored.inventory.lock().unwrap();
+        let registry = &state.as_ref().unwrap().publications;
+        assert!(registry
+            .refuse_destination(
+                f.held.as_ref().unwrap().identity(),
+                std::ffi::OsStr::new("alias-of-pending-original.psb"),
+                Some(expected.identity)
+            )
+            .is_err());
+        assert_eq!(registry.entries[0].closed.is_some(), close);
+        drop(state);
+        // The planned name is reserved independently of a supplied identity hint.
+        let directory = Directory::open(retained.parent().unwrap()).unwrap();
+        assert!(restored
+            .inventory
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .publications
+            .refuse_destination(directory.identity(), retained.file_name().unwrap(), None)
+            .is_err());
+        drop(directory);
+        drop(session);
+        drop(restored);
+        drop(connection);
+    }
+}
+#[test]
 fn partial_intent_latches_existing_runtime_and_restart_refuses_without_deleting_bytes() {
     let f = Fixture::new();
     let (_engine, connection) = f.connection();
@@ -423,11 +503,22 @@ fn empty_prearmed_outcome_keeps_pending_growth_but_native_checkpoint_remains_rea
     };
     let runtime = SourceRuntime::new(context.clone(), checkpoint_limits()).unwrap();
     let mut engine = crate::engine::Engine::new();
-    engine.doc = crate::engine::Document::new_depth(2, 2, 16).unwrap();
-    engine.doc.layers[0]
+    engine
+        .resident_state_mut()
+        .expect("resident fixture")
+        .document = crate::engine::Document::new_depth(2, 2, 16).unwrap();
+    engine
+        .resident_state_mut()
+        .expect("resident fixture")
+        .document
+        .layers[0]
         .pixels
         .set16(0, 0, [12345, 23456, 34567, 0]);
-    engine.doc.layers[0]
+    engine
+        .resident_state_mut()
+        .expect("resident fixture")
+        .document
+        .layers[0]
         .pixels
         .set16(1, 1, [1, 257, 65534, 65535]);
     let cache = crate::engine::scene::LegacyTileCache::new(&runtime.resident(), 4).unwrap();
@@ -679,4 +770,86 @@ fn durable_physical_creation_token_is_idempotent_exact_session_role_and_file() {
     drop(session);
     drop(runtime);
     drop(connection);
+}
+
+#[test]
+fn source_root_census_revalidates_complete_publication_members_and_refuses_same_stamp_changes() {
+    let f = Fixture::new();
+    let (_engine, connection) = f.connection();
+    let context = PersistentRootContext::from_explicit_state(&connection).unwrap();
+    let runtime = SourceRuntime::new(context, limits()).unwrap();
+    let session = runtime.begin().unwrap();
+    let path = f.base.join("external.psb");
+    fs::write(&path, b"old").unwrap();
+    let lease = NativeLease::acquire(&path, || Ok(())).unwrap();
+    let inventory = lease
+        .freeze_inventory(&session.resident(), &|| Ok(()))
+        .unwrap();
+    let observed = inventory.observe_external(&|| Ok(())).unwrap();
+    let intent = session
+        .persist_pending(quota_frame(&session, &observed), &observed, &|| Ok(()))
+        .unwrap();
+    let name = format!(
+        "external-intent-{}.pbi",
+        uuid::Uuid::from_bytes(intent.frame.id)
+    );
+    let (mut file, modified, bytes) = {
+        let state = runtime.inventory.lock().unwrap();
+        let held = state
+            .as_ref()
+            .unwrap()
+            .files
+            .iter()
+            .find(|held| held.path.file_name().and_then(|n| n.to_str()) == Some(name.as_str()))
+            .unwrap();
+        (held.file.try_clone().unwrap(), held.modified, held.bytes)
+    };
+    let identity = crate::file_safety::identity(&file).unwrap();
+    assert_eq!(
+        session
+            .check_publication_member(&name, identity, &|| Ok(()))
+            .unwrap(),
+        intent.sha256()
+    );
+    assert_eq!(
+        session
+            .checkpoint_census(&|| Ok(()))
+            .unwrap()
+            .registered_count(),
+        0
+    );
+    assert!(session
+        .check_publication_member(&name, (99, 99), &|| Ok(()))
+        .is_err());
+    assert!(session
+        .checkpoint_census(&|| Err("cancel census".into()))
+        .is_err());
+    let mut original = [0];
+    owned_rename::read_at(&file, bytes - 1, &mut original).unwrap();
+    file.seek(SeekFrom::Start(bytes - 1)).unwrap();
+    file.write_all(&[original[0] ^ 0xff]).unwrap();
+    file.sync_all().unwrap();
+    file.set_times(fs::FileTimes::new().set_modified(modified))
+        .unwrap();
+    session.check().unwrap();
+    assert!(session
+        .check_publication_member(&name, identity, &|| Ok(()))
+        .is_err());
+    assert!(session.checkpoint_census(&|| Ok(())).is_err());
+    file.seek(SeekFrom::Start(bytes - 1)).unwrap();
+    file.write_all(&original).unwrap();
+    file.sync_all().unwrap();
+    file.set_times(fs::FileTimes::new().set_modified(modified))
+        .unwrap();
+    assert_eq!(
+        session
+            .checkpoint_census(&|| Ok(()))
+            .unwrap()
+            .registered_count(),
+        0
+    );
+    let closing = super::settlement::Closing::prepare(&intent, &|| Ok(())).unwrap();
+    assert!(session.checkpoint_census(&|| Ok(())).is_err());
+    assert_eq!(fs::read(&path).unwrap(), b"old");
+    drop(closing);
 }

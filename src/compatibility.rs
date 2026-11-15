@@ -1,8 +1,26 @@
 //! View-only PSD/PSB save reports derived from the codec's standard layer plan.
-use crate::{engine::Document, psd};
+use crate::{engine::{view::MaskView, Document}, psd};
 use serde::Serialize;
 use std::collections::HashMap;
 mod native;
+
+fn mask_steps_baked(mask: MaskView<'_>, standard_mask: bool, standard_density: bool) -> bool {
+    let paint = match mask.step_count().saturating_sub(usize::from(standard_density)) {
+        0 => return false,
+        1 => 0,
+        // Photoshop's white default is the implicit starting coverage of a
+        // standard mask. The import represents it as an explicit fill step.
+        2 if standard_mask && mask.step(0).is_some_and(|fill| {
+            fill.kind() == "fill" && fill.enabled() && fill.weight() == 1.
+                && (fill.value() == 255. || standard_density && fill.value() == 0.)
+                && fill.settings().is_null()
+        }) => 1,
+        _ => return true,
+    };
+    !mask.step(paint).is_some_and(|step| {
+        step.kind() == "paint" && step.enabled() && step.weight() == 1.
+    })
+}
 
 /// A native report retains its allocation admission through review and response
 /// serialization. It cannot be converted into an uncharged owned report.
@@ -52,6 +70,10 @@ pub enum StandardLayout {
 #[serde(rename_all = "snake_case")]
 pub enum Representation {
     Raster,
+    Adjustment,
+    SolidColor,
+    GradientFill,
+    PatternFill,
     Folder,
     BakedFolderRaster,
     BakedIntoFolder,
@@ -72,6 +94,42 @@ pub enum LossCode {
     MaskLinkPrivate,
     TransformOriginalsPrivate,
     OpacityQuantized,
+    AdjustmentRenderingApproximate,
+}
+const FILL_RASTERIZED: &str = "Solid Color fill remains editable in PeerBrush sources. Other editors receive its current raster appearance.";
+const VIBRANCE_APPROXIMATION: &str = "The editable Legacy Vibrance settings are preserved. Photoshop can re-render this adjustment differently from the current merged composite.";
+const PHOTO_FILTER_APPROXIMATION: &str = "The editable Photo Filter settings are preserved. Photoshop can clip bright colors differently with Preserve Luminosity enabled.";
+const HUE_SATURATION_APPROXIMATION: &str = "The editable Hue/Saturation settings are preserved. Photoshop can render the adjustment differently from the current merged composite, especially at feathered color ranges.";
+const COLOR_LOOKUP_APPROXIMATION: &str = "The embedded Color Lookup source is preserved. Photoshop may interpolate it differently from the current merged composite.";
+const LEGACY_LOOKUP_ORDER: &str = "This earlier PeerBrush CUBE retains its original appearance and saved table-order field. Photoshop can interpret that field differently.";
+const LOOKUP_WITHOUT_PROFILE: &str = "The embedded lookup table is preserved. Photoshop may need a compiled ICC profile to render the adjustment after reopening.";
+
+fn standard_adjustment_approximation(layer: crate::engine::view::LayerView<'_>) -> Option<&'static str> {
+    let effect = layer.effect(0)?;
+    let settings = effect.settings();
+    match effect.kind() {
+        crate::effects::vibrance::KIND if settings["vibrance"].as_f64().is_some_and(|value| value != 0.) =>
+            Some(VIBRANCE_APPROXIMATION),
+        crate::effects::photo_filter::KIND if settings["preserve_luminosity"].as_bool().unwrap_or(true)
+            && settings["density"].as_f64().unwrap_or(25.) > 0. => Some(PHOTO_FILTER_APPROXIMATION),
+        crate::effects::photoshop_hue_saturation::KIND => Some(HUE_SATURATION_APPROXIMATION),
+        crate::effects::color_lookup::KIND => {
+            if settings["lut_format"].as_str().unwrap_or("").is_empty()
+                && settings["profile"].as_str().unwrap_or("").is_empty()
+                && settings["table_order"] == "rgb"
+            {
+                Some(LEGACY_LOOKUP_ORDER)
+            } else if crate::effects::color_lookup::uses_table(settings)
+                && crate::effects::color_lookup::source_size(settings, "profile") == 0
+                && settings["embed_profile"] != true
+            {
+                Some(LOOKUP_WITHOUT_PROFILE)
+            } else {
+                Some(COLOR_LOOKUP_APPROXIMATION)
+            }
+        }
+        _ => None,
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -114,24 +172,41 @@ pub struct SaveReport {
 /// Acceptance applies only to the exact source whose output was reviewed.
 /// It never overrides protection, destination conflicts or final save guards.
 pub(crate) fn authorize_save(doc: &Document, request: &serde_json::Value) -> Result<(), String> {
-    let accepted = request
+    let accepted = save_acceptance(request)?;
+    authorize_report(&report(doc)?, request, accepted)
+}
+pub(crate) fn authorize_snapshot(
+    snapshot: &crate::engine::view::DocumentSnapshot,
+    request: &serde_json::Value,
+) -> Result<(), String> {
+    let accepted = save_acceptance(request)?;
+    authorize_report(report_snapshot(snapshot)?.data(), request, accepted)
+}
+fn save_acceptance(request: &serde_json::Value) -> Result<bool, String> {
+    request
         .get("accept_editability_loss")
         .map(|value| {
             value
                 .as_bool()
                 .ok_or("accept_editability_loss must be boolean")
         })
-        .transpose()?
-        .unwrap_or(false);
-    let report = report(doc)?;
+        .transpose()
+        .map(|value| value.unwrap_or(false))
+        .map_err(String::from)
+}
+fn authorize_report(
+    report: &SaveReport,
+    request: &serde_json::Value,
+    accepted: bool,
+) -> Result<(), String> {
     if !report.save_allowed {
         return Err(
             "Cannot save an unsupported PSD without explicitly creating a compatible copy".into(),
         );
     }
     if accepted
-        && (request["document_id"].as_str() != Some(doc.id.as_str())
-            || request["expected_revision"].as_u64() != Some(doc.revision))
+        && (request["document_id"].as_str() != Some(report.document_id.as_str())
+            || request["expected_revision"].as_u64() != Some(report.revision))
     {
         return Err(
             "Save-loss acceptance requires the reviewed document_id and expected_revision".into(),
@@ -221,6 +296,8 @@ pub fn report(doc: &Document) -> Result<SaveReport, String> {
             },
         });
     }
+    let pattern_geometry = psd::patterns::Geometry::Rotation;
+    let standard_patterns = psd::resident_patterns(doc, &plan, pattern_geometry, psd::PLACED_PATTERN_OVERLAY_FORMAT, &|| Ok(()))?;
     let represented = order
         .iter()
         .filter(|(_, section)| *section != 3)
@@ -241,6 +318,9 @@ pub fn report(doc: &Document) -> Result<SaveReport, String> {
             }
             parent = ancestor.parent.as_deref();
         }
+        let standard_style = represented.get(layer.id.as_str()).and_then(|section| {
+            psd::standard_styles(doc, layer, *section, &plan, &standard_patterns)
+        });
         let standard = if !tree {
             Representation::CompositeOnly
         } else if represented.contains_key(layer.id.as_str()) {
@@ -250,6 +330,21 @@ pub fn report(doc: &Document) -> Result<SaveReport, String> {
                 } else {
                     Representation::Folder
                 }
+            } else if psd::adjustments::standard_invert(
+                layer.into(), doc.width, doc.height, !plan.composite,
+            ) || psd::adjustments::standard_tone(
+                layer.into(), doc.width, doc.height, !plan.composite, psd::adjustments::ToneRecords::current(doc.bit_depth),
+            ).is_some() {
+                Representation::Adjustment
+            } else if (layer.kind == "fill" && standard_style.is_some()) || (!plan.composite
+                && psd::adjustments::standard_solid(layer.into(), doc.width, doc.height).is_some())
+            {
+                Representation::SolidColor
+            } else if !plan.composite && psd::gradient_fill::standard(layer.into(), doc.width, doc.height).is_some() {
+                Representation::GradientFill
+            } else if psd::patterns::standard(layer.into(), doc.width, doc.height, pattern_geometry)
+                .and_then(|fill| standard_patterns.record(fill)).is_some() {
+                Representation::PatternFill
             } else {
                 Representation::Raster
             }
@@ -272,7 +367,14 @@ pub fn report(doc: &Document) -> Result<SaveReport, String> {
             sources.push("folder_hierarchy");
             loss(LossCode::FolderBaked, "Folder color effects bake the folder and its children into one standard raster. The original folder tree and effects require PeerBrush sources.");
         }
-        if !layer.effects.is_empty() {
+        if standard == Representation::Adjustment {
+            if let Some(message) = standard_adjustment_approximation(layer.into()) {
+                loss(LossCode::AdjustmentRenderingApproximate, message);
+            }
+        }
+        if !layer.effects.is_empty() && standard_style.is_none()
+            && !matches!(standard, Representation::Adjustment | Representation::GradientFill | Representation::PatternFill)
+        {
             sources.push("effect_stack");
             if standard == Representation::Raster && crate::effects::active(layer) {
                 loss(LossCode::EffectsBaked, "Layer effects are baked into the standard raster; editable effect settings require PeerBrush sources.");
@@ -287,18 +389,21 @@ pub fn report(doc: &Document) -> Result<SaveReport, String> {
             sources.push("editable_text_vector_source");
             loss(LossCode::EditableSourceRasterized, "Text, vector or path definitions have a standard raster appearance; editable definitions require PeerBrush sources. Photoshop text/vector objects are not written.");
         }
+        if layer.kind == "fill" && !matches!(standard, Representation::SolidColor | Representation::GradientFill | Representation::PatternFill) {
+            sources.push("editable_solid_color");
+            loss(LossCode::EditableSourceRasterized, FILL_RASTERIZED);
+        }
         if let Some(mask) = &layer.mask {
             sources.push("mask_stack");
-            sources.push("mask_link");
-            if !mask.linked {
-                loss(LossCode::MaskLinkPrivate, "The unlinked mask choice is retained in PeerBrush sources. Photoshop mask-link editing behavior is not written or verified; another editor may link the mask. Standard mask pixels and the current composite are preserved.");
+            if !represented.contains_key(layer.id.as_str()) {
+                sources.push("mask_link");
+                if !mask.linked {
+                    loss(LossCode::MaskLinkPrivate, "The unlinked mask choice requires PeerBrush sources because this layer has no separate standard mask record.");
+                }
             }
-            if mask.steps.len() > 1
-                || mask
-                    .steps
-                    .iter()
-                    .any(|step| step.kind != "paint" || !step.enabled || step.weight != 1.)
-            {
+            let standard_mask = represented.contains_key(layer.id.as_str());
+            let density = standard_mask && psd::standard_mask_density(layer.into()).is_some();
+            if mask_steps_baked(MaskView::Resident(mask), standard_mask, density) {
                 loss(LossCode::MaskStackBaked, "Mask steps are combined into a standard raster mask where this layer remains separate. Editable step settings require PeerBrush sources.");
             }
         }
@@ -323,7 +428,7 @@ pub fn report(doc: &Document) -> Result<SaveReport, String> {
             standard_mask: layer.mask.is_some() && represented.contains_key(layer.id.as_str()),
             standard_bounds: represented
                 .get(layer.id.as_str())
-                .map(|section| psd::standard_bounds(doc, layer, *section)),
+                .map(|section| psd::standard_bounds(doc, layer, *section, standard_style)),
             standard,
             standard_container: container,
             peerbrush_sources: sources,
@@ -336,7 +441,13 @@ pub fn report(doc: &Document) -> Result<SaveReport, String> {
         .filter(|layer| {
             matches!(
                 layer.standard,
-                Representation::Raster | Representation::Folder | Representation::BakedFolderRaster
+                Representation::Raster
+                    | Representation::SolidColor
+                    | Representation::GradientFill
+                    | Representation::PatternFill
+                    | Representation::Adjustment
+                    | Representation::Folder
+                    | Representation::BakedFolderRaster
             )
         })
         .count()

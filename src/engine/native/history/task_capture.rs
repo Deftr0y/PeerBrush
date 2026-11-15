@@ -91,6 +91,7 @@ pub(crate) struct TaskCapture {
     request: TaskRequest,
     pub(super) history: DocumentKey,
     pub(super) epoch: u64,
+    pub(super) name_from_save: bool,
 }
 #[derive(Clone, Copy)]
 pub(crate) struct TaskEntry<'a> {
@@ -199,6 +200,7 @@ impl NativeHistory {
             request,
             history: self.identity,
             epoch: self.epoch,
+            name_from_save: self.name_from_save,
         };
         if captured.entries().next().is_none() {
             return Err("No active batches for this task in retained history".into());

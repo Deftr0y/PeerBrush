@@ -13,10 +13,73 @@ fn image(pixels: &[[u8; 4]]) -> Image {
         bytes: pixels.iter().flatten().copied().collect(),
     }
 }
+#[test]
+fn levels_channels_apply_independently_before_master_and_preserve_alpha() {
+    let mut im = image(&[[0,128,255,123], [17,25,61,0]]);
+    let settings = json!({"input_mapping":"exact","output_black":0.125,"output_white":0.625,
+        "channels":[{"output_black":1.,"output_white":0.},{"output_black":0.25,"output_white":0.25},{}]});
+    effects::apply(&mut im, "levels", &settings).unwrap();
+    assert_eq!(im.get(0,0), [159,64,159,123]);
+    assert_eq!(im.get(1,0), [17,25,61,0]);
+    for channels in [json!(null), json!([]), json!([{},{}]), json!([{}, {}, {}, {}]),
+        json!([null,{},{}]), json!([{"channels":[]},{},{}]), json!([{"gamma":10},{},{}]),
+        json!([{"input_mapping":"legacy"},{},{}]), json!([{"black":0.5,"white":0.4},{},{}])] {
+        assert!(effects::normalized("levels", &json!({"channels":channels})).is_err());
+    }
+}
+
+#[test]
+fn exact_levels_preserve_legacy_sources_and_validate_extended_ranges() {
+    let legacy = json!({"black":17./255.,"white":18./255.});
+    let mut exact = legacy.clone();
+    exact["input_mapping"] = json!("exact");
+    let mut old = image(&[[17,18,255,123], [17,18,255,0]]);
+    let mut new = image(&[[17,18,255,123], [17,18,255,0]]);
+    effects::apply(&mut old, "levels", &legacy).unwrap();
+    effects::apply(&mut new, "levels", &exact).unwrap();
+    assert_eq!(old.get(0,0), [0,100,255,123]);
+    assert_eq!(new.get(0,0), [0,255,255,123]);
+    assert_eq!(new.get(1,0), [17,18,255,0]);
+    assert!(effects::normalized("levels", &legacy).unwrap().get("input_mapping").is_none());
+    assert_eq!(effects::defaults("levels")["input_mapping"], "exact");
+    for settings in [json!({"gamma":9.99}), json!({"input_mapping":"exact","black":253./255.,"white":254./255.,"gamma":0.1}),
+        json!({"input_mapping":"exact","black":0.,"white":2./255.})] {
+        assert!(effects::normalized("levels", &settings).is_ok(), "{settings}");
+    }
+    for settings in [json!({"gamma":10.}), json!({"gamma":0.099}), json!({"input_mapping":null}),
+        json!({"input_mapping":true}), json!({"input_mapping":"unknown"}),
+        json!({"input_mapping":"exact","black":1.,"white":1.}),
+        json!({"input_mapping":"exact","black":0.5,"white":0.4})] {
+        assert!(effects::normalized("levels", &settings).is_err(), "{settings}");
+    }
+}
+
+#[test]
+fn levels_output_range_preserves_alpha_and_supports_reversed_and_flat_ranges() {
+    for (low, high, expected) in [
+        (0.2, 0.8, [51, 82, 204, 123]),
+        (0.8, 0.2, [204, 173, 51, 123]),
+        (0.4, 0.4, [102, 102, 102, 123]),
+    ] {
+        let mut im = image(&[[0, 51, 255, 123], [11, 23, 47, 0]]);
+        effects::apply(&mut im, "levels", &json!({"output_black":low,"output_white":high})).unwrap();
+        assert_eq!(im.get(0, 0), expected);
+        assert_eq!(im.get(1, 0), [11, 23, 47, 0]);
+    }
+    let settings = json!({"black":0.25,"white":0.75,"gamma":2.,"output_black":0.1,"output_white":0.5});
+    assert!((effects::map_value("levels", &settings, 0.375) - 0.3).abs() < 0.000001);
+    for key in ["output_black", "output_white"] {
+        for value in [json!(-0.01), json!(1.01), json!("0.5"), json!(null)] {
+            let mut settings = json!({});
+            settings[key] = value;
+            assert!(effects::normalized("levels", &settings).is_err());
+        }
+    }
+}
 fn fixture() -> (Engine, String) {
     let mut e = Engine::new();
-    e.doc = Document::new(32, 16).unwrap();
-    let l = &mut e.doc.layers[0];
+    e.resident_state_mut().expect("resident fixture").document = Document::new(32, 16).unwrap();
+    let l = &mut e.resident_state_mut().expect("resident fixture").document.layers[0];
     for y in 0..16 {
         for x in 0..32 {
             l.pixels.set(
@@ -37,10 +100,10 @@ fn edit(e: &mut Engine, c: Value) {
     e.edit("human", &[c], None, None, "effect").unwrap();
 }
 fn render(e: &Engine) -> Vec<u8> {
-    e.doc.preview(None, 32, None, false).unwrap().2
+    e.resident_state().expect("resident fixture").document.preview(None, 32, None, false).unwrap().2
 }
 fn cached(e: &Engine) -> Arc<Image> {
-    effects::prepare(&e.doc, &vec![None; e.doc.layers.len()]).unwrap()[0]
+    effects::prepare(&e.resident_state().expect("resident fixture").document, &vec![None; e.resident_state().expect("resident fixture").document.layers.len()]).unwrap()[0]
         .as_ref()
         .unwrap()
         .clone()
@@ -212,7 +275,7 @@ fn effect_preview_equals_commit_revisited_cache_undo_and_editable_psd_sources() 
         ),
     ] {
         let (mut e, id) = fixture();
-        let raw = e.doc.layers[0].pixels.rgba();
+        let raw = e.resident_state().expect("resident fixture").document.layers[0].pixels.rgba();
         edit(
             &mut e,
             json!({"op":"effect.add","layer":id,"kind":kind,"settings":first}),
@@ -220,26 +283,26 @@ fn effect_preview_equals_commit_revisited_cache_undo_and_editable_psd_sources() 
         let original = render(&e);
         let first_cache = cached(&e);
         assert!(Arc::ptr_eq(&first_cache, &cached(&e)));
-        let effect = e.doc.layers[0].effects[0].id.clone();
+        let effect = e.resident_state().expect("resident fixture").document.layers[0].effects[0].id.clone();
         // Another effect/layer edit does not replace this source or prevent revisiting its controls.
         edit(
             &mut e,
             json!({"op":"layer.add","kind":"paint","name":"Another layer"}),
         );
         let command = json!({"op":"effect.update","layer":id,"effect":effect,"settings":last});
-        let revision = e.doc.revision;
-        let history = e.undo.len();
-        let draft = Engine::preview_edits(e.doc.clone(), &[command.clone()]).unwrap();
+        let revision = e.resident_state().expect("resident fixture").document.revision;
+        let history = e.resident_state().expect("resident fixture").undo.len();
+        let draft = Engine::preview_edits(e.resident_state().expect("resident fixture").document.clone(), &[command.clone()]).unwrap();
         let preview = draft.preview(None, 32, None, false).unwrap().2;
-        assert_eq!(e.doc.revision, revision);
-        assert_eq!(e.undo.len(), history);
+        assert_eq!(e.resident_state().expect("resident fixture").document.revision, revision);
+        assert_eq!(e.resident_state().expect("resident fixture").undo.len(), history);
         edit(&mut e, command);
         assert_eq!(render(&e), preview, "{kind}");
         let changed = render(&e);
         assert_ne!(original, changed, "{kind}");
-        let layer = e.doc.layers.iter().find(|l| l.id == id).unwrap();
+        let layer = e.resident_state().expect("resident fixture").document.layers.iter().find(|l| l.id == id).unwrap();
         assert_eq!(layer.pixels.rgba(), raw);
-        let bytes = psd::encode(&e.doc).unwrap();
+        let bytes = psd::encode(&e.resident_state().expect("resident fixture").document).unwrap();
         let loaded = psd::decode(&bytes).unwrap();
         assert!(!loaded.read_only);
         assert_eq!(loaded.preview(None, 32, None, false).unwrap().2, changed);
@@ -259,8 +322,8 @@ fn invalid_effects_and_color_only_mask_requests_roll_back_atomically() {
     let (mut e, id) = fixture();
     let before = render(&e);
     for kind in ["color_balance", "hsl", "bloom"] {
-        let revision = e.doc.revision;
-        let history = e.undo.len();
+        let revision = e.resident_state().expect("resident fixture").document.revision;
+        let history = e.resident_state().expect("resident fixture").undo.len();
         assert!(e
             .edit(
                 "human",
@@ -273,9 +336,9 @@ fn invalid_effects_and_color_only_mask_requests_roll_back_atomically() {
                 "invalid mask"
             )
             .is_err());
-        assert_eq!(e.doc.revision, revision);
-        assert_eq!(e.undo.len(), history);
-        assert!(e.doc.layers[0].mask.is_none());
+        assert_eq!(e.resident_state().expect("resident fixture").document.revision, revision);
+        assert_eq!(e.resident_state().expect("resident fixture").undo.len(), history);
+        assert!(e.resident_state().expect("resident fixture").document.layers[0].mask.is_none());
     }
     assert!(e
         .edit(
@@ -289,8 +352,8 @@ fn invalid_effects_and_color_only_mask_requests_roll_back_atomically() {
             "invalid effect"
         )
         .is_err());
-    assert!(e.doc.layers[0].effects.is_empty());
-    assert!(e.undo.is_empty());
+    assert!(e.resident_state().expect("resident fixture").document.layers[0].effects.is_empty());
+    assert!(e.resident_state().expect("resident fixture").undo.is_empty());
     assert_eq!(render(&e), before);
 }
 

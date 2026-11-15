@@ -2,7 +2,7 @@
 
 Open **Image → Whole-image filters…** to process the entire composited image, independently of the selected layer. Source layers, folders, masks and layer effects remain editable. The document filter stack runs after layer compositing; the top filter runs last.
 
-Search the library by name, category or effect ID. Fifteen original presets cover Tone, Color and Blur & light. Thumbnails render a shared native-depth reference image; choosing a preset previews the actual project. Strength sits beside the effect name, followed by its settings. **Filtered** shows the pending result, **Current image** shows the existing stack, and **Original** bypasses all whole-image filters for comparison.
+Search the library by name, category or effect ID. Fifteen original presets cover Tone, Color and Blur & light. Every thumbnail uses the same generated still-life photo, rendered through the filter engine at the project's native depth. Hover over a preset or focus its row with the keyboard to compare its effect side by side with the original photo. Selecting the preset previews the actual project. **Filtered** shows the pending result, **Current image** shows the existing stack, and **Original** bypasses all whole-image filters.
 
 **Apply filter** adds one undoable filter. Selecting an existing stack entry and **Apply changes** updates it in one edit. **Cancel**, Escape, closing the browser or switching projects discards the pending preview. Newer shared edits cancel it; a stale preview cannot overwrite newer work. **Image → Filter stack** provides bypass, removal, ordering and compact strength controls. Dragging strength previews actual pixels and commits once on release; double-click its value to type.
 

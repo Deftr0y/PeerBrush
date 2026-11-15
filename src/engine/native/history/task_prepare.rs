@@ -104,13 +104,15 @@ impl TaskCapture {
                 let mut step = || -> Result<(NativeDocument, Intent)> {
                     let current =
                         copy_metadata(&working.core.metadata, working.budget(), &checked)?;
-                    let result = metadata_inverse::inverse(
+                    let result = metadata_inverse::inverse_with_saved_name(
                         &entry.before().core.metadata,
                         &entry.after().core.metadata,
                         current,
                         &mut sources,
                         working.budget(),
                         &checked,
+                        self.name_from_save
+                            && working.metadata().name() == self.current().metadata().name(),
                     )?;
                     if !result.report.conflicts.is_empty() {
                         conflict_report = Some(result.report);
@@ -392,6 +394,7 @@ impl HistorySnapshot {
                     retired,
                     sources,
                     truncated,
+                    raster_damage: None,
                     _retirement_charge: charge,
                 })
             }

@@ -176,10 +176,12 @@ pub(super) struct Verified {
     pub cdhash: String,
     pub framework: PathBuf,
     pub release: Option<InstalledRelease>,
+    app: PathBuf,
     snapshots: Vec<(PathBuf, Stamp)>,
 }
 impl Verified {
     pub fn recheck(&self) -> Result<(), String> {
+        crate::packaged::homebrew::require_direct_app(&self.app)?;
         for (path, before) in &self.snapshots {
             if stamp(path)? != *before {
                 return Err(
@@ -466,10 +468,10 @@ pub(super) fn verify_selected(
     if !machine_version(&selected) {
         return Err("The selected native update version is invalid".into());
     }
-    if semver::Version::parse(&selected).map_err(|_| "Invalid selected version")?
-        <= semver::Version::parse(env!("CARGO_PKG_VERSION"))
-            .map_err(|_| "Invalid running version")?
-    {
+    let next = semver::Version::parse(&selected).map_err(|_| "Invalid selected version")?;
+    let current = semver::Version::parse(env!("CARGO_PKG_VERSION"))
+        .map_err(|_| "Invalid running version")?;
+    if !crate::updates::release_version_cmp(&next, &current).is_gt() {
         return Err("The installed selection is not newer than this owner".into());
     }
     verify_app(app, configuration, cancel, &selected, true)
@@ -509,6 +511,7 @@ fn verify_app(
     version: &str,
     selected: bool,
 ) -> Result<Verified, String> {
+    crate::packaged::homebrew::require_direct_app(&app)?;
     objc2::rc::autoreleasepool(|_| {
         if cancel.load(Ordering::Acquire) {
             return Err("App update verification cancelled".into());
@@ -596,6 +599,7 @@ fn verify_app(
             cdhash: String::new(),
             framework: framework.clone(),
             release: None,
+            app: app.clone(),
             snapshots,
         };
         super::verify_inventory(&framework, &notice, true)?;
@@ -622,7 +626,7 @@ fn verify_app(
                 );
             }
         }
-        if selected && info["CFBundleVersion"] != version {
+        if selected && info["CFBundleVersion"] != crate::sparkle::bundle_version(version).as_ref() {
             return Err("Installed app differs from the native selected version".into());
         }
         let mut scratch = Scratch::new(cancel.clone())?;
@@ -761,10 +765,17 @@ mod tests {
         fs::create_dir(&directory).unwrap();
         let file = directory.join("installed-release.json");
         fs::write(&file, b"original source identity").unwrap();
+        fs::create_dir_all(directory.join("Contents/MacOS")).unwrap();
+        fs::write(
+            directory.join("Contents/MacOS/peerbrush"),
+            b"synthetic proof app",
+        )
+        .unwrap();
         let proof = Verified {
             cdhash: String::new(),
             framework: directory.clone(),
             release: None,
+            app: directory.clone(),
             snapshots: vec![(file.clone(), stamp(&file).unwrap())],
         };
         proof.recheck().unwrap();

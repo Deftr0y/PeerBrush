@@ -11,11 +11,11 @@ fn first_dab_reuses_an_exact_displayed_baseline_across_gesture_keys() {
     for depth in [8, 16] {
         for isolate in [false, true] {
             let mut engine = Engine::new();
-            engine.doc = Document::new_depth(160, 96, depth).unwrap();
-            let target = engine.doc.layers[0].id.clone();
+            engine.resident_state_mut().expect("resident fixture").document = Document::new_depth(160, 96, depth).unwrap();
+            let target = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
             let layer = isolate.then_some(target.as_str());
             let mut cache = Cache::default();
-            let mut base = engine.doc.clone();
+            let mut base = engine.resident_state().expect("resident fixture").document.clone();
             cache.render(&base, "", None, 117, layer, false).unwrap();
             for gesture in ["first", "second"] {
                 let command = json!({"op":"paint","layer":target,"points":[[50,45]],"radius":4,"color":[233,84,32,255]});
@@ -37,7 +37,7 @@ fn first_dab_reuses_an_exact_displayed_baseline_across_gesture_keys() {
                     reference.preview(None, 117, layer, false).unwrap().2
                 );
                 assert_eq!(draft.layers[0].pixels, reference.layers[0].pixels);
-                assert_eq!(engine.doc.revision, base.revision);
+                assert_eq!(engine.resident_state().expect("resident fixture").document.revision, base.revision);
                 // A cancelled draft cannot serve as the next gesture's baseline.
                 let (_, cancelled) = cache
                     .edit_with_region(base.clone(), std::slice::from_ref(&command), "cancelled")
@@ -46,7 +46,7 @@ fn first_dab_reuses_an_exact_displayed_baseline_across_gesture_keys() {
                 engine
                     .edit("human", &[command], Some(base.revision), None, "Dot")
                     .unwrap();
-                base = engine.doc.clone();
+                base = engine.resident_state().expect("resident fixture").document.clone();
                 cache.render(&base, "", None, 117, layer, false).unwrap();
             }
             let command = json!({"op":"paint","layer":target,"points":[[90,45]],"radius":4});
@@ -62,8 +62,8 @@ fn first_dab_reuses_an_exact_displayed_baseline_across_gesture_keys() {
             );
             engine.undo("human").unwrap();
             engine.undo("human").unwrap();
-            assert!(engine.doc.layers[0].pixels.tiles.is_empty());
-            assert!(engine.doc.layers[0].pixels.samples16.is_empty());
+            assert!(engine.resident_state().expect("resident fixture").document.layers[0].pixels.tiles.is_empty());
+            assert!(engine.resident_state().expect("resident fixture").document.layers[0].pixels.samples16.is_empty());
         }
     }
 }

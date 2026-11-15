@@ -166,18 +166,77 @@ impl Source36 {
         })
     }
 }
+impl Layer36 {
+    pub(in crate::engine) fn header_bytes(&self, check: &dyn Fn() -> Result<()>) -> Result<usize> {
+        let mut measure = Measure::new(check);
+        measure.add(std::mem::size_of::<Self>())?;
+        layer_heap(self, &mut measure)?;
+        Ok(measure.bytes())
+    }
+}
+
 impl Document36 {
     pub(crate) fn copy_runtime(
         &self,
         pool: &ResidentBudget,
         check: &dyn Fn() -> Result<()>,
     ) -> Result<Admitted<Self>> {
-        if !self.runtime_bound(pool) {
+        self.copy_runtime_with_layers(&[], pool, check)
+    }
+    /// Extra layer headers share their already-owned payloads and source references.
+    /// The command must assign fresh IDs and relationships before publication.
+    pub(crate) fn copy_runtime_with_layers(
+        &self,
+        extra: &[usize],
+        pool: &ResidentBudget,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<Admitted<Self>> {
+        self.copy_runtime_with_layers_from(self, extra, pool, check)
+    }
+    /// Copy selected headers from an immutable clipboard in the same source pool.
+    pub(crate) fn copy_runtime_with_layers_from(
+        &self,
+        source: &Self,
+        extra: &[usize],
+        pool: &ResidentBudget,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<Admitted<Self>> {
+        let count = self
+            .layers
+            .len()
+            .checked_add(extra.len())
+            .ok_or("Native layer count overflow")?;
+        if (!extra.is_empty() && count > 100) || extra.iter().any(|&i| i >= source.layers.len()) {
+            return Err("Invalid duplicate layer header request".into());
+        }
+        if !self.runtime_bound(pool) || !source.runtime_bound(pool) {
             return Err("Only owned native metadata can share runtime payloads".into());
         }
         self.visit_rasters(|_| Ok(()))?;
-        let bytes = self.header_bytes(check)?;
-        let owner = MetadataCharge::reserve(pool, bytes, check)?;
+        if !std::ptr::eq(self, source) {
+            source.visit_rasters(|_| Ok(()))?;
+        }
+        let mut measure = Measure::new(check);
+        measure.add(self.header_bytes(check)?)?;
+        for &i in extra {
+            measure.add(source.layers[i].header_bytes(check)?)?;
+        }
+        let owner = MetadataCharge::reserve(pool, measure.bytes(), check)?;
+        let mut layers = Vec::new();
+        layers
+            .try_reserve_exact(count)
+            .map_err(|_| "Native layer header allocation refused")?;
+        if layers.capacity() > count {
+            return Err("Native layer headers exceed admission".into());
+        }
+        for input in self
+            .layers
+            .iter()
+            .chain(extra.iter().map(|&i| &source.layers[i]))
+        {
+            check()?;
+            layers.push(layer(input, check)?);
+        }
         let copied = Self {
             id: text(&self.id)?,
             name: text(&self.name)?,
@@ -191,12 +250,30 @@ impl Document36 {
                 .map(MetadataPayload::shared)
                 .transpose()?,
             srgb_tagged: self.srgb_tagged,
+            psd_intentionally_untagged: self.psd_intentionally_untagged,
+            psd_rgb8_multiply: self.psd_rgb8_multiply,
+            psd_resolution: self.psd_resolution,
+            psd_print_scale: self.psd_print_scale,
+            psd_pixel_aspect: self.psd_pixel_aspect,
+            psd_grid: self.psd_grid,
+            psd_layer_id_seed: self.psd_layer_id_seed,
+            psd_print_flags: self.psd_print_flags,
+            psd_print_flags_info: self.psd_print_flags_info,
+            psd_copyright: self.psd_copyright,
+            psd_file_info: self.psd_file_info.as_ref().map(MetadataPayload::shared).transpose()?,
+            psd_global_angle: self.psd_global_angle,
+            psd_global_altitude: self.psd_global_altitude,
             psd_global_mask: self
                 .psd_global_mask
                 .as_ref()
                 .map(MetadataPayload::shared)
                 .transpose()?,
-            layers: vector(&self.layers, check, |value| layer(value, check))?,
+            psd_global_metadata: self
+                .psd_global_metadata
+                .as_ref()
+                .map(MetadataPayload::shared)
+                .transpose()?,
+            layers,
             filters: vector(&self.filters, check, |value| effect(value, check))?,
             selection: self.selection,
             selection_polygon: self
@@ -228,6 +305,14 @@ impl Document36 {
         pool: &ResidentBudget,
         check: &dyn Fn() -> Result<()>,
     ) -> Result<(Self, Arc<MetadataCharge>)> {
+        if let Some(metadata) = &self.psd_global_metadata {
+            crate::psd::global_metadata::validate(metadata)?;
+        }
+        if let Some(bytes) = &self.psd_file_info {
+            let working = crate::psd::file_info::validation_working_bytes(bytes)?;
+            let _charge = MetadataCharge::reserve(pool, working, check)?;
+            crate::psd::file_info::validate(bytes)?;
+        }
         if self
             .icc_profile
             .as_ref()
@@ -252,7 +337,21 @@ impl Document36 {
             bit_depth,
             icc_profile,
             srgb_tagged,
+            psd_intentionally_untagged,
+            psd_rgb8_multiply,
+            psd_resolution,
+            psd_print_scale,
+            psd_pixel_aspect,
+            psd_grid,
+            psd_layer_id_seed,
+            psd_print_flags,
+            psd_print_flags_info,
+            psd_copyright,
+            psd_file_info,
+            psd_global_angle,
+            psd_global_altitude,
             psd_global_mask,
+            psd_global_metadata,
             layers,
             filters,
             selection,
@@ -271,7 +370,23 @@ impl Document36 {
             bit_depth,
             icc_profile: icc_profile.map(|v| v.bind(pool, check)).transpose()?,
             srgb_tagged,
+            psd_intentionally_untagged,
+            psd_rgb8_multiply,
+            psd_resolution,
+            psd_print_scale,
+            psd_pixel_aspect,
+            psd_grid,
+            psd_layer_id_seed,
+            psd_print_flags,
+            psd_print_flags_info,
+            psd_copyright,
+            psd_file_info: psd_file_info.map(|value| value.bind(pool, check)).transpose()?,
+            psd_global_angle,
+            psd_global_altitude,
             psd_global_mask: psd_global_mask.map(|v| v.bind(pool, check)).transpose()?,
+            psd_global_metadata: psd_global_metadata
+                .map(|v| v.bind(pool, check))
+                .transpose()?,
             layers: owned_vector(layers, check, |v| bind_layer(v, pool, check))?,
             filters: owned_vector(filters, check, |v| bind_effect(v, pool, check))?,
             selection,
@@ -299,11 +414,16 @@ impl Document36 {
         self.icc_profile
             .as_ref()
             .is_none_or(|v| v.uses_budget(pool))
+            && self.psd_file_info.as_ref().is_none_or(|v| v.uses_budget(pool))
             && self
                 .psd_global_mask
                 .as_ref()
                 .is_none_or(|v| v.uses_budget(pool))
             && self.warnings.uses_budget(pool)
+            && self
+                .psd_global_metadata
+                .as_ref()
+                .is_none_or(|v| v.uses_budget(pool))
             && self
                 .selection_polygon
                 .as_ref()
@@ -329,36 +449,7 @@ impl Document36 {
         self.name.heap(&mut measure)?;
         measure.vector(&self.layers)?;
         for layer in &self.layers {
-            if !layer.opacity.is_finite()
-                || layer
-                    .source
-                    .as_ref()
-                    .is_some_and(|s| s.matrix.iter().any(|v| !v.is_finite()))
-            {
-                return Err("Nonfinite native header metadata".into());
-            }
-            for value in [&layer.id, &layer.name, &layer.kind, &layer.blend] {
-                value.heap(&mut measure)?;
-            }
-            for value in [layer.parent.as_ref(), layer.clip_to.as_ref()]
-                .into_iter()
-                .flatten()
-            {
-                value.heap(&mut measure)?;
-            }
-            raster_heap(&layer.pixels, &mut measure)?;
-            if let Some(mask) = &layer.mask {
-                measure.vector(&mask.steps)?;
-                for step in &mask.steps {
-                    if !step.weight.is_finite() || !step.value.is_finite() {
-                        return Err("Nonfinite native mask metadata".into());
-                    }
-                    step.id.heap(&mut measure)?;
-                    step.kind.heap(&mut measure)?;
-                    raster_heap(&step.pixels, &mut measure)?;
-                }
-            }
-            effect_heap(&layer.effects, &mut measure)?;
+            layer_heap(layer, &mut measure)?;
         }
         effect_heap(&self.filters, &mut measure)?;
         for coverage in [
@@ -372,6 +463,39 @@ impl Document36 {
         }
         Ok(measure.bytes())
     }
+}
+fn layer_heap(layer: &Layer36, measure: &mut Measure<'_>) -> Result<()> {
+    if !layer.opacity.is_finite()
+        || layer
+            .source
+            .as_ref()
+            .is_some_and(|s| s.matrix.iter().any(|v| !v.is_finite()))
+    {
+        return Err("Nonfinite native header metadata".into());
+    }
+    for value in [&layer.id, &layer.name, &layer.kind, &layer.blend] {
+        value.heap(measure)?;
+    }
+    for value in [layer.parent.as_ref(), layer.clip_to.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        value.heap(measure)?;
+    }
+    raster_heap(&layer.pixels, measure)?;
+    if let Some(mask) = &layer.mask {
+        measure.vector(&mask.steps)?;
+        for step in &mask.steps {
+            if !step.weight.is_finite() || !step.value.is_finite() {
+                return Err("Nonfinite native mask metadata".into());
+            }
+            step.id.heap(measure)?;
+            step.kind.heap(measure)?;
+            raster_heap(&step.pixels, measure)?;
+        }
+    }
+    effect_heap(&layer.effects, measure)?;
+    Ok(())
 }
 fn bind_coverage(
     value: Coverage36,

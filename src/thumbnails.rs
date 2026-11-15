@@ -10,7 +10,7 @@ use std::{
 
 pub struct Request {
     pub key: String,
-    pub document: Document,
+    pub document: Arc<Document>,
     pub layer: String,
     pub mask: bool,
     pub step: Option<usize>,
@@ -68,7 +68,7 @@ impl Worker {
                 if completed
                     .send(Reply {
                         key: request.key,
-                        document: request.document.id,
+                        document: request.document.id.clone(),
                         revision: request.document.revision,
                         pixels,
                     })

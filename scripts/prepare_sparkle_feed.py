@@ -9,7 +9,7 @@ import sys
 import tempfile
 from xml.etree import ElementTree as ET
 
-from package import git, source_files
+from package import git, macos_bundle_version, release_version_order, source_files
 from package_macos_dmg import MAX_IMAGE_BYTES, bounded_file, inspect_final, private_inspection_directory
 from prepare_site_release import DOWNLOAD, STABLE
 from sparkle_bundle import check_pins
@@ -34,7 +34,10 @@ def feed_bytes(version, record, notes, signature):
     ET.SubElement(channel, 'title').text = 'PeerBrush for macOS'
     item = ET.SubElement(channel, 'item')
     ET.SubElement(item, 'title').text = 'PeerBrush ' + version
-    ET.SubElement(item, f'{{{NS}}}version').text = version
+    build = macos_bundle_version(version)
+    ET.SubElement(item, f'{{{NS}}}version').text = build
+    if build != version:
+        ET.SubElement(item, f'{{{NS}}}shortVersionString').text = version
     ET.SubElement(item, f'{{{NS}}}minimumSystemVersion').text = '12.0.0'
     ET.SubElement(item, f'{{{NS}}}hardwareRequirements').text = 'arm64'
     ET.SubElement(item, 'description', {f'{{{NS}}}format': 'plain-text'}).text = notes
@@ -50,7 +53,9 @@ def prepare(args, key_input, *, private_loopback=False):
             or git(root, 'rev-parse', 'HEAD').decode().strip() != args.commit
             or git(root, 'status', '--porcelain', '--untracked-files=normal')
             or not all(re.fullmatch(STABLE, v) for v in (args.version, args.previous_version))
-            or tuple(map(int, args.version.split('.'))) <= tuple(map(int, args.previous_version.split('.')))):
+            or release_version_order(args.version) <= release_version_order(args.previous_version)
+            or tuple(map(int, macos_bundle_version(args.version).split('.')))
+            <= tuple(map(int, macos_bundle_version(args.previous_version).split('.')))):
         raise ValueError('Requires a clean reviewed macOS checkout and a strictly newer stable version.')
     pins = check_pins({p: b for p, b, _ in source_files(root, args.commit)}, args.version)
     if pins is None:

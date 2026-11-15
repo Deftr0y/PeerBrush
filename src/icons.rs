@@ -4,13 +4,46 @@ use eframe::egui::{self, Color32, Rect, Stroke, Vec2};
 pub enum Icon {
     Cursor,
     Text,
+    AlignLeft,
+    AlignCenter,
+    AlignRight,
+    WrapText,
+    VectorPath,
+    ClosedPath,
+    CornerAnchor,
+    SmoothAnchor,
+    SelectionAdd,
+    SelectionSubtract,
+    SelectionIntersect,
+    SelectionExpand,
+    SelectionContract,
+    ConnectedMatches,
+    AllMatches,
+    MirrorHorizontal,
+    MirrorVertical,
+    QuarterTurnLeft,
+    QuarterTurnRight,
+    LiquifyPush,
+    LiquifyExpand,
+    LiquifyPinch,
+    Cutout,
+    SelectionOverlay,
     Move,
     Rotate,
     Scale,
+    Skew,
+    Distort,
+    Perspective,
+    GridWarp,
+    Snap,
     Brush,
+    StrokeWidth,
+    StrokeOpacity,
     Smudge,
     Clone,
     Heal,
+    RetouchAligned,
+    RetouchRestart,
     Liquify,
     Eraser,
     Fill,
@@ -30,10 +63,20 @@ pub enum Icon {
     Redo,
     Adjust,
     Frame,
+    CanvasBounds,
+    TrimAlpha,
+    SingleLayer,
+    LayerStack,
+    Check,
+    Cross,
+    Stop,
+    Skip,
+    NumberedList,
     Mask,
     Solo,
     Trash,
     Down,
+    Left,
     Right,
     Up,
     Lock,
@@ -56,6 +99,12 @@ pub enum Icon {
     Bloom,
     Invert,
     Grayscale,
+    ToneSteps,
+    ToneRamp,
+    PreserveSamples,
+    QuantizeSamples,
+    FinePixels,
+    CoarsePixels,
 }
 fn tool_cell(icon: Icon) -> Option<usize> {
     match icon {
@@ -151,6 +200,175 @@ pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, enabled: bool) {
     };
     match icon {
         Icon::Text => paint_tinted(painter, rect, icon, color),
+        Icon::WrapText => {
+            line(&[(-11., -8.), (11., -8.)]);
+            line(&[(-11., -2.), (7., -2.), (11., 1.), (11., 6.), (8., 9.), (-11., 9.)]);
+            line(&[(-7., 5.), (-11., 9.), (-7., 13.)]);
+        }
+        Icon::Snap => {
+            line(&[(-11., -10.), (-11., 2.), (-8., 8.), (-3., 11.), (3., 11.), (8., 8.), (11., 2.), (11., -10.)]);
+            line(&[(-5., -10.), (-5., 1.), (-3., 4.), (3., 4.), (5., 1.), (5., -10.)]);
+            line(&[(-11., -10.), (-5., -10.)]);
+            line(&[(5., -10.), (11., -10.)]);
+        }
+        Icon::StrokeWidth => polygon(&[(-12., -1.), (12., -6.), (12., 6.), (-12., 1.)]),
+        Icon::StrokeOpacity => {
+            for (left, opacity) in [(-12., 0.25), (-6., 0.5), (0., 0.75), (6., 1.)] {
+                painter.rect_filled(
+                    Rect::from_min_max(point(left, -4.), point(left + 6., 4.)),
+                    0.,
+                    color.gamma_multiply(opacity),
+                );
+            }
+        }
+        Icon::RetouchAligned | Icon::RetouchRestart => {
+            line(&[(-13., -7.), (-3., -7.)]);
+            line(&[(-8., -12.), (-8., -2.)]);
+            if matches!(icon, Icon::RetouchAligned) {
+                line(&[(-3., -2.), (4., 5.)]);
+                painter.circle_stroke(point(8., 9.), 4. * f, stroke);
+            } else {
+                line(&[(9., 10.), (13., 6.), (13., 2.), (10., -2.), (5., -4.), (-1., -4.)]);
+                line(&[(3., -8.), (-1., -4.), (3., 0.)]);
+            }
+        }
+        Icon::MirrorHorizontal | Icon::MirrorVertical => {
+            let axis = |x, y| {
+                if matches!(icon, Icon::MirrorHorizontal) { (x, y) } else { (y, x) }
+            };
+            line(&[axis(0., -13.), axis(0., 13.)]);
+            polygon(&[axis(-4., -9.), axis(-4., 9.), axis(-12., 9.)]);
+            line(&[axis(4., -9.), axis(12., 9.), axis(4., 9.), axis(4., -9.)]);
+        }
+        Icon::QuarterTurnLeft | Icon::QuarterTurnRight => {
+            let direction = if matches!(icon, Icon::QuarterTurnLeft) { -1_f32 } else { 1_f32 };
+            let reflect = |(x, y): (f32, f32)| (direction * x, y);
+            line(&[(7., 7.), (3., 10.), (-3., 10.), (-8., 7.), (-11., 2.), (-10., -4.),
+                (-6., -9.), (0., -11.), (6., -9.), (10., -5.)].map(reflect));
+            line(&[(4., -5.), (10., -5.), (10., -11.)].map(reflect));
+        }
+        Icon::Skew | Icon::Distort | Icon::Perspective | Icon::GridWarp => {
+            let corners = match icon {
+                Icon::Skew => [(-6., -10.), (12., -10.), (6., 10.), (-12., 10.)],
+                Icon::Distort => [(-9., -6.), (11., -12.), (8., 9.), (-12., 11.)],
+                Icon::Perspective => [(-6., -10.), (6., -10.), (12., 10.), (-12., 10.)],
+                _ => [(-11., -9.), (11., -9.), (11., 9.), (-11., 9.)],
+            };
+            let [a, b, c, d] = corners;
+            if matches!(icon, Icon::GridWarp) {
+                line(&[a, (0., -13.), b, (8., 0.), c, (0., 5.), d, (-14., 0.), a]);
+                line(&[(-14., 0.), (0., -4.), (8., 0.)]);
+                line(&[(0., -13.), (0., 5.)]);
+            } else {
+                line(&[a, b, c, d, a]);
+                for (x, y) in corners {
+                    painter.rect_filled(Rect::from_center_size(point(x, y), Vec2::splat(3.5 * f)), 0., color);
+                }
+            }
+        }
+        Icon::LiquifyPush => {
+            painter.circle_filled(point(-7., 0.), 4. * f, color);
+            line(&[(0., 0.), (12., 0.)]);
+            line(&[(7., -5.), (12., 0.), (7., 5.)]);
+        }
+        Icon::LiquifyExpand | Icon::LiquifyPinch | Icon::SelectionExpand | Icon::SelectionContract => {
+            let outward = matches!(icon, Icon::LiquifyExpand | Icon::SelectionExpand);
+            if matches!(icon, Icon::SelectionExpand | Icon::SelectionContract) {
+                outline((-7., -7.), (7., 7.));
+            }
+            for (x, y) in [(-1., 0.), (1., 0.), (0., -1.), (0., 1.)] {
+                let (from, to) = if outward { (4., 12.) } else { (12., 4.) };
+                let tail = (from * x, from * y);
+                let head = (to * x, to * y);
+                let base = to + if outward { -4. } else { 4. };
+                line(&[tail, head]);
+                line(&[(base * x - 3. * y, base * y + 3. * x), head,
+                    (base * x + 3. * y, base * y - 3. * x)]);
+            }
+        }
+        Icon::Cutout | Icon::SelectionOverlay => {
+            if matches!(icon, Icon::SelectionOverlay) {
+                painter.rect_filled(
+                    Rect::from_min_max(point(-12., -12.), point(12., 12.)), 2., color.gamma_multiply(0.32),
+                );
+            } else {
+                for (x, y) in [(-12., -12.), (6., -12.), (-12., 6.), (6., 6.)] {
+                    painter.rect_filled(Rect::from_min_max(point(x, y), point(x + 6., y + 6.)), 0., color.gamma_multiply(0.5));
+                }
+            }
+            painter.circle_filled(rect.center(), 7. * f, color);
+        }
+        Icon::VectorPath | Icon::ClosedPath => {
+            let anchors = [(-10., 7.), (-2., -8.), (10., 3.)];
+            line(&anchors);
+            if matches!(icon, Icon::ClosedPath) {
+                line(&[anchors[2], anchors[0]]);
+            }
+            for (x, y) in anchors {
+                painter.rect_filled(Rect::from_center_size(point(x, y), Vec2::splat(4. * f)), 0., color);
+            }
+        }
+        Icon::CornerAnchor | Icon::SmoothAnchor => {
+            if matches!(icon, Icon::CornerAnchor) {
+                line(&[(-12., 8.), (0., 0.), (10., 9.)]);
+            } else {
+                line(&[(-12., 8.), (-8., 6.), (-4., 2.), (0., 0.), (4., -2.), (8., -2.), (12., 0.)]);
+                line(&[(-10., 5.), (10., -5.)]);
+                for (x, y) in [(-10., 5.), (10., -5.)] {
+                    painter.circle_filled(point(x, y), 1.7 * f, color);
+                }
+            }
+            painter.rect_filled(Rect::from_center_size(point(0., 0.), Vec2::splat(5. * f)), 0., color);
+        }
+        Icon::SelectionAdd | Icon::SelectionSubtract | Icon::SelectionIntersect => {
+            let fill = |(left, top), (right, bottom)| {
+                painter.rect_filled(
+                    Rect::from_min_max(point(left, top), point(right, bottom)),
+                    0.,
+                    color.gamma_multiply(0.5),
+                );
+            };
+            match icon {
+                Icon::SelectionAdd => {
+                    fill((-12., -10.), (4., 5.));
+                    fill((-4., 5.), (12., 10.));
+                    fill((4., -5.), (12., 5.));
+                }
+                Icon::SelectionSubtract => {
+                    fill((-12., -10.), (4., -5.));
+                    fill((-12., -5.), (-4., 5.));
+                }
+                _ => {
+                    fill((-4., -5.), (4., 5.));
+                }
+            }
+            outline((-12., -10.), (4., 5.));
+            outline((-4., -5.), (12., 10.));
+        }
+        Icon::ConnectedMatches | Icon::AllMatches => {
+            let centers = if matches!(icon, Icon::ConnectedMatches) {
+                [(-7., -4.), (0., -4.), (0., 3.), (7., 3.)]
+            } else {
+                [(-8., -8.), (8., -8.), (-8., 8.), (8., 8.)]
+            };
+            for (x, y) in centers {
+                painter.rect_filled(
+                    Rect::from_center_size(point(x, y), Vec2::splat(7. * f)),
+                    0.,
+                    color,
+                );
+            }
+        }
+        Icon::AlignLeft | Icon::AlignCenter | Icon::AlignRight => {
+            for (y, width) in [(-8., 22.), (-2., 13.), (4., 19.), (10., 11.)] {
+                let left = match icon {
+                    Icon::AlignLeft => -11.,
+                    Icon::AlignRight => 11. - width,
+                    _ => -width * 0.5,
+                };
+                painter.line_segment([point(left, y), point(left + width, y)], stroke);
+            }
+        }
         Icon::Cursor => polygon(&[
             (-8., -11.),
             (-8., 8.),
@@ -434,9 +652,81 @@ pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, enabled: bool) {
                 );
             }
         }
+        Icon::ToneSteps | Icon::ToneRamp => {
+            let steps = if matches!(icon, Icon::ToneSteps) { 4 } else { 24 };
+            for step in 0..steps {
+                let left = -12. + 24. * step as f32 / steps as f32;
+                let right = -12. + 24. * (step + 1) as f32 / steps as f32;
+                let tone = 45 + 195 * step / (steps - 1);
+                painter.rect_filled(
+                    Rect::from_min_max(point(left, -6.), point(right, 6.)),
+                    0.,
+                    Color32::from_gray(tone as u8).gamma_multiply(if enabled { 1. } else { 0.4 }),
+                );
+            }
+        }
         Icon::Frame => {
             for (x, y) in [(-1., -1.), (1., -1.), (-1., 1.), (1., 1.)] {
                 line(&[(x * 5., y * 10.), (x * 10., y * 10.), (x * 10., y * 5.)]);
+            }
+        }
+        Icon::FinePixels | Icon::CoarsePixels => {
+            let cells = if matches!(icon, Icon::FinePixels) { 5 } else { 2 };
+            let step = 24. / cells as f32;
+            for y in 0..cells {
+                for x in 0..cells {
+                    let start = point(-12. + x as f32 * step, -12. + y as f32 * step);
+                    let shade = if x + y < cells - 1 { 100 } else { 225 };
+                    let fill = Color32::from_gray(shade).gamma_multiply(if enabled { 1. } else { 0.4 });
+                    painter.rect_filled(Rect::from_min_size(start, Vec2::splat((step - 1.5) * f)), 0., fill);
+                }
+            }
+        }
+        Icon::PreserveSamples | Icon::QuantizeSamples => {
+            let exact = matches!(icon, Icon::PreserveSamples);
+            for (i, tone) in [45, 83, 120, 159, 198, 238].into_iter().enumerate() {
+                let x = i as f32 * 4. - 12.;
+                let gray = if exact { tone } else if i < 3 { 83 } else { 198 };
+                painter.rect_filled(
+                    Rect::from_min_max(point(x, -8.), point(x + 4., 8.)),
+                    0.,
+                    Color32::from_gray(gray).gamma_multiply(if enabled { 1. } else { 0.4 }),
+                );
+            }
+        }
+        Icon::CanvasBounds | Icon::TrimAlpha => {
+            painter.circle_filled(rect.center(), 5. * f, color);
+            let extent = if matches!(icon, Icon::TrimAlpha) { 6. } else { 12. };
+            outline((-extent, -extent), (extent, extent));
+        }
+        Icon::SingleLayer | Icon::LayerStack => {
+            let y = if matches!(icon, Icon::SingleLayer) { 0. } else { -5. };
+            line(&[(-11., y), (0., y - 6.), (11., y), (0., y + 6.), (-11., y)]);
+            if matches!(icon, Icon::LayerStack) {
+                for y in [0., 5.] {
+                    line(&[(-11., y), (0., y + 6.), (11., y)]);
+                }
+            }
+        }
+        Icon::Check => line(&[(-10., 0.), (-3., 7.), (10., -8.)]),
+        Icon::Cross => {
+            line(&[(-8., -8.), (8., 8.)]);
+            line(&[(-8., 8.), (8., -8.)]);
+        }
+        Icon::Stop => {
+            line(&[(-5., -11.), (5., -11.), (11., -5.), (11., 5.), (5., 11.),
+                (-5., 11.), (-11., 5.), (-11., -5.), (-5., -11.)]);
+            line(&[(-5., 0.), (5., 0.)]);
+        }
+        Icon::Skip => {
+            polygon(&[(-9., -8.), (3., 0.), (-9., 8.)]);
+            line(&[(8., -8.), (8., 8.)]);
+        }
+        Icon::NumberedList => {
+            line(&[(-11., -8.), (-8., -11.), (-8., -2.)]);
+            line(&[(-11., 4.), (-9., 2.), (-6., 3.), (-6., 5.), (-11., 10.), (-6., 10.)]);
+            for y in [-6., 6.] {
+                line(&[(0., y), (11., y)]);
             }
         }
         Icon::Mask => {
@@ -458,6 +748,7 @@ pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, enabled: bool) {
             line(&[(2., -2.), (2., 6.)]);
         }
         Icon::Down => line(&[(-6., -3.), (0., 3.), (6., -3.)]),
+        Icon::Left => line(&[(3., -6.), (-3., 0.), (3., 6.)]),
         Icon::Right => line(&[(-3., -6.), (3., 0.), (-3., 6.)]),
         Icon::Up => line(&[(-6., 3.), (0., -3.), (6., 3.)]),
         Icon::Lock => {
@@ -515,37 +806,24 @@ pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, enabled: bool) {
         | Icon::EllipticalSelection => unreachable!("Selection glyphs use the bundled atlas"),
     }
 }
-fn atlas_image(bytes: &[u8]) -> egui::ColorImage {
-    let mut img = image::load_from_memory(bytes)
-        .expect("Bundled icon atlas")
-        .to_rgba8();
-    // ImageGen's white-on-black source is a glyph coverage map, not canvas artwork.
-    // Decode to white plus alpha once; state tinting never changes the source asset.
-    for pixel in img.pixels_mut() {
-        let coverage = pixel[0].min(pixel[1]).min(pixel[2]);
-        let alpha = ((coverage.saturating_sub(8) as u16 * 255 + 123) / 247) as u8;
-        *pixel = image::Rgba([255, 255, 255, alpha]);
+const ATLAS_CELL: usize = 128;
+const TOOL_ATLAS: &[u8; 6 * 3 * ATLAS_CELL * ATLAS_CELL] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/tool-icons.alpha"));
+const SELECTION_ATLAS: &[u8; 4 * 2 * ATLAS_CELL * ATLAS_CELL] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/selection-icons.alpha"));
+
+fn atlas_image(coverage: &[u8], columns: usize, rows: usize) -> egui::ColorImage {
+    let palette: [Color32; 256] = std::array::from_fn(|alpha| Color32::from_white_alpha(alpha as u8));
+    egui::ColorImage {
+        size: [columns * ATLAS_CELL, rows * ATLAS_CELL],
+        pixels: coverage.iter().map(|&alpha| palette[usize::from(alpha)]).collect(),
     }
-    egui::ColorImage::from_rgba_unmultiplied(
-        [img.width() as usize, img.height() as usize],
-        img.as_raw(),
-    )
 }
 fn paint_atlas(painter: &egui::Painter, rect: Rect, cell: usize, selection: bool, color: Color32) {
     let (name, bytes, columns, rows) = if selection {
-        (
-            "PeerBrush bold selections",
-            include_bytes!("../assets/selection-icons.png").as_slice(),
-            4.0,
-            2.0,
-        )
+        ("PeerBrush bold selections", SELECTION_ATLAS.as_slice(), 4, 2)
     } else {
-        (
-            "PeerBrush bold tools",
-            include_bytes!("../assets/tool-icons.png").as_slice(),
-            6.0,
-            3.0,
-        )
+        ("PeerBrush bold tools", TOOL_ATLAS.as_slice(), 6, 3)
     };
     let id = egui::Id::new(name);
     let texture = if let Some(t) = painter
@@ -556,12 +834,13 @@ fn paint_atlas(painter: &egui::Painter, rect: Rect, cell: usize, selection: bool
     } else {
         let t = painter
             .ctx()
-            .load_texture(name, atlas_image(bytes), egui::TextureOptions::LINEAR);
+            .load_texture(name, atlas_image(bytes, columns, rows), egui::TextureOptions::LINEAR);
         painter.ctx().data_mut(|d| d.insert_temp(id, t.clone()));
         t
     };
-    let col = (cell % columns as usize) as f32;
-    let row = (cell / columns as usize) as f32;
+    let col = (cell % columns) as f32;
+    let row = (cell / columns) as f32;
+    let (columns, rows) = (columns as f32, rows as f32);
     // Keep equal square cells and original padding: wide buttons must not stretch glyphs.
     let uv = Rect::from_min_max(
         egui::pos2(col / columns, row / rows),
@@ -580,10 +859,84 @@ pub fn button(ui: &mut egui::Ui, icon: Icon, tip: &str) -> egui::Response {
 pub fn small_button(ui: &mut egui::Ui, icon: Icon, tip: &str) -> egui::Response {
     button_size(ui, icon, tip, [20., 24.])
 }
+pub(crate) fn menu_choice(ui: &mut egui::Ui, icon: Icon, label: &str, selection: Option<bool>) -> egui::Response {
+    labeled_choice(ui, icon, label, selection, ui.available_width())
+}
+
+pub(crate) fn labeled_choice(
+    ui: &mut egui::Ui,
+    icon: Icon,
+    label: &str,
+    selection: Option<bool>,
+    min_width: f32,
+) -> egui::Response {
+    let selected = selection.unwrap_or(false);
+    let text = ui.painter().layout_no_wrap(
+        label.into(),
+        egui::TextStyle::Button.resolve(ui.style()),
+        Color32::PLACEHOLDER,
+    );
+    let response = ui.add_sized(
+        [min_width.max(text.size().x + 36.), 26.],
+        egui::Button::new("").selected(selected).frame(false),
+    ).on_hover_text(label);
+    response.widget_info(|| match selection {
+        Some(selected) => egui::WidgetInfo::selected(
+            egui::WidgetType::RadioButton, response.enabled(), selected, label,
+        ),
+        None => egui::WidgetInfo::labeled(egui::WidgetType::Button, response.enabled(), label),
+    });
+    let visuals = ui.style().interact_selectable(&response, selected);
+    if selected || response.hovered() {
+        ui.painter().rect_filled(response.rect, 3., visuals.weak_bg_fill);
+    }
+    let start = response.rect.left_center();
+    let glyph = Rect::from_center_size(start + Vec2::new(15., 0.), Vec2::splat(22.));
+    paint(ui.painter(), glyph, icon, response.enabled());
+    let text_pos = start + Vec2::new(30., -text.size().y / 2.);
+    ui.painter().galley(text_pos, text, visuals.text_color());
+    paint_focus(ui, &response);
+    response
+}
+pub fn selectable(ui: &mut egui::Ui, icon: Icon, selected: bool, label: &str) -> egui::Response {
+    let response = choice(ui, icon, selected, label);
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::RadioButton, response.enabled(), selected, label)
+    });
+    response
+}
+pub fn toggle(ui: &mut egui::Ui, icon: Icon, value: &mut bool, label: &str) -> egui::Response {
+    let mut response = choice(ui, icon, *value, label);
+    if response.clicked() {
+        *value = !*value;
+        response.mark_changed();
+    }
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, response.enabled(), *value, label)
+    });
+    response
+}
+fn choice(ui: &mut egui::Ui, icon: Icon, selected: bool, label: &str) -> egui::Response {
+    let response = ui
+        .add_sized([26., 24.], egui::Button::new("").selected(selected))
+        .on_hover_text(label);
+    paint(ui.painter(), response.rect.shrink(3.), icon, response.enabled());
+    paint_focus(ui, &response);
+    response
+}
+
+pub(crate) fn paint_focus(ui: &egui::Ui, response: &egui::Response) {
+    if response.has_focus() {
+        ui.painter().rect_stroke(response.rect.shrink(1.), 2.,
+            Stroke::new(1., ui.visuals().text_color()), egui::StrokeKind::Inside);
+    }
+}
+
 fn button_size(ui: &mut egui::Ui, icon: Icon, tip: &str, size: [f32; 2]) -> egui::Response {
     let r = ui
         .add_sized(size, egui::Button::new("").frame(false))
         .on_hover_text(tip);
+    r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), tip));
     let t = ui
         .ctx()
         .animate_bool_with_time(r.id.with("hover"), r.hovered(), 0.1);
@@ -592,6 +945,7 @@ fn button_size(ui: &mut egui::Ui, icon: Icon, tip: &str, size: [f32; 2]) -> egui
             .rect_filled(r.rect, 4, Color32::WHITE.gamma_multiply(0.07 * t));
     }
     paint(ui.painter(), r.rect.shrink(2.), icon, ui.is_enabled());
+    paint_focus(ui, &r);
     r
 }
 
@@ -601,15 +955,8 @@ mod tests {
 
     #[test]
     fn atlas_coverage_has_clear_background_and_filled_glyphs_in_every_cell() {
-        for (bytes, columns, rows) in [
-            (include_bytes!("../assets/tool-icons.png").as_slice(), 6, 3),
-            (
-                include_bytes!("../assets/selection-icons.png").as_slice(),
-                4,
-                2,
-            ),
-        ] {
-            let image = atlas_image(bytes);
+        for (bytes, columns, rows) in [(TOOL_ATLAS.as_slice(), 6, 3), (SELECTION_ATLAS.as_slice(), 4, 2)] {
+            let image = atlas_image(bytes, columns, rows);
             let [width, height] = image.size;
             assert_eq!(width * rows, height * columns, "Square atlas cells");
             for row in 0..rows {

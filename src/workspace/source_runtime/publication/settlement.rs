@@ -371,7 +371,7 @@ fn capture(
         }
         Ok(())
     };
-    push(Place::Target, &original.target, original.expected.is_some())?;
+    push(Place::Target, &original.target, false)?;
     for (ordinal, old) in original
         .facts
         .iter()
@@ -386,6 +386,9 @@ fn capture(
     }
     if let Some(name) = &original.backup {
         push(Place::CreatedBackup, &original.backups.join(name), false)?;
+    }
+    if let Some(name) = original.retained_original_name() {
+        push(Place::RetainedOriginal, &original.backups.join(name), false)?;
     }
     push(
         Place::Temporary,
@@ -443,6 +446,11 @@ pub(super) fn reobserve(
                     .ok_or("Restored backup name absent")?,
             ),
             Place::Temporary => parent.path().join(&original.temporary),
+            Place::RetainedOriginal => original.backups.join(
+                original
+                    .retained_original_name()
+                    .ok_or("Restored original name absent")?,
+            ),
         };
         if observe(&path)? != Some(binding.fact) {
             return Err("Restored external named facts changed; debt retained".into());
@@ -508,6 +516,11 @@ pub(super) fn census(
                                 original.backup.as_deref() == Some(name.as_os_str())
                                     && binding.fact == fact
                             }
+                            Place::RetainedOriginal => {
+                                original.retained_original_name().as_deref()
+                                    == Some(name.as_os_str())
+                                    && binding.fact == fact
+                            }
                             _ => false,
                         });
                 } else {
@@ -516,6 +529,13 @@ pub(super) fn census(
                     });
                     covered |= original.backup.as_deref() == Some(name.as_os_str())
                         && original.expected.is_some_and(|old| fact.bytes <= old.bytes);
+                    covered |= original.retained_original_name().as_deref()
+                        == Some(name.as_os_str())
+                        && original.expected.is_some_and(|old| {
+                            old.identity == fact.identity
+                                && old.bytes == fact.bytes
+                                && old.modified == fact.modified
+                        });
                 }
             }
             if !covered {

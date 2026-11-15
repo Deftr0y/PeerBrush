@@ -75,6 +75,30 @@ fn parse(
 }
 
 #[test]
+fn official_release_selection_handles_the_04_transition_without_offering_a_downgrade() {
+    let previous = release("0.30.1", "PeerBrush-0.30.1-Windows-x64.zip");
+    let next = release("0.4.0", "PeerBrush-0.4.0-Windows-x64.zip");
+    let patch = release("0.4.1", "PeerBrush-0.4.1-Windows-x64.zip");
+    let report = parse(
+        json!([previous, next, patch]),
+        "0.30.1",
+        Channel::Stable,
+        Target::WindowsX64,
+    )
+    .unwrap();
+    assert_eq!(report.release_version.as_deref(), Some("0.4.1"));
+    assert!(parse(
+        json!([previous, next]),
+        "0.4.0",
+        Channel::Stable,
+        Target::WindowsX64,
+    )
+    .unwrap()
+    .release_version
+    .is_none());
+}
+
+#[test]
 fn release_selection_obeys_semver_channel_architecture_and_published_state() {
     let stable = release("0.30.0", "PeerBrush-0.30.0-Windows-x64.zip");
     let mut preview = release("0.31.0-rc.1", "PeerBrush-0.31.0-rc.1-Windows-x64.zip");
@@ -248,7 +272,7 @@ fn guarded_preferences_survive_restart_and_reject_external_or_future_changes() {
 
 fn workspace() -> (crate::server::Shared, crate::workspace::Registry) {
     let mut engine = crate::engine::Engine::new();
-    engine.doc = crate::engine::Document::new(8, 8).unwrap();
+    engine.resident_state_mut().expect("resident fixture").document = crate::engine::Document::new(8, 8).unwrap();
     let root = Arc::new(Mutex::new(engine));
     let registry = crate::workspace::attach(&root);
     (root, registry)
@@ -259,17 +283,17 @@ fn update_exit_refuses_unsaved_discard_loading_and_source_races() {
     use crate::workspace::lifecycle::{finish_update_exit, update_readiness};
     for depth in [8, 16] {
         let (root, registry) = workspace();
-        root.lock().unwrap().doc = crate::engine::Document::new_depth(8, 8, depth).unwrap();
+        root.lock().unwrap().resident_state_mut().expect("resident fixture").document = crate::engine::Document::new_depth(8, 8, depth).unwrap();
         let reviewed = update_readiness(&registry).unwrap();
         let mut discard = reviewed.clone();
         discard[0].discard = true;
         assert!(finish_update_exit(&registry, &discard).is_err());
-        root.lock().unwrap().doc.revision += 1;
+        root.lock().unwrap().resident_state_mut().expect("resident fixture").document.revision += 1;
         assert!(finish_update_exit(&registry, &reviewed).is_err());
         assert!(update_readiness(&registry).is_err());
         {
             let mut engine = root.lock().unwrap();
-            engine.saved_revision = engine.doc.revision;
+            engine.saved_revision = engine.resident_state().expect("resident fixture").document.revision;
         }
         assert!(update_readiness(&registry).is_ok());
         assert!(!root.lock().unwrap().closed);
@@ -282,11 +306,9 @@ fn update_exit_serializes_live_file_operations_and_rechecks_project_set() {
     let (root, registry) = workspace();
     let reviewed = update_readiness(&registry).unwrap();
     let io = crate::server::FileOperation::begin(&root).unwrap();
-    let frozen_engine = root.lock().unwrap().clone();
+    let retained_io_counter = root.lock().unwrap().file_operations.clone();
     assert_eq!(
-        frozen_engine
-            .file_operations
-            .load(std::sync::atomic::Ordering::Acquire),
+        retained_io_counter.load(std::sync::atomic::Ordering::Acquire),
         1
     );
     assert!(update_readiness(&registry).is_err());
@@ -294,9 +316,7 @@ fn update_exit_serializes_live_file_operations_and_rechecks_project_set() {
     assert!(!root.lock().unwrap().closed);
     drop(io);
     assert_eq!(
-        frozen_engine
-            .file_operations
-            .load(std::sync::atomic::Ordering::Acquire),
+        retained_io_counter.load(std::sync::atomic::Ordering::Acquire),
         0
     );
     root.lock().unwrap().loading = Some(crate::loading::Control::default());
@@ -326,11 +346,11 @@ fn update_exit_protects_external_source_conflicts_without_saving_over_them() {
     let path = directory.join("source.psd");
     crate::server::save(&root, &path).unwrap();
     let reviewed = update_readiness(&registry).unwrap();
-    let pixels = root.lock().unwrap().doc.export_png().unwrap();
+    let pixels = root.lock().unwrap().resident_state().expect("resident fixture").document.export_png().unwrap();
     fs::write(&path, b"newer external source").unwrap();
     assert!(update_readiness(&registry).is_err());
     assert!(finish_update_exit(&registry, &reviewed).is_err());
-    assert_eq!(root.lock().unwrap().doc.export_png().unwrap(), pixels);
+    assert_eq!(root.lock().unwrap().resident_state().expect("resident fixture").document.export_png().unwrap(), pixels);
     assert!(!root.lock().unwrap().closed);
     assert_eq!(fs::read(path).unwrap(), b"newer external source");
     fs::remove_dir_all(directory).unwrap();
@@ -411,8 +431,8 @@ fn instance_preferences_still_work_after_the_original_project_tab_closes() {
         let engine = root.lock().unwrap();
         (
             engine.project_id.clone(),
-            engine.doc.id.clone(),
-            engine.doc.revision,
+            engine.resident_state().expect("resident fixture").document.id.clone(),
+            engine.resident_state().expect("resident fixture").document.revision,
         )
     };
     crate::workspace::close(&root, &project, &document, revision, false, "human").unwrap();

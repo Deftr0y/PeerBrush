@@ -145,19 +145,54 @@ pub struct Ownership {
     pub path: PathBuf,
     project: String,
     files: Mutex<Option<Vec<Arc<Lock>>>>,
+    _charge: Option<Arc<crate::psd::memory36::MetadataCharge>>,
 }
 impl Ownership {
     pub fn open(path: &Path, project: &str) -> Result<Arc<Self>, String> {
-        Self::acquire(path, project, false)
+        Self::acquire(path, project, false, None)
     }
     pub fn save(path: &Path, project: &str) -> Result<Arc<Self>, String> {
-        Self::acquire(path, project, true)
+        Self::acquire(path, project, true, None)
     }
-    fn acquire(path: &Path, project: &str, reuse: bool) -> Result<Arc<Self>, String> {
+    pub(crate) fn save_admitted(
+        path: &Path,
+        project: &str,
+        charge: Arc<crate::psd::memory36::MetadataCharge>,
+    ) -> Result<Arc<Self>, String> {
+        Self::acquire(path, project, true, Some(charge))
+    }
+    pub(crate) fn claim_native(
+        path: PathBuf,
+        project: &str,
+        charge: Arc<crate::psd::memory36::MetadataCharge>,
+        source: &fs::File,
+    ) -> Result<Arc<Self>, String> {
+        let owned = source.try_clone().map_err(|e| e.to_string())?;
+        Self::claim_path(path, project, false, Some(charge), Some(owned))
+    }
+    fn acquire(
+        path: &Path,
+        project: &str,
+        reuse: bool,
+        charge: Option<Arc<crate::psd::memory36::MetadataCharge>>,
+    ) -> Result<Arc<Self>, String> {
         let path = crate::file_safety::canonical_destination(path)?;
+        let source = path
+            .exists()
+            .then(|| fs::File::open(&path))
+            .transpose()
+            .map_err(|e| e.to_string())?;
+        Self::claim_path(path, project, reuse, charge, source)
+    }
+    fn claim_path(
+        path: PathBuf,
+        project: &str,
+        reuse: bool,
+        charge: Option<Arc<crate::psd::memory36::MetadataCharge>>,
+        source: Option<fs::File>,
+    ) -> Result<Arc<Self>, String> {
         let mut keys = vec![(path_key(&path), None)];
-        if path.exists() {
-            let source = fs::File::open(&path).map_err(|e| e.to_string())?;
+        if let Some(source) = source {
             keys.push((
                 identity_key(crate::file_safety::identity(&source)?),
                 Some(source),
@@ -172,6 +207,7 @@ impl Ownership {
             path,
             project: project.into(),
             files: Mutex::new(Some(files)),
+            _charge: charge,
         }))
     }
     /// Own the staged inode before it becomes visible under its destination name.

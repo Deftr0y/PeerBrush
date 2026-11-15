@@ -1,9 +1,12 @@
 //! Provisional generated pixels. File staging never grants document publication.
 use super::*;
+#[cfg(test)]
+use crate::large_document::{BlockRef, Store};
 use crate::{
     engine::scene::StageSession,
-    large_document::{BlockRef, FreshFragment, Reservation, Snapshot, Store},
+    large_document::{FreshFragment, Reservation, Snapshot},
 };
+#[cfg(test)]
 use std::collections::BTreeMap;
 
 pub struct OutputDraft {
@@ -18,6 +21,71 @@ pub struct StagedOutput {
 pub(super) struct Retirement {
     fragments: Vec<FreshFragment>,
     _charge: Option<Reservation>,
+}
+/// All candidate views are released before this owner attempts any unlink.
+/// Output metadata envelopes cover this bounded retirement index.
+#[must_use = "Retire outside Engine locks and retain refused owners for retry"]
+pub(crate) struct AbortBatch {
+    retired: Vec<Retirement>,
+    debt: Option<String>,
+}
+#[must_use]
+pub(crate) struct RefusedAbort {
+    pub(crate) reason: String,
+    pub(crate) batch: AbortBatch,
+}
+impl AbortBatch {
+    pub(super) fn prepare(count: usize) -> Result<Self> {
+        let mut retired = Vec::new();
+        retired
+            .try_reserve_exact(count)
+            .map_err(|_| "Native retirement index allocation refused")?;
+        if retired.capacity() > count {
+            return Err("Native retirement index exceeds admission".into());
+        }
+        Ok(Self {
+            retired,
+            debt: None,
+        })
+    }
+    pub(super) fn capture(&mut self, outputs: Vec<StagedOutput>) {
+        for output in outputs {
+            self.retired.push(output.into_retirement());
+        }
+    }
+    pub(crate) fn retryable(&self) -> bool {
+        self.debt.is_none()
+    }
+    pub(crate) fn retire(
+        mut self,
+        session: &crate::workspace::source_runtime::SourceSession,
+        cleanup: &dyn Fn() -> Result<()>,
+    ) -> std::result::Result<(), RefusedAbort> {
+        if let Some(reason) = &self.debt {
+            return Err(RefusedAbort {
+                reason: reason.clone(),
+                batch: self,
+            });
+        }
+        while let Some(retirement) = self.retired.last_mut() {
+            while let Some(fragment) = retirement.fragments.pop() {
+                if let Err(refused) = session.try_abort_fragment(fragment, &mut || cleanup()) {
+                    if let Some(fragment) = refused.fragment {
+                        // Pop left a slot; restoring the same owner cannot grow the index.
+                        retirement.fragments.push(fragment);
+                    } else {
+                        self.debt = Some(refused.reason.clone());
+                    }
+                    return Err(RefusedAbort {
+                        reason: refused.reason,
+                        batch: self,
+                    });
+                }
+            }
+            self.retired.pop();
+        }
+        Ok(())
+    }
 }
 #[must_use]
 pub struct RefusedOutput {
@@ -75,54 +143,32 @@ impl OutputDraft {
                 "Empty output must be explicit zero after unused fragments are retired".into(),
             );
         }
-        let bytes = count
-            .checked_mul(std::mem::size_of::<BlockRef>() + 256)
-            .and_then(|n| {
-                self.fragments
-                    .capacity()
-                    .checked_mul(std::mem::size_of::<FreshFragment>())
-                    .and_then(|f| n.checked_add(f))
-            })
-            .and_then(|n| n.checked_add(4096))
-            .ok_or("Generated source index footprint overflow")?;
-        self.charge = Some(
-            base.budget()
-                .reserve_bytes(bytes, bytes)
-                .map_err(|e| e.to_string())?,
-        );
-        let mut stores: BTreeMap<[u8; 16], (Store, Vec<BlockRef>)> = BTreeMap::new();
-        for tile in self.surface.physical_tiles() {
-            session.check()?;
-            check()?;
-            let entry = stores
-                .entry(tile.owner().identity())
-                .or_insert_with(|| (tile.owner().clone(), vec![]));
-            entry
-                .1
-                .try_reserve_exact(1)
-                .map_err(|_| "Generated source seal allocation refused")?;
-            entry.1.push(tile.reference());
-        }
-        if self
-            .fragments
-            .iter()
-            .any(|fragment| !stores.contains_key(&fragment.store().identity()))
-        {
+        if self.fragments.iter().any(|fragment| {
+            !self
+                .surface
+                .physical_tiles()
+                .any(|tile| tile.owner().same_owner(fragment.store()))
+        }) {
             return Err("Unused generated fragment must be retired before sealing".into());
         }
-        self.seals.clear();
-        self.seals
-            .try_reserve_exact(stores.len())
-            .map_err(|_| "Generated checkpoint allocation refused")?;
-        for (_, (store, mut refs)) in stores {
-            refs.sort_unstable_by_key(|r| r.fingerprint());
-            refs.dedup();
-            self.seals.push(session.seal_store(
-                &store,
-                &refs,
-                b"PeerBrush provisional native output v1",
-            )?);
-        }
+        let extra_bytes = self
+            .fragments
+            .capacity()
+            .checked_mul(std::mem::size_of::<FreshFragment>())
+            .ok_or("Generated fragment index footprint overflow")?;
+        let sealed = crate::engine::scene::source_copy::seal_sources(
+            std::slice::from_ref(&self.surface),
+            base.budget(),
+            base.disk_budget(),
+            session,
+            b"PeerBrush provisional native output v1",
+            (4096, 4096),
+            extra_bytes,
+            check,
+        )?;
+        self.surface = sealed.rasters.ordinal(1)?.clone();
+        self.seals = sealed.seals;
+        self.charge = Some(sealed.charge);
         session.check()?;
         check()?;
         Ok(())
@@ -237,8 +283,11 @@ impl StagedOutput {
     }
     /// Final Engine path only, after guards. No callbacks or file operations.
     pub(super) fn mark_published(self) {
-        for fragment in self.draft.fragments {
-            let _ = fragment.publish();
+        self.mark_source_published();
+    }
+    pub(crate) fn mark_source_published(&self) {
+        for fragment in &self.draft.fragments {
+            fragment.mark_published();
         }
     }
     pub(super) fn into_draft(self) -> OutputDraft {

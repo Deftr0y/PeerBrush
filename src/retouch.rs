@@ -3,6 +3,7 @@
 pub(crate) mod input;
 #[path = "retouch/native.rs"]
 pub(crate) mod native;
+mod source;
 use crate::{
     brush::{self, Settings},
     engine::{self, Document},

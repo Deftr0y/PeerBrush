@@ -8,7 +8,7 @@ import sys
 from urllib.parse import urlsplit
 
 import acquire_macos_qualification_inputs as transport
-from package_deb import deb_version
+from package_deb import deb_filename
 from package_macos_dmg import bounded_file, private_inspection_directory
 import qualify_linux_deb as qualifier
 from production_readiness import unique_fields
@@ -65,7 +65,7 @@ def acquire(root, output, selection, *, token, environment):
             or not isinstance(t, dict) or set(t) != {'run_id', 'portable_artifact_id', 'portable_artifact_sha256',
                 'deb_artifact_id', 'deb_artifact_sha256', 'source_sha256', 'deb_files'}):
         raise ValueError('Linux native inputs require complete fixed transport and qualification selections.')
-    package = f'peerbrush_{deb_version(version)}_amd64.deb'
+    package = deb_filename(version)
     if (q['portable'] != f'PeerBrush-{version}-Linux-x64.zip' or q['package'] != package
             or not qualifier.sha(q['portable_sha256']) or not qualifier.sha(q['package_sha256'])
             or not qualifier.sha(t['source_sha256']) or not isinstance(t['deb_files'], dict)

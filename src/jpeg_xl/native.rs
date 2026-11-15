@@ -20,10 +20,109 @@ use std::{
 
 pub const ENCODED_LIMIT: usize = 128 * 1024 * 1024;
 const HEADER_LIMIT: usize = 16 * 1024 * 1024;
-const PIXEL_LIMIT: usize = 256 * 1024 * 1024;
 const CALLBACK_LIMIT: usize = 512 * 1024 * 1024;
 const CMS_ROW_LIMIT: usize = 16384;
 const ERROR: &str = "JPEG XL is invalid, unsupported or exceeds the codec memory limit";
+const INPUT_CHUNK: usize = 64 * 1024;
+// libjxl 0.12 retains fewer than 20 bytes at a partial signature or box header.
+const INPUT_CARRY: usize = 32;
+pub(super) const INPUT_WINDOW: usize = INPUT_CHUNK + INPUT_CARRY;
+
+pub(super) enum EncodedInput<'a, 'b> {
+    Slice(&'a [u8]),
+    Stream(&'a mut StreamInput<'b>),
+}
+
+pub(super) struct StreamInput<'a> {
+    input: &'a mut dyn std::io::Read,
+    remaining: u64,
+    window: Vec<u8>,
+    used: usize,
+}
+
+impl<'a> StreamInput<'a> {
+    pub(super) fn new(input: &'a mut dyn std::io::Read, length: u64) -> Result<Self, String> {
+        if !(2..=super::NATIVE_ENCODED_LIMIT).contains(&length) {
+            return Err(ERROR.into());
+        }
+        let mut window = Vec::new();
+        window.try_reserve_exact(INPUT_WINDOW).map_err(|_| ERROR)?;
+        if window.capacity() > INPUT_WINDOW {
+            return Err(ERROR.into());
+        }
+        window.resize(INPUT_WINDOW, 0);
+        Ok(Self { input, remaining: length, window, used: 0 })
+    }
+
+    fn feed(&mut self, decoder: &Decoder, refill: bool) -> Result<(), String> {
+        if self.remaining == 0 {
+            return Err(ERROR.into());
+        }
+        let retained = if refill { unsafe { JxlDecoderReleaseInput(decoder.raw) } } else { 0 };
+        if retained > self.used || retained > INPUT_CARRY {
+            return Err("JPEG XL decoder retained more than its input window".into());
+        }
+        self.window.copy_within(self.used - retained..self.used, 0);
+        let count = INPUT_CHUNK.min(self.remaining as usize);
+        self.used = retained + count;
+        self.input.read_exact(&mut self.window[retained..self.used]).map_err(|_| super::PROTOCOL)?;
+        self.remaining -= count as u64;
+        if !refill && !signature(&self.window[..self.used]) {
+            return Err(ERROR.into());
+        }
+        // The window stays fixed until the decoder releases this registration.
+        unsafe {
+            dec(JxlDecoderSetInput(decoder.raw, self.window.as_ptr(), self.used))?;
+            if self.remaining == 0 {
+                JxlDecoderCloseInput(decoder.raw);
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<(), String> {
+        // The decoder has dropped. Even an early metadata result consumes the
+        // advertised transport, including any boxes after the decoded image.
+        while self.remaining != 0 {
+            let count = self.window.len().min(self.remaining as usize);
+            self.input.read_exact(&mut self.window[..count]).map_err(|_| super::PROTOCOL)?;
+            self.remaining -= count as u64;
+        }
+        super::eof(&mut self.input)
+    }
+}
+
+impl EncodedInput<'_, '_> {
+    fn start(&mut self, decoder: &Decoder) -> Result<(), String> {
+        match self {
+            Self::Slice(bytes) => {
+                if bytes.len() > ENCODED_LIMIT || !signature(bytes) {
+                    return Err(ERROR.into());
+                }
+                unsafe {
+                    dec(JxlDecoderSetInput(decoder.raw, bytes.as_ptr(), bytes.len()))?;
+                    JxlDecoderCloseInput(decoder.raw);
+                }
+                Ok(())
+            }
+            Self::Stream(input) => input.feed(decoder, false),
+        }
+    }
+
+    fn refill(&mut self, decoder: &Decoder) -> Result<(), String> {
+        match self {
+            Self::Slice(_) => Err(ERROR.into()),
+            Self::Stream(input) => input.feed(decoder, true),
+        }
+    }
+
+    pub(super) fn finish(&mut self) -> Result<(), String> {
+        match self {
+            Self::Slice(_) => Ok(()),
+            Self::Stream(input) => input.finish(),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -87,22 +186,8 @@ pub(super) fn version() -> Result<(), String> {
         Err("JPEG XL native library version does not match the reviewed codec".into())
     }
 }
-fn sample_count(info: Info) -> Result<usize, String> {
-    crate::raster::check_size(info.width, info.height)?;
-    if !matches!(info.bit_depth, 8 | 16) {
-        return Err(ERROR.into());
-    }
-    let count = (info.width as usize)
-        .checked_mul(info.height as usize)
-        .and_then(|n| n.checked_mul(4))
-        .ok_or(ERROR)?;
-    if count
-        .checked_mul(usize::from(info.bit_depth / 8))
-        .is_none_or(|n| n > PIXEL_LIMIT)
-    {
-        return Err(ERROR.into());
-    }
-    Ok(count)
+fn sample_count(info: Info, operation: super::Operation) -> Result<usize, String> {
+    Ok(operation.raw_size(info)? / usize::from(info.bit_depth / 8))
 }
 pub(super) fn format(depth: u16) -> JxlPixelFormat {
     JxlPixelFormat {
@@ -391,7 +476,7 @@ impl Drop for Encoder {
     }
 }
 
-fn basic(info: &JxlBasicInfo) -> Result<Info, String> {
+fn basic(info: &JxlBasicInfo, operation: super::Operation) -> Result<Info, String> {
     if !matches!(info.bits_per_sample, 8 | 16)
         || !matches!(info.alpha_bits, 0 | 8 | 16)
         || info.exponent_bits_per_sample != 0
@@ -415,7 +500,7 @@ fn basic(info: &JxlBasicInfo) -> Result<Info, String> {
         height: info.ysize,
         bit_depth: info.bits_per_sample.max(info.alpha_bits) as u16,
     };
-    sample_count(result)?;
+    operation.raw_size(result)?;
     Ok(result)
 }
 unsafe fn icc_profile(
@@ -458,6 +543,34 @@ fn validate_original_profile(cms: &mut Cms, bytes: &[u8]) -> Result<(), String> 
     }
     Ok(())
 }
+
+fn canonical_data_profile(decoder: &Decoder, icc: Vec<u8>) -> Vec<u8> {
+    let mut color = MaybeUninit::<JxlColorEncoding>::uninit();
+    // libjxl returns the structured fields only when the data encoding is
+    // available in that form. An embedded ICC must keep its actual bytes.
+    let status = unsafe {
+        JxlDecoderGetColorAsEncodedProfile(
+            decoder.raw,
+            JxlColorProfileTarget::Data,
+            color.as_mut_ptr(),
+        )
+    };
+    if status == JxlDecoderStatus::Success {
+        let color = unsafe { color.assume_init() };
+        if color.color_space == JxlColorSpace::Rgb
+            && color.white_point == JxlWhitePoint::D65
+            && color.primaries == JxlPrimaries::SRgb
+            && color.transfer_function == JxlTransferFunction::SRGB
+            && color.rendering_intent == JxlRenderingIntent::Relative
+        {
+            // The synthesized ICC approximates the named sRGB encoding.
+            // Converting through it can change native samples by a few codes.
+            return crate::color_profile::srgb_profile().to_vec();
+        }
+    }
+    icc
+}
+
 unsafe fn profile(decoder: &mut Decoder) -> Result<Vec<u8>, String> {
     let mut color = MaybeUninit::<JxlColorEncoding>::uninit();
     if unsafe {
@@ -478,7 +591,7 @@ unsafe fn profile(decoder: &mut Decoder) -> Result<Vec<u8>, String> {
     // Pinned libjxl 0.12 already uses Original for non-XYB samples. Reapplying
     // a valid raw ICC with an unknown structured transfer function can fail.
     if data == original {
-        return Ok(original);
+        return Ok(canonical_data_profile(decoder, original));
     }
     drop(data);
     // XYB defaults can differ from Original. Select representable SDR sRGB,
@@ -494,24 +607,27 @@ unsafe fn profile(decoder: &mut Decoder) -> Result<Vec<u8>, String> {
     }
     let data = unsafe { icc_profile(decoder.raw, JxlColorProfileTarget::Data)? };
     crate::color_profile::supported(&data)?;
-    Ok(data)
+    Ok(canonical_data_profile(decoder, data))
 }
 fn read(
-    bytes: &[u8],
-    pixels: bool,
+    input: &mut EncodedInput<'_, '_>,
+    operation: super::Operation,
+    expected: Option<Info>,
+    spans: Option<&mut super::spans::Writer<'_>>,
     check: &dyn Fn() -> Result<(), String>,
 ) -> Result<Decoded, String> {
     check()?;
+    let pixels = matches!(operation, super::Operation::Decode | super::Operation::DecodePatch | super::Operation::DecodeNative | super::Operation::DecodeSpans);
+    let spans = spans.map(std::ptr::from_mut);
+    let keep_orientation = spans.is_some() || operation == super::Operation::DecodePatch;
     version()?;
-    if bytes.len() > ENCODED_LIMIT || !signature(bytes) {
-        return Err(ERROR.into());
-    }
     // Registered storage is declared first and outlives native destruction on
     // every early return, including cancellation and denied allocations.
     let mut output = Pixels::Eight(Vec::new());
     let mut decoder = Decoder::new()?;
     let mut info = None;
     let mut icc = None;
+    let mut orientation = 1;
     let mut registered = false;
     let mut finished = false;
     unsafe {
@@ -519,11 +635,18 @@ fn read(
             | JxlDecoderStatus::ColorEncoding as i32
             | JxlDecoderStatus::FullImage as i32;
         dec(JxlDecoderSubscribeEvents(decoder.raw, events))?;
-        dec(JxlDecoderSetInput(decoder.raw, bytes.as_ptr(), bytes.len()))?;
-        JxlDecoderCloseInput(decoder.raw);
+        if keep_orientation {
+            dec(JxlDecoderSetKeepOrientation(decoder.raw, JxlBool::True))?;
+        }
+        input.start(&decoder)?;
         loop {
             check()?;
-            match JxlDecoderProcessInput(decoder.raw) {
+            let status = JxlDecoderProcessInput(decoder.raw);
+            if let Some(writer) = spans {
+                (*writer).check()?;
+            }
+            match status {
+                JxlDecoderStatus::NeedMoreInput => input.refill(&decoder)?,
                 JxlDecoderStatus::BasicInfo => {
                     if info.is_some() {
                         return Err(ERROR.into());
@@ -531,7 +654,20 @@ fn read(
                     let mut raw = MaybeUninit::<JxlBasicInfo>::uninit();
                     dec(JxlDecoderGetBasicInfo(decoder.raw, raw.as_mut_ptr()))?;
                     let raw = raw.assume_init();
-                    info = Some(basic(&raw)?);
+                    let admitted = basic(&raw, operation)?;
+                    let display = if keep_orientation {
+                        orientation = raw.orientation as u8;
+                        super::spans::orient(admitted, orientation)?
+                    } else {
+                        admitted
+                    };
+                    if expected.is_some_and(|expected| expected != display) {
+                        return Err(
+                            "JPEG XL source dimensions or precision changed after inspection"
+                                .into(),
+                        );
+                    }
+                    info = Some(admitted);
                     if raw.alpha_bits != 0 {
                         let mut extra = MaybeUninit::<JxlExtraChannelInfo>::uninit();
                         dec(JxlDecoderGetExtraChannelInfo(
@@ -566,7 +702,18 @@ fn read(
                         return Err(ERROR.into());
                     }
                     let info = info.ok_or(ERROR)?;
-                    let count = sample_count(info)?;
+                    if let Some(writer) = spans {
+                        dec(JxlDecoderSetImageOutCallback(
+                            decoder.raw,
+                            &format(info.bit_depth),
+                            super::spans::callback,
+                            writer.cast(),
+                        ))?;
+                        (*writer).start(info, orientation, icc.as_deref().ok_or(ERROR)?)?;
+                        registered = true;
+                        continue;
+                    }
+                    let count = sample_count(info, operation)?;
                     let mut size = 0;
                     dec(JxlDecoderImageOutBufferSize(
                         decoder.raw,
@@ -621,11 +768,23 @@ fn read(
         icc_profile: icc.ok_or(ERROR)?,
     })
 }
-pub fn inspect(bytes: &[u8], check: &dyn Fn() -> Result<(), String>) -> Result<Info, String> {
-    read(bytes, false, check).map(|decoded| decoded.info)
+pub(super) fn inspect(input: &mut EncodedInput<'_, '_>, operation: super::Operation, check: &dyn Fn() -> Result<(), String>) -> Result<Info, String> {
+    read(input, operation, None, None, check).map(|decoded| decoded.info)
 }
+#[cfg(test)]
 pub fn decode(bytes: &[u8], check: &dyn Fn() -> Result<(), String>) -> Result<Decoded, String> {
-    read(bytes, true, check)
+    read(&mut EncodedInput::Slice(bytes), super::Operation::Decode, None, None, check)
+}
+pub(super) fn decode_expected(
+    input: &mut EncodedInput<'_, '_>,
+    operation: super::Operation,
+    expected: Option<Info>,
+    check: &dyn Fn() -> Result<(), String>,
+) -> Result<Decoded, String> {
+    read(input, operation, expected, None, check)
+}
+pub(super) fn decode_spans(input: &mut EncodedInput<'_, '_>, expected: Info, writer: &mut super::spans::Writer<'_>) -> Result<(), String> {
+    read(input, super::Operation::DecodeSpans, Some(expected), Some(writer), &|| Ok(())).map(|_| ())
 }
 pub fn encode(
     width: u32,
@@ -633,6 +792,18 @@ pub fn encode(
     pixels: PixelsRef<'_>,
     profile: Option<&[u8]>,
     options: Options,
+    check: &dyn Fn() -> Result<(), String>,
+) -> Result<Vec<u8>, String> {
+    encode_buffer(width, height, pixels, profile, options, super::CanvasLimits::Resident, check)
+}
+
+pub(super) fn encode_buffer(
+    width: u32,
+    height: u32,
+    pixels: PixelsRef<'_>,
+    profile: Option<&[u8]>,
+    options: Options,
+    geometry: super::CanvasLimits,
     check: &dyn Fn() -> Result<(), String>,
 ) -> Result<Vec<u8>, String> {
     check()?;
@@ -652,12 +823,12 @@ pub fn encode(
             size_of_val(words),
         ),
     };
-    if sample_count(Info {
+    let bytes = super::image_bytes(Info {
         width,
         height,
         bit_depth: depth,
-    })? != count
-    {
+    }, geometry)?;
+    if bytes > super::RAW_LIMIT || bytes / usize::from(depth / 8) != count {
         return Err("JPEG XL RGBA sample count differs from its dimensions".into());
     }
     let profile = profile.unwrap_or_else(|| crate::color_profile::srgb_profile());
@@ -845,7 +1016,7 @@ mod tests {
         raw.alpha_bits = 16;
         raw.num_extra_channels = 1;
         raw.intensity_target = 255.;
-        assert_eq!(basic(&raw).unwrap().bit_depth, 16);
+        assert_eq!(basic(&raw, super::super::Operation::Decode).unwrap().bit_depth, 16);
         for change in 0..9 {
             let mut invalid = raw.clone();
             match change {
@@ -859,7 +1030,7 @@ mod tests {
                 7 => invalid.intensity_target = 1000.,
                 _ => invalid.alpha_exponent_bits = 5,
             }
-            assert!(basic(&invalid).is_err());
+            assert!(basic(&invalid, super::super::Operation::Decode).is_err());
         }
     }
     // Trusted tiny native fixtures exercise metadata independent of encode's
@@ -928,6 +1099,20 @@ mod tests {
         }
     }
     #[test]
+    fn lossless_structured_srgb_keeps_native_samples_in_the_working_profile() {
+        let encoded = fixture(|_| {}, false, false);
+        let decoded = decode(&encoded, &|| Ok(())).unwrap();
+        assert_eq!(
+            decoded.icc_profile.as_slice(),
+            crate::color_profile::srgb_profile()
+        );
+        assert_eq!(
+            decoded.pixels,
+            Pixels::Sixteen((0..24).map(|i| (i * 1579 + 12347) as u16).collect())
+        );
+    }
+
+    #[test]
     fn actual_mixed_alpha_depth_uses_native16_and_orientation_is_applied() {
         let encoded = fixture(|raw| raw.bits_per_sample = 8, false, false);
         let decoded = decode(&encoded, &|| Ok(())).unwrap();
@@ -960,13 +1145,62 @@ mod tests {
             .flat_map(|p| (p * 4..p * 4 + 4).map(|i| (i * 1579 + 12347) as u16))
             .collect();
         assert_eq!(words, expected);
+        let patch = decode_expected(
+            &mut EncodedInput::Slice(&encoded), super::super::Operation::DecodePatch,
+            Some(decoded.info), &|| Ok(()),
+        ).unwrap();
+        assert_eq!((patch.info.width, patch.info.height, patch.info.bit_depth), (3, 2, 16));
+        assert_eq!(patch.pixels, Pixels::Sixteen((0..24).map(|i| (i * 1579 + 12347) as u16).collect()));
+    }
+
+    #[test]
+    fn streamed_input_refills_and_requires_exact_transport() {
+        use super::super::Operation;
+        use std::io::Cursor;
+
+        let info = Info { width: 257, height: 129, bit_depth: 16 };
+        let mut seed = 0x983e62a1u32;
+        let words: Vec<_> = (0..info.width * info.height * 4).map(|index| {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            if index % 4 == 3 { 65535 } else { (seed >> 16) as u16 }
+        }).collect();
+        let bytes = encode(info.width, info.height, PixelsRef::Sixteen(&words), None,
+            Options::default(), &|| Ok(())).unwrap();
+        assert!(bytes.len() > 64 * 1024);
+        let length = bytes.len() as u64;
+        let mut reader = Cursor::new(&bytes);
+        let mut stream = StreamInput::new(&mut reader, length).unwrap();
+        let actual = inspect(&mut EncodedInput::Stream(&mut stream), Operation::InspectNative, &|| Ok(())).unwrap();
+        assert_eq!(actual, info);
+        assert!(stream.remaining > 0);
+        stream.finish().unwrap();
+        assert_eq!(reader.position(), length);
+
+        for fault in 0..3 {
+            let mut framed = bytes.clone();
+            if fault == 1 { framed.pop(); }
+            if fault == 2 { framed.push(0); }
+            let mut reader = Cursor::new(&framed);
+            let mut stream = StreamInput::new(&mut reader, length).unwrap();
+            let mut input = EncodedInput::Stream(&mut stream);
+            let result = decode_expected(&mut input, Operation::DecodeNative, Some(info), &|| Ok(()));
+            let complete = input.finish();
+            if fault == 0 {
+                let actual = result.unwrap();
+                complete.unwrap();
+                assert_eq!(actual.info, info);
+                assert_eq!(actual.pixels, Pixels::Sixteen(words.clone()));
+            } else {
+                assert!(result.is_err() || complete.is_err());
+            }
+        }
     }
     #[test]
     fn actual_unsupported_gray_hdr_and_associated_alpha_are_explicit_errors() {
         let gray = fixture(|_| {}, true, false);
-        assert!(inspect(&gray, &|| Ok(())).is_err());
+        assert!(inspect(&mut EncodedInput::Slice(&gray), super::super::Operation::Inspect, &|| Ok(())).is_err());
         let hdr = fixture(|raw| raw.intensity_target = 1000., false, true);
-        assert!(inspect(&hdr, &|| Ok(())).is_err());
+        assert!(inspect(&mut EncodedInput::Slice(&hdr), super::super::Operation::Inspect, &|| Ok(())).is_err());
         let associated = fixture(|raw| raw.alpha_premultiplied = JxlBool::True, false, false);
         assert!(decode(&associated, &|| Ok(())).is_err());
     }

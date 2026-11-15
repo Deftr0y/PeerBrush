@@ -178,9 +178,77 @@ fn actual_fallback_plan_is_reported_as_hidden_originals_with_current_composite()
 }
 
 #[test]
+fn standard_adjustments_report_editability_without_an_effect_bake() {
+    for (depth, kind) in [(8, "invert"), (16, "invert"), (8, "levels"), (16, "levels")] {
+        let pool = ResidentBudget::new(16 * 1024 * 1024).unwrap();
+        let mut source = Document::new_depth(7, 5, depth).unwrap();
+        crate::adjustment::add(&mut source, &serde_json::json!({"kind":kind})).unwrap();
+        // Native capture requires the document's original precision on every plane.
+        source.layers[0].pixels = Raster::new_depth(7, 5, depth);
+        let document = capture(&source, &pool);
+        let report = super::report(&document, &|| Ok(())).unwrap();
+        assert_eq!(report.data().standard_layout, StandardLayout::LayerTree);
+        assert_eq!(report.data().layers[0].standard, Representation::Adjustment);
+        assert!(!report.data().has_editability_losses);
+        assert_eq!(report.data().standard_layer_count, 2);
+        drop((report, document));
+        assert_eq!(pool.used(), 0);
+    }
+}
+
+#[test]
 fn resident_snapshot_preserves_existing_report_wire_fields() {
     let source = Document::new_depth(7, 5, 16).unwrap();
     let expected = serde_json::to_value(crate::compatibility::report(&source).unwrap()).unwrap();
     let actual = report_snapshot(&DocumentSnapshot::from(source)).unwrap();
     assert_eq!(serde_json::to_value(actual).unwrap(), expected);
+}
+
+#[test]
+fn native_save_authorization_requires_exact_loss_consent_and_never_bypasses_protection() {
+    use serde_json::json;
+    for depth in [8, 16] {
+        let pool = ResidentBudget::new(16 * 1024 * 1024).unwrap();
+        let mut source = Document::new_depth(7, 5, depth).unwrap();
+        source.revision = 7;
+        source.layers[0].opacity = 0.3333;
+        let document = capture(&source, &pool);
+        let key = document.key();
+        let snapshot = DocumentSnapshot::Native(document.clone());
+        let baseline = pool.used();
+        let accepted =
+            json!({"document_id":source.id,"expected_revision":7,"accept_editability_loss":true});
+        for request in [
+            json!({}),
+            json!({"accept_editability_loss":false}),
+            json!({"document_id":source.id,"expected_revision":6,"accept_editability_loss":true}),
+            json!({"document_id":"other","expected_revision":7,"accept_editability_loss":true}),
+        ] {
+            assert!(crate::compatibility::authorize_snapshot(&snapshot, &request).is_err());
+            assert_eq!(pool.used(), baseline);
+        }
+        crate::compatibility::authorize_snapshot(&snapshot, &accepted).unwrap();
+        assert_eq!(pool.used(), baseline);
+        let pressure = pool
+            .reserve_bytes(pool.limit() - baseline, pool.limit())
+            .unwrap();
+        let error = crate::compatibility::authorize_snapshot(
+            &snapshot,
+            &json!({"accept_editability_loss":"true"}),
+        )
+        .unwrap_err();
+        assert!(error.contains("must be boolean"));
+        drop(pressure);
+        assert_eq!(document.key(), key);
+        drop((snapshot, document));
+        source.read_only = true;
+        let protected = DocumentSnapshot::Native(capture(&source, &pool));
+        assert!(
+            crate::compatibility::authorize_snapshot(&protected, &accepted)
+                .unwrap_err()
+                .contains("unsupported PSD")
+        );
+        drop(protected);
+        assert_eq!(pool.used(), 0);
+    }
 }

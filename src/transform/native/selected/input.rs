@@ -79,8 +79,20 @@ impl<'a> Selection<'a> {
             ]),
         }
     }
+    pub(super) fn raw_mask(&self) -> Option<&'a Surface> {
+        match self.values {
+            Values::Raw { mask, .. } => Some(mask),
+            Values::Geometry { .. } => None,
+        }
+    }
     pub(crate) fn rasterized(&self) -> bool {
         !matches!(self.values, Values::Geometry { frame: None, .. })
+    }
+    pub(crate) fn coverage_cost(&self) -> u64 {
+        match self.values {
+            Values::Geometry { polygon: Some(points), .. } => points.len() as u64,
+            _ => 1,
+        }
     }
     pub(crate) fn polygon(&self) -> Option<&'a [[f32; 2]]> {
         match self.values {
@@ -89,6 +101,18 @@ impl<'a> Selection<'a> {
                 polygon,
             } => polygon,
             _ => None,
+        }
+    }
+    pub(crate) fn may_cover(&self, [left, top, right, bottom]: [i32; 4]) -> bool {
+        match self.values {
+            Values::Raw { mask, origin: [x, y] } => {
+                // Raw samples outside the selection bounds hint are still visible.
+                mask.has_physical_tiles([left - x, top - y, right - x, bottom - y])
+            }
+            Values::Geometry { .. } => {
+                let [l, t, r, b] = self.bounds;
+                left < r && l < right && top < b && t < bottom
+            }
         }
     }
     pub(crate) fn prepare(

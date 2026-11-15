@@ -69,29 +69,29 @@ impl Drop for Provider {
 }
 fn fixture() -> (Shared, Value, Value) {
     let mut e = Engine::new();
-    e.doc = Document::new_depth(16, 12, 16).unwrap();
-    e.doc.layers[0].pixels.set16(4, 4, [123, 271, 539, 65535]);
-    let p = json!({"expected_revision":e.doc.revision,"rect":[4,3,8,5]});
-    let reply = json!({"version":1,"document_id":e.doc.id,"source_revision":e.doc.revision,"document_rect":[4,3,8,5],"channel":"luma","png":STANDARD.encode(raster::png(2,1,&[0,0,0,255,255,255,255,255]).unwrap())});
+    e.resident_state_mut().expect("resident fixture").document = Document::new_depth(16, 12, 16).unwrap();
+    e.resident_state_mut().expect("resident fixture").document.layers[0].pixels.set16(4, 4, [123, 271, 539, 65535]);
+    let p = json!({"expected_revision":e.resident_state().expect("resident fixture").document.revision,"rect":[4,3,8,5]});
+    let reply = json!({"version":1,"document_id":e.resident_state().expect("resident fixture").document.id,"source_revision":e.resident_state().expect("resident fixture").document.revision,"document_rect":[4,3,8,5],"channel":"luma","png":STANDARD.encode(raster::png(2,1,&[0,0,0,255,255,255,255,255]).unwrap())});
     (Arc::new(Mutex::new(e)), p, reply)
 }
 #[test]
 fn provider_imports_one_undoable_native_safe_confidence_selection_and_rejects_wrong_snapshot() {
     let _serial = SERIAL.lock().unwrap();
     let (shared, p, mut reply) = fixture();
-    let before = shared.lock().unwrap().doc.export_png().unwrap();
+    let before = shared.lock().unwrap().resident_state().expect("resident fixture").document.export_png().unwrap();
     let provider = Provider::new(&reply, false);
     let result = segmentation::run_with(&shared, "human", &p, &provider.config).unwrap();
     assert_eq!(result["document_rect"], p["rect"]);
     {
         let mut e = shared.lock().unwrap();
-        assert_eq!(e.doc.export_png().unwrap(), before);
-        assert_eq!(e.doc.selection, Some([5, 3, 8, 5]));
-        assert_eq!(e.doc.layers[0].pixels.get16(4, 4), [123, 271, 539, 65535]);
+        assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), before);
+        assert_eq!(e.resident_state().expect("resident fixture").document.selection, Some([5, 3, 8, 5]));
+        assert_eq!(e.resident_state().expect("resident fixture").document.layers[0].pixels.get16(4, 4), [123, 271, 539, 65535]);
         e.undo("human").unwrap();
-        assert!(e.doc.selection.is_none());
+        assert!(e.resident_state().expect("resident fixture").document.selection.is_none());
     }
-    let p = json!({"expected_revision":shared.lock().unwrap().doc.revision});
+    let p = json!({"expected_revision":shared.lock().unwrap().resident_state().expect("resident fixture").document.revision});
     reply["document_id"] = json!("wrong project");
     let provider = Provider::new(&reply, false);
     assert!(
@@ -99,7 +99,7 @@ fn provider_imports_one_undoable_native_safe_confidence_selection_and_rejects_wr
             .unwrap_err()
             .contains("does not match")
     );
-    assert!(shared.lock().unwrap().doc.selection.is_none());
+    assert!(shared.lock().unwrap().resident_state().expect("resident fixture").document.selection.is_none());
 }
 #[test]
 fn inference_cancels_on_human_change_timeout_and_busy_provider_without_mutating_selection() {
@@ -110,7 +110,7 @@ fn inference_cancels_on_human_change_timeout_and_busy_provider_without_mutating_
     let writer = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(250));
         let mut e = edit_shared.lock().unwrap();
-        let id = e.doc.layers[0].id.clone();
+        let id = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
         e.edit(
             "human",
             &[json!({"op":"layer.update","layer":id,"name":"Human rename"})],
@@ -126,8 +126,8 @@ fn inference_cancels_on_human_change_timeout_and_busy_provider_without_mutating_
             .contains("changed")
     );
     writer.join().unwrap();
-    assert!(shared.lock().unwrap().doc.selection.is_none());
-    assert_eq!(shared.lock().unwrap().doc.layers[0].name, "Human rename");
+    assert!(shared.lock().unwrap().resident_state().expect("resident fixture").document.selection.is_none());
+    assert_eq!(shared.lock().unwrap().resident_state().expect("resident fixture").document.layers[0].name, "Human rename");
     let mut provider = Provider::new(&reply, true);
     provider.config.timeout_ms = 1000;
     assert!(segmentation::invoke(&provider.config, &json!({}), || true)
@@ -170,7 +170,7 @@ fn invalid_revision_region_point_and_reservation_fail_before_inference() {
             p[k] = v.clone();
         }
         assert!(segmentation::run_with(&shared, "human", &p, &provider.config).is_err());
-        assert!(shared.lock().unwrap().doc.selection.is_none());
+        assert!(shared.lock().unwrap().resident_state().expect("resident fixture").document.selection.is_none());
     }
     shared
         .lock()

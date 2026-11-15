@@ -9,10 +9,10 @@ use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 fn fixture(depth: u16) -> Engine {
     let mut e = Engine::new();
-    e.doc = Document::new_depth(32, 24, depth).unwrap();
+    e.resident_state_mut().expect("resident fixture").document = Document::new_depth(32, 24, depth).unwrap();
     for y in 0..24 {
         for x in 0..32 {
-            e.doc.layers[0].pixels.set16(
+            e.resident_state_mut().expect("resident fixture").document.layers[0].pixels.set16(
                 x,
                 y,
                 [
@@ -27,7 +27,7 @@ fn fixture(depth: u16) -> Engine {
     e
 }
 fn edit(e: &mut Engine, c: Value) {
-    e.edit("human", &[c], Some(e.doc.revision), None, "Bake test")
+    e.edit("human", &[c], Some(e.resident_state().expect("resident fixture").document.revision), None, "Bake test")
         .unwrap();
 }
 fn native(d: &Document) -> Vec<u16> {
@@ -43,16 +43,16 @@ fn native(d: &Document) -> Vec<u16> {
     }
 }
 fn assert_roundtrip(e: &mut Engine, before: &Document) {
-    assert_eq!(e.undo.len(), 1);
-    assert_eq!(native(&e.doc), native(before));
-    let bytes = psd::encode(&e.doc).unwrap();
+    assert_eq!(e.resident_state().expect("resident fixture").undo.len(), 1);
+    assert_eq!(native(&e.resident_state().expect("resident fixture").document), native(before));
+    let bytes = psd::encode(&e.resident_state().expect("resident fixture").document).unwrap();
     let reopened = psd::decode(&bytes).unwrap();
     assert!(!reopened.read_only);
     assert_eq!(reopened.bit_depth, before.bit_depth);
     assert_eq!(native(&reopened), native(before));
     assert_eq!(
         serde_json::to_value(&reopened.layers[0].effects).unwrap(),
-        serde_json::to_value(&e.doc.layers[0].effects).unwrap()
+        serde_json::to_value(&e.resident_state().expect("resident fixture").document.layers[0].effects).unwrap()
     );
     // Remove supplementary resource sources; retain ordinary layer information,
     // including Lr16 channels, and read the standard raster/mask result.
@@ -68,17 +68,17 @@ fn assert_roundtrip(e: &mut Engine, before: &Document) {
     );
     e.undo("human").unwrap();
     assert_eq!(
-        serde_json::to_value(&e.doc.layers).unwrap(),
+        serde_json::to_value(&e.resident_state().expect("resident fixture").document.layers).unwrap(),
         serde_json::to_value(&before.layers).unwrap()
     );
     e.redo("human").unwrap();
-    assert_eq!(native(&e.doc), native(before));
+    assert_eq!(native(&e.resident_state().expect("resident fixture").document), native(before));
 }
 #[test]
 fn color_prefix_keeps_suffix_masks_selection_and_native_psd_data() {
     for depth in [8, 16] {
         let mut e = fixture(depth);
-        let id = e.doc.layers[0].id.clone();
+        let id = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
         e.edit(
             "human",
             &[
@@ -93,25 +93,25 @@ fn color_prefix_keeps_suffix_masks_selection_and_native_psd_data() {
             "Setup",
         )
         .unwrap();
-        e.doc.layers[0].effects[0].enabled = false;
-        e.doc.layers[0].opacity = 181. / 255.;
-        let before = e.doc.clone();
-        e.undo.clear();
+        e.resident_state_mut().expect("resident fixture").document.layers[0].effects[0].enabled = false;
+        e.resident_state_mut().expect("resident fixture").document.layers[0].opacity = 181. / 255.;
+        let before = e.resident_state().expect("resident fixture").document.clone();
+        e.resident_state_mut().expect("resident fixture").undo.clear();
         edit(
             &mut e,
             json!({"op":"effect.bake","layer":id,"effect":before.layers[0].effects[1].id}),
         );
-        assert_eq!(e.doc.layers[0].effects.len(), 1);
+        assert_eq!(e.resident_state().expect("resident fixture").document.layers[0].effects.len(), 1);
         assert_eq!(
-            e.doc.layers[0].effects[0].id,
+            e.resident_state().expect("resident fixture").document.layers[0].effects[0].id,
             before.layers[0].effects[2].id
         );
         assert_eq!(
-            e.doc.layers[0].mask.as_ref().unwrap().steps[0].pixels,
+            e.resident_state().expect("resident fixture").document.layers[0].mask.as_ref().unwrap().steps[0].pixels,
             before.layers[0].mask.as_ref().unwrap().steps[0].pixels
         );
-        assert_eq!(e.doc.selection_coverage, before.selection_coverage);
-        assert!(e.doc.layers[0].pixels.retained.is_none());
+        assert_eq!(e.resident_state().expect("resident fixture").document.selection_coverage, before.selection_coverage);
+        assert!(e.resident_state().expect("resident fixture").document.layers[0].pixels.retained.is_none());
         assert_roundtrip(&mut e, &before);
     }
 }
@@ -120,13 +120,13 @@ fn all_style_kinds_bake_expanded_document_frame_without_projection() {
     for depth in [8, 16] {
         for kind in effects::styles::KINDS {
             let mut e = fixture(depth);
-            let id = e.doc.layers[0].id.clone();
-            e.doc.layers[0].x = 3;
-            e.doc.layers[0].y = 4;
-            e.doc.layers[0].pixels = Raster::new_depth(16, 16, depth);
+            let id = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
+            e.resident_state_mut().expect("resident fixture").document.layers[0].x = 3;
+            e.resident_state_mut().expect("resident fixture").document.layers[0].y = 4;
+            e.resident_state_mut().expect("resident fixture").document.layers[0].pixels = Raster::new_depth(16, 16, depth);
             for y in 0..16 {
                 for x in 0..16 {
-                    e.doc.layers[0]
+                    e.resident_state_mut().expect("resident fixture").document.layers[0]
                         .pixels
                         .set16(x, y, [12345, 23457, 34569, 65535]);
                 }
@@ -136,15 +136,15 @@ fn all_style_kinds_bake_expanded_document_frame_without_projection() {
                 &mut e,
                 json!({"op":"effect.add","layer":id,"kind":"invert","weight":0.2}),
             );
-            let before = e.doc.clone();
-            e.undo.clear();
+            let before = e.resident_state().expect("resident fixture").document.clone();
+            e.resident_state_mut().expect("resident fixture").undo.clear();
             edit(
                 &mut e,
                 json!({"op":"effect.bake","layer":id,"effect":before.layers[0].effects[0].id}),
             );
-            assert_eq!((e.doc.layers[0].x, e.doc.layers[0].y), (0, 0));
+            assert_eq!((e.resident_state().expect("resident fixture").document.layers[0].x, e.resident_state().expect("resident fixture").document.layers[0].y), (0, 0));
             assert_eq!(
-                (e.doc.layers[0].pixels.width, e.doc.layers[0].pixels.height),
+                (e.resident_state().expect("resident fixture").document.layers[0].pixels.width, e.resident_state().expect("resident fixture").document.layers[0].pixels.height),
                 (32, 24)
             );
             assert_roundtrip(&mut e, &before);
@@ -156,7 +156,7 @@ fn mask_prefix_preserves_color_and_remaining_spatial_pipeline() {
     for depth in [8, 16] {
         for spatial in [false, true] {
             let mut e = fixture(depth);
-            let id = e.doc.layers[0].id.clone();
+            let id = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
             edit(&mut e, json!({"op":"mask.add","layer":id,"value":255}));
             edit(
                 &mut e,
@@ -172,15 +172,15 @@ fn mask_prefix_preserves_color_and_remaining_spatial_pipeline() {
                     json!({"op":"mask.step.add","layer":id,"kind":"blur","value":2.}),
                 );
             }
-            let before = e.doc.clone();
-            e.undo.clear();
+            let before = e.resident_state().expect("resident fixture").document.clone();
+            e.resident_state_mut().expect("resident fixture").undo.clear();
             let at = before.layers[0].mask.as_ref().unwrap().steps.len() - 1;
             edit(
                 &mut e,
                 json!({"op":"mask.step.bake","layer":id,"step":before.layers[0].mask.as_ref().unwrap().steps[at].id}),
             );
-            assert_eq!(e.doc.layers[0].pixels, before.layers[0].pixels);
-            let m = e.doc.layers[0].mask.as_ref().unwrap();
+            assert_eq!(e.resident_state().expect("resident fixture").document.layers[0].pixels, before.layers[0].pixels);
+            let m = e.resident_state().expect("resident fixture").document.layers[0].mask.as_ref().unwrap();
             assert_eq!(m.steps.len(), 1);
             assert_eq!(m.steps[0].kind, "paint");
             assert_eq!(m.steps[0].pixels.depth, depth);
@@ -192,30 +192,30 @@ fn mask_prefix_preserves_color_and_remaining_spatial_pipeline() {
 fn folder_bake_preserves_external_properties_and_restores_hidden_children() {
     for depth in [8, 16] {
         let mut e = fixture(depth);
-        let id = e.doc.layers[0].id.clone();
-        let mut child = e.doc.layers[0].clone();
+        let id = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
+        let mut child = e.resident_state().expect("resident fixture").document.layers[0].clone();
         child.id = peerbrush::engine::id();
         child.parent = Some(id.clone());
         let mut hidden = Layer::new("Hidden source", "paint", 32, 24);
         hidden.parent = Some(id.clone());
         hidden.visible = false;
-        e.doc.layers[0].kind = "group".into();
-        e.doc.layers[0].pixels = Raster::new_depth(32, 24, depth);
-        e.doc.layers.extend([child, hidden]);
+        e.resident_state_mut().expect("resident fixture").document.layers[0].kind = "group".into();
+        e.resident_state_mut().expect("resident fixture").document.layers[0].pixels = Raster::new_depth(32, 24, depth);
+        e.resident_state_mut().expect("resident fixture").document.layers.extend([child, hidden]);
         edit(&mut e, json!({"op":"mask.add","layer":id,"value":211}));
         edit(
             &mut e,
             json!({"op":"effect.add","layer":id,"kind":"invert","weight":0.4}),
         );
-        e.doc.layers[0].opacity = 211. / 255.;
-        let before = e.doc.clone();
-        e.undo.clear();
+        e.resident_state_mut().expect("resident fixture").document.layers[0].opacity = 211. / 255.;
+        let before = e.resident_state().expect("resident fixture").document.clone();
+        e.resident_state_mut().expect("resident fixture").undo.clear();
         edit(
             &mut e,
             json!({"op":"effect.bake","layer":id,"effect":before.layers[0].effects[0].id}),
         );
-        assert_eq!(e.doc.layers.len(), 1);
-        assert_eq!(e.doc.layers[0].kind, "paint");
+        assert_eq!(e.resident_state().expect("resident fixture").document.layers.len(), 1);
+        assert_eq!(e.resident_state().expect("resident fixture").document.layers[0].kind, "paint");
         assert_roundtrip(&mut e, &before);
     }
 }
@@ -224,11 +224,11 @@ fn bake_guards_are_atomic_and_cover_hidden_folder_children() {
     for depth in [8, 16] {
         for guard in ["lock", "reserve", "stale", "read_only", "unknown", "frame"] {
             let mut e = fixture(depth);
-            let id = e.doc.layers[0].id.clone();
+            let id = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
             let kind = if guard == "frame" { "stroke" } else { "invert" };
             edit(&mut e, json!({"op":"effect.add","layer":id,"kind":kind}));
             let mut c =
-                json!({"op":"effect.bake","layer":id,"effect":e.doc.layers[0].effects[0].id});
+                json!({"op":"effect.bake","layer":id,"effect":e.resident_state().expect("resident fixture").document.layers[0].effects[0].id});
             if matches!(guard, "lock" | "reserve") {
                 let mut child = Layer::new("Hidden locked child", "paint", 32, 24);
                 child.parent = Some(id.clone());
@@ -238,43 +238,43 @@ fn bake_guards_are_atomic_and_cover_hidden_folder_children() {
                     e.reserve("other", "Reserved", vec![Scope::layer(&child.id)])
                         .unwrap();
                 }
-                e.doc.layers[0].kind = "group".into();
-                e.doc.layers.push(child);
+                e.resident_state_mut().expect("resident fixture").document.layers[0].kind = "group".into();
+                e.resident_state_mut().expect("resident fixture").document.layers.push(child);
             }
             if guard == "stale" {
-                c["source_revision"] = json!(e.doc.revision + 1);
+                c["source_revision"] = json!(e.resident_state().expect("resident fixture").document.revision + 1);
             }
             if guard == "read_only" {
-                e.doc.read_only = true;
+                e.resident_state_mut().expect("resident fixture").document.read_only = true;
             }
             if guard == "unknown" {
                 c["effect"] = json!("missing");
             }
             if guard == "frame" {
                 edit(&mut e, json!({"op":"mask.add","layer":id}));
-                e.doc.layers[0].x = 4;
+                e.resident_state_mut().expect("resident fixture").document.layers[0].x = 4;
             }
-            e.undo.clear();
-            let before = serde_json::to_value(&e.doc).unwrap();
+            e.resident_state_mut().expect("resident fixture").undo.clear();
+            let before = serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap();
             assert!(
                 e.edit("human", &[c], None, None, "Rejected bake").is_err(),
                 "{guard}"
             );
-            assert_eq!(serde_json::to_value(&e.doc).unwrap(), before);
-            assert!(e.undo.is_empty());
+            assert_eq!(serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap(), before);
+            assert!(e.resident_state().expect("resident fixture").undo.is_empty());
         }
     }
 }
 #[test]
 fn protocol_bake_returns_actual_png_coordinates_and_rejects_stale_revision() {
     let mut e = fixture(16);
-    let id = e.doc.layers[0].id.clone();
+    let id = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
     edit(
         &mut e,
         json!({"op":"effect.add","layer":id,"kind":"invert"}),
     );
-    let c = json!({"op":"effect.bake","layer":id,"effect":e.doc.layers[0].effects[0].id});
-    let revision = e.doc.revision;
+    let c = json!({"op":"effect.bake","layer":id,"effect":e.resident_state().expect("resident fixture").document.layers[0].effects[0].id});
+    let revision = e.resident_state().expect("resident fixture").document.revision;
     let shared = Arc::new(Mutex::new(e));
     let p = json!({"actor":"artist","commands":[c],"expected_revision":revision});
     let r = server::dispatch(&shared, "edit", &p).unwrap();
@@ -286,8 +286,8 @@ fn protocol_bake_returns_actual_png_coordinates_and_rejects_stale_revision() {
         .starts_with("iVBOR"));
     assert!(server::dispatch(&shared, "edit", &p).is_err());
     let e = shared.lock().unwrap();
-    assert_eq!(e.undo.len(), 2);
-    assert_eq!(e.doc.bit_depth, 16);
+    assert_eq!(e.resident_state().expect("resident fixture").undo.len(), 2);
+    assert_eq!(e.resident_state().expect("resident fixture").document.bit_depth, 16);
 }
 
 #[test]
@@ -310,19 +310,19 @@ fn editable_source_bake_is_explicit_and_inactive_prefix_keeps_source() {
                 },
             };
             edit(&mut e, json!({"op":"source.add","source":source}));
-            let id = e.doc.layers[0].id.clone();
+            let id = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
             edit(
                 &mut e,
                 json!({"op":"effect.add","layer":id,"kind":"invert"}),
             );
-            e.doc.layers[0].effects[0].enabled = enabled;
-            let before = e.doc.clone();
-            e.undo.clear();
+            e.resident_state_mut().expect("resident fixture").document.layers[0].effects[0].enabled = enabled;
+            let before = e.resident_state().expect("resident fixture").document.clone();
+            e.resident_state_mut().expect("resident fixture").undo.clear();
             edit(
                 &mut e,
                 json!({"op":"effect.bake","layer":id,"effect":before.layers[0].effects[0].id}),
             );
-            assert_eq!(e.doc.layers[0].source.is_some(), !enabled);
+            assert_eq!(e.resident_state().expect("resident fixture").document.layers[0].source.is_some(), !enabled);
             assert_roundtrip(&mut e, &before);
         }
     }
@@ -330,10 +330,10 @@ fn editable_source_bake_is_explicit_and_inactive_prefix_keeps_source() {
 #[test]
 fn fractional_mask_prefix_that_changes_samples_is_refused_atomically() {
     let mut e = fixture(16);
-    let id = e.doc.layers[0].id.clone();
+    let id = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
     for y in 0..24 {
         for x in 0..32 {
-            e.doc.layers[0].pixels.set16(
+            e.resident_state_mut().expect("resident fixture").document.layers[0].pixels.set16(
                 x,
                 y,
                 [12345, 23457, 34569, 1000 + x as u16 * 1500 + y as u16 * 600],
@@ -353,18 +353,18 @@ fn fractional_mask_prefix_that_changes_samples_is_refused_atomically() {
         &mut e,
         json!({"op":"mask.step.add","layer":id,"kind":"invert","weight":0.3}),
     );
-    let c = json!({"op":"mask.step.bake","layer":id,"step":e.doc.layers[0].mask.as_ref().unwrap().steps[3].id});
-    let before = serde_json::to_value(&e.doc).unwrap();
-    let count = e.undo.len();
+    let c = json!({"op":"mask.step.bake","layer":id,"step":e.resident_state().expect("resident fixture").document.layers[0].mask.as_ref().unwrap().steps[3].id});
+    let before = serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap();
+    let count = e.resident_state().expect("resident fixture").undo.len();
     let error = e
         .edit("human", &[c], None, None, "Prefix bake")
         .unwrap_err();
     assert!(error.contains("native samples"));
-    assert_eq!(serde_json::to_value(&e.doc).unwrap(), before);
-    assert_eq!(e.undo.len(), count);
-    let before = e.doc.clone();
-    e.undo.clear();
-    let last = e.doc.layers[0]
+    assert_eq!(serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap(), before);
+    assert_eq!(e.resident_state().expect("resident fixture").undo.len(), count);
+    let before = e.resident_state().expect("resident fixture").document.clone();
+    e.resident_state_mut().expect("resident fixture").undo.clear();
+    let last = e.resident_state().expect("resident fixture").document.layers[0]
         .mask
         .as_ref()
         .unwrap()

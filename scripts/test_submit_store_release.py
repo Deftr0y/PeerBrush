@@ -114,6 +114,7 @@ class Tests(unittest.TestCase):
 
     def test_versions(self):
         self.assertEqual(s.release_version('v0.26'), ('0.26.0', '1.26.0.0'))
+        self.assertEqual(s.release_version('v0.4.0'), ('0.4.0', '2.4.0.0'))
         self.assertEqual(s.release_version('v1.0.0'), ('1.0.0', '2.0.0.0'))
         for tag in ['v0.25', '0.25.0', 'v0.24', 'v0.26-rc1', 'v65535.0.0', 'x; echo bad']:
             with self.subTest(tag=tag), self.assertRaises(ValueError):

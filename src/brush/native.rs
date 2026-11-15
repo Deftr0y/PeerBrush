@@ -6,26 +6,49 @@ use super::{
 };
 use crate::{
     large_document::{PinnedBytes, Reservation, ResidentBudget, ScratchBytes},
-    raster::{Pixel, TILE},
+    raster::{project16, Pixel, Pixel16, TILE},
 };
+use std::mem::size_of;
 
 const PLAN_BYTES: usize = 2 * 1024 * 1024;
+const DABS_PER_GROUP: usize = 32;
+const NO_TILE: u16 = u16::MAX;
 
-/// Conservative changed preview footprint, including dabs removed from a tail.
-/// A removed tile is restored by dropping its preview override, not repainting
-/// on the previous result. The captured baseline remains immutable.
+/// Bounded row-major set of native tile coordinates.
 pub(crate) struct TileChanges {
     bits: [u64; 64],
     columns: u32,
     rows: u32,
 }
 impl TileChanges {
-    pub(crate) fn contains(&self, key: (u32, u32)) -> bool {
-        if key.0 >= self.columns || key.1 >= self.rows {
-            return false;
+    pub(crate) fn new([width, height]: [u32; 2]) -> Result<Self, String> {
+        let columns = width.div_ceil(TILE);
+        let rows = height.div_ceil(TILE);
+        if columns == 0 || rows == 0 || u64::from(columns) * u64::from(rows) > 4096 {
+            return Err("Native changed tile grid exceeds its footprint".into());
         }
-        let at = (key.1 * self.columns + key.0) as usize;
-        self.bits[at / 64] & (1 << (at % 64)) != 0
+        Ok(Self {
+            bits: [0; 64],
+            columns,
+            rows,
+        })
+    }
+    fn index(&self, key: (u32, u32)) -> Option<usize> {
+        if key.0 >= self.columns || key.1 >= self.rows {
+            return None;
+        }
+        Some((key.1 * self.columns + key.0) as usize)
+    }
+    pub(crate) fn insert(&mut self, key: (u32, u32)) -> Result<(), String> {
+        let at = self
+            .index(key)
+            .ok_or("Changed tile is outside the native frame")?;
+        self.bits[at / 64] |= 1 << (at % 64);
+        Ok(())
+    }
+    pub(crate) fn contains(&self, key: (u32, u32)) -> bool {
+        self.index(key)
+            .is_some_and(|at| self.bits[at / 64] & (1 << (at % 64)) != 0)
     }
     pub(crate) fn iter(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
         (0..self.rows).flat_map(move |y| {
@@ -39,12 +62,15 @@ pub(crate) struct PreparedBrush<'a> {
     height: u32,
     depth: u16,
     settings: Settings,
-    color: Pixel,
+    color: Pixel16,
     erase: bool,
     clip: [i32; 4],
     polygon: Option<&'a [[f32; 2]]>,
     dabs: Vec<Dab>,
     tiles: Vec<(u32, u32)>,
+    tile_slots: Vec<u16>,
+    tile_groups: Vec<u64>,
+    words_per_tile: usize,
     budget: ResidentBudget,
     // The bounded Vec owners above are destroyed before their admission charge.
     _metadata: Reservation,
@@ -69,6 +95,27 @@ impl<'a> PreparedBrush<'a> {
         budget: &ResidentBudget,
         check: &mut dyn FnMut() -> Result<(), String>,
     ) -> Result<Self, String> {
+        Self::with_native_color(
+            width, height, depth, points, pressures, settings,
+            color.map(|value| u16::from(value) * 257), erase, clip, polygon, budget, check,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn with_native_color(
+        width: u32,
+        height: u32,
+        depth: u16,
+        points: &[[f32; 2]],
+        pressures: Option<&[f32]>,
+        settings: Settings,
+        color: Pixel16,
+        erase: bool,
+        clip: Option<[i32; 4]>,
+        polygon: Option<&'a [[f32; 2]]>,
+        budget: &ResidentBudget,
+        check: &mut dyn FnMut() -> Result<(), String>,
+    ) -> Result<Self, String> {
         check()?;
         if width == 0 || height == 0 || width > 16000 || height > 16000 || ![8, 16].contains(&depth)
         {
@@ -77,7 +124,7 @@ impl<'a> PreparedBrush<'a> {
         if polygon.is_some_and(|points| points.iter().flatten().any(|v| !v.is_finite())) {
             return Err("Invalid native brush polygon".into());
         }
-        let metadata = budget
+        let mut metadata = budget
             .reserve_bytes(PLAN_BYTES, PLAN_BYTES)
             .map_err(|e| e.to_string())?;
         let dabs = dabs(points, pressures, settings)?;
@@ -91,9 +138,18 @@ impl<'a> PreparedBrush<'a> {
         work_budget(&dabs, clip)?;
         let columns = width.div_ceil(TILE);
         let rows = height.div_ceil(TILE);
-        let mut bits = [0u64; 64];
+        // The native edge limit and 256-pixel tiles leave at most 3969 slots.
+        let tile_count = (columns * rows) as usize;
+        let words_per_tile = dabs.len().div_ceil(DABS_PER_GROUP).div_ceil(64);
+        let mut tile_slots = Vec::new();
+        let mut tile_groups = Vec::new();
+        let mut occupied = 0u16;
         if settings.opacity > 0.0 && settings.flow > 0.0 && color[3] != 0 {
-            for &dab in &dabs {
+            tile_slots
+                .try_reserve_exact(tile_count)
+                .map_err(|_| "Native brush tile index allocation failed")?;
+            tile_slots.resize(tile_count, NO_TILE);
+            for (index, &dab) in dabs.iter().enumerate() {
                 check()?;
                 if dab.radius <= 0.001 || dab.opacity == 0.0 {
                     continue;
@@ -108,27 +164,42 @@ impl<'a> PreparedBrush<'a> {
                 if left >= right || top >= bottom {
                     continue;
                 }
+                let group = index / DABS_PER_GROUP;
                 for y in top as u32 / TILE..=(bottom - 1) as u32 / TILE {
                     for x in left as u32 / TILE..=(right - 1) as u32 / TILE {
-                        let index = (y * columns + x) as usize;
-                        bits[index / 64] |= 1 << (index % 64);
+                        let slot = &mut tile_slots[(y * columns + x) as usize];
+                        if *slot == NO_TILE {
+                            tile_groups
+                                .try_reserve(words_per_tile)
+                                .map_err(|_| "Native brush dab index allocation failed")?;
+                            tile_groups.resize(tile_groups.len() + words_per_tile, 0u64);
+                            *slot = occupied;
+                            occupied += 1;
+                        }
+                        let start = usize::from(*slot) * words_per_tile;
+                        tile_groups[start + group / 64] |= 1 << (group % 64);
                     }
                 }
             }
         }
-        let count = bits.iter().map(|v| v.count_ones() as usize).sum();
         let mut tiles = Vec::new();
         tiles
-            .try_reserve_exact(count)
+            .try_reserve_exact(usize::from(occupied))
             .map_err(|_| "Native brush tile metadata allocation failed")?;
-        for y in 0..rows {
-            for x in 0..columns {
-                let index = (y * columns + x) as usize;
-                if bits[index / 64] & (1 << (index % 64)) != 0 {
-                    tiles.push((x, y));
-                }
-            }
-        }
+        tiles.extend(
+            tile_slots
+                .iter()
+                .enumerate()
+                .filter(|(_, slot)| **slot != NO_TILE)
+                .map(|(index, _)| (index as u32 % columns, index as u32 / columns)),
+        );
+        let retained = dabs.capacity() * size_of::<Dab>()
+            + tile_slots.capacity() * size_of::<u16>()
+            + tile_groups.capacity() * size_of::<u64>()
+            + tiles.capacity() * size_of::<(u32, u32)>();
+        metadata
+            .shrink_to(retained)
+            .map_err(|_| "Native brush metadata exceeds its resident reservation")?;
         check()?;
         Ok(Self {
             width,
@@ -141,6 +212,9 @@ impl<'a> PreparedBrush<'a> {
             polygon,
             dabs,
             tiles,
+            tile_slots,
+            tile_groups,
+            words_per_tile,
             budget: budget.clone(),
             _metadata: metadata,
         })
@@ -148,6 +222,37 @@ impl<'a> PreparedBrush<'a> {
 
     pub(crate) fn tiles(&self) -> &[(u32, u32)] {
         &self.tiles
+    }
+
+    fn tile_dabs(&self, (x, y): (u32, u32)) -> Option<impl Iterator<Item = &Dab>> {
+        let columns = self.width.div_ceil(TILE);
+        if x >= columns || y >= self.height.div_ceil(TILE) {
+            return None;
+        }
+        let &slot = self.tile_slots.get((y * columns + x) as usize)?;
+        if slot == NO_TILE {
+            return None;
+        }
+        let start = usize::from(slot) * self.words_per_tile;
+        let words = &self.tile_groups[start..start + self.words_per_tile];
+        // Visit marked groups in stroke order so native coverage rounds the same way.
+        Some(
+            words
+                .iter()
+                .enumerate()
+                .flat_map(|(word, &bits)| {
+                    let mut remaining = bits;
+                    std::iter::from_fn(move || {
+                        if remaining == 0 {
+                            return None;
+                        }
+                        let bit = remaining.trailing_zeros() as usize;
+                        remaining &= remaining - 1;
+                        Some((word * 64 + bit) * DABS_PER_GROUP)
+                    })
+                })
+                .flat_map(|start| &self.dabs[start..(start + DABS_PER_GROUP).min(self.dabs.len())]),
+        )
     }
 
     /// Clone/heal use the existing 16-bit dab coverage at both source depths.
@@ -158,19 +263,15 @@ impl<'a> PreparedBrush<'a> {
         check: &mut dyn FnMut() -> Result<(), String>,
     ) -> Result<PinnedBytes, String> {
         check()?;
-        if self
-            .tiles
-            .binary_search_by_key(&(coordinate.1, coordinate.0), |&(x, y)| (y, x))
-            .is_err()
-        {
-            return Err("Native coverage tile is outside its prepared footprint".into());
-        }
+        let dabs = self
+            .tile_dabs(coordinate)
+            .ok_or("Native coverage tile is outside its prepared footprint")?;
         let length = (TILE * TILE * 2) as usize;
         let mut coverage =
             ScratchBytes::new(&self.budget, length, length).map_err(|e| e.to_string())?;
         let origin = [(coordinate.0 * TILE) as i32, (coordinate.1 * TILE) as i32];
         let tip = Tip::new(self.settings);
-        for &dab in &self.dabs {
+        for &dab in dabs {
             check()?;
             if dab.radius <= 0.001 || dab.opacity == 0.0 {
                 continue;
@@ -193,6 +294,8 @@ impl<'a> PreparedBrush<'a> {
         Ok(coverage.freeze())
     }
 
+    /// A removed dab is restored from the captured baseline, never from a
+    /// previous preview. Include its old footprint even if no new dab visits it.
     pub(crate) fn changed_tiles(&self, previous: &Self) -> Result<TileChanges, String> {
         if self.frame() != previous.frame()
             || self.depth != previous.depth
@@ -205,11 +308,7 @@ impl<'a> PreparedBrush<'a> {
         {
             return Err("Native brush preview changed its captured gesture parameters".into());
         }
-        let mut changed = TileChanges {
-            bits: [0; 64],
-            columns: self.width.div_ceil(TILE),
-            rows: self.height.div_ceil(TILE),
-        };
+        let mut changed = TileChanges::new(self.frame())?;
         let prefix = self
             .dabs
             .iter()
@@ -232,8 +331,7 @@ impl<'a> PreparedBrush<'a> {
             }
             for y in top as u32 / TILE..=(bottom - 1) as u32 / TILE {
                 for x in left as u32 / TILE..=(right - 1) as u32 / TILE {
-                    let at = (y * changed.columns + x) as usize;
-                    changed.bits[at / 64] |= 1 << (at % 64);
+                    changed.insert((x, y))?;
                 }
             }
         }
@@ -252,13 +350,9 @@ impl<'a> PreparedBrush<'a> {
         if !source.uses_budget(&self.budget) {
             return Err("Native brush source uses a different resident pool".into());
         }
-        if self
-            .tiles
-            .binary_search_by_key(&(coordinate.1, coordinate.0), |&(x, y)| (y, x))
-            .is_err()
-        {
-            return Err("Native brush tile is outside its prepared footprint".into());
-        }
+        let dabs = self
+            .tile_dabs(coordinate)
+            .ok_or("Native brush tile is outside its prepared footprint")?;
         let stride = if self.depth == 16 { 8 } else { 4 };
         let bytes = (TILE * TILE) as usize * stride;
         if source.len() != bytes {
@@ -272,7 +366,7 @@ impl<'a> PreparedBrush<'a> {
             .map_err(|e| e.to_string())?;
         let origin = [(coordinate.0 * TILE) as i32, (coordinate.1 * TILE) as i32];
         let tip = Tip::new(self.settings);
-        for &dab in &self.dabs {
+        for &dab in dabs {
             check()?;
             if dab.radius <= 0.001 || dab.opacity == 0.0 {
                 continue;
@@ -297,7 +391,6 @@ impl<'a> PreparedBrush<'a> {
             );
         }
         if self.depth == 16 {
-            let color = self.color.map(|v| u16::from(v) * 257);
             for (index, pixel) in output.chunks_exact_mut(8).enumerate() {
                 if index % 4096 == 0 {
                     check()?;
@@ -309,7 +402,7 @@ impl<'a> PreparedBrush<'a> {
                 }
                 let old =
                     std::array::from_fn(|i| u16::from_be_bytes([pixel[i * 2], pixel[i * 2 + 1]]));
-                let result = coverage_pixel16(old, alpha, self.settings.opacity, color, self.erase);
+                let result = coverage_pixel16(old, alpha, self.settings.opacity, self.color, self.erase);
                 for (channel, value) in pixel.chunks_exact_mut(2).zip(result) {
                     channel.copy_from_slice(&value.to_be_bytes());
                 }
@@ -319,7 +412,7 @@ impl<'a> PreparedBrush<'a> {
                 &mut output,
                 &coverage,
                 self.settings.opacity,
-                self.color,
+                self.color.map(project16),
                 self.erase,
             );
         }
@@ -353,6 +446,53 @@ mod tests {
             bytes.copy_from_slice(tile);
         }
         bytes.freeze()
+    }
+
+    #[test]
+    fn tile_dab_groups_skip_distant_work_and_keep_revisits_in_order() {
+        let budget = ResidentBudget::new(4 * 1024 * 1024).unwrap();
+        let plan = PreparedBrush::new(
+            16000,
+            16000,
+            16,
+            &[[4090., 15997.], [8., 15997.], [4090., 15997.]],
+            Some(&[0.4, 0.9, 0.6]),
+            Settings {
+                radius: 5.0,
+                spacing: 0.2,
+                smoothing: 0.0,
+                ..Settings::default()
+            },
+            [37, 91, 173, 255],
+            false,
+            None,
+            None,
+            &budget,
+            &mut || Ok(()),
+        )
+        .unwrap();
+
+        assert!(plan.words_per_tile > 1);
+        assert_eq!(plan.tiles(), &(0..16).map(|x| (x, 62)).collect::<Vec<_>>());
+        assert_eq!(
+            plan.tile_groups.len(),
+            plan.tiles().len() * plan.words_per_tile
+        );
+        assert!(budget.used() < 256 * 1024);
+        let touches_first_tile = |dab: &&Dab| dab_bounds(**dab)[0] < TILE as i32;
+        let dabs = plan.tile_dabs((0, 62)).unwrap();
+        assert!(dabs
+            .filter(touches_first_tile)
+            .eq(plan.dabs().iter().filter(touches_first_tile)));
+        let mut checks = 0;
+        plan.coverage16_tile((0, 62), &mut || {
+            checks += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert!(checks * 10 < plan.dabs().len());
+        assert!(plan.tile_dabs((16, 62)).is_none());
+        assert!(plan.tile_dabs((63, 61)).is_none());
     }
 
     #[test]
@@ -482,9 +622,8 @@ mod tests {
         let wrong = native_tile(&raster, (0, 0), &foreign);
         assert!(plan.render_tile((0, 0), &wrong, &mut || Ok(())).is_err());
         assert!(plan.render_tile((1, 0), &source, &mut || Ok(())).is_err());
-        let held = budget
-            .reserve_bytes(1024 * 1024 + 1, 1024 * 1024 + 1)
-            .unwrap();
+        let held_bytes = budget.limit() - before - source.len();
+        let held = budget.reserve_bytes(held_bytes, held_bytes).unwrap();
         assert!(plan.render_tile((0, 0), &source, &mut || Ok(())).is_err());
         assert_eq!(budget.used(), before + held.bytes());
         drop(held);

@@ -1,7 +1,102 @@
 //! Borrowed presentation metadata. Pixel preparation and mutation have separate
 //! fallible commands; this view never reads backing files or copies a document.
-use super::{native, Document, Engine, Layer, Mask, MaskStep};
+use super::{native, Document, Engine, Layer, Mask, MaskStep, Scope};
 use crate::raster::Pixel;
+use std::collections::{HashMap, HashSet};
+
+pub(crate) fn descendant(doc: DocumentView<'_>, child: &str, ancestor: &str) -> bool {
+    descendant_with_parent(child, ancestor, |id| {
+        doc.find_layer(id).and_then(LayerView::parent)
+    })
+}
+
+fn descendant_with_parent<'a>(
+    child: &str,
+    ancestor: &str,
+    parent_of: impl Fn(&str) -> Option<&'a str>,
+) -> bool {
+    let mut parent = parent_of(child);
+    for _ in 0..16 {
+        let Some(id) = parent else { return false };
+        if id == ancestor {
+            return true;
+        }
+        parent = parent_of(id);
+    }
+    false
+}
+
+fn scope_targets_overlap<'a>(
+    a: Option<&str>,
+    b: Option<&str>,
+    parent_of: impl Fn(&str) -> Option<&'a str>,
+) -> bool {
+    let visibility = |target: Option<&str>| target.is_some_and(|id| id.starts_with("@visibility:"));
+    if visibility(a) || visibility(b) {
+        return a == b;
+    }
+    match (a, b) {
+        (Some(x), Some(y)) => {
+            x == y || descendant_with_parent(x, y, &parent_of)
+                || descendant_with_parent(y, x, parent_of)
+        }
+        _ => true,
+    }
+}
+
+pub(crate) fn scope_overlap(doc: DocumentView<'_>, a: &Scope, b: &Scope) -> bool {
+    let a_target = a.target.as_deref();
+    let b_target = b.target.as_deref();
+    scope_targets_overlap(a_target, b_target, |id| {
+        doc.find_layer(id).and_then(LayerView::parent)
+    }) && (a_target.is_some_and(|id| id.starts_with("@visibility:"))
+        || Scope { target: None, rect: a.rect }.overlap(b))
+}
+
+pub(crate) fn reserved_layers<'a>(doc: DocumentView<'a>, scopes: &[Scope]) -> HashSet<&'a str> {
+    if scopes.is_empty() {
+        return HashSet::new();
+    }
+    let parents: HashMap<_, _> = doc.layers()
+        .map(|layer| (layer.id(), layer.parent()))
+        .collect();
+    // Layer panel targets cover the whole layer, so any rectangle on a matching scope overlaps.
+    parents.keys().copied()
+        .filter(|id| {
+            scopes.iter().any(|scope| {
+                scope_targets_overlap(scope.target.as_deref(), Some(*id), |id| {
+                    parents.get(id).copied().flatten()
+                })
+            })
+        })
+        .collect()
+}
+/// Shared declared-scope containment, evaluated against the current draft.
+pub(crate) fn scopes_contained(
+    doc: DocumentView<'_>,
+    declared: &[Scope],
+    actual: &[Scope],
+) -> bool {
+    actual.iter().all(|inner| {
+        declared.iter().any(|outer| {
+            let target = match outer.target.as_deref() {
+                None => true,
+                Some(a) => inner.target.as_deref().is_some_and(|b| {
+                    let b = b.strip_prefix("@visibility:").unwrap_or(b);
+                    a == b || descendant(doc, b, a)
+                }),
+            };
+            target
+                && match (outer.rect, inner.rect) {
+                    (None, _) => true,
+                    (Some(a), Some(b)) => {
+                        a[0] <= b[0] && a[1] <= b[1] && a[2] >= b[2] && a[3] >= b[3]
+                    }
+                    _ => false,
+                }
+        })
+    })
+}
 
 #[derive(Clone, Copy)]
 pub(crate) enum DocumentView<'a> {
@@ -58,9 +153,13 @@ impl<'a> From<&'a Layer> for LayerView<'a> {
         Self::Resident(layer)
     }
 }
-/// The active engine still has resident authority until the coordinated switch.
+impl<'a> From<&'a crate::effects::Effect> for EffectView<'a> {
+    fn from(effect: &'a crate::effects::Effect) -> Self {
+        Self::Resident(effect)
+    }
+}
 pub(crate) fn current(engine: &Engine) -> DocumentView<'_> {
-    DocumentView::Resident(&engine.doc)
+    engine.authority.view()
 }
 #[derive(Clone, Copy)]
 pub(crate) enum LayerView<'a> {
@@ -133,6 +232,15 @@ macro_rules! doc_ref {
     };
 }
 impl<'a> DocumentView<'a> {
+    pub(crate) fn same_observation(self, other: Self) -> bool {
+        self.id() == other.id()
+            && self.revision() == other.revision()
+            && match (self.native(), other.native()) {
+                (Some(a), Some(b)) => a.key() == b.key(),
+                (None, None) => true,
+                _ => false,
+            }
+    }
     pub(crate) fn native(self) -> Option<&'a native::NativeDocument> {
         match self {
             Self::Native(doc) => Some(doc),
@@ -155,6 +263,12 @@ impl<'a> DocumentView<'a> {
     doc_field!(srgb_tagged, srgb_tagged, bool);
     doc_field!(selection, selection, Option<[i32; 4]>);
     doc_ref!(warnings, warnings, &'a [String]);
+    pub(crate) fn global_light_angle(self) -> Option<u32> {
+        match self {
+            Self::Resident(doc) => doc.psd_global_angle.map(u32::from_be_bytes),
+            Self::Native(doc) => doc.metadata().global_light_angle(),
+        }
+    }
     pub(crate) fn profile(self) -> Option<&'a [u8]> {
         match self {
             Self::Resident(doc) => doc.icc_profile.as_deref().map(Vec::as_slice),
@@ -165,6 +279,20 @@ impl<'a> DocumentView<'a> {
         match self {
             Self::Resident(doc) => doc.selection_polygon.as_deref(),
             Self::Native(doc) => doc.metadata().selection_polygon(),
+        }
+    }
+    pub(crate) fn selection_contours(self) -> Option<&'a [Vec<[f32; 2]>]> {
+        match self {
+            Self::Resident(doc) => doc
+                .selection_coverage
+                .as_ref()
+                .filter(|coverage| doc.selection == Some(coverage.bounds))
+                .map(|coverage| coverage.contours.as_slice()),
+            Self::Native(doc) => doc
+                .metadata()
+                .selection_coverage()
+                .filter(|coverage| doc.metadata().selection() == Some(coverage.bounds()))
+                .map(|coverage| coverage.contours()),
         }
     }
     pub(crate) fn has_soft_selection(self) -> bool {
@@ -201,6 +329,13 @@ impl<'a> DocumentView<'a> {
             Self::Native(doc) => doc.metadata().filters().len(),
         }
     }
+    pub(crate) fn wand_source(self) -> Option<(&'a str, &'a serde_json::Value)> {
+        match self {
+            Self::Resident(doc) => crate::selection::wand_source(doc)
+                .map(|source| (source.id.as_str(), &source.command)),
+            Self::Native(doc) => doc.wand().map(|source| (source.id(), source.command())),
+        }
+    }
     pub(crate) fn filter(self, index: usize) -> Option<EffectView<'a>> {
         match self {
             Self::Resident(doc) => doc.filters.get(index).map(EffectView::Resident),
@@ -213,8 +348,13 @@ impl<'a> DocumentView<'a> {
             Self::Native(doc) => doc.metadata().global_mask(),
         }
     }
-    /// Native editable headers contain no legacy view-only unsupported records.
-    /// Absence is explicit so callers cannot treat it as an empty source tree.
+    pub(crate) fn source_structure(self) -> Option<&'a [crate::psd::SourceLayerInfo]> {
+        match self {
+            Self::Resident(doc) => Some(&doc.source_structure),
+            Self::Native(doc) => doc.protected_structure(),
+        }
+    }
+    /// Absence is explicit so callers cannot treat it as an empty legacy inspection.
     pub(crate) fn legacy_inspection(
         self,
     ) -> Option<(
@@ -291,6 +431,42 @@ impl<'a> LayerView<'a> {
     layer_field!(visible, bool);
     layer_field!(locked, bool);
     layer_field!(opacity, f32);
+    pub(crate) fn fill_opacity(self) -> u8 {
+        match self {
+            Self::Resident(layer) => crate::psd::fill_opacity::value(&layer.psd_metadata),
+            Self::Native(layer) => layer.fill_opacity(),
+        }
+    }
+    pub(crate) fn blend_clipped_as_group(self) -> bool {
+        match self {
+            Self::Resident(layer) => crate::psd::clipping::grouped(&layer.psd_metadata),
+            Self::Native(layer) => layer.blend_clipped_as_group(),
+        }
+    }
+    pub(crate) fn blend_if(self) -> Option<[[u8; 8]; 4]> {
+        match self {
+            Self::Resident(layer) => crate::psd::blend_ranges::value(&layer.psd_metadata),
+            Self::Native(layer) => layer.blend_if(),
+        }
+    }
+    pub(crate) fn blend_channels(self) -> [bool; 3] {
+        match self {
+            Self::Resident(layer) => crate::psd::blend_channels::enabled(&layer.psd_metadata),
+            Self::Native(layer) => layer.blend_channels(),
+        }
+    }
+    pub(crate) fn color_label(self) -> &'static str {
+        crate::psd::layer_color_label(match self {
+            Self::Resident(layer) => &layer.psd_metadata,
+            Self::Native(layer) => layer.psd_metadata(),
+        })
+    }
+    pub(crate) fn photoshop_folder_is_closed(self) -> bool {
+        self.kind() == "group" && crate::psd::folder_is_closed(match self {
+            Self::Resident(layer) => &layer.psd_metadata,
+            Self::Native(layer) => layer.psd_metadata(),
+        })
+    }
     layer_field!(color, Pixel);
     pub(crate) fn origin(self) -> [i32; 2] {
         match self {
@@ -351,7 +527,19 @@ impl<'a> LayerView<'a> {
         }
     }
 }
-impl SourceView<'_> {
+impl<'a> SourceView<'a> {
+    pub(crate) fn path_nodes(self) -> Option<(&'a [crate::path::Anchor], bool)> {
+        match self {
+            Self::Resident(source) => match &source.content {
+                crate::source::Content::Bezier { nodes, closed, .. } => Some((nodes, *closed)),
+                _ => None,
+            },
+            Self::Native(source) => match source.definition() {
+                super::scene::Content36::Bezier { nodes, closed, .. } => Some((nodes, *closed)),
+                _ => None,
+            },
+        }
+    }
     pub(crate) fn dimensions(self) -> [u32; 2] {
         match self {
             Self::Resident(source) => [source.width, source.height],
@@ -475,6 +663,39 @@ mod tests {
         large_document::{DiskBudget, ResidentBudget},
         raster::{Raster, Surface},
     };
+
+    #[test]
+    fn layer_reservation_indicators_use_the_shared_hierarchy_rules() {
+        let mut document = Document::new(12, 11).unwrap();
+        let outer = Layer::new("Outer", "group", 12, 11);
+        let mut inner = Layer::new("Inner", "group", 12, 11);
+        inner.parent = Some(outer.id.clone());
+        document.layers[0].parent = Some(inner.id.clone());
+        let leaf = document.layers[0].id.clone();
+        let child = inner.id.clone();
+        let root = outer.id.clone();
+        document.layers.extend([inner, outer, Layer::new("Unrelated", "paint", 12, 11)]);
+        let doc = DocumentView::from(&document);
+        let rect = Some([1, 1, 4, 4]);
+        for (target, expected_count) in [
+            (None, 4),
+            (Some(leaf.clone()), 3),
+            (Some(root.clone()), 3),
+            (Some(format!("@visibility:{leaf}")), 0),
+            (Some("@selection".into()), 0),
+        ] {
+            let scope = Scope { target, rect };
+            let reserved = reserved_layers(doc, std::slice::from_ref(&scope));
+            assert_eq!(reserved.len(), expected_count);
+            for layer in doc.layers() {
+                assert_eq!(reserved.contains(layer.id()), scope_overlap(doc, &scope, &Scope::layer(layer.id())));
+            }
+        }
+        let scope = Scope { target: Some(root), rect };
+        let disjoint = Scope { target: Some(child), rect: Some([4, 4, 8, 8]) };
+        assert!(!scope_overlap(doc, &scope, &disjoint));
+    }
+
     struct Zeros(Vec<Surface>);
     impl RasterCollector for Zeros {
         fn resident(&mut self, pixels: &Raster) -> Result<RasterRef36, String> {
@@ -524,8 +745,39 @@ mod tests {
                 weight: 0.75,
                 settings: std::sync::Arc::new(serde_json::json!({"color":[19,37,71,255]})),
             });
+            document.layers[0].source = Some(std::sync::Arc::new(crate::source::Source {
+                width: 12,
+                height: 11,
+                matrix: [1.1, 0.25, -0.1, 0.9, 2., -1.],
+                content: crate::source::Content::Bezier {
+                    nodes: vec![
+                        crate::path::Anchor {
+                            point: [2., 3.],
+                            in_handle: None,
+                            out_handle: Some([5., 6.]),
+                            smooth: false,
+                        },
+                        crate::path::Anchor {
+                            point: [8., 7.],
+                            in_handle: Some([6., 5.]),
+                            out_handle: None,
+                            smooth: false,
+                        },
+                    ],
+                    closed: false,
+                    fill: [0; 4],
+                    stroke: [12345, 23457, 34569, 65535],
+                    stroke_width: 2.,
+                },
+            }));
             document.selection = Some([1, 2, 7, 8]);
             document.selection_polygon = Some(vec![[1., 2.], [7., 2.], [7., 8.]]);
+            document.selection_coverage = Some(crate::selection::Coverage {
+                mask: Raster::new(6, 6),
+                bounds: [1, 2, 7, 8],
+                origin: [1, 2],
+                contours: vec![vec![[1., 2.], [7., 2.], [7., 8.]]],
+            });
             let budget = ResidentBudget::new(32 * 1024 * 1024).unwrap();
             let owner =
                 crate::psd::memory36::MetadataCharge::reserve(&budget, 8 * 1024 * 1024, &|| Ok(()))
@@ -558,6 +810,20 @@ mod tests {
             );
             assert_eq!(left.selection(), right.selection());
             assert_eq!(left.selection_polygon(), right.selection_polygon());
+            assert_eq!(left.selection_contours(), right.selection_contours());
+            assert!(std::ptr::eq(
+                left.selection_contours().unwrap(),
+                document
+                    .selection_coverage
+                    .as_ref()
+                    .unwrap()
+                    .contours
+                    .as_slice()
+            ));
+            assert!(std::ptr::eq(
+                right.selection_contours().unwrap(),
+                native.metadata().selection_coverage().unwrap().contours()
+            ));
             assert_eq!(left.layer_count(), right.layer_count());
             for (a, b) in left.layers().zip(right.layers()) {
                 assert_eq!(
@@ -581,6 +847,32 @@ mod tests {
                         b.pixels(),
                         b.source_kind()
                     )
+                );
+                assert_eq!(
+                    a.source().unwrap().path_nodes(),
+                    b.source().unwrap().path_nodes()
+                );
+                for point in [[2., 3.], [5., 6.], [8., 7.]] {
+                    assert_eq!(
+                        crate::path::document_point_view(a, point),
+                        crate::path::document_point_view(b, point)
+                    );
+                    assert_eq!(
+                        crate::path::nearest_segment_view(a, point, 12.),
+                        crate::path::nearest_segment_view(b, point, 12.)
+                    );
+                }
+                let command = serde_json::json!({"op":"path.node.move","layer":a.id(),"index":1,"point":[9,6]});
+                let controls_a = crate::path::preview_controls(left, Some(a), &[command.clone()])
+                    .unwrap()
+                    .unwrap();
+                let controls_b = crate::path::preview_controls(right, Some(b), &[command])
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(controls_a.0, controls_b.0);
+                assert_eq!(
+                    serde_json::to_value(controls_a.1).unwrap(),
+                    serde_json::to_value(controls_b.1).unwrap()
                 );
                 let (am, bm) = (a.mask().unwrap(), b.mask().unwrap());
                 assert_eq!(

@@ -3,8 +3,9 @@ use super::planning::{LayerPlan, Pixels, Plane};
 use crate::{
     engine::{
         native::{
-            CapturedEdit, Command, CommandToken, LayerPatch, Method, NativeDocument, OutputDraft,
-            PreparedDelta, RasterBatch, RasterPatch, RetainedUpdate, SourceUpdate, StagedOutput,
+            Cancellation, CapturedEdit, Command, CommandToken, LayerPatch, Method, NativeDocument,
+            OutputDraft, PreparedDelta, RasterBatch, RasterPatch, RetainedUpdate, SourceUpdate,
+            StagedOutput,
         },
         scene::{Grid36, StageSession, Warp36},
     },
@@ -20,6 +21,9 @@ pub(crate) trait Session: StageSession {
     fn resident(&self) -> ResidentBudget;
     fn disk(&self) -> DiskBudget;
     fn fresh(&self) -> Result<FreshFragment, String>;
+    fn check_pinned_work(&self) -> Result<(), String> {
+        self.check()
+    }
 }
 impl Session for crate::workspace::source_runtime::SourceSession {
     fn resident(&self) -> ResidentBudget {
@@ -30,6 +34,9 @@ impl Session for crate::workspace::source_runtime::SourceSession {
     }
     fn fresh(&self) -> Result<FreshFragment, String> {
         self.fresh_fragment()
+    }
+    fn check_pinned_work(&self) -> Result<(), String> {
+        self.check_pinned_work()
     }
 }
 
@@ -138,12 +145,9 @@ fn prepare(
     check: &dyn Fn() -> Result<(), String>,
 ) -> Result<PreparedDelta, String> {
     let cancellation = captured.cancellation();
-    let checked = || {
-        cancellation.check()?;
-        session.check()?;
-        check()?;
-        cancellation.check()
-    };
+    let active = || cancellation.check().and_then(|_| check());
+    let checked = || active().and_then(|_| session.check()).and_then(|_| cancellation.check());
+    let pinned = || active().and_then(|_| session.check_pinned_work());
     checked()?;
     let base = captured.document();
     if !base.budget().same_pool(&session.resident())
@@ -152,21 +156,31 @@ fn prepare(
         return Err("Native transform session uses another document admission".into());
     }
     let mut count = 0usize;
+    let mut affine_frame = None;
+    let mut affine_only = true;
+    let area = |[w, h]: [u32; 2]| u64::from(w) * u64::from(h);
     for plan in plans {
         base.source(plan.layer.pixels().slot())?;
         for plane in plan.color.iter().chain(&plan.masks) {
             base.source(plane.target)?;
-            if matches!(plane.pixels, Pixels::Editable { .. }) {
-                // Never publish new source placement with stale raster pixels.
-                return Err(
-                    "Editable-source transform requires the qualified native source renderer"
-                        .into(),
-                );
+            match &plane.pixels {
+                Pixels::Zero { .. } => {}
+                Pixels::Native { pose, .. } | Pixels::Fill { pose, .. }
+                    if pose.projective.is_none() && pose.warps().is_empty() =>
+                {
+                    if affine_frame.is_none_or(|previous| area(plan.frame) > area(previous)) {
+                        affine_frame = Some(plan.frame);
+                    }
+                }
+                _ => affine_only = false,
             }
             count = count
                 .checked_add(1)
                 .ok_or("Native transform plane count overflow")?;
         }
+    }
+    if let Some(frame) = affine_frame.filter(|_| affine_only) {
+        work.admit_affine_frame(frame);
     }
     let bytes = count
         .checked_mul(32 * 1024 + std::mem::size_of::<RasterPatch>())
@@ -216,13 +230,23 @@ fn prepare(
             checked()?;
             for plane in plan.color.iter().chain(&plan.masks) {
                 batch.rasters.push(stage_plane(
-                    base, plane, plan.frame, session, work, &checked,
+                    base,
+                    plane,
+                    plan.frame,
+                    session,
+                    &cancellation,
+                    work,
+                    &checked,
+                    &pinned,
                 )?);
             }
             batch.layers.push(LayerPatch {
                 target: plan.layer.pixels().slot(),
                 origin: Some(plan.origin),
-                source: SourceUpdate::Keep,
+                source: match plan.color.as_ref().map(|plane| &plane.pixels) {
+                    Some(Pixels::Editable { matrix, .. }) => SourceUpdate::Matrix(*matrix),
+                    _ => SourceUpdate::Keep,
+                },
                 materialize_fill: plan.materialize_fill,
             });
         }
@@ -245,14 +269,17 @@ fn prepare(
     result
 }
 
-fn stage_plane(
+pub(crate) fn stage_plane(
     base: &NativeDocument,
     plane: &Plane<'_>,
     frame: [u32; 2],
     session: &impl Session,
+    cancellation: &Cancellation,
     work: &mut Work,
     check: &dyn Fn() -> Result<(), String>,
+    pinned: &dyn Fn() -> Result<(), String>,
 ) -> Result<RasterPatch, String> {
+    cancellation.check()?;
     check()?;
     let (input, pose, fill) = match &plane.pixels {
         Pixels::Native { input, pose } => (input, pose, None),
@@ -267,7 +294,46 @@ fn stage_plane(
                 layer_origin: None,
             });
         }
-        Pixels::Editable { .. } => return Err("Native source renderer is unavailable".into()),
+        Pixels::Editable {
+            source,
+            matrix,
+            depth,
+        } => {
+            let layer = base
+                .metadata()
+                .layers()
+                .find(|layer| layer.pixels().slot() == plane.target)
+                .ok_or("Editable transform requires a captured primary source slot")?;
+            if !layer
+                .source()
+                .is_some_and(|current| std::ptr::eq(current, *source))
+                || layer.pixels().depth() != *depth
+                || base.source(plane.target)?.depth() != *depth
+            {
+                return Err("Editable transform definition or native precision differs from its captured source".into());
+            }
+            let prepared = crate::source::prepared::PreparedSource::load_transformed(
+                source,
+                *matrix,
+                base.budget(),
+                &mut || check(),
+            )?;
+            let output = crate::source::stage::render_captured(
+                &prepared,
+                frame,
+                *depth,
+                base,
+                session,
+                cancellation,
+                &mut || check(),
+            )?;
+            return Ok(RasterPatch {
+                target: plane.target,
+                output,
+                retained: RetainedUpdate::Clear,
+                layer_origin: None,
+            });
+        }
     };
     if input.document().key() != base.key() {
         return Err("Native transform source generation differs".into());
@@ -299,12 +365,24 @@ fn stage_plane(
             points: s.grid.points,
         },
     }));
+    let write = |source: &Surface,
+                 store: &Store,
+                 checked: &dyn Fn() -> crate::large_document::Result<()>,
+                 work: &mut Work| {
+        let failure = RefCell::new(None);
+        let active = || pinned().map_err(|reason| {
+            *failure.borrow_mut() = Some(reason);
+            Error::Cancelled
+        });
+        native::write_plane_guarded(source, &mapping, frame, store, work, &active, checked)
+            .map_err(|reason| failure.into_inner().unwrap_or(reason))
+    };
     if let Some(color) = fill {
         let original = stage(base, session, check, |store, checked| {
             native::write_fill(pose.frame, pose.depth, color, store, work, checked)
         })?;
         let output = stage(base, session, check, |store, checked| {
-            native::write_plane(original.surface(), &mapping, frame, store, work, checked)
+            write(original.surface(), store, checked, work)
         });
         let output = match output {
             Ok(output) => output,
@@ -328,7 +406,7 @@ fn stage_plane(
         })
     } else {
         let output = stage(base, session, check, |store, checked| {
-            native::write_plane(input.source()?, &mapping, frame, store, work, checked)
+            write(input.source()?, store, checked, work)
         })?;
         Ok(RasterPatch {
             target: plane.target,
@@ -353,6 +431,22 @@ pub(crate) fn stage(
         &dyn Fn() -> crate::large_document::Result<()>,
     ) -> Result<Surface, String>,
 ) -> Result<StagedOutput, String> {
+    stage_optional(base, session, check, |store, checked| {
+        write(store, checked).map(Some)
+    })?
+    .ok_or_else(|| "Required native source output missing".into())
+}
+
+/// A producer returning no change still retires every provisional source byte.
+pub(crate) fn stage_optional(
+    base: &NativeDocument,
+    session: &impl Session,
+    check: &dyn Fn() -> Result<(), String>,
+    write: impl FnOnce(
+        &Store,
+        &dyn Fn() -> crate::large_document::Result<()>,
+    ) -> Result<Option<Surface>, String>,
+) -> Result<Option<StagedOutput>, String> {
     check()?;
     let mut tokens = Vec::new();
     tokens
@@ -375,7 +469,15 @@ pub(crate) fn stage(
         }
     };
     let surface = match write(fragment.store(), &checked) {
-        Ok(surface) => surface,
+        Ok(Some(surface)) => surface,
+        Ok(None) => {
+            session
+                .abort_fragment(fragment, &|| Ok(()))
+                .map_err(|reason| format!("Unchanged native fragment retained: {reason}"))?;
+            session.check()?;
+            check()?;
+            return Ok(None);
+        }
         Err(reason) => {
             return Err(retire_fragment(
                 session,
@@ -384,16 +486,22 @@ pub(crate) fn stage(
             ))
         }
     };
-    if surface.is_known_zero() {
+    // A tile-preserving producer may return existing sources, including an
+    // unchanged plane or zero patches only. Its unused fresh fragment must not
+    // be sealed as though it owned those older source blocks.
+    if !surface
+        .physical_tiles()
+        .any(|tile| tile.owner().identity() == fragment.store().identity())
+    {
         if let Err(reason) = session.abort_fragment(fragment, &|| Ok(())) {
-            return Err(format!("Empty transform fragment retained: {reason}"));
+            return Err(format!("Unused transform fragment retained: {reason}"));
         }
     } else {
         tokens.push(fragment);
     }
-    seal(base, session, OutputDraft::new(surface, tokens), check)
+    seal(base, session, OutputDraft::new(surface, tokens), check).map(Some)
 }
-fn seal(
+pub(crate) fn seal(
     base: &NativeDocument,
     session: &impl Session,
     draft: OutputDraft,

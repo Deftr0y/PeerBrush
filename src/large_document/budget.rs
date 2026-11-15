@@ -1,6 +1,6 @@
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    Arc, Mutex, Weak,
 };
 
 use super::{Error, Result};
@@ -14,6 +14,14 @@ struct Budget {
     limit: usize,
     used: AtomicUsize,
     index: AtomicUsize,
+    caches: Mutex<[Option<Weak<dyn DerivedCache>>; 8]>,
+    evicting: AtomicBool,
+}
+
+/// Memory-only derived data. Eviction must use try_lock, do no I/O, and never
+/// acquire engine locks, allocate, or change document/history state.
+pub(crate) trait DerivedCache: Send + Sync {
+    fn evict(&self);
 }
 
 /// A reservation for an external buffer; retain it until that allocation is
@@ -62,6 +70,8 @@ impl ResidentBudget {
             limit,
             used: AtomicUsize::new(0),
             index: AtomicUsize::new(0),
+            caches: Mutex::new(std::array::from_fn(|_| None)),
+            evicting: AtomicBool::new(false),
         })))
     }
 
@@ -89,6 +99,49 @@ impl ResidentBudget {
         Arc::ptr_eq(&self.0, &other.0)
     }
 
+    pub(crate) fn register_cache(&self, cache: &Arc<dyn DerivedCache>) -> bool {
+        let Ok(mut caches) = self.0.caches.try_lock() else {
+            return false;
+        };
+        let weak = Arc::downgrade(cache);
+        for slot in caches.iter_mut() {
+            if slot.as_ref().is_some_and(|old| old.ptr_eq(&weak)) {
+                return true;
+            }
+            if slot.as_ref().is_some_and(|old| old.strong_count() == 0) {
+                *slot = None;
+            }
+        }
+        let Some(slot) = caches.iter_mut().find(|slot| slot.is_none()) else {
+            return false;
+        };
+        *slot = Some(weak);
+        true
+    }
+
+    fn evict_caches(&self) {
+        if self.0.evicting.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        struct Reset<'a>(&'a AtomicBool);
+        impl Drop for Reset<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let _reset = Reset(&self.0.evicting);
+        // Callbacks and their last owners drop outside the registry lock.
+        let caches = match self.0.caches.try_lock() {
+            Ok(caches) => {
+                std::array::from_fn::<_, 8, _>(|i| caches[i].as_ref().and_then(Weak::upgrade))
+            }
+            Err(_) => return,
+        };
+        for cache in caches.into_iter().flatten() {
+            cache.evict();
+        }
+    }
+
     pub fn reserve_bytes(&self, length: usize, maximum: usize) -> Result<Reservation> {
         if maximum > 64 * 1024 * 1024 || length > maximum {
             return Err(Error::Budget);
@@ -97,12 +150,20 @@ impl ResidentBudget {
     }
 
     pub(super) fn reserve(&self, bytes: usize) -> Result<Charge> {
-        self.0
-            .used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                used.checked_add(bytes).filter(|next| *next <= self.0.limit)
-            })
-            .map_err(|_| Error::Budget)?;
+        if bytes > self.0.limit {
+            return Err(Error::Budget);
+        }
+        let reserve = || {
+            self.0
+                .used
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                    used.checked_add(bytes).filter(|next| *next <= self.0.limit)
+                })
+        };
+        if reserve().is_err() {
+            self.evict_caches();
+            reserve().map_err(|_| Error::Budget)?;
+        }
         Ok(Reservation {
             budget: self.clone(),
             bytes,
@@ -150,6 +211,105 @@ impl Drop for Reservation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct Pixels(Mutex<Option<crate::large_document::PinnedBytes>>);
+    impl DerivedCache for Pixels {
+        fn evict(&self) {
+            if let Ok(mut pixels) = self.0.try_lock() {
+                let old = pixels.take();
+                drop(pixels);
+                drop(old);
+            }
+        }
+    }
+
+    #[test]
+    fn pressure_evicts_optional_pixels_but_cannot_refund_escaped_owners() {
+        for escaped in [false, true] {
+            let budget = ResidentBudget::new(1024).unwrap();
+            let bytes = crate::large_document::ScratchBytes::new(&budget, 768, 768)
+                .unwrap()
+                .freeze();
+            let pin = escaped.then(|| bytes.clone());
+            let cache = Arc::new(Pixels(Mutex::new(Some(bytes))));
+            let callback: Arc<dyn DerivedCache> = cache.clone();
+            assert!(budget.register_cache(&callback));
+            assert!(budget.register_cache(&callback));
+            // Invalid/impossible requests do not discard useful cache data.
+            assert!(budget.reserve_bytes(2048, 2048).is_err());
+            assert!(budget.reserve_bytes(1, 64 * 1024 * 1024 + 1).is_err());
+            assert!(cache.0.lock().unwrap().is_some());
+            let result = budget.reserve_bytes(512, 512);
+            assert!(cache.0.lock().unwrap().is_none());
+            if escaped {
+                assert!(matches!(result, Err(Error::Budget)));
+                assert_eq!(budget.used(), 768);
+                drop(pin);
+                assert_eq!(budget.used(), 0);
+                drop(budget.reserve_bytes(1024, 1024).unwrap());
+            } else {
+                drop(result.unwrap());
+            }
+            assert_eq!(budget.used(), 0);
+        }
+    }
+
+    #[test]
+    fn registry_is_bounded_weak_and_busy_caches_refuse_without_waiting() {
+        let budget = ResidentBudget::new(1024).unwrap();
+        let caches: [Arc<dyn DerivedCache>; 8] =
+            std::array::from_fn(|_| Arc::new(Pixels(Mutex::new(None))) as Arc<dyn DerivedCache>);
+        for cache in &caches {
+            assert!(budget.register_cache(cache));
+        }
+        let other: Arc<dyn DerivedCache> = Arc::new(Pixels(Mutex::new(None)));
+        assert!(!budget.register_cache(&other));
+        assert_eq!(Arc::strong_count(&other), 1);
+        let weak = Arc::downgrade(&caches[0]);
+        drop(caches);
+        assert!(weak.upgrade().is_none());
+        assert!(budget.register_cache(&other));
+        let bytes = crate::large_document::ScratchBytes::new(&budget, 1024, 1024)
+            .unwrap()
+            .freeze();
+        let cache = Arc::new(Pixels(Mutex::new(Some(bytes))));
+        let callback: Arc<dyn DerivedCache> = cache.clone();
+        assert!(budget.register_cache(&callback));
+        let busy = cache.0.lock().unwrap();
+        assert!(matches!(budget.reserve_bytes(1, 1), Err(Error::Budget)));
+        assert_eq!(budget.used(), 1024);
+        drop(busy);
+        drop(budget.reserve_bytes(1024, 1024).unwrap());
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn pressure_callbacks_run_outside_registry_lock_and_cannot_recurse() {
+        struct Nested {
+            budget: ResidentBudget,
+            calls: AtomicUsize,
+            charge: Mutex<Option<Reservation>>,
+        }
+        impl DerivedCache for Nested {
+            fn evict(&self) {
+                assert_eq!(self.calls.fetch_add(1, Ordering::Relaxed), 0);
+                assert!(self.budget.0.caches.try_lock().is_ok());
+                assert!(self.budget.reserve_bytes(1, 1).is_err());
+                drop(self.charge.try_lock().unwrap().take());
+            }
+        }
+        let budget = ResidentBudget::new(1024).unwrap();
+        let cache = Arc::new(Nested {
+            budget: budget.clone(),
+            calls: AtomicUsize::new(0),
+            charge: Mutex::new(Some(budget.reserve_bytes(1024, 1024).unwrap())),
+        });
+        let callback: Arc<dyn DerivedCache> = cache.clone();
+        assert!(budget.register_cache(&callback));
+        drop(budget.reserve_bytes(1024, 1024).unwrap());
+        assert_eq!(cache.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(budget.used(), 0);
+    }
 
     #[test]
     fn shared_reservations_refuse_overflow_and_return_capacity_on_every_exit() {

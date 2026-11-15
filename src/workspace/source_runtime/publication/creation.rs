@@ -30,6 +30,16 @@ pub(super) fn validate_closed(
             }
             Place::Target | Place::Temporary => 0,
             Place::CreatedBackup => 1,
+            Place::RetainedOriginal => {
+                if entry
+                    .frame
+                    .expected
+                    .is_none_or(|old| old.identity != binding.fact.identity)
+                {
+                    return Err("Relocated original has no admitted original identity".into());
+                }
+                continue;
+            }
             Place::BackupOrdinal(_) => continue,
         };
         if entry.created[slot]

@@ -497,7 +497,7 @@ impl Helper {
             Err(_) => return Err(STAGE_HOLD.into()),
         }
         let parent = Directory::open(&root)?;
-        if fs::read_dir(&root).map_err(|_| STAGE_HOLD)?.count() >= 8 {
+        if fs::read_dir(&root).map_err(|_| STAGE_HOLD)?.take(8).count() >= 8 {
             return Err("Retained Windows owner capacity requires review; no historical archives were deleted.".into());
         }
         let path = root.join(format!("owner-{}", uuid::Uuid::new_v4()));
@@ -541,6 +541,7 @@ impl Parent {
             let c = control();
             profile.validate()?;
             let namespace = Namespace::capture(profile)?;
+            HistorySlot::preflight(&namespace.physical.profile(), &c)?;
             let context = Context::load(
                 &profile.locations.profile().join("windows-prepared"),
                 &policy,
@@ -857,6 +858,7 @@ pub(super) fn owner_main(name: &str) -> Result<()> {
         authenticate_helper(&owner, &helper, &c)?;
         let gate = gate::Gate::own(&hello.namespace.physical.config)?;
         let mut context = Context::load(&root, &policy, &native::Verifier, &c, true)?;
+        let history = HistorySlot::reserve(&hello.namespace.physical.profile(), &c)?;
         context.intent = Some(stage_record(
             &context.selected.owned.path.join("owner-intent.json"),
             &Intent {
@@ -908,7 +910,7 @@ pub(super) fn owner_main(name: &str) -> Result<()> {
                 {
                     return Err(STAGE_HOLD.into());
                 }
-                cancel_before_seal(context, active, &hello.namespace, &c)?;
+                cancel_before_seal(context, active, &hello.namespace, &history, &c)?;
                 let end = Instant::now() + Duration::from_secs(2);
                 pipe.send(&true, &parent, end)?;
                 let _ = pipe.receive::<bool>(&parent, end);
@@ -916,6 +918,7 @@ pub(super) fn owner_main(name: &str) -> Result<()> {
             }
             _ => return Err(STAGE_HOLD.into()),
         };
+        history.check_empty(&c)?;
         let held = Held::open(
             &context.selected.owned.path.join("final-seal.json"),
             SMALL,
@@ -967,6 +970,7 @@ pub(super) fn owner_main(name: &str) -> Result<()> {
             profile,
             originals,
             active,
+            history,
             c,
             next: None,
         };
@@ -979,16 +983,85 @@ fn cancel_before_seal(
     mut context: Context,
     active: Held,
     namespace: &Namespace,
+    history: &HistorySlot,
     c: &Control,
 ) -> Result<()> {
     context.check(c)?;
     active.check(c)?;
     namespace.check(false)?;
     let intent = context.intent.take().ok_or(STAGE_HOLD)?;
-    retire_cancelled_records(intent, active, &namespace.physical.profile(), c, || {
-        context.check(c)?;
-        namespace.check(false)
-    })
+    retire_cancelled_records(
+        intent, active, &namespace.physical.profile(), history, c, || {
+            context.check(c)?;
+            namespace.check(false)
+        },
+    )
+}
+
+const HISTORY_LIMIT: usize = 8;
+
+struct HistorySlot {
+    parent: Directory,
+    archive: Directory,
+}
+
+impl HistorySlot {
+    fn capacity(directory: &Directory, c: &Control) -> Result<()> {
+        directory.check()?;
+        let mut count = 0;
+        for entry in fs::read_dir(&directory.path).map_err(|_| STAGE_HOLD)?.take(HISTORY_LIMIT) {
+            c.check()?;
+            entry.map_err(|_| STAGE_HOLD)?;
+            count += 1;
+        }
+        if count == HISTORY_LIMIT {
+            return Err("Windows update history is full. Retained archives require review before another update.".into());
+        }
+        directory.check()
+    }
+
+    fn preflight(profile: &Path, c: &Control) -> Result<()> {
+        let history = profile.join("windows-update-history");
+        match fs::symlink_metadata(&history) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err(STAGE_HOLD.into()),
+            Ok(_) => Self::capacity(&Directory::open(&history)?, c),
+        }
+    }
+
+    fn reserve(profile: &Path, c: &Control) -> Result<Self> {
+        let history = profile.join("windows-update-history");
+        c.check()?;
+        match fs::create_dir(&history) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(_) => return Err(STAGE_HOLD.into()),
+        }
+        let parent = Directory::open(&history)?;
+        Self::capacity(&parent, c)?;
+        let path = history.join(format!("transition-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&path).map_err(|_| STAGE_HOLD)?;
+        let result = Self {
+            parent,
+            archive: Directory::open(&path)?,
+        };
+        result.check_empty(c)?;
+        Ok(result)
+    }
+
+    fn check(&self) -> Result<()> {
+        self.parent.check()?;
+        self.archive.check()
+    }
+
+    fn check_empty(&self, c: &Control) -> Result<()> {
+        c.check()?;
+        self.check()?;
+        if fs::read_dir(&self.archive.path).map_err(|_| STAGE_HOLD)?.next().is_some() {
+            return Err(STAGE_HOLD.into());
+        }
+        self.check()
+    }
 }
 fn pre_seal_absence(attempt: &Path) -> Result<()> {
     for name in ["profile-final", "final-seal.json", "apply-records"] {
@@ -1004,6 +1077,7 @@ fn retire_cancelled_records(
     intent: Held,
     active: Held,
     root: &Path,
+    history: &HistorySlot,
     c: &Control,
     guard: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
@@ -1020,19 +1094,11 @@ fn retire_cancelled_records(
     let identity = intent.identity;
     let active_path = active.path.clone();
     let active_identity = active.identity;
-    let history = root.join("windows-update-history");
-    match fs::create_dir(&history) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(_) => return Err(STAGE_HOLD.into()),
-    }
-    let history_directory = Directory::open(&history)?;
-    if fs::read_dir(&history).map_err(|_| STAGE_HOLD)?.count() >= 8 {
+    if history.parent.path != root.join("windows-update-history") {
         return Err(STAGE_HOLD.into());
     }
-    let archive = history.join(format!("cancelled-{}", uuid::Uuid::new_v4()));
-    fs::create_dir(&archive).map_err(|_| STAGE_HOLD)?;
-    let archive_directory = Directory::open(&archive)?;
+    history.check_empty(c)?;
+    let archive = &history.archive.path;
     intent.check(c)?;
     active.check(c)?;
     attempt.check()?;
@@ -1043,8 +1109,7 @@ fn retire_cancelled_records(
     guard()?;
     attempt.check()?;
     pre_seal_absence(&attempt.path)?;
-    history_directory.check()?;
-    archive_directory.check()?;
+    history.check()?;
     retirement::rename_file(
         &active_path,
         active_identity,
@@ -1061,6 +1126,7 @@ struct Live {
     profile: crate::settings::Profile,
     originals: profile::Originals,
     active: Held,
+    history: HistorySlot,
     c: Control,
     next: Option<Directory>,
 }
@@ -1081,6 +1147,7 @@ impl transaction::Host for Live {
         self.profile.update_profile().validate()?;
         self.originals.check(&self.c)?;
         self.active.check(&self.c)?;
+        self.history.check_empty(&self.c)?;
         if !self.parent.exited()? {
             return Err(STAGE_HOLD.into());
         }
@@ -1412,19 +1479,6 @@ impl Live {
         let mut owned = self;
         owned.guard()?;
         let root = owned.namespace.physical.profile();
-        let history = root.join("windows-update-history");
-        match fs::create_dir(&history) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(_) => return Err(STAGE_HOLD.into()),
-        }
-        let history_directory = Directory::open(&history)?;
-        if fs::read_dir(&history).map_err(|_| STAGE_HOLD)?.count() >= 8 {
-            return Err(STAGE_HOLD.into());
-        }
-        let archive = history.join(format!("transition-{}", uuid::Uuid::new_v4()));
-        fs::create_dir(&archive).map_err(|_| STAGE_HOLD)?;
-        let archive_directory = Directory::open(&archive)?;
         let prepared_id = owned.context.roots[1].identity;
         let current_id = owned.context.roots[0].identity;
         let next_identity = owned.next.as_ref().map(|p| p.identity);
@@ -1453,11 +1507,14 @@ impl Live {
             profile,
             originals,
             helper,
+            history,
             ..
         } = owned;
         drop(context);
         drop(next);
         drop(active);
+        history.check_empty(&control())?;
+        let archive = &history.archive.path;
         if outcome == transaction::Outcome::Healthy {
             retirement::rename(
                 &root.join("windows-current"),
@@ -1475,8 +1532,7 @@ impl Live {
             prepared_id,
             &archive.join("completed-prepared"),
         )?;
-        history_directory.check()?;
-        archive_directory.check()?;
+        history.check()?;
         originals.check(&control())?;
         retirement::rename_file(
             &root.join("windows-update-active.json"),
@@ -1723,6 +1779,39 @@ mod tests {
         );
     }
     #[test]
+    fn final_history_slot_is_retained_through_cancellation_and_blocks_another_owner() {
+        let root = std::env::temp_dir().join(format!("peerbrush-history-slot-{}", uuid::Uuid::new_v4()));
+        let attempt = root.join("windows-prepared/attempt-owned");
+        fs::create_dir_all(&attempt).unwrap();
+        let history_root = root.join("windows-update-history");
+        fs::create_dir(&history_root).unwrap();
+        for index in 0..HISTORY_LIMIT - 1 {
+            fs::write(history_root.join(format!("archive-{index}")), b"existing evidence").unwrap();
+        }
+        let c = control();
+        HistorySlot::preflight(&root, &c).unwrap();
+        let history = HistorySlot::reserve(&root, &c).unwrap();
+        assert!(HistorySlot::preflight(&root, &c).unwrap_err().contains("history is full"));
+        assert!(HistorySlot::reserve(&root, &c).is_err());
+        let foreign = history.archive.path.join("foreign");
+        fs::write(&foreign, b"preserve").unwrap();
+        assert!(history.check_empty(&c).is_err());
+        assert_eq!(fs::read(&foreign).unwrap(), b"preserve");
+        fs::remove_file(&foreign).unwrap();
+        let marker = serde_json::json!({"synthetic":"history-slot"});
+        let intent = stage_record(&attempt.join("owner-intent.json"), &marker, &c).unwrap();
+        let active = stage_record(&root.join("windows-update-active.json"), &marker, &c).unwrap();
+        retire_cancelled_records(intent, active, &root, &history, &c, || Ok(())).unwrap();
+        assert!(history.archive.path.join("cancelled-owner.json").is_file());
+        assert!(!root.join("windows-update-active.json").exists());
+        for index in 0..HISTORY_LIMIT - 1 {
+            assert_eq!(fs::read(history_root.join(format!("archive-{index}"))).unwrap(), b"existing evidence");
+        }
+        drop(history);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn native_pre_seal_cancellation_preserves_stage_and_refuses_every_late_boundary() {
         for marker in [
             None,
@@ -1737,6 +1826,7 @@ mod tests {
             fs::create_dir_all(&attempt).unwrap();
             fs::write(attempt.join("stage-outcome.json"), b"retained-stage").unwrap();
             let c = control();
+            let history = HistorySlot::reserve(&root, &c).unwrap();
             let intent = stage_record(
                 &attempt.join("owner-intent.json"),
                 &serde_json::json!({"synthetic":"intent"}),
@@ -1752,7 +1842,7 @@ mod tests {
             if let Some(marker) = marker.filter(|n| *n != "late-seal") {
                 fs::write(attempt.join(marker), b"foreign-boundary").unwrap();
             }
-            let result = retire_cancelled_records(intent, active, &root, &c, || {
+            let result = retire_cancelled_records(intent, active, &root, &history, &c, || {
                 if marker == Some("late-seal") {
                     fs::write(attempt.join("final-seal.json"), b"late-boundary").unwrap();
                 }
@@ -1794,6 +1884,7 @@ mod tests {
                     }
                 );
             }
+            drop(history);
             fs::remove_dir_all(root).unwrap();
         }
     }

@@ -25,6 +25,26 @@ spec.loader.exec_module(packaging)
 
 
 class NativeJxlBuild(unittest.TestCase):
+    @unittest.skipIf(os.name == 'nt', 'POSIX executable symlink fixture')
+    def test_driver_aliases_keep_their_launch_names_and_distinct_cxx_selection(self):
+        with tempfile.TemporaryDirectory(prefix='peerbrush-driver-alias-') as temporary:
+            root = Path(temporary).resolve() / 'native tools with spaces'
+            root.mkdir()
+            driver = root / 'shared-driver'
+            driver.write_text('#!/bin/sh\ncase "$0" in */clang-18|*/clang++-18) ;; *) exit 47 ;; esac\n'
+                              'test "$1" = --version || exit 48\nprintf "clang version 18.1.3\\n"\n', encoding='utf-8')
+            driver.chmod(0o755)
+            selected = []
+            for name in ['clang-18', 'clang++-18']:
+                launcher = root / name
+                launcher.symlink_to(driver.name)
+                path, version = jxl_build.tool(name, 'clang', {'18.1.3'}, {'PATH': os.defpath}, str(launcher))
+                self.assertEqual(version, '18.1.3')
+                self.assertEqual(path, str(launcher))
+                self.assertTrue(Path(path).samefile(driver))
+                selected.append(path)
+            self.assertNotEqual(*selected)
+
     def test_native_python_pin_reuses_one_existing_interpreter_before_tool_path_shadowing(self):
         import select_native_python
         import shutil
@@ -197,8 +217,8 @@ class NativeJxlBuild(unittest.TestCase):
             response = subprocess.CompletedProcess([], 0, b'clang version 21.1.8\n', b'')
             with mock.patch.object(jxl_build.shutil, 'which', return_value=str(executable)), mock.patch.object(jxl_build.subprocess, 'run', return_value=response) as run:
                 path, version = jxl_build.tool('clang-cl', 'clang', {'21.1.8'}, {'PATH': 'fixture'})
-                self.assertEqual((path, version), (str(executable.resolve()), '21.1.8'))
-                self.assertEqual(run.call_args.args[0], [str(executable.resolve()), '--version'])
+                self.assertEqual((path, version), (str(executable.absolute()), '21.1.8'))
+                self.assertEqual(run.call_args.args[0], [str(executable.absolute()), '--version'])
                 self.assertEqual(run.call_args.kwargs['timeout'], 60)
                 self.assertNotIn('shell', run.call_args.kwargs)
                 for output in [b'clang version 22.0.0\n', b'not a version', b'x' * 16385]:
@@ -221,7 +241,7 @@ class NativeJxlBuild(unittest.TestCase):
                 for system in ['Windows', 'Darwin']:
                     with self.subTest(platform=system):
                         self.assertEqual(jxl_build.tool('cmake', 'cmake', jxl_build.VERSIONS[system]['cmake'], {}),
-                                         (str(executable.resolve()), '4.4.4'))
+                                         (str(executable.absolute()), '4.4.4'))
                 allowed = jxl_build.VERSIONS['Windows']['cmake']
                 cases = [
                     ('cmake', 'cmake', allowed, b'cmake version 4.4.6\n', '4.4.6'),
@@ -253,7 +273,7 @@ class NativeJxlBuild(unittest.TestCase):
             with mock.patch.object(jxl_build.shutil, 'which', return_value=str(executable)), \
                     mock.patch.object(jxl_build.subprocess, 'run', return_value=response):
                 self.assertEqual(jxl_build.tool('cmake', 'cmake', jxl_build.VERSIONS['Windows']['cmake'], {}),
-                                 (str(executable.resolve()), '4.4.5'))
+                                 (str(executable.absolute()), '4.4.5'))
                 with self.assertRaisesRegex(ValueError, 'Unqualified'):
                     jxl_build.tool('cmake', 'cmake', jxl_build.VERSIONS['Darwin']['cmake'], {})
 

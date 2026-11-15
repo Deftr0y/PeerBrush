@@ -268,7 +268,7 @@ fn fill_rectangle(
     buffers: &mut Buffers,
     check: &dyn Fn() -> Result<()>,
 ) -> Result<(usize, [u8; 32])> {
-    input.check(check)?;
+    let identity = input.cache_identity(buffers.binding, check)?;
     let native = usize::from(input.output().native_source_depth / 8);
     let pixel = 4 * native;
     let count = rectangle.width as usize * rectangle.height as usize * pixel;
@@ -297,24 +297,25 @@ fn fill_rectangle(
     }
     let mut hash = Context::new(&SHA256);
     let output_width = u64::from(input.output().width);
+    let mut originals = buffers
+        .originals
+        .lock()
+        .map_err(|_| "Streaming original cache is poisoned")?;
+    // Rectangle boundaries check the source. Cache misses also check it
+    // around each authenticated physical read. Hits only copy private bytes.
     if rectangle.x == 0 && rectangle.width == input.output().width {
         // Full-width native rows are one contiguous original-byte range.
         // Authenticate once per covered chunk, rather than repeating the
         // identical profile/inventory checks for every narrow image row.
         let start = u64::from(rectangle.y) * output_width * pixel as u64;
-        let identity = input.cache_identity(buffers.binding, check)?;
-        buffers
-            .originals
-            .lock()
-            .map_err(|_| "Streaming original cache is poisoned")?
-            .copy_prefix(
-                identity,
-                start,
-                &mut buffers.window,
-                count,
-                &|| input.check(check),
-                |at, n, output| input.copy_complete_chunk(at, n, output, check),
-            )?;
+        originals.copy_prefix(
+            identity,
+            start,
+            &mut buffers.window,
+            count,
+            check,
+            |at, n, output| input.copy_complete_chunk(at, n, output, check),
+        )?;
         hash.update(&buffers.window[..count]);
         input.check(check)?;
         return Ok((count, hash.finish().as_ref().try_into().unwrap()));
@@ -324,18 +325,13 @@ fn fill_rectangle(
         let at =
             (u64::from(rectangle.y + y) * output_width + u64::from(rectangle.x)) * pixel as u64;
         let scratch = buffers.row.as_mut().ok_or("Streaming row buffer missing")?;
-        let identity = input.cache_identity(buffers.binding, check)?;
-        buffers
-            .originals
-            .lock()
-            .map_err(|_| "Streaming original cache is poisoned")?
-            .copy(
-                identity,
-                at,
-                scratch,
-                &|| input.check(check),
-                |start, count, output| input.copy_complete_chunk(start, count, output, check),
-            )?;
+        originals.copy(
+            identity,
+            at,
+            scratch,
+            check,
+            |start, count, output| input.copy_complete_chunk(start, count, output, check),
+        )?;
         let start = y as usize * row;
         buffers.window[start..start + row].copy_from_slice(scratch);
         hash.update(scratch);
@@ -360,18 +356,21 @@ fn exchange<'scene, 'output, 'session>(
     SessionSegmentLog<'session>,
     Result<()>,
 ) {
-    let active = || {
+    let running = || {
         if stop.load(Ordering::SeqCst) {
             return Err("Streaming JXL operation stopped".into());
         }
-        check()?;
         if started.elapsed() >= Duration::from_millis(u64::from(configuration.max_elapsed_ms)) {
             return Err("Streaming JXL operation timed out".into());
         }
-        input.check(check)
+        check()
     };
+    let active = || input.check(&running);
     let result = (|| -> Result<()> {
         let mut state = State::new(configuration, nonce)?;
+        // Source ownership is checked around framed exchanges and every
+        // physical original read. The pipe only moves admitted memory.
+        active()?;
         #[cfg(test)]
         broker_mark(
             configuration.info.bit_depth,
@@ -384,8 +383,9 @@ fn exchange<'scene, 'output, 'session>(
             &mut stdin,
             &mut std::io::Cursor::new(input.profile()),
             &mut buffers.io,
-            &active,
+            &running,
         )?;
+        active()?;
         #[cfg(test)]
         broker_mark(
             configuration.info.bit_depth,
@@ -396,7 +396,7 @@ fn exchange<'scene, 'output, 'session>(
         let mut observed = [false; 11];
         loop {
             active()?;
-            let frame = Frame::read(&mut stdout, &active)?;
+            let frame = Frame::read(&mut stdout, &running)?;
             let sequence = frame.sequence();
             let message = frame.message();
             #[cfg(test)]
@@ -429,7 +429,7 @@ fn exchange<'scene, 'output, 'session>(
                 frame,
                 &mut stdout,
                 &mut buffers.io,
-                &active,
+                &running,
                 &mut |bytes| {
                     let end = copied
                         .checked_add(bytes.len())
@@ -461,10 +461,13 @@ fn exchange<'scene, 'output, 'session>(
             };
             let payload =
                 matches!(message, Message::Segment { .. }).then_some((&buffers.segment, copied));
-            log.append(sequence, event, payload, &mut || active())?;
+            active()?;
+            log.append(sequence, event, payload, &mut || running())?;
+            active()?;
             match message {
                 Message::NeedRectangle(rectangle) => {
-                    let (count, sha256) = fill_rectangle(&input, rectangle, &mut buffers, &active)?;
+                    // Rectangle reads already bracket every chunk with source checks.
+                    let (count, sha256) = fill_rectangle(&input, rectangle, &mut buffers, &running)?;
                     state.send(
                         Direction::Parent,
                         Message::RectangleData {
@@ -475,7 +478,7 @@ fn exchange<'scene, 'output, 'session>(
                         &mut stdin,
                         &mut std::io::Cursor::new(&buffers.window[..count]),
                         &mut buffers.io,
-                        &active,
+                        &running,
                     )?;
                 }
                 Message::Done { .. } => {
@@ -483,7 +486,7 @@ fn exchange<'scene, 'output, 'session>(
                         return Err("Streaming child lacks complete transport proof".into());
                     }
                     drop(stdin);
-                    wire::exact_eof(&mut stdout, &active)?;
+                    wire::exact_eof(&mut stdout, &running)?;
                     #[cfg(test)]
                     if marked {
                         broker_mark(
@@ -500,7 +503,7 @@ fn exchange<'scene, 'output, 'session>(
                     &mut stdin,
                     &mut std::io::empty(),
                     &mut buffers.io,
-                    &active,
+                    &running,
                 )?,
             }
             #[cfg(test)]
@@ -560,6 +563,7 @@ fn run_worker<'scene, 'output, 'session>(
             _limits: None,
             _source: Some(source),
             _resources: Some(resources),
+            may_retire: None,
             #[cfg(test)]
             primary_kill_failed: false,
             #[cfg(test)]
@@ -749,7 +753,7 @@ pub(crate) fn encode<'scene, 'output, 'session>(
         check()?;
         let input = held.as_ref().ok_or("Streaming input was consumed")?;
         let configuration = configuration(input, &limits)?;
-        let started = Instant::now();
+        let queue_started = Instant::now();
         ensure_reaper()?;
         if cleanup_failed() {
             return Err("JPEG XL cleanup is blocked; source work retained".into());
@@ -767,7 +771,7 @@ pub(crate) fn encode<'scene, 'output, 'session>(
                 Err(std::sync::TryLockError::Poisoned(_)) => return Err(FAILED.into()),
                 Err(std::sync::TryLockError::WouldBlock) => {}
             }
-            if started.elapsed() >= Duration::from_millis(u64::from(limits.deadline_ms)) {
+            if queue_started.elapsed() >= Duration::from_millis(u64::from(limits.deadline_ms)) {
                 return Err("Streaming JXL queue timed out".into());
             }
             thread::sleep(Duration::from_millis(10));
@@ -842,7 +846,7 @@ pub(crate) fn encode<'scene, 'output, 'session>(
             resources,
             source,
             command,
-            started,
+            Instant::now(),
             check,
         );
         held = input;
@@ -945,6 +949,34 @@ mod tests {
         }
     }
     #[test]
+    fn narrow_rectangle_replays_each_strided_native_row() {
+        use crate::production_export::staged_rows::tests::{expected_byte, with_staged};
+
+        for depth in [8, 16] {
+            with_staged(depth, |input| {
+                let session = input.session();
+                let mut buffers = Buffers::new(&input, [77; 32]).unwrap();
+                let rectangle = wire::Rectangle {
+                    id: 1, x: 2, y: 481, width: 3, height: 3,
+                };
+                let (count, digest) =
+                    fill_rectangle(&input, rectangle, &mut buffers, &|| Ok(())).unwrap();
+                let pixel_bytes = usize::from(depth / 8) * 4;
+                let expected: Vec<_> = (481..484)
+                    .flat_map(|y| {
+                        let start = (y * 17 + 2) * pixel_bytes;
+                        (start..start + 3 * pixel_bytes).map(move |at| expected_byte(at, depth))
+                    })
+                    .collect();
+                assert_eq!(&buffers.window[..count], &expected);
+                assert_eq!(digest.as_slice(), ring::digest::digest(&SHA256, &expected).as_ref());
+                drop(buffers);
+                input.retire(&mut || session.cleanup_check()).unwrap();
+            });
+        }
+    }
+
+    #[test]
     fn actual_session_original_cache_meters_only_misses_and_checks_cancellation_on_hits() {
         crate::production_export::staged_rows::tests::with_staged(16, |input| {
             let session = input.session();
@@ -961,8 +993,13 @@ mod tests {
             assert_eq!(first - before, 65536);
             fill_rectangle(&input, one_row(0), &mut buffers, &|| Ok(())).unwrap();
             assert_eq!(input.read_used(), first);
+            let checks = std::cell::Cell::new(0);
             let error = fill_rectangle(&input, one_row(0), &mut buffers, &|| {
-                Err("specific cached source cancellation".into())
+                checks.set(checks.get() + 1);
+                if checks.get() == 3 {
+                    return Err("specific cached source cancellation".into());
+                }
+                Ok(())
             })
             .unwrap_err();
             assert_eq!(error, "specific cached source cancellation");
@@ -1137,7 +1174,7 @@ mod tests {
                             input_bytes: wire::source_work_ceiling(raw).unwrap(),
                             deadline_ms: 15000,
                         },
-                        &|| Ok(()),
+                        &|| session.check(),
                     ),
                 );
                 fixture_mark(depth, FixturePhase::Recheck, "begin");

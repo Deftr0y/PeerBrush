@@ -616,14 +616,17 @@ fn deep_and_long_trees_are_refused_by_writer_and_consumer_with_all_sources_retai
     let profile = f.profile();
     let preferences = fs::read(profile.locations.profile().join("tool-settings.json")).unwrap();
     let mut engine = crate::engine::Engine::new();
-    engine.doc = crate::engine::Document::new_depth(4, 3, 16).unwrap();
-    engine.doc.layers[0]
+    let resident = engine.resident_state_mut().unwrap();
+    resident.document = crate::engine::Document::new_depth(4, 3, 16).unwrap();
+    resident.document.layers[0]
         .pixels
         .set16(0, 0, [1001, 3003, 5007, 0]);
     let source = std::sync::Arc::new(std::sync::Mutex::new(engine));
     let source_path = f.0.join("keep.psd");
     crate::server::save(&source, &source_path).unwrap();
-    let document = serde_json::to_value(&source.lock().unwrap().doc).unwrap();
+    let document = serde_json::to_value(
+        &source.lock().unwrap().resident_state().unwrap().document,
+    ).unwrap();
     let document_bytes = fs::read(&source_path).unwrap();
     let input = f.0.join("deep-input");
     fs::create_dir(&input).unwrap();
@@ -703,7 +706,7 @@ fn deep_and_long_trees_are_refused_by_writer_and_consumer_with_all_sources_retai
         preferences
     );
     assert_eq!(
-        serde_json::to_value(&source.lock().unwrap().doc).unwrap(),
+        serde_json::to_value(&source.lock().unwrap().resident_state().unwrap().document).unwrap(),
         document
     );
     assert_eq!(fs::read(&source_path).unwrap(), document_bytes);
@@ -923,11 +926,11 @@ fn final_profile_recheck_refuses_between_file_replacement_and_creation_without_p
                 .create(&publication)
                 .unwrap();
             let mut engine = crate::engine::Engine::new();
-            engine.doc = crate::engine::Document::new_depth(4, 3, depth).unwrap();
-            engine.doc.layers[0]
-                .pixels
-                .set16(0, 0, [1001, 3003, 5007, 0]);
-            let layer = engine.doc.layers[0].id.clone();
+            let resident = engine.resident_state_mut().unwrap();
+            resident.document = crate::engine::Document::new_depth(4, 3, depth).unwrap();
+            let raster = &mut resident.document.layers[0];
+            raster.pixels.set16(0, 0, [1001, 3003, 5007, 0]);
+            let layer = raster.id.clone();
             engine
                 .edit(
                     "human",
@@ -963,8 +966,9 @@ fn final_profile_recheck_refuses_between_file_replacement_and_creation_without_p
                 let history = |items: &[crate::engine::History]| {
                     items.iter().map(|h| json!({"before":h.before,"after":h.after,"actor":h.actor,"label":h.label,"task":h.task,"scopes":h.scopes,"gesture":h.gesture,"reverted":h.reverted})).collect::<Vec<_>>()
                 };
-                assert!(!e.undo.is_empty() && !e.redo.is_empty() && !e.leases.is_empty());
-                json!({"doc":e.doc,"undo":history(&e.undo),"redo":history(&e.redo),"leases":e.leases,"saved":e.saved_revision,"path":e.path,"closed":e.closed,"bytes":fs::read(&source_path).unwrap()})
+                let resident = e.resident_state().unwrap();
+                assert!(!resident.undo.is_empty() && !resident.redo.is_empty() && !e.leases.is_empty());
+                json!({"doc":resident.document,"undo":history(&resident.undo),"redo":history(&resident.redo),"leases":e.leases,"saved":e.saved_revision,"path":e.path,"closed":e.closed,"bytes":fs::read(&source_path).unwrap()})
             };
             let expected = state();
             let owner = source.lock().unwrap().file_ownership.clone().unwrap();
@@ -1191,7 +1195,7 @@ fn current_profile_workspace(
     use crate::engine::{Document, Engine, Scope};
     use std::sync::{Arc, Mutex};
     let mut engine = Engine::new();
-    engine.doc = Document::new_depth(4, 3, 8).unwrap();
+    engine.resident_state_mut().unwrap().document = Document::new_depth(4, 3, 8).unwrap();
     let root = Arc::new(Mutex::new(engine));
     let workspace = crate::workspace::attach(&root);
     let second = crate::workspace::new_project(&root, 4, 3, 16, None).unwrap();
@@ -1200,8 +1204,9 @@ fn current_profile_workspace(
     for (project, path) in projects.iter().zip(&paths) {
         {
             let mut e = project.lock().unwrap();
-            e.doc.layers[0].pixels.set16(0, 0, [1001, 3003, 5007, 0]);
-            let layer = e.doc.layers[0].id.clone();
+            let raster = &mut e.resident_state_mut().unwrap().document.layers[0];
+            raster.pixels.set16(0, 0, [1001, 3003, 5007, 0]);
+            let layer = raster.id.clone();
             e.edit("human", &[serde_json::json!({"op":"fill","layer":layer,"rect":[1,1,3,3],"color":[41,83,127,173]})], None, None, "Keep undo").unwrap();
             e.edit(
                 "human",
@@ -1229,8 +1234,9 @@ fn current_workspace_bytes(
             "before":h.before,"after":h.after,"actor":h.actor,"label":h.label,"task":h.task,
             "scopes":h.scopes,"gesture":h.gesture,"reverted":h.reverted
         })).collect::<Vec<_>>();
-        assert!(!e.undo.is_empty() && !e.redo.is_empty() && !e.leases.is_empty());
-        serde_json::json!({"project":e.project_id,"document":e.doc,"undo":history(&e.undo),"redo":history(&e.redo),
+        let resident = e.resident_state().unwrap();
+        assert!(!resident.undo.is_empty() && !resident.redo.is_empty() && !e.leases.is_empty());
+        serde_json::json!({"project":e.project_id,"document":resident.document,"undo":history(&resident.undo),"redo":history(&resident.redo),
             "leases":e.leases,"saved":e.saved_revision,"path":e.path,"closed":e.closed,
             "source":fs::read(path).unwrap(),"owner_path":e.file_ownership.as_ref().map(|owner|&owner.path),
             "owner_project":crate::file_ownership::local_project(path)})
@@ -1288,7 +1294,7 @@ fn actual_current_capture_preserves_later_flushed_settings_and_joint_native_sour
             fs::write(file, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
         }
         if outcome == "unsaved" {
-            projects[1].lock().unwrap().doc.revision += 1;
+            projects[1].lock().unwrap().resident_state_mut().unwrap().document.revision += 1;
         }
         if outcome == "copy-error" {
             fs::create_dir(attempt.join("current-profile")).unwrap();
@@ -1916,7 +1922,7 @@ fn actual_final_profile_observation_reuses_writer_authority_and_preserves_curren
         for (project, path) in projects.iter().zip(&paths) {
             let (project_id, document, revision) = {
                 let mut e = project.lock().unwrap();
-                let raster = e.doc.layers[0].id.clone();
+                let raster = e.resident_state().unwrap().document.layers[0].id.clone();
                 let source = Source {
                     width: 4,
                     height: 3,
@@ -1950,9 +1956,9 @@ fn actual_final_profile_observation_reuses_writer_authority_and_preserves_curren
                     .unwrap();
                 }
                 e.undo("human").unwrap();
-                assert!(e.doc.layers.iter().any(|layer| layer.source.is_some()));
-                let hidden = e
-                    .doc
+                let doc = &e.resident_state().unwrap().document;
+                assert!(doc.layers.iter().any(|layer| layer.source.is_some()));
+                let hidden = doc
                     .layers
                     .iter()
                     .find(|layer| layer.id == raster)
@@ -1961,10 +1967,10 @@ fn actual_final_profile_observation_reuses_writer_authority_and_preserves_curren
                     .get16(0, 0);
                 assert_eq!(hidden[3], 0);
                 assert!(hidden[..3].iter().any(|v| *v != 0));
-                if e.doc.bit_depth == 16 {
+                if doc.bit_depth == 16 {
                     assert!(hidden[..3].iter().any(|v| v % 257 != 0));
                 }
-                (e.project_id.clone(), e.doc.id.clone(), e.doc.revision)
+                (e.project_id.clone(), doc.id.clone(), doc.revision)
             };
             let report = crate::server::dispatch(
                 project,
@@ -1984,8 +1990,9 @@ fn actual_final_profile_observation_reuses_writer_authority_and_preserves_curren
             crate::server::save_accepted_source(project, path, &document, revision, false).unwrap();
             let e = project.lock().unwrap();
             let reopened = crate::psd::decode(&fs::read(path).unwrap()).unwrap();
-            assert_eq!(reopened.bit_depth, e.doc.bit_depth);
-            assert_eq!(reopened.export_png().unwrap(), e.doc.export_png().unwrap());
+            let doc = &e.resident_state().unwrap().document;
+            assert_eq!(reopened.bit_depth, doc.bit_depth);
+            assert_eq!(reopened.export_png().unwrap(), doc.export_png().unwrap());
         }
         let tools = workspace.lock().unwrap().tool_settings.clone();
         *tools.lock().unwrap() = crate::tool_settings::Store::load(root.join("tool-settings.json"));
@@ -2050,7 +2057,7 @@ fn actual_final_profile_observation_reuses_writer_authority_and_preserves_curren
             outcome == "dirty-before"
         );
         if outcome == "unsaved-before" {
-            projects[1].lock().unwrap().doc.revision += 1;
+            projects[1].lock().unwrap().resident_state_mut().unwrap().document.revision += 1;
         }
         if outcome == "copy-error" {
             fs::create_dir(attempt.join("final-profile")).unwrap();
@@ -2218,7 +2225,7 @@ fn actual_final_profile_observation_reuses_writer_authority_and_preserves_curren
                 "newer-source" => {
                     let mut e = projects[1].lock().unwrap();
                     let raster = e
-                        .doc
+                        .resident_state().unwrap().document
                         .layers
                         .iter()
                         .find(|l| l.source.is_none())
@@ -2564,7 +2571,7 @@ fn actual_final_profile_observation_reuses_writer_authority_and_preserves_curren
                 {
                     let mut e = projects[1].lock().unwrap();
                     let raster = e
-                        .doc
+                        .resident_state().unwrap().document
                         .layers
                         .iter()
                         .find(|layer| layer.source.is_none())
@@ -2585,7 +2592,8 @@ fn actual_final_profile_observation_reuses_writer_authority_and_preserves_curren
                         .unwrap();
                     }
                     e.undo("human").unwrap();
-                    assert!(!e.undo.is_empty() && !e.redo.is_empty());
+                    let resident = e.resident_state().unwrap();
+                    assert!(!resident.undo.is_empty() && !resident.redo.is_empty());
                 }
                 let newer = current_workspace_bytes(&projects, &paths);
                 assert_ne!(newer, expected);
@@ -2688,7 +2696,7 @@ fn planned_update_exit_seals_current_joint_sources_only_after_final_owner_authen
         for (project, path) in projects.iter().zip(&paths) {
             let (project_id, document, revision) = {
                 let mut e = project.lock().unwrap();
-                let raster = e.doc.layers[0].id.clone();
+                let raster = e.resident_state().unwrap().document.layers[0].id.clone();
                 let source = crate::source::Source {
                     width: 4,
                     height: 3,
@@ -2713,7 +2721,8 @@ fn planned_update_exit_seals_current_joint_sources_only_after_final_owner_authen
                 .unwrap();
                 e.edit("human", &[serde_json::json!({"op":"layer.update","layer":raster,"name":"Temporary exit name"})], None, None, "Keep redo").unwrap();
                 e.undo("human").unwrap();
-                (e.project_id.clone(), e.doc.id.clone(), e.doc.revision)
+                let doc = &e.resident_state().unwrap().document;
+                (e.project_id.clone(), doc.id.clone(), doc.revision)
             };
             let report = crate::server::dispatch(project, "document", &serde_json::json!({"action":"save_report","project_id":project_id,"document_id":document,"expected_revision":revision})).unwrap();
             assert_eq!(report["save_allowed"], true);
@@ -2776,7 +2785,7 @@ fn planned_update_exit_seals_current_joint_sources_only_after_final_owner_authen
         if outcome == "unsaved" {
             let mut e = projects[1].lock().unwrap();
             let layer = e
-                .doc
+                .resident_state().unwrap().document
                 .layers
                 .iter()
                 .find(|layer| layer.source.is_none())

@@ -1,7 +1,7 @@
 //! One selected command prepares every pixel, selection and typed local clip
 //! update before the existing guarded Engine/working-transaction publication.
 #[path = "selected/effects.rs"]
-mod effects;
+pub(crate) mod effects;
 #[path = "selected/layer.rs"]
 mod layer;
 #[path = "selected/state.rs"]
@@ -16,7 +16,7 @@ use crate::{
     retained::transaction::{self, Session},
     transform::native::{
         selected::{self, Placement, Selection},
-        Work,
+        Checks, Work,
     },
 };
 use std::cell::RefCell;
@@ -44,12 +44,9 @@ pub(crate) fn prepare(
         return Err("Selected transform needs a move or transform command".into());
     }
     let cancellation = captured.cancellation();
-    let checked = || {
-        cancellation.check()?;
-        session.check()?;
-        check()?;
-        cancellation.check()
-    };
+    let active = || cancellation.check().and_then(|_| check());
+    let checked = || active().and_then(|_| session.check()).and_then(|_| cancellation.check());
+    let pinned = || active().and_then(|_| session.check_pinned_work());
     checked()?;
     if !base.budget().same_pool(&session.resident())
         || !base.disk_budget().same_pool(&session.disk())
@@ -185,7 +182,7 @@ pub(crate) fn prepare(
         .try_reserve_exact(effect_count)
         .map_err(|_| "Selected effect packet allocation refused")?;
     let failure = RefCell::new(None);
-    let source_check = || match checked() {
+    let pinned_check = || match pinned() {
         Ok(()) => Ok(()),
         Err(reason) => {
             *failure.borrow_mut() = Some(reason);
@@ -195,6 +192,9 @@ pub(crate) fn prepare(
     // Empty raw coverage returns before layer/mask validation in the resident
     // selection_with_coverage path. Geometric single-layer bounds still validate.
     let empty = selection.rasterized() && selection.bounds[0] >= selection.bounds[2];
+    if empty && command.preserves_selection() {
+        return captured.unchanged(token, &checked);
+    }
     let placement = if empty {
         None
     } else {
@@ -204,6 +204,26 @@ pub(crate) fn prepare(
             base.budget(),
         )?)
     };
+    let coverage_cost = selection.coverage_cost();
+    if let Some(placement) = placement.as_ref().filter(|placement| {
+        placement.is_affine() && !placement.noop && coverage_cost <= 4
+    }) {
+        let [left, top, right, bottom] = placement.bounds;
+        let destination = [(right - left) as u32, (bottom - top) as u32];
+        for target in &targets {
+            let (_, frame) = layer::after(
+                target.origin(),
+                [target.pixels().width(), target.pixels().height()],
+                placement,
+            )?;
+            work.admit_selected_affine(
+                frame,
+                destination,
+                coverage_cost,
+                selection.rasterized() && !command.preserves_selection(),
+            );
+        }
+    }
     let staged = (|| {
         if let Some(placement) = &placement {
             let write_box = [
@@ -230,21 +250,6 @@ pub(crate) fn prepare(
                         }
                     }
                 }
-                if crate::warp::parse(command.parameters())?.is_some() {
-                    let (_, frame) = layer::after(
-                        target.origin(),
-                        [target.pixels().width(), target.pixels().height()],
-                        placement,
-                    )?;
-                    let steps = target.mask().map_or(0, |m| m.steps().len());
-                    crate::warp::work_budget(
-                        frame[0],
-                        frame[1],
-                        1 + steps * (1 + steps),
-                        1,
-                        selection.polygon().map_or(4, |p| p.len()) + placement.polygon.len(),
-                    )?;
-                }
                 states.push(layer::Layer::new(&base, *target)?);
                 let state = states.last_mut().ok_or("Missing selected working layer")?;
                 state.apply(
@@ -256,9 +261,10 @@ pub(crate) fn prepare(
                     session,
                     work,
                     &checked,
+                    &pinned_check,
                 )?;
                 state.reconcile(&base, session, work, &checked)?;
-                state.check_reframed_writes(&base, command, work, &checked)?;
+                state.check_reframed_writes(&base, command, work, &checked, &pinned_check)?;
                 if state.expanded() {
                     batch.effects.extend(effects::patches(
                         &base,
@@ -268,6 +274,9 @@ pub(crate) fn prepare(
                     )?);
                 }
             }
+        }
+        if command.preserves_selection() {
+            return checked();
         }
         let previous = base
             .metadata()
@@ -283,7 +292,7 @@ pub(crate) fn prepare(
                     session,
                     work,
                     &checked,
-                    &source_check,
+                    &pinned_check,
                 )?
             } else if let Some(source) = base
                 .metadata()
@@ -352,11 +361,14 @@ fn scalar(
     session: &impl Session,
     work: &mut Work,
     check: &dyn Fn() -> Result<(), String>,
-    source_check: &dyn Fn() -> crate::large_document::Result<()>,
+    pinned: &dyn Fn() -> crate::large_document::Result<()>,
 ) -> Result<CoveragePatch, String> {
     let mut metadata = None;
-    let output = transaction::stage(base, session, check, |store, _| {
-        let source = selected::write_coverage(selection, placement, store, work, source_check)?;
+    let output = transaction::stage(base, session, check, |store, owner| {
+        let source = selected::write_coverage(selection, placement, store, work, Checks {
+            active: pinned,
+            owner,
+        })?;
         let contours = base.copy_contour_metadata(source.contours(), check)?;
         metadata = Some((source.bounds(), source.origin(), contours));
         let mask = source.mask().clone();

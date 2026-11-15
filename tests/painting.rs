@@ -362,38 +362,38 @@ fn invalid_pressure_settings_and_excessive_smudge_work_reject_before_mutation() 
 fn painting_and_smudge_share_preview_commit_undo_and_lock_rules() {
     for op in ["paint", "smudge"] {
         let mut engine = Engine::new();
-        engine.doc = Document::new(64, 32).unwrap();
-        engine.doc.layers[0].pixels = pigment_canvas();
-        let target = engine.doc.layers[0].id.clone();
+        engine.resident_state_mut().expect("resident fixture").document = Document::new(64, 32).unwrap();
+        engine.resident_state_mut().expect("resident fixture").document.layers[0].pixels = pigment_canvas();
+        let target = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
         let command = json!({"op":op,"layer":target,"points":[[16,16,0.3],[54,16,0.9]],"radius":6,"tip":"bristle","density":0.75,"seed":9,"taper_start":5,"taper_end":8,"color":[20,240,120,255],"load":0.2});
-        let before = engine.doc.clone();
+        let before = engine.resident_state().expect("resident fixture").document.clone();
         let preview = Engine::preview_edits(before.clone(), &[command.clone()]).unwrap();
         engine
             .edit("human", &[command.clone()], None, None, "Painting")
             .unwrap();
         assert_eq!(
-            engine.doc.layers[0].pixels.tiles, preview.layers[0].pixels.tiles,
+            engine.resident_state().expect("resident fixture").document.layers[0].pixels.tiles, preview.layers[0].pixels.tiles,
             "{op} preview differs from commit"
         );
         assert_ne!(
-            engine.doc.layers[0].pixels.tiles,
+            engine.resident_state().expect("resident fixture").document.layers[0].pixels.tiles,
             before.layers[0].pixels.tiles
         );
         engine.undo("human").unwrap();
         assert_eq!(
-            engine.doc.layers[0].pixels.tiles,
+            engine.resident_state().expect("resident fixture").document.layers[0].pixels.tiles,
             before.layers[0].pixels.tiles
         );
         engine.redo("human").unwrap();
         assert_eq!(
-            engine.doc.layers[0].pixels.tiles,
+            engine.resident_state().expect("resident fixture").document.layers[0].pixels.tiles,
             preview.layers[0].pixels.tiles
         );
-        engine.doc.layers[0].locked = true;
+        engine.resident_state_mut().expect("resident fixture").document.layers[0].locked = true;
         assert!(engine
             .edit("human", &[command.clone()], None, None, "Painting")
             .is_err());
-        engine.doc.layers[0].locked = false;
+        engine.resident_state_mut().expect("resident fixture").document.layers[0].locked = false;
         engine
             .reserve("artist", "Painting", vec![Scope::layer(&target)])
             .unwrap();
@@ -433,11 +433,11 @@ fn stroke_axis_matches_native_rendering_selection_masks_undo_and_psd_for_every_b
         for op in ["paint", "erase", "smudge", "clone", "heal"] {
             for mask in [false, true] {
                 let mut e = Engine::new();
-                e.doc = Document::new_depth(64, 32, depth).unwrap();
-                let id = e.doc.layers[0].id.clone();
+                e.resident_state_mut().expect("resident fixture").document = Document::new_depth(64, 32, depth).unwrap();
+                let id = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
                 for y in 0..32 {
                     for x in 0..64 {
-                        e.doc.layers[0].pixels.set16(
+                        e.resident_state_mut().expect("resident fixture").document.layers[0].pixels.set16(
                             x,
                             y,
                             [10001 + x as u16 * 251, 20003 + y as u16 * 347, 30007, 65535],
@@ -465,8 +465,8 @@ fn stroke_axis_matches_native_rendering_selection_masks_undo_and_psd_for_every_b
                     )
                     .unwrap();
                 }
-                e.undo.clear();
-                let before = e.doc.clone();
+                e.resident_state_mut().expect("resident fixture").undo.clear();
+                let before = e.resident_state().expect("resident fixture").document.clone();
                 let mut c = json!({"op":if op=="erase" {"paint"} else {op},"erase":op=="erase","layer":id,"mask":mask,"points":[[14,17,0.3],[30,24,0.6],[49,21,1.0]],"stroke_axis":"horizontal","radius":3,"tip":"grain","grain":2.5,"seed":17,"density":0.7,"hardness":0.7,"spacing":0.2,"opacity":0.8,"flow":0.65,"color":[20,240,120,255],"load":0.2,"source":[3,4],"source_layer":id,"sample_merged":false,"document_id":before.id,"source_revision":before.revision});
                 let preview = Engine::preview_edits(before.clone(), &[c.clone()]).unwrap();
                 let mut expected = c.clone();
@@ -488,26 +488,26 @@ fn stroke_axis_matches_native_rendering_selection_masks_undo_and_psd_for_every_b
                     "Axis stroke",
                 )
                 .unwrap();
-                assert_eq!(e.undo.len(), 1);
-                assert_eq!(e.doc.export_png().unwrap(), preview.export_png().unwrap());
+                assert_eq!(e.resident_state().expect("resident fixture").undo.len(), 1);
+                assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), preview.export_png().unwrap());
                 assert_eq!(
-                    e.doc.layers[0].pixels.get16(2, 2),
+                    e.resident_state().expect("resident fixture").document.layers[0].pixels.get16(2, 2),
                     before.layers[0].pixels.get16(2, 2)
                 );
                 let reopened =
-                    peerbrush::psd::decode(&peerbrush::psd::encode(&e.doc).unwrap()).unwrap();
-                assert_eq!(reopened.export_png().unwrap(), e.doc.export_png().unwrap());
+                    peerbrush::psd::decode(&peerbrush::psd::encode(&e.resident_state().expect("resident fixture").document).unwrap()).unwrap();
+                assert_eq!(reopened.export_png().unwrap(), e.resident_state().expect("resident fixture").document.export_png().unwrap());
                 assert_eq!(reopened.bit_depth, depth);
                 e.undo("human").unwrap();
-                assert_eq!(e.doc.export_png().unwrap(), before.export_png().unwrap());
+                assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), before.export_png().unwrap());
                 e.redo("human").unwrap();
-                assert_eq!(e.doc.export_png().unwrap(), preview.export_png().unwrap());
-                let current = e.doc.export_png().unwrap();
-                c["source_revision"] = json!(e.doc.revision);
+                assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), preview.export_png().unwrap());
+                let current = e.resident_state().expect("resident fixture").document.export_png().unwrap();
+                c["source_revision"] = json!(e.resident_state().expect("resident fixture").document.revision);
                 e.reserve("other", "Stroke", vec![Scope::layer(&id)])
                     .unwrap();
                 assert!(e.edit("human", &[c], None, None, "Blocked axis").is_err());
-                assert_eq!(e.doc.export_png().unwrap(), current);
+                assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), current);
             }
         }
     }

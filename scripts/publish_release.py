@@ -15,7 +15,7 @@ import time
 from urllib.parse import quote, urlsplit
 
 from final_release import Candidate, LIMIT, MANIFEST, STORE_FORMAT, checksum_bytes, encode, public_records, read, validate_manifest
-from package import regular_file
+from package import regular_file, release_version_order
 from package_macos_dmg import bounded_file
 from production_readiness import unique_fields
 
@@ -327,7 +327,8 @@ def _transfer(client, directory, manifest, notes, readback=None, after_publish=N
         match = re.fullmatch(r'v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:\.(0|[1-9][0-9]*))?', str(old.get('tag_name')))
         if match is None:
             raise ValueError('Unrecognized stable release history requires explicit reconciliation.')
-        if tuple(int(part or 0) for part in match.groups()) > tuple(map(int, version.split('.'))):
+        published = '.'.join(part or '0' for part in match.groups())
+        if release_version_order(published) > release_version_order(version):
             raise ValueError('A later stable version is already published; no downgrade is permitted.')
     release = client.release(tag)
     if release is None:

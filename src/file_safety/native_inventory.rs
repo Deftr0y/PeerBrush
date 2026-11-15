@@ -214,19 +214,70 @@ impl NativeInventory<'_> {
         &self,
         check: &dyn Fn() -> Result<(), String>,
     ) -> Result<Vec<NativeExternalFile>, String> {
-        self.validate_files(check)?;
+        self.writer_facts_members(None, check)
+    }
+    fn writer_facts_members(
+        &self,
+        extra: Option<&std::ffi::OsStr>,
+        check: &dyn Fn() -> Result<(), String>,
+    ) -> Result<Vec<NativeExternalFile>, String> {
+        self.validate_members(extra, check)?;
         let mut facts = Vec::new();
         facts
-            .try_reserve_exact(self.entries.len() + 1)
+            .try_reserve_exact(self.entries.len() + 2)
             .map_err(|_| "Native outcome fact allocation refused")?;
-        if facts.capacity() > MAX_ENTRIES + 1 {
+        if facts.capacity() > MAX_ENTRIES + 2 {
             return Err("Native outcome fact allocation exceeds admission".into());
         }
         for entry in &self.entries {
             check()?;
             facts.push(NativeExternalFile::observe_held(&entry.file)?);
         }
-        self.validate_files(check)?;
+        self.validate_members(extra, check)?;
+        Ok(facts)
+    }
+    pub(in crate::file_safety) fn writer_facts_with_original(
+        &self,
+        plan: &crate::workspace::source_runtime::PublicationPlan,
+        original: &fs::File,
+        check: &dyn Fn() -> Result<(), String>,
+    ) -> Result<Vec<NativeExternalFile>, String> {
+        if plan.target() != self.lease.path()
+            || plan.expected_version() != self.lease.expected()
+            || plan.backup_directory() != self.directory
+            || plan.backup_directory_identity() != self.directory_identity
+        {
+            return Err("Relocated original differs from the frozen native inventory".into());
+        }
+        let name = plan
+            .retained_original_name()
+            .ok_or("Native original has no admitted retained name")?;
+        if self.entries.iter().any(|entry| entry.name == name) {
+            return Err("Relocated original aliases a frozen inventory member".into());
+        }
+        let expected = plan
+            .expected_version()
+            .ok_or("Relocated original needs an admitted source")?;
+        let fact = NativeExternalFile::observe_held(original)?;
+        let path = self.directory.join(&name);
+        if fact.identity() != expected.identity
+            || fact.bytes() != expected.bytes
+            || fact.modified_nanos() != expected.modified_nanos()
+            || !regular(&path)
+            || NativeExternalFile::observe_held(&open_inventory_file(&path)?)? != fact
+        {
+            return Err(
+                "Relocated native original name or physical owner changed; all files retained"
+                    .into(),
+            );
+        }
+        let mut facts = self.writer_facts_members(Some(&name), check)?;
+        if NativeExternalFile::observe_held(original)? != fact
+            || NativeExternalFile::observe_held(&open_inventory_file(&path)?)? != fact
+        {
+            return Err("Relocated native original changed during inventory observation".into());
+        }
+        facts.push(fact);
         Ok(facts)
     }
     fn names(&self, check: &dyn Fn() -> Result<(), String>) -> Result<Vec<OsString>, String> {
@@ -250,8 +301,8 @@ impl NativeInventory<'_> {
     pub(crate) fn backup_bytes(&self) -> u64 {
         self.backup_bytes
     }
-    /// Existing files remain disk debt, including the old destination even
-    /// though a successful replacement will later unlink that directory entry.
+    /// Existing files remain disk debt, including an old destination retained
+    /// under its admitted backup-directory name after a successful replacement.
     pub(crate) fn external_bytes(&self) -> Result<u64, String> {
         self.backup_bytes
             .checked_add(self.lease.expected().map_or(0, |v| v.bytes))
@@ -272,6 +323,92 @@ impl NativeInventory<'_> {
         check()
     }
     fn validate_files(&self, check: &dyn Fn() -> Result<(), String>) -> Result<(), String> {
+        self.validate_members(None, check)
+    }
+    pub(in crate::file_safety) fn admit_created_backup(&self, bytes: u64) -> Result<u64, String> {
+        self.admit_created_backups(bytes, 1)
+    }
+    pub(in crate::file_safety) fn admit_created_backups(
+        &self,
+        bytes: u64,
+        count: usize,
+    ) -> Result<u64, String> {
+        if self
+            .entries
+            .len()
+            .checked_add(count)
+            .is_none_or(|n| n > self.entries.capacity() || n > MAX_ENTRIES)
+        {
+            return Err("Native backup exceeds its frozen entry admission".into());
+        }
+        self.backup_bytes
+            .checked_add(bytes)
+            .filter(|n| *n <= FilePolicy::Source36.backup_bytes())
+            .ok_or_else(|| "Native backup exceeds its directory admission".into())
+    }
+    pub(in crate::file_safety) fn validate_created_backup(
+        &self,
+        plan: &crate::workspace::source_runtime::PublicationPlan,
+        file: &fs::File,
+        expected: (u64, u64),
+        check: &dyn Fn() -> Result<(), String>,
+    ) -> Result<(), String> {
+        if plan.target() != self.lease.path()
+            || plan.expected_version() != self.lease.expected()
+            || plan.backup_directory() != self.directory
+            || plan.backup_directory_identity() != self.directory_identity
+            || self
+                .entries
+                .iter()
+                .any(|entry| Some(entry.name.as_os_str()) == plan.backup_name())
+        {
+            return Err("Created backup differs from the frozen destination inventory".into());
+        }
+        let name = plan
+            .backup_name()
+            .ok_or("Created backup has no admitted name")?;
+        let maximum = plan
+            .expected_version()
+            .ok_or("Backup requires an existing destination")?
+            .bytes;
+        let fact = NativeExternalFile::observe_held(file)?;
+        let path = self.directory.join(name);
+        if fact.identity() != expected
+            || fact.bytes() > maximum
+            || !regular(&path)
+            || link_count(file)? != 1
+        {
+            return Err("Created backup ownership or prefix changed; all bytes retained".into());
+        }
+        let named = open_inventory_file(&path)?;
+        if NativeExternalFile::observe_held(&named)? != fact || link_count(&named)? != 1 {
+            return Err("Created backup name changed; all bytes retained".into());
+        }
+        self.validate_members(Some(name), check)
+    }
+    pub(in crate::file_safety) fn retain_created_backup(
+        &mut self,
+        backup: &super::native_outcome::NativeBackupData<'_>,
+        check: &dyn Fn() -> Result<(), String>,
+    ) -> Result<(), String> {
+        backup.recheck(check)?;
+        let (plan, file, fact) = backup.inventory_binding();
+        self.validate_created_backup(plan, file, fact.identity(), check)?;
+        let bytes = self.admit_created_backup(fact.bytes())?;
+        let entry = Entry::capture(&self.directory, plan.backup_name().unwrap().into())?;
+        if NativeExternalFile::observe_held(&entry.file)? != fact {
+            return Err("Completed backup changed before inventory transfer".into());
+        }
+        self.entries.push(entry);
+        self.entries.sort_by(|a, b| a.name.cmp(&b.name));
+        self.backup_bytes = bytes;
+        self.validate(check)
+    }
+    fn validate_members(
+        &self,
+        created: Option<&std::ffi::OsStr>,
+        check: &dyn Fn() -> Result<(), String>,
+    ) -> Result<(), String> {
         check()?;
         regular_directory(&self.directory)?;
         if identity(&self.held_directory)? != self.directory_identity
@@ -283,9 +420,11 @@ impl NativeInventory<'_> {
             return Err("Native previous-save inventory owner changed; files retained".into());
         }
         let names = self.names(check)?;
-        if names.len() != self.entries.len()
+        if names.len() != self.entries.len() + usize::from(created.is_some())
+            || created.is_some_and(|name| !names.iter().any(|entry| entry == name))
             || names
                 .iter()
+                .filter(|name| Some(name.as_os_str()) != created)
                 .zip(&self.entries)
                 .any(|(name, entry)| name != &entry.name)
         {

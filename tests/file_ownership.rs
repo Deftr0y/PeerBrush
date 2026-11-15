@@ -26,8 +26,8 @@ impl Drop for Directory {
 }
 fn fixture() -> server::Shared {
     let mut e = Engine::new();
-    e.doc = Document::new_depth(13, 9, 16).unwrap();
-    e.doc.layers[0]
+    e.resident_state_mut().expect("resident fixture").document = Document::new_depth(13, 9, 16).unwrap();
+    e.resident_state_mut().expect("resident fixture").document.layers[0]
         .pixels
         .set16(2, 3, [12345, 23457, 45679, 65535]);
     Arc::new(Mutex::new(e))
@@ -44,10 +44,10 @@ fn normalized_aliases_same_source_and_saves_cannot_create_duplicates_or_damage_w
     let path = source(&dir);
     let a = fixture();
     server::open(&a, &path).unwrap();
-    let layer = a.lock().unwrap().doc.layers[0].id.clone();
+    let layer = a.lock().unwrap().resident_state().expect("resident fixture").document.layers[0].id.clone();
     server::dispatch(&a,"edit",&json!({"actor":"human","commands":[{"op":"layer.update","layer":layer,"name":"Unsaved art"}]})).unwrap();
-    let before = a.lock().unwrap().state();
-    let png = a.lock().unwrap().doc.export_png().unwrap();
+    let before = server::state(&a).unwrap().as_ref().clone();
+    let png = a.lock().unwrap().resident_state().expect("resident fixture").document.export_png().unwrap();
     fs::create_dir(dir.0.join("alias")).unwrap();
     let relative = dir.0.join("alias/../Artwork.psd");
     let hard = dir.0.join("Hard.psd");
@@ -57,14 +57,14 @@ fn normalized_aliases_same_source_and_saves_cannot_create_duplicates_or_damage_w
         assert!(server::open(&b, alias)
             .unwrap_err()
             .starts_with("File already open"));
-        let id = b.lock().unwrap().doc.id.clone();
+        let id = b.lock().unwrap().resident_state().expect("resident fixture").document.id.clone();
         assert!(server::save_confirmed_source(&b, alias, &id, 0, true).is_err());
     }
     assert!(server::open(&a, &path).is_err());
-    let mut after = a.lock().unwrap().state();
+    let mut after = server::state(&a).unwrap().as_ref().clone();
     after["file_status"] = before["file_status"].clone();
     assert_eq!(after, before);
-    assert_eq!(a.lock().unwrap().doc.export_png().unwrap(), png);
+    assert_eq!(a.lock().unwrap().resident_state().expect("resident fixture").document.export_png().unwrap(), png);
     #[cfg(windows)]
     {
         assert!(server::open(&fixture(), &dir.0.join("ARTWORK.PSD")).is_err());
@@ -103,10 +103,10 @@ fn failed_and_cancelled_loads_release_pending_ownership_and_close_releases_clone
     assert!(server::open_progress(&fixture(), &path, &control).is_err());
     let a = fixture();
     server::open(&a, &path).unwrap();
-    let snapshot = a.lock().unwrap().clone();
+    let snapshot = a.lock().unwrap().capture_scene(None).unwrap();
     let (project, doc, rev) = {
         let e = a.lock().unwrap();
-        (e.project_id.clone(), e.doc.id.clone(), e.doc.revision)
+        (e.project_id.clone(), e.resident_state().expect("resident fixture").document.id.clone(), e.resident_state().expect("resident fixture").document.revision)
     };
     workspace::close(&a, &project, &doc, rev, false, "human").unwrap();
     let b = fixture();
@@ -117,8 +117,8 @@ fn failed_and_cancelled_loads_release_pending_ownership_and_close_releases_clone
         let e = b.lock().unwrap();
         workspace::lifecycle::Reviewed {
             project: e.project_id.clone(),
-            document: e.doc.id.clone(),
-            revision: e.doc.revision,
+            document: e.resident_state().expect("resident fixture").document.id.clone(),
+            revision: e.resident_state().expect("resident fixture").document.revision,
             discard: false,
         }
     };
@@ -126,22 +126,25 @@ fn failed_and_cancelled_loads_release_pending_ownership_and_close_releases_clone
     server::open(&fixture(), &path).unwrap();
 }
 #[test]
-fn repeated_atomic_saves_keep_native_work_while_engine_snapshots_survive() {
+fn repeated_atomic_saves_keep_native_work_while_captured_scenes_survive() {
     let dir = Directory::new();
     let path = dir.0.join("Repeated.psd");
     let shared = fixture();
     server::save(&shared, &path).unwrap();
-    let snapshot = shared.lock().unwrap().clone();
-    let original = snapshot.doc.layers[0].pixels.rgba16();
+    let (snapshot, captured_scene) = {
+        let engine = shared.lock().unwrap();
+        (engine.resident_state().expect("resident fixture").document.clone(), engine.capture_scene(None).unwrap())
+    };
+    let original = snapshot.layers[0].pixels.rgba16();
     for index in 0..3 {
         let expected = {
             let mut engine = shared.lock().unwrap();
-            engine.doc.layers[0].name = format!("Save {index}");
-            engine.doc.layers[0]
+            engine.resident_state_mut().expect("resident fixture").document.layers[0].name = format!("Save {index}");
+            engine.resident_state_mut().expect("resident fixture").document.layers[0]
                 .pixels
                 .set16(3, 4, [23459 + index, 34571, 45683, 65535]);
-            engine.doc.revision += 1;
-            engine.doc.layers[0].pixels.rgba16()
+            engine.resident_state_mut().expect("resident fixture").document.revision += 1;
+            engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16()
         };
         server::save(&shared, &path).unwrap();
         let reopened = peerbrush::psd::decode(&fs::read(&path).unwrap()).unwrap();
@@ -149,11 +152,11 @@ fn repeated_atomic_saves_keep_native_work_while_engine_snapshots_survive() {
         assert_eq!(reopened.bit_depth, 16);
         assert_eq!(reopened.layers[0].pixels.rgba16(), expected);
         let engine = shared.lock().unwrap();
-        assert_eq!(engine.saved_revision, engine.doc.revision);
+        assert_eq!(engine.saved_revision, engine.resident_state().expect("resident fixture").document.revision);
     }
-    assert_eq!(snapshot.doc.layers[0].pixels.rgba16(), original);
+    assert_eq!(snapshot.layers[0].pixels.rgba16(), original);
     assert!(server::open(&fixture(), &path).is_err());
-    drop(snapshot);
+    drop((snapshot, captured_scene));
 }
 #[test]
 fn ownership_child() {

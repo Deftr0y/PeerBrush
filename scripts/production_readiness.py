@@ -8,7 +8,7 @@ import re
 import stat
 
 from verify_release import inspect_archive
-from package import regular_file, relative_path
+from package import regular_file, relative_path, release_version_order
 from package_deb import inspect_final
 from package_macos_dmg import bounded_file, private_inspection_directory
 
@@ -69,8 +69,8 @@ def immutable(previous, current):
                    or type(a.get('sha256')) is not str or not re.fullmatch('[0-9a-f]{64}', a['sha256']) for a in assets)
             or len({a['file'] for a in assets}) != len(assets)):
         raise ValueError('The retained inventory has invalid or duplicate immutable assets.')
-    candidate = tuple(map(int, current['version'].split('-')[0].split('.')))
-    published = tuple(map(int, previous['version'].split('.')))
+    candidate = release_version_order(current['version'].split('-')[0])
+    published = release_version_order(previous['version'])
     if candidate < published or (candidate == published and '-' in current['version']):
         raise ValueError('A production candidate cannot downgrade the published version.')
     if previous['version'] != current['version']:

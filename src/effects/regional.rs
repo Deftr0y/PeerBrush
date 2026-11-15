@@ -20,12 +20,21 @@ impl Frame {
     pub(crate) fn dimensions(self) -> [u32; 2] {
         self.0
     }
+    pub(crate) fn expand(self, bounds: [i32; 4], halo: i32) -> [i32; 4] {
+        [
+            bounds[0].saturating_sub(halo).max(0),
+            bounds[1].saturating_sub(halo).max(0),
+            bounds[2].saturating_add(halo).min(self.0[0] as i32),
+            bounds[3].saturating_add(halo).min(self.0[1] as i32),
+        ]
+    }
 }
 
 pub(crate) struct Plan {
     frame: Frame,
     output: Region,
     input: [i32; 4],
+    halo: i32,
     depth: u16,
     stages: Vec<(usize, Effect)>,
     stage_count: usize,
@@ -34,7 +43,7 @@ pub(crate) struct Plan {
     _metadata_charge: Option<crate::large_document::Reservation>,
 }
 
-fn reach(kind: &str, settings: &Value) -> Result<i32, String> {
+pub(crate) fn reach(kind: &str, settings: &Value) -> Result<i32, String> {
     let gaussian = |key, default| {
         super::gaussian_radii(super::number(settings, key, default))
             .iter()
@@ -42,7 +51,7 @@ fn reach(kind: &str, settings: &Value) -> Result<i32, String> {
     };
     if styles::contains(kind) {
         return Ok(if kind == "stroke" {
-            settings["size"].as_f64().unwrap_or(0.).ceil() as i32 + 1
+            settings["size"].as_f64().unwrap_or(3.).ceil() as i32 + 1
         } else {
             styles::smoothing_radii(kind, settings).iter().sum::<u32>() as i32
                 + styles::field_padding(kind, settings)
@@ -64,13 +73,108 @@ fn reach(kind: &str, settings: &Value) -> Result<i32, String> {
         }
         "stroke" => super::number(settings, "size", 0.).ceil() as i32 + 1,
         "levels" | "curves" | "adjust" | "color_balance" | "hsl" | "invert" | "grayscale"
-        | "posterize" | "channel_clamp" | "contour" | "texture" | "color_overlay"
-        | "gradient_overlay" | "pattern_overlay" => 0,
+        | "posterize" | "threshold" | "channel_clamp" | "contour" | "texture" | "color_overlay"
+        | "gradient_overlay" | "pattern_overlay" | super::legacy_brightness::KIND
+        | super::modern_brightness::KIND | super::exposure::KIND | super::channel_mixer::KIND
+        | super::black_white::KIND | super::selective_color::KIND | super::vibrance::KIND
+        | super::photo_filter::KIND | super::gradient_map::KIND | super::photoshop_color_balance::KIND
+        | super::photoshop_hue_saturation::KIND | super::color_lookup::KIND => 0,
         "liquify" => {
             return Err("Regional Liquify requires an explicit inverse-mapped source plan".into())
         }
         _ => return Err("Effect has no verified regional support plan".into()),
     })
+}
+
+/// A finite radius bounds how far an input change can affect the output.
+pub(crate) fn local_change_reach(kind: &str, settings: &Value) -> Result<Option<i32>, String> {
+    match kind {
+        "levels" | "curves" | "adjust" | "color_balance" | "hsl" | "invert" | "grayscale"
+        | "posterize" | "threshold" | "blur" | "bloom" | "channel_clamp" | "stroke"
+        | super::legacy_brightness::KIND | super::modern_brightness::KIND
+        | super::exposure::KIND | super::channel_mixer::KIND | super::black_white::KIND
+        | super::selective_color::KIND | super::vibrance::KIND | super::photo_filter::KIND
+        | super::gradient_map::KIND | super::photoshop_color_balance::KIND | super::photoshop_hue_saturation::KIND
+        | super::color_lookup::KIND => {
+            super::validate(kind, settings)?;
+            reach(kind, settings).map(Some)
+        }
+        "drop_shadow" | "outer_glow" | "inner_shadow" | "inner_glow" | "satin" | "bevel_emboss" => {
+            super::validate(kind, settings)?;
+            // Smoothed styles preserve the full-origin accumulation order.
+            // Keep their existing full render path.
+            if styles::smoothing_radii(kind, settings).iter().any(|&radius| radius > 0) {
+                Ok(None)
+            } else {
+                reach(kind, settings).map(Some)
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
+/// A finite radius also requires that zero RGBA outside input support stays zero.
+pub(crate) fn zero_preserving_reach(kind: &str, settings: &Value, depth: u16) -> Result<Option<i32>, String> {
+    if kind == "stroke" {
+        // With no source alpha inside the halo, the outline has no edge to cast from.
+        return local_change_reach(kind, settings);
+    }
+    if matches!(kind, "drop_shadow" | "outer_glow") {
+        super::validate(kind, settings)?;
+        // Built-in profiles map zero field coverage to zero. Custom curves
+        // may generate visible pixels even when the entire halo is empty.
+        return if settings["contour"] == "custom" {
+            Ok(None)
+        } else {
+            reach(kind, settings).map(Some)
+        };
+    }
+    if styles::contains(kind) {
+        return Ok(None);
+    }
+    if kind == super::color_lookup::KIND {
+        let max = if depth == 16 { u16::MAX } else { 255 };
+        let zero = super::color_lookup::prepare(settings)?.is_none_or(|lookup| lookup.sample([0; 3], max) == [0; 3]);
+        return Ok(zero.then_some(0));
+    }
+    if kind == super::photoshop_hue_saturation::KIND {
+        let adjustment = super::photoshop_hue_saturation::Settings::new(settings)?.prepare(depth);
+        return Ok(adjustment.preserves_black().then_some(0));
+    }
+    if kind == super::legacy_brightness::KIND {
+        let max = if depth == 16 { u16::MAX } else { 255 };
+        return Ok((super::legacy_brightness::Mapping::new(settings)?.sample(0, max) == 0).then_some(0));
+    }
+    if kind == super::exposure::KIND {
+        let max = if depth == 16 { u16::MAX } else { 255 };
+        let mapping = super::exposure::Prepared::new(settings)?;
+        return Ok((mapping.sample(0, max) == 0).then_some(0));
+    }
+    if kind == super::channel_mixer::KIND {
+        let max = if depth == 16 { u16::MAX } else { 255 };
+        let mixer = super::channel_mixer::Mixer::new(settings)?.prepare();
+        return Ok((mixer.sample([0; 3], max) == [0; 3]).then_some(0));
+    }
+    if kind == super::black_white::KIND {
+        let max = if depth == 16 { u16::MAX } else { 255 };
+        let adjustment = super::black_white::Settings::new(settings)?.prepare(max);
+        return Ok((adjustment.sample([0; 3]) == [0; 3]).then_some(0));
+    }
+    if kind == super::selective_color::KIND {
+        let max = if depth == 16 { u16::MAX } else { 255 };
+        let adjustment = super::selective_color::Settings::new(settings)?.prepare();
+        return Ok((adjustment.sample([0; 3], max) == [0; 3]).then_some(0));
+    }
+    if kind == super::gradient_map::KIND {
+        let max = if depth == 16 { u16::MAX } else { 255 };
+        let map = super::gradient_map::Settings::new(settings)?.prepare();
+        return Ok((map.lookup(0., max) == [0; 3]).then_some(0));
+    }
+    if kind == "channel_clamp" {
+        let (_, minimum, _) = super::channel_clamp::native_bounds(settings, if depth == 16 { 65535 } else { 255 })?;
+        return Ok((minimum == 0).then_some(0));
+    }
+    local_change_reach(kind, settings)
 }
 
 impl Plan {
@@ -196,16 +300,12 @@ impl Plan {
             normalized.settings = std::sync::Arc::new(settings);
             stages.push((index, normalized));
         }
-        let input = [
-            bounds[0].saturating_sub(halo).max(0),
-            bounds[1].saturating_sub(halo).max(0),
-            bounds[2].saturating_add(halo).min(width as i32),
-            bounds[3].saturating_add(halo).min(height as i32),
-        ];
+        let input = frame.expand(bounds, halo);
         Ok(Self {
             frame,
             output,
             input,
+            halo,
             depth,
             stages,
             stage_count: effects.len(),
@@ -266,6 +366,14 @@ impl Plan {
         &self,
         index: usize,
     ) -> Result<([u32; 2], [i32; 4], Vec<u32>), String> {
+        self.field_request_for(index, self.output.bounds())
+    }
+
+    pub(super) fn field_request_for(
+        &self,
+        index: usize,
+        output: [i32; 4],
+    ) -> Result<([u32; 2], [i32; 4], Vec<u32>), String> {
         let effect = &self
             .stages
             .iter()
@@ -273,15 +381,10 @@ impl Plan {
             .ok_or("Unknown regional effect stage")?
             .1;
         let pad = styles::field_padding(&effect.kind, &effect.settings);
-        let b = self.input;
+        let input = self.frame.expand(output, self.halo);
         Ok((
             self.frame.0,
-            [
-                (b[0] - pad).max(0),
-                (b[1] - pad).max(0),
-                (b[2] + pad).min(self.frame.0[0] as i32),
-                (b[3] + pad).min(self.frame.0[1] as i32),
-            ],
+            self.frame.expand(input, pad),
             styles::smoothing_radii(&effect.kind, &effect.settings),
         ))
     }
@@ -537,7 +640,7 @@ fn copy<T: Copy>(source: &[T]) -> Result<Vec<T>, String> {
 // Conservative node/key/string admission for captured normalized settings.
 // A BTreeMap node can keep spare slots; charge a full KiB per value/member
 // rather than claiming serialized JSON length measures its allocation.
-fn metadata_bytes(value: &Value, depth: u32, bytes: &mut usize) -> Result<(), String> {
+pub(crate) fn metadata_bytes(value: &Value, depth: u32, bytes: &mut usize) -> Result<(), String> {
     if depth > 64 {
         return Err("Regional settings nesting exceeds metadata admission".into());
     }
@@ -573,6 +676,40 @@ fn metadata_bytes(value: &Value, depth: u32, bytes: &mut usize) -> Result<(), St
     Ok(())
 }
 
+/// Render bounded horizontal windows and retain their output in band order.
+pub(crate) fn render_band<E: ToString>(
+    band: Region,
+    depth: u16,
+    budget: &ResidentBudget,
+    check: &mut dyn FnMut() -> Result<(), E>,
+    mut render: impl FnMut(Region, &mut dyn FnMut() -> Result<(), E>) -> Result<RegionalImage, String>,
+) -> Result<RegionalImage, String> {
+    const WINDOW_WIDTH: i32 = 512;
+    let [left, top, right, bottom] = band.bounds();
+    if right - left <= WINDOW_WIDTH {
+        return render(band, check);
+    }
+    let stride = usize::from(depth / 2);
+    let row_bytes = (right - left) as usize * stride;
+    let length = band.pixels() * stride;
+    let mut output = ScratchBytes::new(budget, length, length).map_err(|error| error.to_string())?;
+    for x in (left..right).step_by(WINDOW_WIDTH as usize) {
+        let end = (x + WINDOW_WIDTH).min(right);
+        let window = Region::new([x, top, end, bottom]).map_err(|error| error.to_string())?;
+        let image = render(window, check)?;
+        if image.bounds() != window.bounds() || image.depth() != depth || !image.uses_budget(budget) {
+            return Err("Effect output differs from its admitted window".into());
+        }
+        let offset = (x - left) as usize * stride;
+        for (y, row) in image.bytes().chunks_exact((end - x) as usize * stride).enumerate() {
+            check().map_err(|error| error.to_string())?;
+            let start = y * row_bytes + offset;
+            output[start..start + row.len()].copy_from_slice(row);
+        }
+    }
+    RegionalImage::from_native(band, depth, output.freeze())
+}
+
 #[derive(Clone)]
 pub(crate) struct RegionalImage {
     bounds: [i32; 4],
@@ -601,6 +738,14 @@ impl RegionalImage {
     }
     pub(crate) fn uses_budget(&self, budget: &ResidentBudget) -> bool {
         self.bytes.uses_budget(budget)
+    }
+    pub(super) fn rebase(mut self, region: Region) -> Result<Self, String> {
+        let bounds = region.bounds();
+        if (0..2).any(|axis| bounds[axis + 2] - bounds[axis] != self.bounds[axis + 2] - self.bounds[axis]) {
+            return Err("Rebased effect window differs from its stored shape".into());
+        }
+        self.bounds = bounds;
+        Ok(self)
     }
     pub(crate) fn bounds(&self) -> [i32; 4] {
         self.bounds
@@ -642,7 +787,7 @@ mod tests {
         let area = Region::new([19, 21, 39, 43]).unwrap();
         for depth in [8, 16] {
             for kind in ["pattern_overlay", "texture"] {
-                let pool = ResidentBudget::new(16 * 1024 * 1024).unwrap();
+                let pool = ResidentBudget::new(64 * 1024 * 1024).unwrap();
                 let words = [
                     12347u16, 33559, 51237, 65535, 54321, 12345, 45679, 27139, 19001, 27003, 37007,
                     49151, 61001, 51003, 41009, 65535,
@@ -676,6 +821,28 @@ mod tests {
                     )
                     .unwrap(),
                 );
+                let decoded = std::sync::Arc::new(
+                    super::super::patterns::PreparedBitmap::from_png(
+                        &source,
+                        &pool,
+                        &mut || Ok(()),
+                    )
+                    .unwrap(),
+                );
+                use super::super::patterns::Sampler;
+                for y in 0..2 {
+                    for x in 0..2 {
+                        assert_eq!(
+                            decoded.sample(x as f64, y as f64, &json!({"sampling":"nearest"})),
+                            bitmap.sample(x as f64, y as f64, &json!({"sampling":"nearest"})),
+                        );
+                    }
+                }
+                assert_eq!(decoded.depth(), depth);
+                decoded.matches_source(&source).unwrap();
+                assert!(decoded.matches_source("different").is_err());
+                drop(bitmap);
+                let bitmap = decoded;
                 let mut effect = effect(kind);
                 let settings = std::sync::Arc::make_mut(&mut effect.settings);
                 settings["pattern"] = json!("bitmap");
@@ -771,6 +938,17 @@ mod tests {
                 drop(actual);
                 drop(plan);
                 assert_eq!(pool.used(), 32);
+                if depth == 16 {
+                    assert!(Plan::new_prepared(
+                        Frame::new(61, 67).unwrap(),
+                        area,
+                        8,
+                        &[effect.clone()],
+                        &pool,
+                        &[Some(bitmap.clone())],
+                    )
+                    .is_err());
+                }
                 let mut changed = effect.clone();
                 std::sync::Arc::make_mut(&mut changed.settings)["bitmap_png"] =
                     json!("different-source");

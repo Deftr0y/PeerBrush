@@ -1,4 +1,4 @@
-//! Borrowed observation DTOs preserve editable definitions without Raster copies.
+//! Borrowed engine reports preserve editable definitions without Raster copies.
 use crate::engine::{
     native::{
         CoverageMetadata, EffectMetadata, LayerMetadata, MaskMetadata, MaskStepMetadata,
@@ -24,7 +24,7 @@ impl Serialize for Document<'_> {
         let polygon = d
             .selection_polygon()
             .filter(|p| crate::selection::bounds(p).ok() == d.selection());
-        fields!(map,"id"=>d.id(),"name"=>d.name(),"width"=>d.width(),"height"=>d.height(),"revision"=>d.revision(),"bit_depth"=>d.depth(),"color_profile"=>self.profile,"read_only"=>d.read_only(),"warnings"=>d.warnings(),"source_structure"=>self.scene.source_structure(),"source_patterns"=>self.scene.source_patterns(),"filters"=>Filters(self.scene),"selection"=>d.selection(),"selection_polygon"=>polygon);
+        fields!(map,"id"=>d.id(),"name"=>d.name(),"width"=>d.width(),"height"=>d.height(),"revision"=>d.revision(),"bit_depth"=>d.depth(),"global_light_angle"=>d.global_light_angle(),"color_profile"=>self.profile,"read_only"=>d.read_only(),"warnings"=>d.warnings(),"source_structure"=>self.scene.source_structure(),"source_patterns"=>self.scene.source_patterns(),"filters"=>Filters(self.scene),"selection"=>d.selection(),"selection_polygon"=>polygon);
         map.end()
     }
 }
@@ -46,7 +46,8 @@ impl Serialize for Layer<'_> {
         let p = l.pixels();
         let [x, y] = l.origin();
         let mut map = s.serialize_map(None)?;
-        fields!(map,"id"=>l.id(),"name"=>l.name(),"kind"=>l.kind(),"parent"=>l.parent(),"clip_to"=>l.clip_to(),"visible"=>l.visible(),"locked"=>l.locked(),"opacity"=>l.opacity(),"blend"=>l.blend(),"bounds"=>[x,y,x+p.width() as i32,y+p.height() as i32],"effects"=>Effects(l),"source"=>l.source().map(Source),"path_document_nodes"=>Path(l),"transform_source"=>Retained(p),"mask"=>l.mask().map(Mask));
+        map.serialize_entry("color_label", crate::psd::layer_color_label(l.psd_metadata()))?;
+        fields!(map,"id"=>l.id(),"name"=>l.name(),"kind"=>l.kind(),"parent"=>l.parent(),"clip_to"=>l.clip_to(),"visible"=>l.visible(),"locked"=>l.locked(),"opacity"=>l.opacity(),"fill_opacity"=>l.fill_opacity(),"blend_clipped_as_group"=>l.blend_clipped_as_group(),"blend_if"=>l.blend_if(),"blend_channels"=>l.blend_channels(),"blend"=>l.blend(),"bounds"=>[x,y,x+p.width() as i32,y+p.height() as i32],"effects"=>Effects(l),"source"=>l.source().map(Source),"path_document_nodes"=>Path(l),"transform_source"=>Retained(p),"mask"=>l.mask().map(Mask));
         map.end()
     }
 }

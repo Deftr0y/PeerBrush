@@ -23,7 +23,7 @@ mod macos;
 #[path = "fonts/windows.rs"]
 mod windows;
 
-const FILE_BYTES: usize = 32 * 1024 * 1024;
+pub(crate) const FILE_BYTES: usize = 32 * 1024 * 1024;
 const CACHE_BYTES: usize = 64 * 1024 * 1024;
 const FACE_LIMIT: usize = 8192;
 const FILE_FACES: u32 = 256;
@@ -230,7 +230,7 @@ fn sha256(bytes: &[u8]) -> String {
         .map(|b| format!("{b:02x}"))
         .collect()
 }
-fn read_owned(path: &Path) -> Result<Vec<u8>, FontError> {
+pub(crate) fn read_owned(path: &Path) -> Result<Vec<u8>, FontError> {
     if !path.is_absolute() {
         return Err(FontError::Unavailable);
     }

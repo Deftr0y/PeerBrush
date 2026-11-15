@@ -18,8 +18,8 @@ fn textured_strokes_keep_native_pixels_across_pan_and_zoom_and_preview_the_share
                 app.recovery.open = false;
                 {
                     let mut e = app.shared.lock().unwrap();
-                    e.doc = Document::new_depth(64, 64, depth).unwrap();
-                    let l = &mut e.doc.layers[0];
+                    e.resident_state_mut().expect("resident fixture").document = Document::new_depth(64, 64, depth).unwrap();
+                    let l = &mut e.resident_state_mut().expect("resident fixture").document.layers[0];
                     l.x = -13;
                     l.y = -11;
                     l.pixels = crate::raster::Raster::new_depth(77, 75, depth);
@@ -32,7 +32,7 @@ fn textured_strokes_keep_native_pixels_across_pan_and_zoom_and_preview_the_share
                             );
                         }
                     }
-                    e.undo.clear();
+                    e.resident_state_mut().expect("resident fixture").undo.clear();
                 }
                 frame(&mut app, &ctx, 0., vec![]);
                 app.select_tool(Tool::Brush);
@@ -49,7 +49,7 @@ fn textured_strokes_keep_native_pixels_across_pan_and_zoom_and_preview_the_share
                 app.pan = pan;
                 frame(&mut app, &ctx, 0.1, vec![]);
                 frame(&mut app, &ctx, 0.2, vec![]);
-                let before = app.shared.lock().unwrap().doc.clone();
+                let before = app.shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
                 let rect = app.view_rect.unwrap();
                 let scale = rect.width() / 64.;
                 let start = rect.min + Vec2::new(16., 32.) * scale;
@@ -68,7 +68,7 @@ fn textured_strokes_keep_native_pixels_across_pan_and_zoom_and_preview_the_share
                 );
                 frame(&mut app, &ctx, 0.4, vec![egui::Event::PointerMoved(end)]);
                 assert!(app.points.len() >= 2);
-                let commands = vec![app.stroke_command(app.points.clone(), app.color)];
+                let commands = vec![app.stroke_command(&app.points, app.color)];
                 assert_eq!(commands.len(), 1);
                 assert_eq!(commands[0]["tip"], tip.name());
                 for (actual, expected) in commands[0]["points"]
@@ -99,12 +99,12 @@ fn textured_strokes_keep_native_pixels_across_pan_and_zoom_and_preview_the_share
                     );
                     std::thread::sleep(Duration::from_millis(5));
                 }
-                assert!(app.shared.lock().unwrap().undo.is_empty());
+                assert!(app.shared.lock().unwrap().resident_state().expect("resident fixture").undo.is_empty());
                 frame(&mut app, &ctx, time, vec![button(end, false)]);
                 let mut e = app.shared.lock().unwrap();
-                assert_eq!(e.undo.len(), 1, "{}", app.message);
-                assert_eq!(e.doc.bit_depth, depth);
-                let actual = e.doc.export_png().unwrap();
+                assert_eq!(e.resident_state().expect("resident fixture").undo.len(), 1, "{}", app.message);
+                assert_eq!(e.resident_state().expect("resident fixture").document.bit_depth, depth);
+                let actual = e.resident_state().expect("resident fixture").document.export_png().unwrap();
                 assert_eq!(actual, preview.export_png().unwrap());
                 if let Some(expected) = &reference {
                     assert_eq!(&actual, expected, "{depth}, {}, zoom {zoom}", tip.name());
@@ -112,11 +112,11 @@ fn textured_strokes_keep_native_pixels_across_pan_and_zoom_and_preview_the_share
                     reference = Some(actual);
                 }
                 assert_eq!(
-                    e.doc.layers[0].pixels.get16(17, 15),
+                    e.resident_state().expect("resident fixture").document.layers[0].pixels.get16(17, 15),
                     before.layers[0].pixels.get16(17, 15)
                 );
                 e.undo("human").unwrap();
-                assert_eq!(e.doc.export_png().unwrap(), before.export_png().unwrap());
+                assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), before.export_png().unwrap());
             }
         }
     }
@@ -145,10 +145,10 @@ fn switching_all_brush_tools_restores_complete_profiles_and_ui_commands_match_en
         app.recovery.open = false;
         {
             let mut e = app.shared.lock().unwrap();
-            e.doc = Document::new_depth(64, 64, depth).unwrap();
+            e.resident_state_mut().expect("resident fixture").document = Document::new_depth(64, 64, depth).unwrap();
             for y in 0..64 {
                 for x in 0..64 {
-                    e.doc.layers[0].pixels.set16(
+                    e.resident_state_mut().expect("resident fixture").document.layers[0].pixels.set16(
                         x,
                         y,
                         [12345 + x as u16 * 53, 23457 + y as u16 * 61, 45679, 65535],
@@ -192,7 +192,7 @@ fn switching_all_brush_tools_restores_complete_profiles_and_ui_commands_match_en
             assert_eq!(app.brush, profiles[index].settings);
             assert_eq!(app.radius, profiles[index].settings.radius);
             frame(&mut app, &ctx, 1. + index as f64 * 0.1, vec![]);
-            let before = app.shared.lock().unwrap().doc.clone();
+            let before = app.shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
             app.retouch_source = Some(retouch::Anchor {
                 project: before.id.clone(),
                 layer: app.selected.clone(),
@@ -202,13 +202,13 @@ fn switching_all_brush_tools_restores_complete_profiles_and_ui_commands_match_en
             });
             app.retouch_revision = Some(before.revision);
             let points = vec![[20., 30.], [38., 35.]];
-            let command = app.stroke_command(points, [233, 84, 32, 255]);
+            let command = app.stroke_command(&points, [233, 84, 32, 255]);
             assert_eq!(
                 crate::brush::Settings::from_command(&command).unwrap(),
                 profiles[index].settings
             );
             let mut oracle = crate::engine::Engine::new();
-            oracle.doc = before.clone();
+            oracle.resident_state_mut().expect("resident fixture").document = before.clone();
             let mut expected = serde_json::to_value(profiles[index].settings).unwrap();
             for (key, value) in command.as_object().unwrap() {
                 if !expected.as_object().unwrap().contains_key(key) {
@@ -228,19 +228,19 @@ fn switching_all_brush_tools_restores_complete_profiles_and_ui_commands_match_en
             e.edit("human", &[command], None, None, "Native tool stroke")
                 .unwrap();
             assert_eq!(
-                e.doc.export_png().unwrap(),
-                oracle.doc.export_png().unwrap()
+                e.resident_state().expect("resident fixture").document.export_png().unwrap(),
+                oracle.resident_state().expect("resident fixture").document.export_png().unwrap()
             );
-            assert_ne!(e.doc.export_png().unwrap(), before.export_png().unwrap());
-            assert_eq!(e.undo.len(), 1);
-            let saved = crate::psd::decode(&crate::psd::encode(&e.doc).unwrap()).unwrap();
+            assert_ne!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), before.export_png().unwrap());
+            assert_eq!(e.resident_state().expect("resident fixture").undo.len(), 1);
+            let saved = crate::psd::decode(&crate::psd::encode(&e.resident_state().expect("resident fixture").document).unwrap()).unwrap();
             assert_eq!(saved.bit_depth, depth);
             assert_eq!(
                 saved.layers[0].pixels.rgba16(),
-                e.doc.layers[0].pixels.rgba16()
+                e.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16()
             );
             e.undo("human").unwrap();
-            assert_eq!(e.doc.export_png().unwrap(), before.export_png().unwrap());
+            assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), before.export_png().unwrap());
         }
         app.select_tool(Tool::Liquify);
         app.radius = 39.;
@@ -279,7 +279,7 @@ fn presets_are_snapshots_per_tool_including_preset_induced_tool_switches() {
     app.select_tool(Tool::Eraser);
     assert_eq!(app.brush, crate::brush::Settings::default());
     frame(&mut app, &ctx, 0., vec![]);
-    assert!(app.shared.lock().unwrap().undo.is_empty());
+    assert!(app.shared.lock().unwrap().resident_state().expect("resident fixture").undo.is_empty());
 }
 
 #[test]
@@ -288,7 +288,7 @@ fn agent_preferences_commit_immediately_animate_only_controls_and_human_input_in
     let (mut app, ctx) = super::tests::fixture();
     app.recovery.open = false;
     frame(&mut app, &ctx, 0., vec![]);
-    let before = crate::psd::encode(&app.shared.lock().unwrap().doc).unwrap();
+    let before = crate::psd::encode(&app.shared.lock().unwrap().resident_state().expect("resident fixture").document).unwrap();
     server::dispatch(&app.shared,"tool_settings",&json!({"action":"set","tool":"brush","actor":"artist","expected_tool_revision":0,"settings":{"radius":31,"opacity":0.4,"flow":0.25}})).unwrap();
     assert_eq!(
         app.tool_settings_store
@@ -329,10 +329,10 @@ fn agent_preferences_commit_immediately_animate_only_controls_and_human_input_in
     );
     assert!(!app.tool_preferences_ai(0.5));
     assert_eq!(
-        crate::psd::encode(&app.shared.lock().unwrap().doc).unwrap(),
+        crate::psd::encode(&app.shared.lock().unwrap().resident_state().expect("resident fixture").document).unwrap(),
         before
     );
-    assert!(app.shared.lock().unwrap().undo.is_empty());
+    assert!(app.shared.lock().unwrap().resident_state().expect("resident fixture").undo.is_empty());
     let current = app
         .tool_settings_store
         .lock()
@@ -360,9 +360,9 @@ fn update_profile_flush_merges_deferred_human_controls_with_newer_agent_settings
         app.restore_tool_profile(Tool::Brush);
         {
             let mut e = app.shared.lock().unwrap();
-            e.doc = Document::new_depth(4, 3, depth).unwrap();
-            let layer = e.doc.layers[0].id.clone();
-            e.doc.layers[0].pixels.set16(0, 0, [1001, 3003, 5007, 0]);
+            e.resident_state_mut().expect("resident fixture").document = Document::new_depth(4, 3, depth).unwrap();
+            let layer = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
+            e.resident_state_mut().expect("resident fixture").document.layers[0].pixels.set16(0, 0, [1001, 3003, 5007, 0]);
             e.edit(
                 "human",
                 &[json!({"op":"layer.update","layer":layer,"name":"Undo retained"})],
@@ -381,7 +381,7 @@ fn update_profile_flush_merges_deferred_human_controls_with_newer_agent_settings
             .unwrap();
             e.undo("human").unwrap();
         }
-        let before = serde_json::to_value(&app.shared.lock().unwrap().doc).unwrap();
+        let before = serde_json::to_value(&app.shared.lock().unwrap().resident_state().expect("resident fixture").document).unwrap();
         let brush = app
             .tool_settings_store
             .lock()
@@ -410,8 +410,8 @@ fn update_profile_flush_merges_deferred_human_controls_with_newer_agent_settings
         let disk = crate::tool_settings::Store::load(directory.join("tool-settings.json"));
         assert_eq!(disk.get("brush").unwrap().profile, current.profile);
         let e = app.shared.lock().unwrap();
-        assert_eq!(serde_json::to_value(&e.doc).unwrap(), before);
-        assert_eq!((e.undo.len(), e.redo.len()), (1, 1));
+        assert_eq!(serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap(), before);
+        assert_eq!((e.resident_state().expect("resident fixture").undo.len(), e.resident_state().expect("resident fixture").redo.len()), (1, 1));
         assert!(!e.closed);
         drop(e);
         std::fs::remove_dir_all(directory).unwrap();
@@ -438,8 +438,8 @@ fn update_profile_flush_reports_protected_disk_bytes_and_pending_values_without_
     let external = serde_json::to_vec_pretty(&changed).unwrap();
     std::fs::write(&file, &external).unwrap();
     app.brush.opacity = 0.63;
-    app.shared.lock().unwrap().doc.revision += 1;
-    let before = serde_json::to_value(&app.shared.lock().unwrap().doc).unwrap();
+    app.shared.lock().unwrap().resident_state_mut().expect("resident fixture").document.revision += 1;
+    let before = serde_json::to_value(&app.shared.lock().unwrap().resident_state().expect("resident fixture").document).unwrap();
     assert!(app.flush_update_tool_profile().is_err());
     assert!(app
         .tool_settings_store
@@ -450,7 +450,7 @@ fn update_profile_flush_reports_protected_disk_bytes_and_pending_values_without_
     assert_eq!(app.brush.opacity, 0.63);
     assert_eq!(std::fs::read(&file).unwrap(), external);
     assert_eq!(
-        serde_json::to_value(&app.shared.lock().unwrap().doc).unwrap(),
+        serde_json::to_value(&app.shared.lock().unwrap().resident_state().expect("resident fixture").document).unwrap(),
         before
     );
     assert!(!app.shared.lock().unwrap().closed);
@@ -472,7 +472,7 @@ fn ordinary_on_exit_still_flushes_its_last_ui_delta_and_preserves_document_sourc
     app.restore_tool_profile(Tool::Brush);
     app.radius = 47.;
     app.brush.opacity = 0.67;
-    let before = serde_json::to_value(&app.shared.lock().unwrap().doc).unwrap();
+    let before = serde_json::to_value(&app.shared.lock().unwrap().resident_state().expect("resident fixture").document).unwrap();
     eframe::App::on_exit(&mut app);
     let disk = crate::tool_settings::Store::load(directory.join("tool-settings.json"));
     assert!(disk.error.is_none());
@@ -480,7 +480,7 @@ fn ordinary_on_exit_still_flushes_its_last_ui_delta_and_preserves_document_sourc
     assert_eq!(current.settings.radius, 47.);
     assert_eq!(current.settings.opacity, 0.67);
     assert_eq!(
-        serde_json::to_value(&app.shared.lock().unwrap().doc).unwrap(),
+        serde_json::to_value(&app.shared.lock().unwrap().resident_state().expect("resident fixture").document).unwrap(),
         before
     );
     assert!(!app.shared.lock().unwrap().closed);
@@ -521,18 +521,18 @@ fn update_exit_fixture() -> (
     app.updates = updates::Panel::load(&preferences);
     app.updates
         .set_update_profile(Some(profile.update_profile()));
-    app.shared.lock().unwrap().doc = Document::new_depth(32, 24, 8).unwrap();
-    app.selected = app.shared.lock().unwrap().doc.layers[0].id.clone();
+    app.shared.lock().unwrap().resident_state_mut().expect("resident fixture").document = Document::new_depth(32, 24, 8).unwrap();
+    app.selected = app.shared.lock().unwrap().resident_state().expect("resident fixture").document.layers[0].id.clone();
     let second = crate::workspace::new_project(&app.shared, 32, 24, 16, None).unwrap();
     let projects = vec![app.shared.clone(), second];
     crate::workspace::select_in(&app.workspace, &app.project_id).unwrap();
     for (index, shared) in projects.iter().enumerate() {
         let mut engine = shared.lock().unwrap();
-        let raster = engine.doc.layers[0].id.clone();
-        engine.doc.layers[0]
+        let raster = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
+        engine.resident_state_mut().expect("resident fixture").document.layers[0]
             .pixels
             .set16(25, 20, [12347, 23459, 34567, 0]);
-        let hidden = engine.doc.layers[0].pixels.get16(25, 20);
+        let hidden = engine.resident_state().expect("resident fixture").document.layers[0].pixels.get16(25, 20);
         assert_eq!(hidden[3], 0);
         assert!(hidden[..3].iter().any(|value| *value != 0));
         let source = Source {
@@ -569,10 +569,10 @@ fn update_exit_fixture() -> (
                 vec![crate::engine::Scope::layer(&raster)],
             )
             .unwrap();
-        assert!(!engine.undo.is_empty() && !engine.redo.is_empty());
+        assert!(!engine.resident_state().expect("resident fixture").undo.is_empty() && !engine.resident_state().expect("resident fixture").redo.is_empty());
         assert_eq!(
             engine
-                .doc
+                .resident_state().expect("resident fixture").document
                 .layers
                 .iter()
                 .find(|layer| layer.id == raster)
@@ -592,8 +592,8 @@ fn update_exit_save(shared: &Shared, path: &Path) {
         let engine = shared.lock().unwrap();
         (
             engine.project_id.clone(),
-            engine.doc.id.clone(),
-            engine.doc.revision,
+            engine.resident_state().expect("resident fixture").document.id.clone(),
+            engine.resident_state().expect("resident fixture").document.revision,
         )
     };
     let report = server::dispatch(
@@ -620,12 +620,12 @@ fn update_exit_documents(projects: &[Shared]) -> Vec<Value> {
         let history = |entries: &[crate::engine::History]| entries.iter().map(|entry|json!({
             "before":entry.before,"after":entry.after,"actor":entry.actor,"label":entry.label,"task":entry.task,
             "scopes":entry.scopes,"gesture":entry.gesture,"reverted":entry.reverted})).collect::<Vec<_>>();
-        assert!(!engine.undo.is_empty() && !engine.redo.is_empty() && !engine.leases.is_empty());
-        assert!(engine.doc.layers.iter().any(|layer|layer.source.is_some()));
-        let raster=engine.doc.layers.iter().find(|layer|layer.source.is_none()).unwrap();
-        assert_eq!(raster.pixels.depth,engine.doc.bit_depth);
-        json!({"document":engine.doc,"png":engine.doc.export_png().unwrap(),"hidden":raster.pixels.get16(25,20),
-            "undo":history(&engine.undo),"redo":history(&engine.redo),"leases":engine.leases,
+        assert!(!engine.resident_state().expect("resident fixture").undo.is_empty() && !engine.resident_state().expect("resident fixture").redo.is_empty() && !engine.leases.is_empty());
+        assert!(engine.resident_state().expect("resident fixture").document.layers.iter().any(|layer|layer.source.is_some()));
+        let raster=engine.resident_state().expect("resident fixture").document.layers.iter().find(|layer|layer.source.is_none()).unwrap();
+        assert_eq!(raster.pixels.depth,engine.resident_state().expect("resident fixture").document.bit_depth);
+        json!({"document":engine.resident_state().expect("resident fixture").document,"png":engine.resident_state().expect("resident fixture").document.export_png().unwrap(),"hidden":raster.pixels.get16(25,20),
+            "undo":history(&engine.resident_state().expect("resident fixture").undo),"redo":history(&engine.resident_state().expect("resident fixture").redo),"leases":engine.leases,
             "saved_revision":engine.saved_revision,"path":engine.path})
     }).collect()
 }
@@ -760,7 +760,7 @@ fn final_update_profile_transaction_blocks_same_future_frame_on_exit_and_late_mc
 fn failed_final_update_transaction_keeps_newer_work_cancel_and_ordinary_on_exit_writable() {
     let (mut app, ctx, projects, profile, directory) = update_exit_fixture();
     let reviewed = crate::workspace::lifecycle::update_readiness(&app.workspace).unwrap();
-    let layer = projects[1].lock().unwrap().doc.layers[0].id.clone();
+    let layer = projects[1].lock().unwrap().resident_state().expect("resident fixture").document.layers[0].id.clone();
     projects[1]
         .lock()
         .unwrap()
@@ -772,7 +772,7 @@ fn failed_final_update_transaction_keeps_newer_work_cancel_and_ordinary_on_exit_
             "Keep newer work",
         )
         .unwrap();
-    let newer = serde_json::to_value(&projects[1].lock().unwrap().doc).unwrap();
+    let newer = serde_json::to_value(&projects[1].lock().unwrap().resident_state().expect("resident fixture").document).unwrap();
     let invoked = std::cell::Cell::new(false);
     assert!(app
         .finish_update_exit(&reviewed, |_| {
@@ -784,7 +784,7 @@ fn failed_final_update_transaction_keeps_newer_work_cancel_and_ordinary_on_exit_
     assert!(!app.workspace.lock().unwrap().exiting);
     assert!(projects.iter().all(|shared| !shared.lock().unwrap().closed));
     assert_eq!(
-        serde_json::to_value(&projects[1].lock().unwrap().doc).unwrap(),
+        serde_json::to_value(&projects[1].lock().unwrap().resident_state().expect("resident fixture").document).unwrap(),
         newer
     );
     // The real Don't Save review is still cancelable; no update-close receipt
@@ -812,7 +812,7 @@ fn failed_final_update_transaction_keeps_newer_work_cancel_and_ordinary_on_exit_
     }
     assert!(app.lifecycle.is_none() && !app.exit_approved);
     assert_eq!(
-        serde_json::to_value(&projects[1].lock().unwrap().doc).unwrap(),
+        serde_json::to_value(&projects[1].lock().unwrap().resident_state().expect("resident fixture").document).unwrap(),
         newer
     );
     let path = projects[1].lock().unwrap().path.clone().unwrap();
@@ -851,7 +851,7 @@ fn failed_final_update_transaction_keeps_newer_work_cancel_and_ordinary_on_exit_
         crate::tool_settings::Store::load(profile.locations.profile().join("tool-settings.json"));
     assert_eq!(disk.get("brush").unwrap().profile.settings.radius, 59.);
     assert_eq!(
-        serde_json::to_value(&projects[1].lock().unwrap().doc).unwrap(),
+        serde_json::to_value(&projects[1].lock().unwrap().resident_state().expect("resident fixture").document).unwrap(),
         newer
     );
     drop(app);

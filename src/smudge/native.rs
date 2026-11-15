@@ -3,7 +3,7 @@ use super::{premultiplied, premultiplied16, unpremultiplied, unpremultiplied16};
 use crate::{
     brush::{self, native::PreparedBrush, Settings, Tip},
     large_document::{PinnedBytes, ResidentBudget, ScratchBytes},
-    raster::{project16, Pixel, Pixel16, TILE},
+    raster::{project16, Pixel16, TILE},
 };
 
 const STRIP_PIXELS: usize = 128 * 1024;
@@ -124,7 +124,7 @@ pub(crate) struct PreparedSmudge<'a> {
     clip: [i32; 4],
     polygon: Option<&'a [[f32; 2]]>,
     settings: Settings,
-    color: Pixel,
+    color: Pixel16,
     pool: ResidentBudget,
 }
 impl<'a> PreparedSmudge<'a> {
@@ -136,7 +136,7 @@ impl<'a> PreparedSmudge<'a> {
         points: &[[f32; 2]],
         pressures: Option<&[f32]>,
         settings: Settings,
-        color: Pixel,
+        color: Pixel16,
         clip: Option<[i32; 4]>,
         polygon: Option<&'a [[f32; 2]]>,
         pool: &ResidentBudget,
@@ -253,7 +253,7 @@ impl<'a> PreparedSmudge<'a> {
             average.divide(weight);
             let Some(mut pigment) = carry else {
                 average.move_toward(
-                    Pigment::from_pixel(self.depth, self.color.map(|v| v as u16 * 257)),
+                    Pigment::from_pixel(self.depth, self.color),
                     self.settings.load,
                 );
                 carry = Some(average);
@@ -615,7 +615,12 @@ mod tests {
     #[test]
     fn ordered_provisional_smudge_matches_resident_native_pixels_and_padding() {
         for depth in [8, 16] {
-            for color in [[71, 137, 211, 193], [71, 137, 211, 0]] {
+            let load_colors = if depth == 16 {
+                [[18248, 35211, 54229, 49599], [18248, 35211, 54229, 0]]
+            } else {
+                [[71, 137, 211, 193], [71, 137, 211, 0]].map(|rgba| rgba.map(|value| value * 257))
+            };
+            for color in load_colors {
                 let original = input(depth);
                 let mut expected = original.clone();
                 let settings = Settings {
@@ -637,7 +642,7 @@ mod tests {
                 let pressures = [0.33, 0.91, 0.57];
                 let polygon = [[8., 4.], [273., 0.], [273., 265.], [0., 256.]];
                 let clip = Some([5, 7, 273, 265]);
-                super::super::paint(
+                super::super::paint_native_color(
                     &mut expected,
                     &points,
                     Some(&pressures),
@@ -708,7 +713,7 @@ mod tests {
             &points,
             None,
             Settings::default(),
-            [211, 17, 37, 255],
+            [211 * 257, 17 * 257, 37 * 257, 65535],
             None,
             None,
             &pool,
@@ -755,7 +760,7 @@ mod tests {
                 radius: 512.,
                 ..Settings::default()
             },
-            [211, 17, 37, 255],
+            [211 * 257, 17 * 257, 37 * 257, 65535],
             None,
             None,
             &pool,

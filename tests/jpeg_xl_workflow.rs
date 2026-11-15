@@ -95,7 +95,7 @@ fn state(shared: &server::Shared) -> Value {
         entries.iter().map(|h|json!({"before":h.before,"after":h.after,
         "label":h.label,"actor":h.actor,"task":h.task,"scopes":h.scopes,"gesture":h.gesture,"reverted":h.reverted})).collect::<Vec<_>>()
     };
-    json!({"document":e.doc,"png":e.doc.export_png().unwrap(),"undo":history(&e.undo),"redo":history(&e.redo),
+    json!({"document":e.resident_state().expect("resident fixture").document,"png":e.resident_state().expect("resident fixture").document.export_png().unwrap(),"undo":history(&e.resident_state().expect("resident fixture").undo),"redo":history(&e.resident_state().expect("resident fixture").redo),
         "saved_revision":e.saved_revision,"path":e.path})
 }
 fn fixture(depth: u16) -> Document {
@@ -145,8 +145,8 @@ fn open_creates_native_unsaved_editable_project_without_discarding_human_work_or
         let (bytes, expected) = source(depth);
         let path = temp.file("source.JXL", &bytes);
         let mut engine = Engine::new();
-        engine.doc = fixture(16);
-        let layer = engine.doc.layers[0].id.clone();
+        engine.resident_state_mut().expect("resident fixture").document = fixture(16);
+        let layer = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
         engine
             .edit(
                 "human",
@@ -174,23 +174,23 @@ fn open_creates_native_unsaved_editable_project_without_discarding_human_work_or
         let project = workspace::get(&shared, opened["project_id"].as_str().unwrap()).unwrap();
         assert_eq!(state(&shared), before);
         let e = project.lock().unwrap();
-        assert_eq!((e.doc.width, e.doc.height, e.doc.bit_depth), (3, 2, depth));
-        assert!(e.path.is_none() && e.file_version.is_none() && e.undo.is_empty());
+        assert_eq!((e.resident_state().expect("resident fixture").document.width, e.resident_state().expect("resident fixture").document.height, e.resident_state().expect("resident fixture").document.bit_depth), (3, 2, depth));
+        assert!(e.path.is_none() && e.file_version.is_none() && e.resident_state().expect("resident fixture").undo.is_empty());
         assert_eq!(e.saved_revision, u64::MAX);
-        assert!(!e.doc.read_only && e.doc.srgb_tagged);
-        assert_eq!(e.doc.layers[0].pixels.rgba16(), expected);
+        assert!(!e.resident_state().expect("resident fixture").document.read_only && e.resident_state().expect("resident fixture").document.srgb_tagged);
+        assert_eq!(e.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(), expected);
         for psb in [false, true] {
             let saved = if psb {
-                peerbrush::psd::encode_psb(&e.doc)
+                peerbrush::psd::encode_psb(&e.resident_state().expect("resident fixture").document)
             } else {
-                peerbrush::psd::encode(&e.doc)
+                peerbrush::psd::encode(&e.resident_state().expect("resident fixture").document)
             }
             .unwrap();
             let reopened = peerbrush::psd::decode(&saved).unwrap();
             assert!(!reopened.read_only);
             assert_eq!(reopened.bit_depth, depth);
             assert_eq!(reopened.layers[0].pixels.rgba16(), expected);
-            assert_eq!(reopened.export_png().unwrap(), e.doc.export_png().unwrap());
+            assert_eq!(reopened.export_png().unwrap(), e.resident_state().expect("resident fixture").document.export_png().unwrap());
         }
         assert_eq!(fs::read(path).unwrap(), bytes);
     }
@@ -205,17 +205,17 @@ fn import_and_place_share_native_precision_coordinates_reservations_and_one_undo
             let path = temp.file("source.jxl", &bytes);
             for place in [false, true] {
                 let mut engine = Engine::new();
-                engine.doc = Document::new_depth(8, 6, target_depth).unwrap();
-                let target = engine.doc.layers[0].id.clone();
-                engine.doc.layers[0]
+                engine.resident_state_mut().expect("resident fixture").document = Document::new_depth(8, 6, target_depth).unwrap();
+                let target = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
+                engine.resident_state_mut().expect("resident fixture").document.layers[0]
                     .pixels
                     .set16(7, 5, [53001, 44003, 35007, 65535]);
                 let mut folder = Layer::new("Import folder", "group", 8, 6);
                 folder.pixels = Raster::new_depth(8, 6, target_depth);
                 let parent = folder.id.clone();
-                engine.doc.layers.push(folder);
-                let before = serde_json::to_value(&engine.doc).unwrap();
-                let original = engine.doc.layers[0].pixels.rgba16();
+                engine.resident_state_mut().expect("resident fixture").document.layers.push(folder);
+                let before = serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap();
+                let original = engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16();
                 let command = if place {
                     json!({"op":"image.place","path":path,"layer":target,"new_layer":false,"mode":"replace","rect":[2,3,5,5]})
                 } else {
@@ -231,22 +231,22 @@ fn import_and_place_share_native_precision_coordinates_reservations_and_one_undo
                 assert!(engine
                     .edit("human", &[command.clone()], Some(0), None, "Import")
                     .is_err());
-                assert_eq!(serde_json::to_value(&engine.doc).unwrap(), before);
-                assert!(engine.undo.is_empty());
+                assert_eq!(serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap(), before);
+                assert!(engine.resident_state().expect("resident fixture").undo.is_empty());
                 engine.leases.clear();
-                let draft = Engine::preview_edits(engine.doc.clone(), &[command.clone()]).unwrap();
-                assert_eq!(serde_json::to_value(&engine.doc).unwrap(), before);
+                let draft = Engine::preview_edits(engine.resident_state().expect("resident fixture").document.clone(), &[command.clone()]).unwrap();
+                assert_eq!(serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap(), before);
                 engine
                     .edit("human", &[command], Some(0), None, "Import")
                     .unwrap();
-                assert_eq!(engine.doc.bit_depth, source_depth.max(target_depth));
+                assert_eq!(engine.resident_state().expect("resident fixture").document.bit_depth, source_depth.max(target_depth));
                 assert_eq!(
-                    engine.doc.export_png().unwrap(),
+                    engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
                     draft.export_png().unwrap()
                 );
-                assert_eq!(engine.undo.len(), 1);
+                assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), 1);
                 let layer = engine
-                    .doc
+                    .resident_state().expect("resident fixture").document
                     .layers
                     .iter()
                     .find(|l| {
@@ -279,7 +279,7 @@ fn import_and_place_share_native_precision_coordinates_reservations_and_one_undo
                     .unwrap();
                 assert_eq!(
                     engine
-                        .doc
+                        .resident_state().expect("resident fixture").document
                         .layers
                         .iter()
                         .find(|l| l.id == target)
@@ -288,16 +288,16 @@ fn import_and_place_share_native_precision_coordinates_reservations_and_one_undo
                         .get16(7, 5),
                     old_pixel
                 );
-                let applied = engine.doc.export_png().unwrap();
+                let applied = engine.resident_state().expect("resident fixture").document.export_png().unwrap();
                 engine.undo("human").unwrap();
-                assert_eq!(engine.doc.bit_depth, target_depth);
-                assert_eq!(engine.doc.layers[0].pixels.rgba16(), original);
+                assert_eq!(engine.resident_state().expect("resident fixture").document.bit_depth, target_depth);
+                assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(), original);
                 engine.redo("human").unwrap();
-                assert_eq!(engine.doc.export_png().unwrap(), applied);
+                assert_eq!(engine.resident_state().expect("resident fixture").document.export_png().unwrap(), applied);
             }
             let mut engine = Engine::new();
-            engine.doc = Document::new_depth(8, 6, target_depth).unwrap();
-            let target = engine.doc.layers[0].id.clone();
+            engine.resident_state_mut().expect("resident fixture").document = Document::new_depth(8, 6, target_depth).unwrap();
+            let target = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
             let shared = Arc::new(Mutex::new(engine));
             let response = server::mcp(
                 &shared,
@@ -326,9 +326,9 @@ fn import_and_place_share_native_precision_coordinates_reservations_and_one_undo
                 feedback.get_pixel(2, 1).0,
                 opaque.map(peerbrush::raster::project16)
             );
-            assert_eq!(shared.lock().unwrap().undo.len(), 1);
+            assert_eq!(shared.lock().unwrap().resident_state().expect("resident fixture").undo.len(), 1);
             assert_eq!(
-                shared.lock().unwrap().doc.bit_depth,
+                shared.lock().unwrap().resident_state().expect("resident fixture").document.bit_depth,
                 source_depth.max(target_depth)
             );
             assert_eq!(fs::read(path).unwrap(), bytes);
@@ -342,7 +342,7 @@ fn malformed_mismatched_canceled_budget_and_stale_imports_preserve_existing_work
     let (bytes, _) = source(16);
     let valid = temp.file("valid.jxl", &bytes);
     let mut engine = Engine::new();
-    engine.doc = fixture(16);
+    engine.resident_state_mut().expect("resident fixture").document = fixture(16);
     let shared = Arc::new(Mutex::new(engine));
     let before = state(&shared);
     for (name, bad) in [
@@ -370,7 +370,7 @@ fn malformed_mismatched_canceled_budget_and_stale_imports_preserve_existing_work
         .unwrap_err()
         .contains("canceled"));
     assert!(shared.lock().unwrap().loading.is_none());
-    let doc = shared.lock().unwrap().doc.clone();
+    let doc = shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
     for commands in [
         vec![
             json!({"op":"image.import","path":valid}),
@@ -519,9 +519,9 @@ fn linear_profile() -> Vec<u8> {
 fn lossy_native16_preview_uses_actual_decoded_profile_and_protocol_reports_real_pixels_and_coordinates(
 ) {
     let mut engine = Engine::new();
-    engine.doc = fixture(16);
-    engine.doc.icc_profile = Some(Arc::new(linear_profile()));
-    let doc = engine.doc.clone();
+    engine.resident_state_mut().expect("resident fixture").document = fixture(16);
+    engine.resident_state_mut().expect("resident fixture").document.icc_profile = Some(Arc::new(linear_profile()));
+    let doc = engine.resident_state().expect("resident fixture").document.clone();
     let shared = Arc::new(Mutex::new(engine));
     let before = state(&shared);
     let settings = Settings {
@@ -669,12 +669,12 @@ fn presets_batches_and_direct_export_use_current_native_sources_and_preserve_loa
     for depth in [8, 16] {
         let temp = Temp::new();
         let mut engine = Engine::new();
-        engine.doc = fixture(depth);
+        engine.resident_state_mut().expect("resident fixture").document = fixture(depth);
         engine.export_library = Arc::new(Mutex::new(export::library::Library::load(
             temp.0.join("presets.json"),
         )));
         let shared = Arc::new(Mutex::new(engine));
-        let doc = shared.lock().unwrap().doc.clone();
+        let doc = shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
         let before = state(&shared);
         let settings = Settings {
             format: Format::Jxl,
@@ -702,7 +702,7 @@ fn presets_batches_and_direct_export_use_current_native_sources_and_preserve_loa
         assert_eq!(words(decoded.pixels), expected);
         let reopened = Arc::new(Mutex::new(Engine::new()));
         server::open(&reopened, &path).unwrap();
-        assert_eq!(reopened.lock().unwrap().doc.bit_depth, depth);
+        assert_eq!(reopened.lock().unwrap().resident_state().expect("resident fixture").document.bit_depth, depth);
         assert!(server::dispatch(
             &reopened,
             "document",

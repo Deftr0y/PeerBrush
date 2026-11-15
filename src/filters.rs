@@ -16,8 +16,7 @@ pub const CACHE_BUDGET: usize = 128 * 1024 * 1024;
 pub fn supports(kind: &str) -> bool {
     effects::KINDS.contains(&kind) && kind != "liquify" && !effects::styles::contains(kind)
 }
-/// Source validation for a captured regional scene. This grants neither live
-/// document-size admission nor authority to allocate a complete filter image.
+/// Source validation for native filters rendered in admitted regions.
 pub(crate) fn validate_regional(filters: &[Effect]) -> Result<(), String> {
     if filters.len() > LIMIT {
         return Err("Whole-image filter stack limit: 32".into());
@@ -80,6 +79,8 @@ mod regional_tests {
         invalid.enabled = false;
         invalid.settings = Arc::new(json!({"unknown_setting":1}));
         assert!(validate_regional(&[invalid]).is_err());
+        assert!(settings("posterize", &json!({"levels":3,"mapping":"photoshop_native"})).is_ok());
+        assert!(settings("posterize", &json!({"levels":3,"mapping":"unknown"})).is_err());
     }
 }
 pub fn active(doc: &Document) -> bool {
@@ -97,7 +98,12 @@ pub(crate) fn reach(doc: &Document) -> Option<i32> {
                 .iter()
                 .sum::<usize>() as i32,
             "levels" | "curves" | "adjust" | "color_balance" | "hsl" | "invert" | "grayscale"
-            | "posterize" | "channel_clamp" => 0,
+            | "posterize" | "threshold" | "channel_clamp" | effects::legacy_brightness::KIND
+            | effects::modern_brightness::KIND | effects::exposure::KIND
+            | effects::channel_mixer::KIND | effects::black_white::KIND
+            | effects::selective_color::KIND | effects::vibrance::KIND | effects::photo_filter::KIND
+            | effects::gradient_map::KIND | effects::photoshop_color_balance::KIND
+            | effects::photoshop_hue_saturation::KIND | effects::color_lookup::KIND => 0,
             _ => return None,
         };
         reach = reach.saturating_add(padding);
@@ -113,28 +119,52 @@ pub fn settings(kind: &str, value: &Value) -> Result<Value, String> {
         .as_object()
         .ok_or("Filter settings must be an object")?
         .keys()
-        .any(|k| defaults.get(k).is_none())
+        .any(|key| {
+            defaults.get(key).is_none()
+                && !matches!((kind, key.as_str()), ("levels" | "curves", "channels") | ("posterize", "mapping"))
+                && !(key == "preset" && effects::supports_tone_preset(kind))
+        })
     {
         return Err("Unknown whole-image filter setting".into());
     }
-    if serde_json::to_vec(value).map_err(|e| e.to_string())?.len() > 64 * 1024 {
-        return Err("Filter settings exceed 64 KiB".into());
-    }
+    // Count through the bounded serializer; escaped strings must not allocate
+    // an arbitrarily large temporary before the encoded-size check refuses them.
+    let limit = settings_limit(kind);
+    crate::psd::canonical36::Canonical::raw_length(
+        value,
+        crate::psd::canonical36::Limits {
+            bytes: limit,
+            nodes: 8_388_608,
+            depth: 128,
+        },
+        &|| Ok(()),
+    )
+    .map_err(|_| format!("Filter settings exceed {} KiB", limit / 1024))?;
     effects::normalized(kind, value)
 }
+pub(crate) fn settings_limit(kind: &str) -> usize {
+    if kind == effects::color_lookup::KIND { effects::color_lookup::MAX_SETTINGS } else { 64 * 1024 }
+}
 pub fn validate(doc: &Document) -> Result<(), String> {
-    if doc.filters.len() > LIMIT {
+    validate_stack(doc.width, doc.height, doc.bit_depth, &doc.filters)
+}
+fn validate_stack(
+    width: u32,
+    height: u32,
+    depth: u16,
+    filters: &[Effect],
+) -> Result<(), String> {
+    if filters.len() > LIMIT {
         return Err("Whole-image filter stack limit: 32".into());
     }
     let mut ids = HashSet::new();
-    let bytes =
-        u64::from(doc.width) * u64::from(doc.height) * if doc.bit_depth == 16 { 8 } else { 4 };
-    let budget = if doc.bit_depth == 16 {
+    let bytes = u64::from(width) * u64::from(height) * if depth == 16 { 8 } else { 4 };
+    let budget = if depth == 16 {
         128 * 1024 * 1024
     } else {
         effects::BUDGET as u64
     };
-    for filter in &doc.filters {
+    for filter in filters {
         if filter.id.is_empty() || !ids.insert(&filter.id) {
             return Err("Invalid or duplicate whole-image filter ID".into());
         }
@@ -149,13 +179,13 @@ pub fn validate(doc: &Document) -> Result<(), String> {
                     "Whole-image filter output exceeds the native derived-image budget".into(),
                 );
             }
-            if doc.bit_depth == 16 {
-                if depth16::color::weighted_working_bytes(filter, doc.width, doc.height)?
+            if depth == 16 {
+                if depth16::color::weighted_working_bytes(filter, width, height)?
                     > 128 * 1024 * 1024
                 {
                     return Err("Whole-image native16 filter scratch budget exceeded".into());
                 }
-            } else if effects::weighted_working_bytes(filter, doc.width, doc.height)?
+            } else if effects::weighted_working_bytes(filter, width, height)?
                 > effects::WORKING_BUDGET as u64
             {
                 return Err("Whole-image filter scratch budget exceeded".into());
@@ -168,6 +198,14 @@ pub(crate) fn apply(doc: &mut Document, command: &Value) -> Result<(), String> {
     if doc.read_only {
         return Err("This document is read-only".into());
     }
+    if doc.layers.iter().any(|l| l.locked) {
+        return Err("Unlock layers and folders before changing whole-image filters".into());
+    }
+    apply_stack(&mut doc.filters, command)?;
+    validate(doc)
+}
+/// Shared command semantics; callers own document locks, admission and history.
+pub(crate) fn apply_stack(filters: &mut Vec<Effect>, command: &Value) -> Result<(), String> {
     if ["layer", "rect", "mask"]
         .iter()
         .any(|key| command.get(key).is_some_and(|v| !v.is_null()))
@@ -176,12 +214,9 @@ pub(crate) fn apply(doc: &mut Document, command: &Value) -> Result<(), String> {
             "Whole-image filters target the document, without a layer, region or mask".into(),
         );
     }
-    if doc.layers.iter().any(|l| l.locked) {
-        return Err("Unlock layers and folders before changing whole-image filters".into());
-    }
     match command["op"].as_str().ok_or("Missing filter operation")? {
         "filter.add" => {
-            if doc.filters.len() >= LIMIT {
+            if filters.len() >= LIMIT {
                 return Err("Whole-image filter stack limit: 32".into());
             }
             let kind = command["kind"]
@@ -194,7 +229,10 @@ pub(crate) fn apply(doc: &mut Document, command: &Value) -> Result<(), String> {
                 .get("settings")
                 .cloned()
                 .unwrap_or_else(|| effects::defaults(kind));
-            doc.filters.push(Effect {
+            filters
+                .try_reserve_exact(1)
+                .map_err(|_| "Filter allocation refused")?;
+            filters.push(Effect {
                 id: id(),
                 kind: kind.into(),
                 enabled: true,
@@ -203,8 +241,7 @@ pub(crate) fn apply(doc: &mut Document, command: &Value) -> Result<(), String> {
             });
         }
         "filter.update" => {
-            let filter = doc
-                .filters
+            let filter = filters
                 .iter_mut()
                 .find(|f| Some(f.id.as_str()) == command["filter"].as_str())
                 .ok_or("Unknown whole-image filter")?;
@@ -231,27 +268,26 @@ pub(crate) fn apply(doc: &mut Document, command: &Value) -> Result<(), String> {
             }
         }
         "filter.delete" | "filter.reorder" => {
-            let index = doc
-                .filters
+            let index = filters
                 .iter()
                 .position(|f| Some(f.id.as_str()) == command["filter"].as_str())
                 .ok_or("Unknown whole-image filter")?;
             if command["op"] == "filter.delete" {
-                doc.filters.remove(index);
+                filters.remove(index);
             } else {
                 let dest = command["index"]
                     .as_u64()
                     .ok_or("Choose a filter stack index")?;
-                if dest >= doc.filters.len() as u64 {
+                if dest >= filters.len() as u64 {
                     return Err("Invalid filter stack index".into());
                 }
-                let filter = doc.filters.remove(index);
-                doc.filters.insert(dest as usize, filter);
+                let filter = filters.remove(index);
+                filters.insert(dest as usize, filter);
             }
         }
         _ => return Err("Unknown whole-image filter operation".into()),
     }
-    validate(doc)
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -397,6 +433,10 @@ fn retain(doc: &Document, key: String, output: Output) {
     }
 }
 pub(crate) fn prepare8(doc: &Document) -> Result<Arc<Image>, String> {
+    prepare8_checked(doc, &|| Ok(()))
+}
+pub(crate) fn prepare8_checked(doc: &Document, check: &crate::render::Check<'_>) -> Result<Arc<Image>, String> {
+    check()?;
     validate(doc)?;
     let output_key = key(doc, true);
     if let Some(Output::Eight(image)) = cached(doc, &output_key) {
@@ -408,8 +448,9 @@ pub(crate) fn prepare8(doc: &Document) -> Result<Arc<Image>, String> {
     } else {
         let mut original = doc.clone();
         original.filters.clear();
-        let (width, height, bytes, _) =
-            original.preview_native8(None, doc.width.max(doc.height), None, false)?;
+        let (width, height, bytes, _) = original.preview_native8_checked(
+            None, doc.width.max(doc.height), None, false, check,
+        )?;
         let image = Arc::new(Image {
             width,
             height,
@@ -418,15 +459,22 @@ pub(crate) fn prepare8(doc: &Document) -> Result<Arc<Image>, String> {
         retain(doc, raw_key, Output::Eight(image.clone()));
         image
     };
+    check()?;
     let mut image = (*raw).clone();
     for filter in &doc.filters {
+        check()?;
         effects::apply_effect(&mut image, filter, None)?;
     }
+    check()?;
     let image = Arc::new(image);
     retain(doc, output_key, Output::Eight(image.clone()));
     Ok(image)
 }
 pub(crate) fn prepare16(doc: &Document) -> Result<Arc<Image16>, String> {
+    prepare16_checked(doc, &|| Ok(()))
+}
+pub(crate) fn prepare16_checked(doc: &Document, check: &crate::render::Check<'_>) -> Result<Arc<Image16>, String> {
+    check()?;
     validate(doc)?;
     let output_key = key(doc, true);
     if let Some(Output::Sixteen(image)) = cached(doc, &output_key) {
@@ -438,14 +486,19 @@ pub(crate) fn prepare16(doc: &Document) -> Result<Arc<Image16>, String> {
     } else {
         let mut original = doc.clone();
         original.filters.clear();
-        let image = Arc::new(depth16::render(&original)?);
+        let image = Arc::new(depth16::render_crop_checked(
+            &original, [0, 0, doc.width as i32, doc.height as i32], check,
+        )?);
         retain(doc, raw_key, Output::Sixteen(image.clone()));
         image
     };
+    check()?;
     let mut image = (*raw).clone();
     for filter in &doc.filters {
+        check()?;
         depth16::color::apply_effect(&mut image, filter, None)?;
     }
+    check()?;
     let image = Arc::new(image);
     retain(doc, output_key, Output::Sixteen(image.clone()));
     Ok(image)

@@ -1,6 +1,10 @@
 //! Bounded native RGB and independent opacity stops; no bitmap or display projection.
 use serde_json::Value;
 
+pub fn coverage(kind: &str, value: &Value) -> bool {
+    kind == "gradient_overlay" && value.get("use_gradient_alpha").is_some()
+}
+
 pub fn gridded(kind: &str, value: &Value) -> bool {
     kind == "gradient_overlay"
         && (value.get("pixel_grid").is_some() || value.get("align_layer").is_some())
@@ -156,12 +160,30 @@ fn interval(stops: &[Value], position: f64) -> (usize, f64) {
     let t = (position - a["position"].as_f64().unwrap())
         / (b["position"].as_f64().unwrap() - a["position"].as_f64().unwrap());
     let midpoint = a["midpoint"].as_f64().unwrap_or(0.5);
+    (index, remap_midpoint(t, midpoint))
+}
+pub(super) fn remap_midpoint(t: f64, midpoint: f64) -> f64 {
     let t = if t <= midpoint {
         0.5 * t / midpoint
     } else {
         0.5 + 0.5 * (t - midpoint) / (1. - midpoint)
     };
-    (index, t.clamp(0., 1.))
+    t.clamp(0., 1.)
+}
+pub(super) fn smooth_channel([previous, left, right, next]: [f64; 4], t: f64, smoothness: f64) -> f64 {
+    let linear = left * (1. - t) + right * t;
+    if smoothness == 0. {
+        return linear;
+    }
+    let tangent_left = (right - previous) / 2.;
+    let tangent_right = (next - left) / 2.;
+    let t2 = t * t;
+    let t3 = t2 * t;
+    let curve = (2. * t3 - 3. * t2 + 1.) * left
+        + (t3 - 2. * t2 + t) * tangent_left
+        + (-2. * t3 + 3. * t2) * right
+        + (t3 - t2) * tangent_right;
+    (linear + (curve - linear) * smoothness).clamp(0., 1.)
 }
 pub fn sample(value: &Value, position: f64) -> ([u16; 3], f64) {
     let colors = value["color_stops"].as_array().filter(|s| s.len() >= 2);
@@ -176,25 +198,16 @@ pub fn sample(value: &Value, position: f64) -> ([u16; 3], f64) {
         std::array::from_fn(|c| {
             let left = a["color"][c].as_f64().unwrap();
             let right = b["color"][c].as_f64().unwrap();
-            let linear = left * (1. - t) + right * t;
             // A native Catmull-Rom color curve, with duplicated outer knots.
             // Keep the original linear calculation unchanged at zero strength.
             let color = if smoothness == 0. {
-                linear
+                left * (1. - t) + right * t
             } else {
                 let previous = stops[index.saturating_sub(1)]["color"][c].as_f64().unwrap();
                 let next = stops[(index + 2).min(stops.len() - 1)]["color"][c]
                     .as_f64()
                     .unwrap();
-                let tangent_left = (right - previous) / 2.;
-                let tangent_right = (next - left) / 2.;
-                let t2 = t * t;
-                let t3 = t2 * t;
-                let curve = (2. * t3 - 3. * t2 + 1.) * left
-                    + (t3 - 2. * t2 + t) * tangent_left
-                    + (-2. * t3 + 3. * t2) * right
-                    + (t3 - t2) * tangent_right;
-                (linear + (curve - linear) * smoothness).clamp(0., 1.)
+                smooth_channel([previous, left, right, next], t, smoothness)
             };
             (color * 65535.).round() as u16
         })

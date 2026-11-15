@@ -1,6 +1,11 @@
 //! Stable project engines. Registry locks never acquire existing engine locks.
 pub mod lifecycle;
 pub(crate) mod native_dispatch;
+mod native_recovery;
+pub(crate) mod native_registration;
+mod native_transfer;
+pub(crate) use native_transfer::NativeTransferPreview;
+pub(crate) use native_recovery::register as register_native_recovery;
 pub(crate) mod source_runtime;
 use crate::{
     engine::{self, Document, Engine, Scope},
@@ -36,9 +41,12 @@ struct Entry {
     id: String,
     name: String,
     handle: Handle,
+    _native_admission: Option<Arc<crate::psd::memory36::MetadataCharge>>,
 }
 pub struct Workspace {
     pub(crate) source_runtime: Option<Arc<source_runtime::SourceRuntime>>,
+    pub(crate) native_proposals: Option<Arc<Mutex<crate::collaboration::native::Store>>>,
+    pub(crate) native_proposals_closing: bool,
     pub(crate) activation: crate::activation::Queue,
     pub(crate) open_warning: Option<String>,
     entries: Vec<Entry>,
@@ -123,11 +131,14 @@ pub fn attach(root: &Shared) -> Registry {
     }
     let workspace = Arc::new(Mutex::new(Workspace {
         source_runtime: None,
+        native_proposals: None,
+        native_proposals_closing: false,
         activation: Default::default(),
         entries: vec![Entry {
             id: e.project_id.clone(),
             name: engine::view::current(&e).name().to_owned(),
             handle: Handle::Root(Arc::downgrade(root)),
+            _native_admission: None,
         }],
         active: e.project_id.clone(),
         exiting: false,
@@ -312,7 +323,13 @@ pub fn state(root: &Shared) -> Value {
         let mut e=shared.lock().unwrap();e.expire();
         if e.closed {return None;}
         let view = engine::view::current(&e);
-        Some(json!({"project_id":e.project_id,"document_id":view.id(),"name":view.name(),"revision":view.revision(),"dirty":view.revision()!=e.saved_revision,"path":e.path,"bit_depth":view.depth(),"read_only":view.read_only(),"loading":e.loading.as_ref().map(|c|c.status().stage),"ai_change":e.ai_change}))
+        Some(json!({
+            "project_id":e.project_id, "document_id":view.id(), "name":view.name(),
+            "revision":view.revision(), "dirty":view.revision()!=e.saved_revision, "path":e.path,
+            "bit_depth":view.depth(), "read_only":view.read_only(), "ai_change":e.ai_change,
+            "loading":e.loading.as_ref().map(|control| control.status().stage),
+            "saving":e.saving.as_ref().map(|control| control.status()),
+        }))
     }).collect::<Vec<_>>();
     let error = attach(root).lock().unwrap().recovery_error.clone();
     json!({"active_project_id":active,"projects":projects,"max_projects":MAX_PROJECTS,"autosave_error":error})
@@ -339,9 +356,9 @@ pub fn register_in(
     engine.workspace = Some(Arc::downgrade(workspace));
     engine.workspace_owner = None;
     // A runtime source identity distinguishes multiple opens of the same serialized PSD.
-    engine.doc.id = engine::id();
+    engine.authority.resident_state_mut()?.document.id = engine::id();
     let id = engine.project_id.clone();
-    let name = engine.doc.name.clone();
+    let name = engine.authority.resident_state()?.document.name.clone();
     let shared = Arc::new(Mutex::new(engine));
     let mut workspace = workspace.lock().unwrap();
     if workspace.exiting {
@@ -357,6 +374,7 @@ pub fn register_in(
         id: id.clone(),
         name,
         handle: Handle::Owned(shared.clone()),
+        _native_admission: None,
     });
     if activate_if.is_some_and(|source| source == workspace.active) {
         workspace.active = id;
@@ -382,8 +400,49 @@ pub fn new_project(
     depth: u16,
     activate_if: Option<&str>,
 ) -> Result<Shared, String> {
+    new_project_with(root, width, height, depth, activate_if, |_, _| Ok(()))
+        .map(|(shared, ())| shared)
+}
+
+pub(crate) fn new_project_with<T>(
+    initiating: &Shared,
+    width: u32,
+    height: u32,
+    depth: u16,
+    activate_if: Option<&str>,
+    prepare_reply: impl FnOnce(&Shared, Option<&source_runtime::SourceReadSession>) -> Result<T, String>,
+) -> Result<(Shared, T), String> {
+    let (workspace, native_source) = {
+        let engine = initiating.lock().unwrap();
+        engine.ensure_open()?;
+        (
+            engine.workspace.as_ref().and_then(Weak::upgrade),
+            engine.native_document().is_some(),
+        )
+    };
+    let workspace = match workspace {
+        Some(workspace) => workspace,
+        None if native_source => return Err("Native project has no configured workspace".into()),
+        None => attach(initiating),
+    };
+    let runtime = workspace.lock().unwrap().source_runtime.clone();
+    if let Some(runtime) = runtime {
+        return native_registration::new_blank_with(
+            &workspace,
+            &runtime,
+            (width, height, depth),
+            &crate::loading::Control::default(),
+            activate_if,
+            |shared, session| prepare_reply(shared, Some(session)),
+        );
+    }
+    if native_source {
+        return Err("Native source service is not configured".into());
+    }
     let engine = Engine::from_document(Document::new_depth(width, height, depth)?);
-    register(root, engine, activate_if)
+    let shared = register_in(&workspace, engine, activate_if)?;
+    let reply = prepare_reply(&shared, None)?;
+    Ok((shared, reply))
 }
 pub fn guard(e: &Engine, document: &str, revision: u64) -> Result<(), String> {
     e.ensure_open()?;
@@ -458,9 +517,12 @@ pub fn close_in(
     // Closed handles must see an empty document immediately. Release the old
     // pixels, histories and draft owners after releasing the workspace and project locks.
     let retired = (
-        std::mem::replace(&mut e.doc, Document::new(1, 1).unwrap()),
-        std::mem::take(&mut e.undo),
-        std::mem::take(&mut e.redo),
+        std::mem::replace(
+            &mut e.authority,
+            crate::engine::authority::DocumentAuthority::from_resident(
+                Document::new(1, 1).unwrap(),
+            ),
+        ),
         std::mem::take(&mut e.proposals),
     );
     e.saved_revision = 0;
@@ -482,8 +544,9 @@ pub fn close_in(
         let id = blank.project_id.clone();
         workspace_guard.entries.push(Entry {
             id: id.clone(),
-            name: blank.doc.name.clone(),
+            name: blank.authority.resident_state()?.document.name.clone(),
             handle: Handle::Owned(Arc::new(Mutex::new(blank))),
+            _native_admission: None,
         });
         workspace_guard.active = id;
     } else if workspace_guard.active == id {
@@ -512,21 +575,66 @@ pub struct Transfer<'a> {
 pub fn transfer(root: &Shared, request: &Transfer<'_>) -> Result<Value, String> {
     transfer_in(&attach(root), request)
 }
-pub fn transfer_in(workspace: &Registry, request: &Transfer<'_>) -> Result<Value, String> {
-    if request.source == request.destination {
-        return Err("Choose different source and destination projects".into());
+struct TransferPair {
+    source: Shared,
+    destination: Shared,
+    source_first: bool,
+}
+impl TransferPair {
+    fn new(workspace: &Registry, request: &Transfer<'_>) -> Result<Self, String> {
+        if request.source == request.destination {
+            return Err("Choose different source and destination projects".into());
+        }
+        let source = get_in(workspace, request.source)?;
+        let destination = get_in(workspace, request.destination)?;
+        if Arc::ptr_eq(&source, &destination) {
+            return Err("Choose different source and destination projects".into());
+        }
+        Ok(Self {
+            source,
+            destination,
+            source_first: request.source < request.destination,
+        })
     }
-    let source = get_in(workspace, request.source)?;
-    let destination = get_in(workspace, request.destination)?;
-    // Every operation involving two existing engines takes the same lock order.
-    if request.source < request.destination {
-        let mut from = source.lock().unwrap();
-        let mut to = destination.lock().unwrap();
-        transfer_locked(&mut from, &mut to, request)
-    } else {
-        let mut to = destination.lock().unwrap();
-        let mut from = source.lock().unwrap();
-        transfer_locked(&mut from, &mut to, request)
+    fn with<T>(&self, edit: impl FnOnce(&mut Engine, &mut Engine) -> T) -> T {
+        // Every operation involving two existing engines takes the same lock order.
+        if self.source_first {
+            let mut from = self.source.lock().unwrap();
+            let mut to = self.destination.lock().unwrap();
+            edit(&mut from, &mut to)
+        } else {
+            let mut to = self.destination.lock().unwrap();
+            let mut from = self.source.lock().unwrap();
+            edit(&mut from, &mut to)
+        }
+    }
+}
+
+pub fn transfer_in(workspace: &Registry, request: &Transfer<'_>) -> Result<Value, String> {
+    enum Start {
+        Complete(Value),
+        NativeSource(native_transfer::Capture),
+        NativeDestination(native_transfer::Destination),
+    }
+    let _operation = crate::server::FileOperation::begin_workspace(workspace)?;
+    let pair = TransferPair::new(workspace, request)?;
+    let start = pair.with(|from, to| {
+        if let Some(capture) = native_transfer::Destination::capture(from, to, request)? {
+            return Ok(Start::NativeDestination(capture));
+        }
+        match native_transfer::Capture::from_pair(from, to, request)? {
+            Some(capture) => Ok(Start::NativeSource(capture)),
+            None => transfer_locked(from, to, request).map(Start::Complete),
+        }
+    })?;
+    match start {
+        Start::Complete(reply) => Ok(reply),
+        Start::NativeSource(capture) => capture
+            .prepare(&pair, request, &|| Ok(()))?
+            .commit(&pair, request),
+        Start::NativeDestination(capture) => capture
+            .prepare(&pair, request, &|| Ok(()))?
+            .commit(&pair, request),
     }
 }
 fn transfer_locked(from: &mut Engine, to: &mut Engine, r: &Transfer<'_>) -> Result<Value, String> {
@@ -537,50 +645,59 @@ fn transfer_locked(from: &mut Engine, to: &mut Engine, r: &Transfer<'_>) -> Resu
     }
     let snapshot = crate::layer_clipboard::copy(from.resident()?, r.layers)?;
     let cut = if r.move_layers {
-        Some(crate::layer_clipboard::cut_commands(from.resident()?, r.layers)?)
+        Some(crate::layer_clipboard::cut_commands(
+            from.resident()?,
+            r.layers,
+        )?)
     } else {
         None
     };
-    let before_from = from.clone();
-    let before_to = to.clone();
-    let result = (|| {
-        let pasted = to.paste_layers(
+    let before_to = to.resident_checkpoint()?;
+    let pasted = to.paste_layers(
+        r.actor,
+        &snapshot,
+        r.target,
+        Some(r.destination_revision),
+        r.destination_task,
+    )?;
+    if let Some(commands) = cut {
+        if let Err(reason) = from.edit(
             r.actor,
-            &snapshot,
-            r.target,
-            Some(r.destination_revision),
-            r.destination_task,
-        )?;
-        if let Some(commands) = cut {
-            from.edit(
-                r.actor,
-                &commands,
-                Some(r.source_revision),
-                r.source_task,
-                "Move layers to another project",
-            )?;
+            &commands,
+            Some(r.source_revision),
+            r.source_task,
+            "Move layers to another project",
+        ) {
+            before_to.restore(to)?;
+            return Err(reason);
         }
-        Ok(
-            json!({"source_project_id":from.project_id,"destination_project_id":to.project_id,"source_revision":engine::view::current(from).revision(),"destination_revision":engine::view::current(to).revision(),"moved":r.move_layers,"created_roots":pasted["created_roots"],"created":pasted["created"]}),
-        )
-    })();
-    if result.is_err() {
-        *from = before_from;
-        *to = before_to;
     }
-    result
+    Ok(transfer_reply(from, to, r, &pasted))
+}
+
+fn transfer_reply(from: &Engine, to: &Engine, r: &Transfer<'_>, pasted: &Value) -> Value {
+    json!({"source_project_id":from.project_id,"destination_project_id":to.project_id,"source_revision":engine::view::current(from).revision(),"destination_revision":engine::view::current(to).revision(),"moved":r.move_layers,"created_roots":pasted["created_roots"],"created":pasted["created"]})
 }
 /// Actual destination pixels for a tab-hover preview, isolated from both authoritative histories.
 pub fn transfer_preview(root: &Shared, r: &Transfer<'_>) -> Result<Document, String> {
     transfer_preview_in(&attach(root), r)
 }
 pub fn transfer_preview_in(workspace: &Registry, r: &Transfer<'_>) -> Result<Document, String> {
-    if r.source == r.destination {
-        return Err("Choose different source and destination projects".into());
+    let _operation = crate::server::FileOperation::begin_workspace(workspace)?;
+    let pair = TransferPair::new(workspace, r)?;
+    preview_resident_destination(&pair, r, &|| Ok(()))
+}
+
+fn preview_resident_destination(
+    pair: &TransferPair,
+    r: &Transfer<'_>,
+    check: &dyn Fn() -> Result<(), String>,
+) -> Result<Document, String> {
+    check()?;
+    if let Some(capture) = pair.with(|from, to| native_transfer::Capture::from_pair(from, to, r))? {
+        return capture.prepare(pair, r, check)?.preview(pair, r, check);
     }
-    let source = get_in(workspace, r.source)?;
-    let destination = get_in(workspace, r.destination)?;
-    let from = source.lock().unwrap();
+    let from = pair.source.lock().unwrap();
     guard(&from, r.source_document, r.source_revision)?;
     if engine::view::current(&from).read_only() {
         return Err("Protected Photoshop sources need an explicit compatible copy before transferring editable layers".into());
@@ -595,6 +712,7 @@ pub fn transfer_preview_in(workspace: &Registry, r: &Transfer<'_>) -> Result<Doc
         None
     };
     drop(from);
+    check()?;
     if let Some((commands, mut source_draft)) = cut {
         source_draft.edit(
             r.actor,
@@ -604,10 +722,11 @@ pub fn transfer_preview_in(workspace: &Registry, r: &Transfer<'_>) -> Result<Doc
             "Preview cross-project move",
         )?;
     }
-    let to = destination.lock().unwrap();
+    let to = pair.destination.lock().unwrap();
     guard(&to, r.destination_document, r.destination_revision)?;
     let mut draft = to.resident_draft()?;
     drop(to);
+    check()?;
     draft.paste_layers(
         r.actor,
         &snapshot,
@@ -615,30 +734,298 @@ pub fn transfer_preview_in(workspace: &Registry, r: &Transfer<'_>) -> Result<Doc
         Some(r.destination_revision),
         r.destination_task,
     )?;
+    check()?;
     draft.into_resident_document()
+}
+
+pub(crate) struct TransferSummary {
+    pub(crate) name: String,
+    pub(crate) layers: usize,
+    pub(crate) bit_depth: u16,
+}
+impl TransferSummary {
+    fn from_view(view: engine::view::DocumentView<'_>) -> Self {
+        Self { name: view.name().to_owned(), layers: view.layer_count(), bit_depth: view.depth() }
+    }
+}
+
+enum TransferPixels {
+    Resident(Vec<u8>),
+    Native(crate::large_document::PinnedBytes),
+}
+
+pub(crate) struct TransferImage {
+    pub(crate) summary: TransferSummary,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) rect: [i32; 4],
+    pixels: TransferPixels,
+}
+impl TransferImage {
+    pub(crate) fn bytes(&self) -> &[u8] {
+        match &self.pixels {
+            TransferPixels::Resident(pixels) => pixels,
+            TransferPixels::Native(pixels) => pixels,
+        }
+    }
+}
+
+pub(crate) fn render_transfer_in(
+    workspace: &Registry,
+    r: &Transfer<'_>,
+    edge: u32,
+    coarse: Option<u32>,
+    check: &crate::render::Check<'_>,
+    emit_coarse: impl FnMut(TransferImage),
+) -> Result<TransferImage, String> {
+    render_transfer_with(workspace, r, edge, coarse, check, |image| image,
+        |preview| preview.render_image(), emit_coarse)
+}
+
+pub(crate) fn render_transfer_with<T>(
+    workspace: &Registry,
+    r: &Transfer<'_>,
+    edge: u32,
+    coarse: Option<u32>,
+    check: &crate::render::Check<'_>,
+    render_resident: impl Fn(TransferImage) -> T,
+    render_native: impl Fn(NativeTransferPreview<'_>) -> Result<T, String>,
+    mut emit_coarse: impl FnMut(T),
+) -> Result<T, String> {
+    check()?;
+    let _operation = crate::server::FileOperation::begin_workspace(workspace)?;
+    let pair = TransferPair::new(workspace, r)?;
+    if let Some(capture) = pair.with(|from, to| native_transfer::Destination::capture(from, to, r))? {
+        return capture
+            .prepare(&pair, r, check)?
+            .preview(&pair, r, edge, coarse, check, render_native, &mut emit_coarse);
+    }
+    let doc = preview_resident_destination(&pair, r, check)?;
+    let render = |edge| {
+        check()?;
+        let (width, height, bytes, rect) = doc.preview_checked(None, edge, None, false, check)?;
+        check()?;
+        Ok(render_resident(TransferImage {
+            summary: TransferSummary::from_view((&doc).into()), width, height, rect,
+            pixels: TransferPixels::Resident(bytes),
+        }))
+    };
+    if let Some(coarse) = coarse.filter(|&coarse| coarse < edge && doc.width.max(doc.height) > coarse) {
+        if let Ok(frame) = render(coarse) {
+            emit_coarse(frame);
+        }
+    }
+    render(edge)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
+    fn refused_cross_project_move_restores_edit_state_without_replacing_live_owners() {
+        for depth in [8, 16] {
+            let mut document = Document::new_depth(8, 6, depth).unwrap();
+            document.layers[0]
+                .pixels
+                .set16(1, 2, [12347, 23459, 34571, 61379]);
+            let root = Arc::new(Mutex::new(Engine::from_document(document)));
+            let registry = attach(&root);
+            let destination = new_project(&root, 8, 6, depth, None).unwrap();
+            let (source_project, source_document, source_revision, layer) = {
+                let mut engine = root.lock().unwrap();
+                let layer = engine
+                    .resident_state()
+                    .expect("resident fixture")
+                    .document
+                    .layers[0]
+                    .id
+                    .clone();
+                engine
+                    .reserve(
+                        "other-agent",
+                        "Protect the move source",
+                        vec![Scope::layer(&layer)],
+                    )
+                    .unwrap();
+                (
+                    engine.project_id.clone(),
+                    engine
+                        .resident_state()
+                        .expect("resident fixture")
+                        .document
+                        .id
+                        .clone(),
+                    engine
+                        .resident_state()
+                        .expect("resident fixture")
+                        .document
+                        .revision,
+                    layer,
+                )
+            };
+            let (
+                destination_project,
+                destination_document,
+                destination_revision,
+                target,
+                task,
+                io_counter,
+            ) = {
+                let mut engine = destination.lock().unwrap();
+                let target = engine
+                    .resident_state()
+                    .expect("resident fixture")
+                    .document
+                    .layers[0]
+                    .id
+                    .clone();
+                engine
+                    .edit(
+                        "agent",
+                        &[json!({"op":"layer.update","layer":target,"name":"Before move"})],
+                        None,
+                        None,
+                        "Existing edit",
+                    )
+                    .unwrap();
+                engine.undo("human").unwrap();
+                let task = engine
+                    .reserve("agent", "Destination task", vec![Scope::layer(&target)])
+                    .unwrap();
+                engine
+                    .leases
+                    .iter_mut()
+                    .find(|lease| lease.id == task.id)
+                    .unwrap()
+                    .expires = engine::now() + 120;
+                (
+                    engine.project_id.clone(),
+                    engine
+                        .resident_state()
+                        .expect("resident fixture")
+                        .document
+                        .id
+                        .clone(),
+                    engine
+                        .resident_state()
+                        .expect("resident fixture")
+                        .document
+                        .revision,
+                    target,
+                    task.id,
+                    engine.file_operations.clone(),
+                )
+            };
+            let proposal = crate::collaboration::propose(
+                &destination,
+                "agent",
+                &json!({
+                    "document_id":destination_document,"expected_revision":destination_revision,
+                    "commands":[{"op":"layer.update","layer":target,"opacity":0.5}],
+                }),
+            )
+            .unwrap();
+            let id = proposal["id"].as_str().unwrap();
+            let snapshot = destination.lock().unwrap().proposal_snapshot(id).unwrap();
+            let before = {
+                let engine = destination.lock().unwrap();
+                json!({"document":engine.resident_state().expect("resident fixture").document,"undo":engine.resident_state().expect("resident fixture").undo.len(),"redo":engine.resident_state().expect("resident fixture").redo.len(),"ai":engine.ai_change,"status":engine.status,"leases":engine.leases})
+            };
+            let operation = crate::server::FileOperation::track(io_counter.clone());
+            let source_before = serde_json::to_value(
+                &root
+                    .lock()
+                    .unwrap()
+                    .resident_state()
+                    .expect("resident fixture")
+                    .document,
+            )
+            .unwrap();
+            let layers = [layer];
+            let error = transfer_in(
+                &registry,
+                &Transfer {
+                    actor: "agent",
+                    source: &source_project,
+                    destination: &destination_project,
+                    source_document: &source_document,
+                    source_revision,
+                    destination_document: &destination_document,
+                    destination_revision,
+                    layers: &layers,
+                    target: &target,
+                    move_layers: true,
+                    source_task: None,
+                    destination_task: Some(&task),
+                },
+            )
+            .unwrap_err();
+            assert!(error.contains("Reserved"));
+            assert_eq!(
+                serde_json::to_value(
+                    &root
+                        .lock()
+                        .unwrap()
+                        .resident_state()
+                        .expect("resident fixture")
+                        .document
+                )
+                .unwrap(),
+                source_before
+            );
+            let mut engine = destination.lock().unwrap();
+            assert_eq!(
+                json!({"document":engine.resident_state().expect("resident fixture").document,"undo":engine.resident_state().expect("resident fixture").undo.len(),"redo":engine.resident_state().expect("resident fixture").redo.len(),"ai":engine.ai_change,"status":engine.status,"leases":engine.leases}),
+                before
+            );
+            assert!(Arc::ptr_eq(
+                &snapshot,
+                &engine.proposal_snapshot(id).unwrap()
+            ));
+            assert!(Arc::ptr_eq(&io_counter, &engine.file_operations));
+            assert_eq!(io_counter.load(std::sync::atomic::Ordering::Acquire), 1);
+            drop(operation);
+            assert_eq!(io_counter.load(std::sync::atomic::Ordering::Acquire), 0);
+        }
+    }
+    #[test]
+    fn resident_checkpoint_cannot_reacquire_a_task_that_ended_during_preparation() {
+        let mut engine = Engine::new();
+        let task = engine.reserve("agent", "End this task", vec![]).unwrap();
+        let checkpoint = engine.resident_checkpoint().unwrap();
+        engine.finish_task(&task.id, "taken_over");
+        checkpoint.restore(&mut engine).unwrap();
+        assert!(engine.leases.is_empty());
+        assert!(!engine.status.starts_with("Reserved by"));
+        assert_eq!(engine.task_recovery()["recent"][0]["status"], "taken_over");
+    }
+    #[test]
     fn cached_workspace_cannot_attach_a_different_root_after_close() {
         let old_root = Arc::new(Mutex::new(Engine::new()));
         let old_workspace = attach(&old_root);
-        let snapshot = old_root.lock().unwrap().clone();
-        close(
-            &old_root,
-            &snapshot.project_id,
-            &snapshot.doc.id,
-            snapshot.doc.revision,
-            false,
-            "human",
-        )
-        .unwrap();
+        let (old_project, document, revision) = {
+            let engine = old_root.lock().unwrap();
+            (
+                engine.project_id.clone(),
+                engine
+                    .resident_state()
+                    .expect("resident fixture")
+                    .document
+                    .id
+                    .clone(),
+                engine
+                    .resident_state()
+                    .expect("resident fixture")
+                    .document
+                    .revision,
+            )
+        };
+        let retained_workspace = old_workspace.clone();
+        close(&old_root, &old_project, &document, revision, false, "human").unwrap();
         let old_identity = Arc::downgrade(&old_root);
         drop(old_root);
         assert!(old_identity.upgrade().is_none());
-        // A retained snapshot keeps the closed root's workspace alive. Model
+        // A retained registry keeps the closed workspace alive. Model
         // an address-only cache collision directly rather than depending on
         // platform allocator timing to reuse the former root's address.
         let fresh = Arc::new(Mutex::new(Engine::new()));
@@ -655,9 +1042,9 @@ mod tests {
         assert!(Arc::ptr_eq(&current, &attach(&fresh)));
         assert!(Arc::ptr_eq(&fresh, &get_in(&current, &project).unwrap()));
         assert_eq!(active_id(&fresh), project);
-        assert!(get_in(&current, &snapshot.project_id).is_err());
+        assert!(get_in(&current, &old_project).is_err());
         assert!(get_in(&old_workspace, &project).is_err());
-        drop(snapshot);
+        drop(retained_workspace);
         assert!(Arc::ptr_eq(&fresh, &get_in(&current, &project).unwrap()));
     }
 }

@@ -23,7 +23,28 @@ impl Commands {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Origin {
     Action,
+    Stroke(eframe::egui::Id),
+    SampledStroke(super::sample_input::Id),
+    Magnetic(eframe::egui::Id),
+    Pen(usize, Option<crate::engine::native::DocumentKey>),
+    Duplicate,
+    NativeDuplicateRepeat(crate::engine::native::DocumentKey),
+    Group,
+    Masks,
+    Parameter(eframe::egui::Id),
     Source(u64),
+    CanvasGesture(crate::engine::native::DocumentKey),
+    FreeTransform(eframe::egui::Id, Option<crate::engine::native::DocumentKey>),
+    Filter(eframe::egui::Id, Option<crate::engine::native::DocumentKey>),
+    Geometry(eframe::egui::Id, Option<crate::engine::native::DocumentKey>),
+    Refinement(eframe::egui::Id),
+    History(crate::engine::native::Direction),
+    Proposal(eframe::egui::Id),
+}
+impl Origin {
+    pub(super) fn is_duplicate(self) -> bool {
+        matches!(self, Self::Duplicate | Self::NativeDuplicateRepeat(_))
+    }
 }
 pub(super) struct Request {
     pub project: String,
@@ -38,6 +59,11 @@ pub(super) struct Completed<T> {
     pub result: Result<T, String>,
     // Keep the admitted command allocation alive through terminal handling.
     _commands: Commands,
+}
+impl<T> Completed<T> {
+    pub(super) fn commands(&self) -> &[Value] {
+        self._commands.values()
+    }
 }
 struct Pending<T> {
     request: Arc<Request>,
@@ -58,6 +84,9 @@ impl<T: Send + 'static> Worker<T> {
     }
     pub(super) fn request(&self) -> Option<&Request> {
         self.pending.as_ref().map(|pending| &*pending.request)
+    }
+    pub(super) fn request_owner(&self) -> Option<Arc<Request>> {
+        self.pending.as_ref().map(|pending| pending.request.clone())
     }
     pub(super) fn submit(
         &mut self,

@@ -213,8 +213,8 @@ mod tests {
     fn native_quit_coalesces_without_locks_or_file_queue_changes() {
         for depth in [8, 16] {
             let mut engine = Engine::new();
-            engine.doc = crate::engine::Document::new_depth(64, 64, depth).unwrap();
-            engine.doc.revision = 7;
+            engine.resident_state_mut().expect("resident fixture").document = crate::engine::Document::new_depth(64, 64, depth).unwrap();
+            engine.resident_state_mut().expect("resident fixture").document.revision = 7;
             let root = Arc::new(Mutex::new(engine));
             let registry = workspace::attach(&root);
             let signal = quit_signal(&registry);
@@ -226,7 +226,7 @@ mod tests {
             enable(&root);
             let file = std::env::temp_dir().join("synthetic pending.psd");
             enqueue(&root, vec![file.clone()]).unwrap();
-            let before = root.lock().unwrap().doc.clone();
+            let before = root.lock().unwrap().resident_state().expect("resident fixture").document.clone();
             {
                 let _engine = root.lock().unwrap();
                 let _workspace = registry.lock().unwrap();
@@ -237,7 +237,7 @@ mod tests {
             assert!(!take_quit(&registry));
             assert_eq!(next(&registry), Some(file));
             assert_eq!(
-                serde_json::to_value(&root.lock().unwrap().doc).unwrap(),
+                serde_json::to_value(&root.lock().unwrap().resident_state().expect("resident fixture").document).unwrap(),
                 serde_json::to_value(&before).unwrap()
             );
             registry.lock().unwrap().exiting = true;
@@ -344,8 +344,8 @@ mod tests {
     #[test]
     fn activation_only_queues_and_never_replaces_dirty_documents() {
         let root = Arc::new(Mutex::new(Engine::new()));
-        root.lock().unwrap().doc.revision = 7;
-        let before = root.lock().unwrap().state();
+        root.lock().unwrap().resident_state_mut().expect("resident fixture").document.revision = 7;
+        let before = crate::server::state(&root).unwrap();
         let path = std::env::temp_dir().join("作品 with spaces.psd");
         assert!(
             enqueue(&root, vec![path.clone()]).is_err(),
@@ -354,7 +354,7 @@ mod tests {
         enable(&root);
         let result = server::dispatch(&root, "native_open", &json!({"paths":[path]})).unwrap();
         assert_eq!(result["queued"], 1);
-        assert_eq!(root.lock().unwrap().state(), before);
+        assert_eq!(crate::server::state(&root).unwrap(), before);
         assert_eq!(workspace::handles(&root).len(), 1);
         assert_eq!(next(&workspace::attach(&root)), Some(path));
         assert!(next(&workspace::attach(&root)).is_none());

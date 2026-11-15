@@ -108,20 +108,20 @@ fn every_curated_pressure_curve_matches_incremental_native_strokes_and_undo() {
             }
         }
         let mut e = Engine::new();
-        e.doc = Document::new_depth(112, 64, depth).unwrap();
-        let before = e.doc.export_png().unwrap();
-        let id = e.doc.layers[0].id.clone();
+        e.resident_state_mut().expect("resident fixture").document = Document::new_depth(112, 64, depth).unwrap();
+        let before = e.resident_state().expect("resident fixture").document.export_png().unwrap();
+        let id = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
         e.edit("human",&[json!({"op":"paint","layer":id,"preset":"brush-pen","points":points,"pressures":pressures,"color":[170,70,29,247]})],None,None,"Brush pen").unwrap();
-        assert_eq!(e.undo.len(), 1);
-        assert_ne!(e.doc.export_png().unwrap(), before);
-        let saved = psd::decode(&psd::encode(&e.doc).unwrap()).unwrap();
+        assert_eq!(e.resident_state().expect("resident fixture").undo.len(), 1);
+        assert_ne!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), before);
+        let saved = psd::decode(&psd::encode(&e.resident_state().expect("resident fixture").document).unwrap()).unwrap();
         assert_eq!(saved.bit_depth, depth);
         assert_eq!(
             saved.layers[0].pixels.rgba16(),
-            e.doc.layers[0].pixels.rgba16()
+            e.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16()
         );
         e.undo("human").unwrap();
-        assert_eq!(e.doc.export_png().unwrap(), before);
+        assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), before);
     }
 }
 
@@ -130,10 +130,10 @@ fn shared_preset_settings_match_explicit_commands_for_paint_smudge_clone_and_hea
     for depth in [8, 16] {
         for op in ["paint", "smudge", "clone", "heal"] {
             let mut a = Engine::new();
-            a.doc = Document::new_depth(96, 64, depth).unwrap();
+            a.resident_state_mut().expect("resident fixture").document = Document::new_depth(96, 64, depth).unwrap();
             for y in 0..64 {
                 for x in 0..96 {
-                    a.doc.layers[0].pixels.set16(
+                    a.resident_state_mut().expect("resident fixture").document.layers[0].pixels.set16(
                         x,
                         y,
                         [12001 + x as u16 * 251, 22003 + y as u16 * 113, 32007, 51013],
@@ -141,8 +141,8 @@ fn shared_preset_settings_match_explicit_commands_for_paint_smudge_clone_and_hea
                 }
             }
             let mut b = Engine::new();
-            b.doc = a.doc.clone();
-            let c = json!({"op":op,"layer":a.doc.layers[0].id,"preset":"wet-paint","radius":6,"pressure_gamma":1.6,"points":[[45,30],[75,35]],"pressures":[0.25,0.8],"source":[20,20],"color":[245,70,10,255]});
+            b.resident_state_mut().expect("resident fixture").document = a.resident_state().expect("resident fixture").document.clone();
+            let c = json!({"op":op,"layer":a.resident_state().expect("resident fixture").document.layers[0].id,"preset":"wet-paint","radius":6,"pressure_gamma":1.6,"points":[[45,30],[75,35]],"pressures":[0.25,0.8],"source":[20,20],"color":[245,70,10,255]});
             let resolved = a
                 .brush_library
                 .lock()
@@ -152,11 +152,11 @@ fn shared_preset_settings_match_explicit_commands_for_paint_smudge_clone_and_hea
             a.edit("human", &[c], None, None, op).unwrap();
             b.edit("human", &resolved, None, None, op).unwrap();
             assert_eq!(
-                a.doc.layers[0].pixels.rgba16(),
-                b.doc.layers[0].pixels.rgba16(),
+                a.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(),
+                b.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(),
                 "{op} at {depth}"
             );
-            assert_eq!(a.undo.len(), 1);
+            assert_eq!(a.resident_state().expect("resident fixture").undo.len(), 1);
         }
     }
 }
@@ -164,8 +164,8 @@ fn shared_preset_settings_match_explicit_commands_for_paint_smudge_clone_and_hea
 #[test]
 fn preset_footprints_respect_reservations_overrides_and_atomic_failures() {
     let mut e = Engine::new();
-    e.doc = Document::new(96, 64).unwrap();
-    let layer = e.doc.layers[0].id.clone();
+    e.resident_state_mut().expect("resident fixture").document = Document::new(96, 64).unwrap();
+    let layer = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
     e.reserve(
         "other",
         "Protected pixels",
@@ -180,14 +180,14 @@ fn preset_footprints_respect_reservations_overrides_and_atomic_failures() {
         .edit("human", &[c.clone()], None, None, "Blocked")
         .unwrap_err()
         .contains("Reserved"));
-    assert!(e.undo.is_empty());
-    assert_eq!(e.doc.revision, 0);
+    assert!(e.resident_state().expect("resident fixture").undo.is_empty());
+    assert_eq!(e.resident_state().expect("resident fixture").document.revision, 0);
     let mut small = c.clone();
     small["radius"] = json!(1);
     e.edit("human", &[small], None, None, "Small override")
         .unwrap();
-    assert_eq!(e.doc.revision, 1);
-    let before = e.doc.export_png().unwrap();
+    assert_eq!(e.resident_state().expect("resident fixture").document.revision, 1);
+    let before = e.resident_state().expect("resident fixture").document.export_png().unwrap();
     let mut bad = c;
     bad["preset"] = json!("unknown");
     assert!(e
@@ -202,9 +202,9 @@ fn preset_footprints_respect_reservations_overrides_and_atomic_failures() {
             "Invalid"
         )
         .is_err());
-    assert_eq!(e.doc.export_png().unwrap(), before);
-    assert_ne!(e.doc.layers[0].name, "Do not commit");
-    assert_eq!(e.undo.len(), 1);
+    assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), before);
+    assert_ne!(e.resident_state().expect("resident fixture").document.layers[0].name, "Do not commit");
+    assert_eq!(e.resident_state().expect("resident fixture").undo.len(), 1);
 }
 
 #[test]
@@ -257,8 +257,8 @@ fn proposals_freeze_custom_settings_even_when_the_library_changes() {
     let shared = Arc::new(Mutex::new(Engine::new()));
     let (doc, library) = {
         let mut e = shared.lock().unwrap();
-        e.doc = Document::new_depth(96, 64, 16).unwrap();
-        (e.doc.clone(), e.brush_library.clone())
+        e.resident_state_mut().expect("resident fixture").document = Document::new_depth(96, 64, 16).unwrap();
+        (e.resident_state().expect("resident fixture").document.clone(), e.brush_library.clone())
     };
     let p = library
         .lock()
@@ -297,10 +297,10 @@ fn proposals_freeze_custom_settings_even_when_the_library_changes() {
         )
         .unwrap();
     let mut e = shared.lock().unwrap();
-    assert!(e.undo.is_empty());
+    assert!(e.resident_state().expect("resident fixture").undo.is_empty());
     e.accept_proposal("human", id, &doc.id, 0).unwrap();
-    assert_eq!(e.doc.export_png().unwrap(), expected);
-    assert_eq!(e.undo.len(), 1);
+    assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), expected);
+    assert_eq!(e.resident_state().expect("resident fixture").undo.len(), 1);
 }
 
 #[test]
@@ -360,7 +360,7 @@ fn mcp_library_returns_real_png_in_preview_coordinates_and_never_marks_document_
     let save=server::dispatch(&shared,"brushes",&json!({"action":"save","name":"Tiny","category":"Ink","settings":{"radius":2,"pressure_gamma":0.5}})).unwrap();
     assert_eq!(save["preset"]["settings"]["pressure_gamma"], 0.5);
     let e = shared.lock().unwrap();
-    assert_eq!(e.doc.revision, 0);
+    assert_eq!(e.resident_state().expect("resident fixture").document.revision, 0);
     assert_eq!(e.saved_revision, 0);
-    assert!(e.undo.is_empty());
+    assert!(e.resident_state().expect("resident fixture").undo.is_empty());
 }

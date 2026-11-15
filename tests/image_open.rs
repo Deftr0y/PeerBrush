@@ -41,10 +41,10 @@ fn opening_images_creates_independent_unsaved_projects_and_exact_native_psd_sour
     for depth in [8, 16] {
         let file = File::new("png", &png(depth));
         let root = shared();
-        let layer = root.lock().unwrap().doc.layers[0].id.clone();
+        let layer = root.lock().unwrap().resident_state().expect("resident fixture").document.layers[0].id.clone();
         server::dispatch(&root,"edit",&json!({"actor":"human","commands":[{"op":"layer.update","layer":layer,"name":"Keep existing work"}]})).unwrap();
-        let before = root.lock().unwrap().state();
-        let history = root.lock().unwrap().undo.len();
+        let before = root.lock().unwrap().capture_state().unwrap().project().unwrap();
+        let history = root.lock().unwrap().resident_state().expect("resident fixture").undo.len();
         let result = server::dispatch(
             &root,
             "projects",
@@ -52,20 +52,20 @@ fn opening_images_creates_independent_unsaved_projects_and_exact_native_psd_sour
         )
         .unwrap();
         let opened = workspace::get(&root, result["project_id"].as_str().unwrap()).unwrap();
-        assert_eq!(root.lock().unwrap().state(), before);
-        assert_eq!(root.lock().unwrap().undo.len(), history);
+        assert_eq!(root.lock().unwrap().capture_state().unwrap().project().unwrap(), before);
+        assert_eq!(root.lock().unwrap().resident_state().expect("resident fixture").undo.len(), history);
         let e = opened.lock().unwrap();
-        assert_eq!((e.doc.width, e.doc.height, e.doc.bit_depth), (3, 2, depth));
+        assert_eq!((e.resident_state().expect("resident fixture").document.width, e.resident_state().expect("resident fixture").document.height, e.resident_state().expect("resident fixture").document.bit_depth), (3, 2, depth));
         assert!(e.path.is_none() && e.file_version.is_none());
         assert_eq!(e.saved_revision, u64::MAX);
-        assert!(e.undo.is_empty() && !e.doc.read_only && e.doc.srgb_tagged);
+        assert!(e.resident_state().expect("resident fixture").undo.is_empty() && !e.resident_state().expect("resident fixture").document.read_only && e.resident_state().expect("resident fixture").document.srgb_tagged);
         let expected = if depth == 16 {
             [12345, 23457, 45679, 32123]
         } else {
             [123 * 257, 45 * 257, 67 * 257, 89 * 257]
         };
-        assert_eq!(e.doc.layers[0].pixels.get16(1, 1), expected);
-        let encoded = peerbrush::psd::encode(&e.doc).unwrap();
+        assert_eq!(e.resident_state().expect("resident fixture").document.layers[0].pixels.get16(1, 1), expected);
+        let encoded = peerbrush::psd::encode(&e.resident_state().expect("resident fixture").document).unwrap();
         let decoded = peerbrush::psd::decode(&encoded).unwrap();
         assert_eq!(decoded.bit_depth, depth);
         assert_eq!(decoded.layers[0].pixels.get16(1, 1), expected);
@@ -95,8 +95,8 @@ fn jpeg_and_static_formats_keep_dimensions_and_use_shared_decoders() {
         let s = shared();
         server::open(&s, &file.0).unwrap();
         let e = s.lock().unwrap();
-        assert_eq!((e.doc.width, e.doc.height, e.doc.bit_depth), (7, 5, 8));
-        assert_eq!(e.doc.layers[0].pixels.get(3, 2)[3], 255);
+        assert_eq!((e.resident_state().expect("resident fixture").document.width, e.resident_state().expect("resident fixture").document.height, e.resident_state().expect("resident fixture").document.bit_depth), (7, 5, 8));
+        assert_eq!(e.resident_state().expect("resident fixture").document.layers[0].pixels.get(3, 2)[3], 255);
     }
 }
 
@@ -114,15 +114,15 @@ fn animated_images_require_an_explicit_choice_and_open_selected_composited_frame
     drop(encoder);
     let file = File::new("gif", &bytes);
     let s = shared();
-    let before = s.lock().unwrap().doc.id.clone();
+    let before = s.lock().unwrap().resident_state().expect("resident fixture").document.id.clone();
     assert!(server::open(&s, &file.0)
         .unwrap_err()
         .to_lowercase()
         .contains("frame"));
-    assert_eq!(s.lock().unwrap().doc.id, before);
+    assert_eq!(s.lock().unwrap().resident_state().expect("resident fixture").document.id, before);
     server::open_options(&s, &file.0, &Default::default(), &json!({"frame":1})).unwrap();
     assert_eq!(
-        s.lock().unwrap().doc.layers[0].pixels.get(1, 1),
+        s.lock().unwrap().resident_state().expect("resident fixture").document.layers[0].pixels.get(1, 1),
         [0, 255, 0, 255]
     );
 }
@@ -131,9 +131,9 @@ fn animated_images_require_an_explicit_choice_and_open_selected_composited_frame
 fn unsupported_or_canceled_open_preserves_work_and_releases_source_claims() {
     let invalid = File::new("png", b"invalid PNG");
     let s = shared();
-    let before = s.lock().unwrap().doc.id.clone();
+    let before = s.lock().unwrap().resident_state().expect("resident fixture").document.id.clone();
     assert!(server::open(&s, &invalid.0).is_err());
-    assert_eq!(s.lock().unwrap().doc.id, before);
+    assert_eq!(s.lock().unwrap().resident_state().expect("resident fixture").document.id, before);
     fs::write(&invalid.0, png(16)).unwrap();
     let control = peerbrush::loading::Control::default();
     control.cancel();
@@ -143,11 +143,11 @@ fn unsupported_or_canceled_open_preserves_work_and_releases_source_claims() {
     assert!(s.lock().unwrap().loading.is_none());
     server::open(&s, &invalid.0).unwrap();
     let unsupported = File::new("pdf", b"%PDF-1.4");
-    let id = s.lock().unwrap().doc.id.clone();
+    let id = s.lock().unwrap().resident_state().expect("resident fixture").document.id.clone();
     assert!(server::open(&s, &unsupported.0)
         .unwrap_err()
         .contains("Unsupported"));
-    assert_eq!(s.lock().unwrap().doc.id, id);
+    assert_eq!(s.lock().unwrap().resident_state().expect("resident fixture").document.id, id);
 }
 
 #[test]
@@ -177,21 +177,21 @@ fn image_sources_cannot_be_exported_over_and_save_as_releases_original() {
     server::save(&s, &destination.0).unwrap();
     assert_eq!(fs::read(&file.0).unwrap(), original);
     server::open(&other, &file.0).unwrap();
-    assert_eq!(s.lock().unwrap().doc.bit_depth, 16);
+    assert_eq!(s.lock().unwrap().resident_state().expect("resident fixture").document.bit_depth, 16);
 }
 
 #[test]
 fn svg_opens_with_editable_vector_source_and_document_open_requires_discard() {
     let file=File::new("svg",br##"<svg xmlns="http://www.w3.org/2000/svg" width="9" height="7"><rect width="9" height="7" fill="#e95420"/></svg>"##);
     let s = shared();
-    let layer = s.lock().unwrap().doc.layers[0].id.clone();
+    let layer = s.lock().unwrap().resident_state().expect("resident fixture").document.layers[0].id.clone();
     server::dispatch(
         &s,
         "edit",
         &json!({"actor":"human","commands":[{"op":"layer.update","layer":layer,"name":"Unsaved"}]}),
     )
     .unwrap();
-    let id = s.lock().unwrap().doc.id.clone();
+    let id = s.lock().unwrap().resident_state().expect("resident fixture").document.id.clone();
     assert!(server::dispatch(
         &s,
         "document",
@@ -199,7 +199,7 @@ fn svg_opens_with_editable_vector_source_and_document_open_requires_discard() {
     )
     .unwrap_err()
     .contains("Unsaved"));
-    assert_eq!(s.lock().unwrap().doc.id, id);
+    assert_eq!(s.lock().unwrap().resident_state().expect("resident fixture").document.id, id);
     server::dispatch(
         &s,
         "document",
@@ -207,7 +207,7 @@ fn svg_opens_with_editable_vector_source_and_document_open_requires_discard() {
     )
     .unwrap();
     let e = s.lock().unwrap();
-    assert_eq!((e.doc.width, e.doc.height), (9, 7));
-    assert!(e.doc.layers[0].source.is_some());
-    assert_eq!(e.doc.layers[0].pixels.get(4, 3), [233, 84, 32, 255]);
+    assert_eq!((e.resident_state().expect("resident fixture").document.width, e.resident_state().expect("resident fixture").document.height), (9, 7));
+    assert!(e.resident_state().expect("resident fixture").document.layers[0].source.is_some());
+    assert_eq!(e.resident_state().expect("resident fixture").document.layers[0].pixels.get(4, 3), [233, 84, 32, 255]);
 }

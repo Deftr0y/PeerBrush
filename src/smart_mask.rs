@@ -5,8 +5,70 @@ use crate::{
 };
 use serde_json::Value;
 use std::collections::VecDeque;
+pub(crate) struct Parameters<'a> {
+    pub point: [u32; 2],
+    pub tolerance: f64,
+    pub contiguous: bool,
+    pub mode: &'a str,
+}
+impl<'a> Parameters<'a> {
+    pub fn new(c: &'a Value, origin: [i32; 2], size: [u32; 2]) -> Result<Self, String> {
+        let mut point = [0; 2];
+        for i in 0..2 {
+            let value = c["point"][i].as_i64().ok_or(if i == 0 {
+                "Missing mask point x"
+            } else {
+                "Missing mask point y"
+            })?;
+            point[i] = value
+                .checked_sub(i64::from(origin[i]))
+                .filter(|v| *v >= 0 && *v < i64::from(size[i]))
+                .ok_or("Invalid smart-mask point or tolerance")? as u32;
+        }
+        let tolerance = c["tolerance"].as_f64().unwrap_or(0.12);
+        if !tolerance.is_finite() || !(0.0..=1.0).contains(&tolerance) {
+            return Err("Invalid smart-mask point or tolerance".into());
+        }
+        let mode = c["mode"].as_str().unwrap_or("replace");
+        if !["replace", "add", "subtract"].contains(&mode) {
+            return Err("Mask mode must be replace, add or subtract".into());
+        }
+        Ok(Self {
+            point,
+            tolerance,
+            contiguous: c["contiguous"].as_bool().unwrap_or(true),
+            mode,
+        })
+    }
+    pub fn matches(&self, pixel: [u8; 4], seed: [u8; 4]) -> bool {
+        (0..4)
+            .map(|i| (f64::from(pixel[i]) - f64::from(seed[i])).powi(2))
+            .sum::<f64>()
+            .sqrt()
+            / 510.0
+            <= self.tolerance
+    }
+}
 pub fn from_color(layer: &mut Layer, source: &Image, c: &Value) -> Result<(), String> {
     from_color_with_native(layer, source, c, None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn mask_points_are_checked_before_local_coordinate_conversion() {
+        for (point, origin) in [(i64::MIN, 2), (i64::MAX, -2)] {
+            assert!(Parameters::new(&json!({"point":[point,0]}), [origin, 0], [4, 4]).is_err());
+        }
+        let command = json!({"point":[-2,3]});
+        assert_eq!(
+            Parameters::new(&command, [-2, 3], [4, 4]).unwrap().point,
+            [0, 0]
+        );
+        assert!(Parameters::new(&json!({"point":[2,3]}), [-2, 3], [4, 4]).is_err());
+    }
 }
 pub fn from_color_with_native(
     layer: &mut Layer,
@@ -14,34 +76,12 @@ pub fn from_color_with_native(
     c: &Value,
     native: Option<&crate::depth16::Image16>,
 ) -> Result<(), String> {
-    let x = c["point"][0].as_i64().ok_or("Missing mask point x")? - layer.x as i64;
-    let y = c["point"][1].as_i64().ok_or("Missing mask point y")? - layer.y as i64;
-    let tolerance = c["tolerance"].as_f64().unwrap_or(0.12);
-    if !tolerance.is_finite()
-        || !(0.0..=1.0).contains(&tolerance)
-        || x < 0
-        || y < 0
-        || x >= source.width as i64
-        || y >= source.height as i64
-    {
-        return Err("Invalid smart-mask point or tolerance".into());
-    }
-    let contiguous = c["contiguous"].as_bool().unwrap_or(true);
-    let mode = c["mode"].as_str().unwrap_or("replace");
-    if !["replace", "add", "subtract"].contains(&mode) {
-        return Err("Mask mode must be replace, add or subtract".into());
-    }
+    let parameters = Parameters::new(c, [layer.x, layer.y], [source.width, source.height])?;
+    let [x, y] = parameters.point;
+    let contiguous = parameters.contiguous;
+    let mode = parameters.mode;
     let seed = source.get(x as i32, y as i32);
-    let matches = |x: i32, y: i32| {
-        let p = source.get(x, y);
-        let d = (0..4)
-            .map(|i| {
-                let delta = p[i] as f64 - seed[i] as f64;
-                delta * delta
-            })
-            .sum::<f64>();
-        d.sqrt() / 510.0 <= tolerance
-    };
+    let matches = |x: i32, y: i32| parameters.matches(source.get(x, y), seed);
     let w = source.width as usize;
     let h = source.height as usize;
     let mut selected = vec![0u8; w * h];

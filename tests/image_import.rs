@@ -206,6 +206,93 @@ fn tiff(pages: &[(u16, u16, [u16; 4])]) -> Vec<u8> {
     out
 }
 
+fn with_tiff_profile(mut bytes: Vec<u8>, page: usize, profile: &[u8]) -> (Vec<u8>, usize) {
+    let mut link = 4;
+    for _ in 0..page {
+        let at = u32::from_le_bytes(bytes[link..link + 4].try_into().unwrap()) as usize;
+        let count = u16::from_le_bytes(bytes[at..at + 2].try_into().unwrap()) as usize;
+        link = at + 2 + count * 12;
+    }
+    let at = u32::from_le_bytes(bytes[link..link + 4].try_into().unwrap()) as usize;
+    let count = u16::from_le_bytes(bytes[at..at + 2].try_into().unwrap()) as usize;
+    let entries = bytes[at + 2..at + 2 + count * 12].to_vec();
+    let next = bytes[at + 2 + count * 12..at + 6 + count * 12].to_vec();
+    let offset = bytes.len() as u32;
+    bytes.extend_from_slice(profile);
+    let directory = bytes.len() as u32;
+    bytes.extend_from_slice(&((count + 1) as u16).to_le_bytes());
+    bytes.extend_from_slice(&entries);
+    let tag = bytes.len();
+    bytes.extend_from_slice(&34675u16.to_le_bytes());
+    bytes.extend_from_slice(&7u16.to_le_bytes());
+    bytes.extend_from_slice(&(profile.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(&offset.to_le_bytes());
+    bytes.extend_from_slice(&next);
+    bytes[link..link + 4].copy_from_slice(&directory.to_le_bytes());
+    (bytes, tag)
+}
+
+#[test]
+fn selected_tiff_profile_is_validated_without_silently_becoming_untagged() {
+    let words = [12347, 33559, 51237, 45679];
+    let original = tiff(&[(8, 1, [257; 4]), (16, 6, words)]);
+    let profile = moxcms::ColorProfile::new_display_p3().encode().unwrap();
+    let (valid, tag) = with_tiff_profile(original.clone(), 1, &profile);
+    let file = File::new("tiff", &valid);
+    assert_eq!(decode(&file.0, json!({"page":0})).get(0, 0), [1; 4]);
+    let actual = decode(&file.0, json!({"page":1}));
+    let expected_png = File::new(
+        "png",
+        &peerbrush::raster::png16_with_profile(1, 2, &[words, words].concat(), Some(&profile))
+            .unwrap(),
+    );
+    let expected = decode(&expected_png.0, json!({}));
+    assert_eq!((actual.width, actual.height, actual.depth), (1, 2, 16));
+    assert_eq!(actual.get16(0, 1), expected.get16(0, 1));
+    assert_ne!(actual.get16(0, 1), words);
+    assert_eq!(std::fs::read(&file.0).unwrap(), valid);
+
+    let mut cases = Vec::new();
+    let mut bad_type = valid.clone();
+    bad_type[tag + 2..tag + 4].copy_from_slice(&3u16.to_le_bytes());
+    cases.push(bad_type);
+    let mut bad_offset = valid.clone();
+    bad_offset[tag + 8..tag + 12].copy_from_slice(&u32::MAX.to_le_bytes());
+    cases.push(bad_offset);
+    let mut bad_length = valid.clone();
+    bad_length[tag + 4..tag + 8]
+        .copy_from_slice(&((peerbrush::color_profile::MAX_PROFILE_BYTES + 1) as u32).to_le_bytes());
+    cases.push(bad_length);
+    cases.push(with_tiff_profile(valid, 1, &profile).0);
+    cases.push(with_tiff_profile(original, 1, &[0; 132]).0);
+    for bytes in cases {
+        let file = File::new("tif", &bytes);
+        // An unrelated untagged page remains usable; only the selected page's
+        // color declaration participates in its import.
+        assert_eq!(decode(&file.0, json!({"page":0})).get(0, 0), [1; 4]);
+        let result = image_import::decode_file(&file.0, &json!({"page":1}), BUDGET);
+        assert!(result.is_err());
+        for op in ["image.import", "image.place", "image.paste"] {
+            let mut engine = Engine::new();
+            let before = serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap();
+            let layer = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
+            assert!(engine
+                .edit(
+                    "human",
+                    &[
+                        json!({"op":"image.import","path":file.0,"page":0}),
+                        json!({"op":op,"path":file.0,"page":1,"layer":layer}),
+                    ],
+                    Some(0),
+                    None,
+                    "Reject invalid TIFF profile"
+                )
+                .is_err());
+            assert_eq!(serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap(), before);
+        }
+    }
+}
+
 #[test]
 fn common_static_formats_share_bounded_decoding() {
     for (ext, format) in [
@@ -262,19 +349,19 @@ fn animations_require_explicit_frames_and_preserve_composited_color() {
         );
         if ext == "webp" {
             let shared = Arc::new(Mutex::new(Engine::new()));
-            let before = serde_json::to_value(&shared.lock().unwrap().doc).unwrap();
+            let before = serde_json::to_value(&shared.lock().unwrap().resident_state().expect("resident fixture").document).unwrap();
             assert!(server::open(&shared, &file.0)
                 .unwrap_err()
                 .contains("frame"));
             assert_eq!(
-                serde_json::to_value(&shared.lock().unwrap().doc).unwrap(),
+                serde_json::to_value(&shared.lock().unwrap().resident_state().expect("resident fixture").document).unwrap(),
                 before
             );
             server::open_options(&shared, &file.0, &Default::default(), &json!({"frame":1}))
                 .unwrap();
-            assert_eq!(shared.lock().unwrap().doc.bit_depth, 8);
+            assert_eq!(shared.lock().unwrap().resident_state().expect("resident fixture").document.bit_depth, 8);
             assert_eq!(
-                shared.lock().unwrap().doc.layers[0].pixels.get(0, 0),
+                shared.lock().unwrap().resident_state().expect("resident fixture").document.layers[0].pixels.get(0, 0),
                 expected
             );
         }
@@ -339,8 +426,8 @@ fn native16_import_and_placement_promote_and_roundtrip_with_one_undo() {
     let file = File::new("png", &bytes);
     for existing in [false, true] {
         let mut engine = Engine::new();
-        engine.doc = Document::new(4, 4).unwrap();
-        let target = engine.doc.layers[0].id.clone();
+        engine.resident_state_mut().expect("resident fixture").document = Document::new(4, 4).unwrap();
+        let target = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
         let command = if existing {
             json!({"op":"image.place","path":file.0,"layer":target,"new_layer":false,"mode":"replace","rect":[1,1,3,2]})
         } else {
@@ -349,26 +436,26 @@ fn native16_import_and_placement_promote_and_roundtrip_with_one_undo() {
         engine
             .edit("human", &[command], Some(0), None, "Import native16")
             .unwrap();
-        assert_eq!(engine.doc.bit_depth, 16);
-        assert!(engine.doc.srgb_tagged);
-        let layer = &engine.doc.layers[0];
+        assert_eq!(engine.resident_state().expect("resident fixture").document.bit_depth, 16);
+        assert!(engine.resident_state().expect("resident fixture").document.srgb_tagged);
+        let layer = &engine.resident_state().expect("resident fixture").document.layers[0];
         assert_eq!(
             layer
                 .pixels
                 .get16(if existing { 1 } else { 0 }, if existing { 1 } else { 0 }),
             words
         );
-        let encoded = peerbrush::psd::encode(&engine.doc).unwrap();
+        let encoded = peerbrush::psd::encode(&engine.resident_state().expect("resident fixture").document).unwrap();
         let reopened = peerbrush::psd::decode(&encoded).unwrap();
         assert!(!reopened.read_only);
         assert_eq!(
             reopened.export_png().unwrap(),
-            engine.doc.export_png().unwrap()
+            engine.resident_state().expect("resident fixture").document.export_png().unwrap()
         );
         engine.undo("human").unwrap();
-        assert_eq!(engine.doc.bit_depth, 8);
-        assert_eq!(engine.doc.layers.len(), 1);
-        assert_eq!(engine.doc.layers[0].pixels.get(1, 1), [0; 4]);
+        assert_eq!(engine.resident_state().expect("resident fixture").document.bit_depth, 8);
+        assert_eq!(engine.resident_state().expect("resident fixture").document.layers.len(), 1);
+        assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].pixels.get(1, 1), [0; 4]);
     }
 }
 
@@ -404,10 +491,10 @@ fn draft_and_commit_share_the_cumulative_import_budget_and_preserve_work() {
     .unwrap();
     let file = File::new("png", &out.into_inner());
     let mut engine = Engine::new();
-    engine.doc = Document::new(4, 4).unwrap();
-    let before = engine.doc.export_png().unwrap();
+    engine.resident_state_mut().expect("resident fixture").document = Document::new(4, 4).unwrap();
+    let before = engine.resident_state().expect("resident fixture").document.export_png().unwrap();
     let commands = vec![json!({"op":"image.import","path":file.0}); 9];
-    assert!(Engine::preview_edits(engine.doc.clone(), &commands)
+    assert!(Engine::preview_edits(engine.resident_state().expect("resident fixture").document.clone(), &commands)
         .err()
         .unwrap()
         .contains("256 MiB"));
@@ -416,26 +503,26 @@ fn draft_and_commit_share_the_cumulative_import_budget_and_preserve_work() {
         .err()
         .unwrap()
         .contains("256 MiB"));
-    assert_eq!(engine.doc.layers.len(), 1);
-    assert_eq!(engine.doc.revision, 0);
-    assert!(!engine.doc.srgb_tagged);
-    assert!(engine.undo.is_empty());
-    assert_eq!(engine.doc.export_png().unwrap(), before);
+    assert_eq!(engine.resident_state().expect("resident fixture").document.layers.len(), 1);
+    assert_eq!(engine.resident_state().expect("resident fixture").document.revision, 0);
+    assert!(!engine.resident_state().expect("resident fixture").document.srgb_tagged);
+    assert!(engine.resident_state().expect("resident fixture").undo.is_empty());
+    assert_eq!(engine.resident_state().expect("resident fixture").document.export_png().unwrap(), before);
 }
 #[test]
 fn batch_failures_locks_reservations_and_stale_guards_are_atomic() {
     let file = File::new("bmp", &encoded(ImageFormat::Bmp));
     let mut engine = Engine::new();
-    engine.doc = Document::new(4, 4).unwrap();
+    engine.resident_state_mut().expect("resident fixture").document = Document::new(4, 4).unwrap();
     let mut folder = Layer::new("Imported", "group", 4, 4);
     let parent = folder.id.clone();
     folder.locked = true;
-    engine.doc.layers.insert(0, folder);
+    engine.resident_state_mut().expect("resident fixture").document.layers.insert(0, folder);
     let import = json!({"op":"image.import","path":file.0,"parent":parent});
     assert!(engine
         .edit("human", &[import.clone()], None, None, "Import")
         .is_err());
-    engine.doc.layers[0].locked = false;
+    engine.resident_state_mut().expect("resident fixture").document.layers[0].locked = false;
     let _lease = engine
         .reserve(
             "other",
@@ -458,20 +545,20 @@ fn batch_failures_locks_reservations_and_stale_guards_are_atomic() {
         vec![json!({"op":"image.import","path":file.0,"source_revision":1})],
         vec![json!({"op":"image.import","path":file.0,"document_id":"closed"})],
     ] {
-        let before = engine.doc.export_png().unwrap();
+        let before = engine.resident_state().expect("resident fixture").document.export_png().unwrap();
         assert!(engine
             .edit("human", &commands, Some(0), None, "Import")
             .is_err());
-        assert_eq!(engine.doc.revision, 0);
-        assert_eq!(engine.doc.layers.len(), 2);
-        assert!(engine.undo.is_empty());
-        assert_eq!(engine.doc.export_png().unwrap(), before);
+        assert_eq!(engine.resident_state().expect("resident fixture").document.revision, 0);
+        assert_eq!(engine.resident_state().expect("resident fixture").document.layers.len(), 2);
+        assert!(engine.resident_state().expect("resident fixture").undo.is_empty());
+        assert_eq!(engine.resident_state().expect("resident fixture").document.export_png().unwrap(), before);
     }
     engine
         .edit("human", &[import], Some(0), None, "Import")
         .unwrap();
     assert_eq!(
-        engine.doc.layers[1].parent.as_deref(),
+        engine.resident_state().expect("resident fixture").document.layers[1].parent.as_deref(),
         Some(parent.as_str())
     );
 }
@@ -516,7 +603,7 @@ fn protocol_exposes_import_inspection_and_precise_frame_targeting() {
         serde_json::from_str(result["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(value["choice"], "frame");
     assert_eq!(value["count"], 2);
-    assert!(shared.lock().unwrap().undo.is_empty());
+    assert!(shared.lock().unwrap().resident_state().expect("resident fixture").undo.is_empty());
     let info = server::capabilities();
     for format in [
         "PNG", "JPEG", "BMP", "GIF", "TIFF", "WebP", "ICO", "Netpbm", "TGA", "QOI",
@@ -545,7 +632,72 @@ fn protocol_exposes_import_inspection_and_precise_frame_targeting() {
         .edit("human", &[command], Some(0), None, "Chosen frame")
         .unwrap();
     assert_eq!(
-        shared.lock().unwrap().doc.layers[0].pixels.get(0, 0),
+        shared.lock().unwrap().resident_state().expect("resident fixture").document.layers[0].pixels.get(0, 0),
         [0, 255, 0, 255]
     );
+}
+
+#[test]
+fn possible_precision_promotion_protects_unrelated_reserved_layers_before_decoding() {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    let png = peerbrush::raster::png16(1, 1, &[12347, 23459, 34571, 49153]).unwrap();
+    let file = File::new("png", &png);
+    let mut engine = Engine::new();
+    engine.resident_state_mut().expect("resident fixture").document = Document::new(4, 4).unwrap();
+    let target = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
+    let neighbor = Layer::new("Reserved neighbor", "paint", 4, 4);
+    let neighbor_id = neighbor.id.clone();
+    engine.resident_state_mut().expect("resident fixture").document.layers.push(neighbor);
+    engine
+        .reserve("other", "Neighbor", vec![Scope::layer(&neighbor_id)])
+        .unwrap();
+    let before = serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap();
+    for command in [
+        json!({"op":"image.import","path":file.0}),
+        json!({"op":"image.place","path":file.0,"layer":target,"new_layer":false}),
+        json!({"op":"image.paste","png":STANDARD.encode(&png),"layer":target}),
+        json!({"op":"layer.paste","parent":null}),
+        json!({"op":"effect.add","layer":target,"kind":"pattern_overlay","settings":{"pattern":"bitmap","bitmap_png":STANDARD.encode(&png)}}),
+    ] {
+        assert_eq!(
+            engine.scopes(&command),
+            vec![Scope {
+                target: None,
+                rect: None
+            }]
+        );
+        let reason = engine
+            .edit("human", &[command], Some(0), None, "Promoting source")
+            .unwrap_err();
+        assert!(reason.contains("Reserved"), "{reason}");
+        assert_eq!(serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap(), before);
+        assert!(engine.resident_state().expect("resident fixture").undo.is_empty());
+    }
+}
+
+#[test]
+fn placement_reserves_the_complete_existing_frame_even_in_a_native16_document() {
+    let mut engine = Engine::new();
+    engine.resident_state_mut().expect("resident fixture").document = Document::new_depth(32, 32, 16).unwrap();
+    let target = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
+    engine
+        .reserve(
+            "other",
+            "Layer edge",
+            vec![Scope {
+                target: Some(target.clone()),
+                rect: Some([20, 20, 30, 30]),
+            }],
+        )
+        .unwrap();
+    let command = json!({"op":"image.place","layer":target,"new_layer":false,
+        "rect":[-1,-1,2,2],"path":"not-decoded.png"});
+    assert_eq!(engine.scopes(&command), vec![Scope::layer(&target)]);
+    let before = serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap();
+    assert!(engine
+        .edit("human", &[command], None, None, "Place")
+        .unwrap_err()
+        .contains("Reserved"));
+    assert_eq!(serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap(), before);
+    assert!(engine.resident_state().expect("resident fixture").undo.is_empty());
 }

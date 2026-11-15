@@ -7,6 +7,7 @@ use super::{
     },
 };
 use crate::{
+    engine::native::{NativeDocument, OutputDraft, StagedOutput},
     large_document::{BlockRef, FreshFragment, Reservation, ScratchBytes, Snapshot},
     raster::Surface,
     workspace::source_runtime::SourceSession,
@@ -32,6 +33,46 @@ impl StagedPng {
     }
     pub(crate) fn seal(&self) -> &Snapshot {
         &self.seal
+    }
+
+    pub(super) fn is_ready_for_import(&self) -> bool {
+        self.complete.color_policy() == ColorPolicy::ImportSource
+            && self.complete.profile().is_none()
+            && self.complete.header().orientation == image::metadata::Orientation::NoTransforms
+    }
+
+    pub(super) fn into_unchanged_output(
+        self,
+        base: &NativeDocument,
+        session: &SourceSession,
+        check: &dyn Fn() -> Result<(), String>,
+    ) -> Result<StagedOutput, String> {
+        if !self.is_ready_for_import() {
+            let reason = "Staged PNG still requires color or orientation normalization";
+            return Err(match self.abort(session) {
+                Ok(()) => reason.into(),
+                Err(cleanup) => format!("{reason}; PNG source retirement refused: {cleanup}"),
+            });
+        }
+        let Self {
+            surface,
+            complete,
+            seal,
+            fragment,
+        } = self;
+        drop((complete, seal));
+        let draft = if surface.physical_tiles().next().is_none() {
+            let (width, height, depth) = (surface.width(), surface.height(), surface.depth());
+            drop(surface);
+            session.abort_fragment(fragment, &mut || session.cleanup_check())?;
+            let zero = Surface::zero(width, height, depth).map_err(|error| error.to_string())?;
+            OutputDraft::new(zero, vec![])
+        } else {
+            OutputDraft::new(surface, vec![fragment])
+        };
+        // Transfer the owned fragment through the normal provisional output
+        // fence. The existing checkpoint covers the same physical references.
+        crate::retained::transaction::seal(base, session, draft, check)
     }
 
     /// Infallible, memory-only final mark. The engine must recheck the captured
@@ -88,7 +129,7 @@ pub(crate) fn stage_file(
 }
 
 type RowSink<'a> = dyn FnMut(Header, PassRow, &[u8]) -> Result<(), String> + 'a;
-fn stage_with(
+pub(super) fn stage_with(
     session: &SourceSession,
     binding: SourceBinding,
     color: ColorPolicy,
@@ -107,12 +148,18 @@ fn stage_with(
     let mut final_fragment = None;
     let result: Result<StagedPng, String> = (|| {
         let caller = RefCell::new(check);
+        let mut active = || {
+            session.check_pinned_work()?;
+            (caller.borrow_mut())()
+        };
         let mut guarded = || {
             session.check()?;
             (caller.borrow_mut())()
         };
         let mut writer = None;
-        let complete = decode(&mut guarded, &mut |header, row, bytes| {
+        // Decoding and packing operate on admitted memory. FileSource checks
+        // refills, and tile writes, merging and sealing use the full guard.
+        let complete = decode(&mut active, &mut |header, row, bytes| {
             if writer.is_none() {
                 let fragment = session.fresh_fragment()?;
                 partial = Some(fragment);
@@ -124,10 +171,14 @@ fn stage_with(
                     color,
                 )?);
             }
-            writer.as_mut().unwrap().push(header, row, bytes, &mut || {
-                session.check()?;
-                (caller.borrow_mut())()
-            })
+            writer.as_mut().unwrap().push(
+                header, row, bytes,
+                &mut || {
+                    session.check_pinned_work()?;
+                    (caller.borrow_mut())()
+                },
+                &mut guarded,
+            )
         })?;
         let passes = writer
             .ok_or("PNG source completed without native rows")?
@@ -254,10 +305,13 @@ fn metadata(
     bytes[28] = h.orientation.to_exif();
     bytes[29] = u8::from(h.animated);
     bytes[30] = u8::from(h.cicp.is_some());
-    bytes[31] = if complete.color_policy() == ColorPolicy::RawSelection {
-        1
-    } else {
-        0
+    bytes[31] = match complete.color_policy() {
+        ColorPolicy::Raw => 0,
+        ColorPolicy::RawSelection => 1,
+        ColorPolicy::ImportSource => 2,
+        ColorPolicy::ToSrgb => {
+            return Err("Converted PNG cannot be sealed as raw pass samples".into())
+        }
     };
     bytes[32..64].copy_from_slice(&complete.source_sha256());
     if let Some(hash) = complete.base64_sha256() {
@@ -422,6 +476,38 @@ mod tests {
         )
         .unwrap()
     }
+    #[test]
+    fn unchanged_import_reuses_exact_png_tiles_and_can_retire_them_before_publication() {
+        let f = Fixture::new();
+        let (runtime, _connection) = f.runtime(16 * 1024 * 1024);
+        let session = runtime.begin().unwrap();
+        let baseline = runtime.disk().used().unwrap();
+        for (adam, depth) in [(false, 8), (true, 16)] {
+            let base = NativeDocument::new_blank(1, 1, depth, &runtime.resident(), &runtime.disk(), &|| Ok(())).unwrap();
+            let input = encoded(&png(adam, depth), &runtime);
+            let stage_input = || stage(&session, &input, Limits::SELECTION, ColorPolicy::ImportSource, &mut || Ok(())).unwrap();
+            let raw = stage_input();
+            let tiles = |surface: &Surface| surface.physical_tiles().map(|tile| (tile.owner().identity(), tile.reference())).collect::<Vec<_>>();
+            let references = tiles(raw.surface());
+            assert!(!references.is_empty());
+            let output = raw.into_unchanged_output(&base, &session, &|| Ok(())).unwrap();
+            assert_eq!(tiles(output.surface()), references);
+            output.abort(&session, &|| session.cleanup_check()).unwrap();
+            assert_eq!(runtime.disk().used().unwrap(), baseline);
+            assert!(stage_input().into_unchanged_output(&base, &session, &|| Err("Cancelled".into())).is_err());
+            assert_eq!(runtime.disk().used().unwrap(), baseline);
+        }
+        let base = NativeDocument::new_blank(1, 1, 16, &runtime.resident(), &runtime.disk(), &|| Ok(())).unwrap();
+        let empty = encoded(&crate::raster::png16(2, 1, &[0; 8]).unwrap(), &runtime);
+        let raw = stage(&session, &empty, Limits::SELECTION, ColorPolicy::ImportSource, &mut || Ok(())).unwrap();
+        assert!(raw.surface().physical_tiles().next().is_none());
+        let output = raw.into_unchanged_output(&base, &session, &|| Ok(())).unwrap();
+        assert!(output.surface().is_known_zero());
+        assert_eq!((output.surface().width(), output.surface().height(), output.surface().depth()), (2, 1, 16));
+        assert_eq!(runtime.disk().used().unwrap(), baseline);
+        output.abort(&session, &|| session.cleanup_check()).unwrap();
+    }
+
     #[test]
     fn actual_session_seals_native_plain_adam_and_reclaims_all_unpublished_fragments() {
         let f = Fixture::new();

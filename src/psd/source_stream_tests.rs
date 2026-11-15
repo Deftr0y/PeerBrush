@@ -248,14 +248,14 @@ fn bounded_slice_source_checks_final_eof_cancel_and_never_retries_read_errors() 
 
 fn fixture(depth: u16) -> crate::engine::Engine {
     let mut engine = crate::engine::Engine::new();
-    engine.doc = Document::new_depth(32, 24, depth).unwrap();
-    let pixels = &mut engine.doc.layers[0].pixels;
+    engine.resident_state_mut().expect("resident fixture").document = Document::new_depth(32, 24, depth).unwrap();
+    let pixels = &mut engine.resident_state_mut().expect("resident fixture").document.layers[0].pixels;
     pixels.set16(0, 0, [12347, 23459, 34571, 0]);
     pixels.set16(1, 0, [50001, 30003, 10001, 32769]);
     pixels.set16(31, 23, [60001, 40003, 20009, 65535]);
     let mut mask = Raster::new_depth(32, 24, depth);
     mask.set16(1, 0, [12345, 12345, 12345, 65535]);
-    engine.doc.layers[0].mask = Some(Mask {
+    engine.resident_state_mut().expect("resident fixture").document.layers[0].mask = Some(Mask {
         linked: false,
         enabled: false,
         cache_key: id(),
@@ -358,12 +358,12 @@ fn current_standard_composite(bytes: &[u8], layout: Layout, doc: &Document) {
 fn bounded_editable_native_sources_match_legacy_reader_masks_png_history_and_standard_composite() {
     for depth in [8, 16] {
         let mut engine = fixture(depth);
-        let before = serde_json::to_value(&engine.doc).unwrap();
-        let png = engine.doc.export_png().unwrap();
-        assert_eq!(engine.undo.len(), 1);
-        assert_eq!(engine.redo.len(), 0);
+        let before = serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap();
+        let png = engine.resident_state().expect("resident fixture").document.export_png().unwrap();
+        assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), 1);
+        assert_eq!(engine.resident_state().expect("resident fixture").redo.len(), 0);
         for layout in [Layout::Psd, Layout::Psb] {
-            let bytes = encode_layout(&engine.doc, layout).unwrap();
+            let bytes = encode_layout(&engine.resident_state().expect("resident fixture").document, layout).unwrap();
             let (zipped, _, _, _, _) = payload(&bytes);
             let expected = legacy(
                 zipped,
@@ -414,8 +414,8 @@ fn bounded_editable_native_sources_match_legacy_reader_masks_png_history_and_sta
                     image::ColorType::Rgba8
                 }
             );
-            assert_eq!(reopened.layers.len(), engine.doc.layers.len());
-            for (loaded, source) in reopened.layers.iter().zip(&engine.doc.layers) {
+            assert_eq!(reopened.layers.len(), engine.resident_state().expect("resident fixture").document.layers.len());
+            for (loaded, source) in reopened.layers.iter().zip(&engine.resident_state().expect("resident fixture").document.layers) {
                 assert_eq!(
                     (&loaded.id, loaded.x, loaded.y, &loaded.source),
                     (&source.id, source.x, source.y, &source.source)
@@ -428,7 +428,7 @@ fn bounded_editable_native_sources_match_legacy_reader_masks_png_history_and_sta
             }
             // No serializer or standard plane/composite byte changes are needed.
             assert_eq!(encode_layout(&expected.document, layout).unwrap(), bytes);
-            current_standard_composite(&bytes, layout, &engine.doc);
+            current_standard_composite(&bytes, layout, &engine.resident_state().expect("resident fixture").document);
             let mut invalid = serde_json::to_value(&expected).unwrap();
             invalid["format"] = json!(u32::MAX);
             let protected = decode(&replaced(
@@ -439,19 +439,19 @@ fn bounded_editable_native_sources_match_legacy_reader_masks_png_history_and_sta
             assert!(protected.read_only);
             assert!(protected.layers.iter().all(|layer| layer.source.is_none()));
             assert_eq!(protected.bit_depth, depth);
-            assert_eq!(serde_json::to_value(&engine.doc).unwrap(), before);
-            assert_eq!(engine.undo.len(), 1);
-            assert!(engine.redo.is_empty());
+            assert_eq!(serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap(), before);
+            assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), 1);
+            assert!(engine.resident_state().expect("resident fixture").redo.is_empty());
         }
         engine.undo("human").unwrap();
-        assert!(engine.doc.layers.iter().all(|layer| layer.source.is_none()));
+        assert!(engine.resident_state().expect("resident fixture").document.layers.iter().all(|layer| layer.source.is_none()));
         engine.redo("human").unwrap();
         let mut after_redo = before.clone();
         after_redo["revision"] = json!(before["revision"].as_u64().unwrap() + 2);
-        assert_eq!(serde_json::to_value(&engine.doc).unwrap(), after_redo);
-        assert_eq!(engine.doc.export_png().unwrap(), png);
-        assert_eq!(engine.undo.len(), 1);
-        assert!(engine.redo.is_empty());
+        assert_eq!(serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap(), after_redo);
+        assert_eq!(engine.resident_state().expect("resident fixture").document.export_png().unwrap(), png);
+        assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), 1);
+        assert!(engine.resident_state().expect("resident fixture").redo.is_empty());
     }
 }
 
@@ -459,9 +459,9 @@ fn bounded_editable_native_sources_match_legacy_reader_masks_png_history_and_sta
 fn invalid_streams_or_definition_gates_preserve_standard_protected_fallback_and_cancel() {
     for depth in [8, 16] {
         let engine = fixture(depth);
-        let before = serde_json::to_value(&engine.doc).unwrap();
+        let before = serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap();
         for layout in [Layout::Psd, Layout::Psb] {
-            let bytes = encode_layout(&engine.doc, layout).unwrap();
+            let bytes = encode_layout(&engine.resident_state().expect("resident fixture").document, layout).unwrap();
             let (zipped, _, _, _, _) = payload(&bytes);
             let embedded = legacy(zipped, 512 * 1024 * 1024).unwrap();
             let json = serde_json::to_value(&embedded).unwrap();
@@ -556,9 +556,9 @@ fn invalid_streams_or_definition_gates_preserve_standard_protected_fallback_and_
                 .err()
                 .unwrap()
                 .contains("Opening canceled"));
-            assert_eq!(serde_json::to_value(&engine.doc).unwrap(), before);
-            assert_eq!(engine.undo.len(), 1);
-            assert!(engine.redo.is_empty());
+            assert_eq!(serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap(), before);
+            assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), 1);
+            assert!(engine.resident_state().expect("resident fixture").redo.is_empty());
         }
     }
 }
@@ -771,7 +771,7 @@ fn actual_dense_psd_open_phase_diagnostic() {
             let shared = Arc::new(Mutex::new(crate::engine::Engine::new()));
             let (document_id, revision) = {
                 let engine = shared.lock().unwrap();
-                (engine.doc.id.clone(), engine.doc.revision)
+                (engine.resident_state().expect("resident fixture").document.id.clone(), engine.resident_state().expect("resident fixture").document.revision)
             };
             let request = json!({"action":"open","document_id":document_id.clone(),"expected_revision":revision,"path":source,"actor":"human"});
             let phases = Rc::new(RefCell::new(Vec::new()));
@@ -826,51 +826,51 @@ fn actual_dense_psd_open_phase_diagnostic() {
             let opened_document;
             {
                 let engine = shared.lock().unwrap();
-                opened_document = engine.doc.id.clone();
+                opened_document = engine.resident_state().expect("resident fixture").document.id.clone();
                 assert!(
                     !opened_document.is_empty()
                         && opened_document != document.id
                         && opened_document != document_id
                 );
                 // Engine::replace deliberately creates a fresh runtime document ID.
-                let mut actual = serde_json::to_value(&engine.doc).unwrap();
+                let mut actual = serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap();
                 actual["id"] = expected["id"].clone();
                 assert!(
                     actual == expected,
                     "All persisted native source definitions and stored words remain exact"
                 );
-                assert!(engine.doc.layers[0].pixels == document.layers[0].pixels);
-                assert_eq!(engine.doc.layers.len(), 1);
+                assert!(engine.resident_state().expect("resident fixture").document.layers[0].pixels == document.layers[0].pixels);
+                assert_eq!(engine.resident_state().expect("resident fixture").document.layers.len(), 1);
                 assert!(
-                    engine.doc.layers[0].source.is_none() && engine.doc.layers[0].mask.is_none()
+                    engine.resident_state().expect("resident fixture").document.layers[0].source.is_none() && engine.resident_state().expect("resident fixture").document.layers[0].mask.is_none()
                 );
                 assert!(
-                    engine.doc.warnings.is_empty()
-                        && !engine.doc.read_only
-                        && engine.doc.srgb_tagged
+                    engine.resident_state().expect("resident fixture").document.warnings.is_empty()
+                        && !engine.resident_state().expect("resident fixture").document.read_only
+                        && engine.resident_state().expect("resident fixture").document.srgb_tagged
                 );
-                assert_eq!(engine.doc.bit_depth, depth);
-                assert!(engine.undo.is_empty() && engine.redo.is_empty());
-                assert_eq!(engine.saved_revision, engine.doc.revision);
+                assert_eq!(engine.resident_state().expect("resident fixture").document.bit_depth, depth);
+                assert!(engine.resident_state().expect("resident fixture").undo.is_empty() && engine.resident_state().expect("resident fixture").redo.is_empty());
+                assert_eq!(engine.saved_revision, engine.resident_state().expect("resident fixture").document.revision);
                 assert!(engine.loading.is_none() && engine.file_ownership.is_some());
                 assert_eq!(engine.file_version, Some(version));
                 assert_eq!(engine.path.as_deref(), Some(source.as_path()));
-                assert_eq!(engine.doc.export_png().unwrap(), expected_png);
+                assert_eq!(engine.resident_state().expect("resident fixture").document.export_png().unwrap(), expected_png);
             }
             assert_eq!(crate::file_safety::version(&source).unwrap(), version);
             let other = Arc::new(Mutex::new(crate::engine::Engine::new()));
-            let before = other.lock().unwrap().doc.id.clone();
+            let before = other.lock().unwrap().resident_state().expect("resident fixture").document.id.clone();
             assert!(crate::server::open(&other, &source)
                 .unwrap_err()
                 .starts_with("File already open"));
-            assert_eq!(other.lock().unwrap().doc.id, before);
+            assert_eq!(other.lock().unwrap().resident_state().expect("resident fixture").document.id, before);
             {
                 let engine = shared.lock().unwrap();
-                assert_eq!(engine.doc.id, opened_document);
-                let mut actual = serde_json::to_value(&engine.doc).unwrap();
+                assert_eq!(engine.resident_state().expect("resident fixture").document.id, opened_document);
+                let mut actual = serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap();
                 actual["id"] = expected["id"].clone();
                 assert!(actual == expected);
-                assert!(engine.undo.is_empty() && engine.redo.is_empty());
+                assert!(engine.resident_state().expect("resident fixture").undo.is_empty() && engine.resident_state().expect("resident fixture").redo.is_empty());
             }
             let phase_count = durations.len();
             records.push(json!({"depth":depth,"repetition":repetition,"width":2048,"height":2048,
@@ -1002,9 +1002,9 @@ fn borrowed_sections_alias_input_and_keep_size_truncation_and_cancel_checks() {
 fn borrowed_and_owned_restoration_cancel_before_native_acceptance() {
     for depth in [8, 16] {
         let engine = fixture(depth);
-        let before = serde_json::to_value(&engine.doc).unwrap();
+        let before = serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap();
         for layout in [Layout::Psd, Layout::Psb] {
-            let bytes = encode_layout(&engine.doc, layout).unwrap();
+            let bytes = encode_layout(&engine.resident_state().expect("resident fixture").document, layout).unwrap();
             for borrowed in [false, true] {
                 for phase in ["sections_read", "json_inflated"] {
                     let control = crate::loading::Control::default();
@@ -1025,9 +1025,9 @@ fn borrowed_and_owned_restoration_cancel_before_native_acceptance() {
                     drop(watch);
                     assert!(observed.get());
                     assert!(result.unwrap_err().contains("Opening canceled"));
-                    assert_eq!(serde_json::to_value(&engine.doc).unwrap(), before);
-                    assert_eq!(engine.undo.len(), 1);
-                    assert!(engine.redo.is_empty());
+                    assert_eq!(serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap(), before);
+                    assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), 1);
+                    assert!(engine.resident_state().expect("resident fixture").redo.is_empty());
                 }
             }
         }
@@ -1046,8 +1046,8 @@ fn recovery_reuses_verified_bytes_and_keeps_native_sources_history_and_recovery_
         fs::create_dir(&dir).unwrap();
         let shared = Arc::new(Mutex::new(fixture(depth)));
         let registry = crate::workspace::attach(&shared);
-        let before = serde_json::to_value(&shared.lock().unwrap().doc).unwrap();
-        let png = shared.lock().unwrap().doc.export_png().unwrap();
+        let before = serde_json::to_value(&shared.lock().unwrap().resident_state().expect("resident fixture").document).unwrap();
+        let png = shared.lock().unwrap().resident_state().expect("resident fixture").document.export_png().unwrap();
         let mut versions = crate::recovery::Versions::new();
         crate::recovery::checkpoint(&registry, &dir, &mut versions);
         let catalog = crate::recovery::catalog(&dir);
@@ -1061,20 +1061,20 @@ fn recovery_reuses_verified_bytes_and_keeps_native_sources_history_and_recovery_
                 .unwrap();
         {
             let engine = restored.lock().unwrap();
-            assert!(!engine.doc.read_only);
-            assert_eq!(engine.doc.bit_depth, depth);
-            let mut actual = serde_json::to_value(&engine.doc).unwrap();
+            assert!(!engine.resident_state().expect("resident fixture").document.read_only);
+            assert_eq!(engine.resident_state().expect("resident fixture").document.bit_depth, depth);
+            let mut actual = serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap();
             assert_ne!(actual["id"], before["id"]);
             actual["id"] = before["id"].clone();
             assert_eq!(actual, before);
-            assert_eq!(engine.doc.export_png().unwrap(), png);
+            assert_eq!(engine.resident_state().expect("resident fixture").document.export_png().unwrap(), png);
             assert_eq!(engine.saved_revision, u64::MAX);
             assert!(
                 engine.path.is_none()
                     && engine.file_version.is_none()
                     && engine.file_ownership.is_none()
             );
-            assert!(engine.undo.is_empty() && engine.redo.is_empty());
+            assert!(engine.resident_state().expect("resident fixture").undo.is_empty() && engine.resident_state().expect("resident fixture").redo.is_empty());
         }
         let entries = crate::workspace::entries_in(&registry).len();
         let canceled = crate::loading::Control::default();
@@ -1106,10 +1106,10 @@ fn recovery_reuses_verified_bytes_and_keeps_native_sources_history_and_recovery_
         assert_eq!(fs::read(&path).unwrap(), damaged);
         {
             let engine = shared.lock().unwrap();
-            assert_eq!(serde_json::to_value(&engine.doc).unwrap(), before);
-            assert_eq!(engine.doc.export_png().unwrap(), png);
-            assert_eq!(engine.undo.len(), 1);
-            assert!(engine.redo.is_empty());
+            assert_eq!(serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap(), before);
+            assert_eq!(engine.resident_state().expect("resident fixture").document.export_png().unwrap(), png);
+            assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), 1);
+            assert!(engine.resident_state().expect("resident fixture").redo.is_empty());
         }
         drop(restored);
         drop(shared);
@@ -1141,12 +1141,12 @@ fn normal_file_open_keeps_final_content_scan_for_same_inode_size_and_restored_mt
             let dir = temp.join(format!("pb-open-content-check-{}", id()));
             fs::create_dir(&dir).unwrap();
             let path = dir.join("Original.psd");
-            let original = encode(&fixture(depth).doc).unwrap();
+            let original = encode(&fixture(depth).resident_state().expect("resident fixture").document).unwrap();
             fs::write(&path, &original).unwrap();
             let version = crate::file_safety::version(&path).unwrap();
             let modified = fs::metadata(&path).unwrap().modified().unwrap();
             let shared = Arc::new(Mutex::new(fixture(depth)));
-            let before = serde_json::to_value(&shared.lock().unwrap().doc).unwrap();
+            let before = serde_json::to_value(&shared.lock().unwrap().resident_state().expect("resident fixture").document).unwrap();
             let request = json!({"action":"open","actor":"human","path":path,
                 "document_id":before["id"],"expected_revision":before["revision"],"discard":true});
             let observed = Rc::new(Cell::new(false));
@@ -1196,10 +1196,10 @@ fn normal_file_open_keeps_final_content_scan_for_same_inode_size_and_restored_mt
                     .contains("Photoshop file changed during decoding"));
                 assert!(!verified.get());
                 let engine = shared.lock().unwrap();
-                assert_eq!(serde_json::to_value(&engine.doc).unwrap(), before);
-                assert_eq!(engine.undo.len(), 1);
+                assert_eq!(serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap(), before);
+                assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), 1);
                 assert!(
-                    engine.redo.is_empty()
+                    engine.resident_state().expect("resident fixture").redo.is_empty()
                         && engine.path.is_none()
                         && engine.file_version.is_none()
                 );
@@ -1217,8 +1217,8 @@ fn normal_file_open_keeps_final_content_scan_for_same_inode_size_and_restored_mt
                 assert_eq!(crate::file_safety::version(&path).unwrap(), version);
                 assert_eq!(fs::read(&path).unwrap(), original);
                 let engine = shared.lock().unwrap();
-                assert_eq!(engine.doc.bit_depth, depth);
-                assert!(engine.undo.is_empty() && engine.redo.is_empty());
+                assert_eq!(engine.resident_state().expect("resident fixture").document.bit_depth, depth);
+                assert!(engine.resident_state().expect("resident fixture").undo.is_empty() && engine.resident_state().expect("resident fixture").redo.is_empty());
                 assert_eq!(engine.file_version, Some(version));
                 assert!(engine.file_ownership.is_some() && engine.loading.is_none());
             }

@@ -12,8 +12,9 @@ struct Entry {
     chunk: Option<u64>,
     touched: u64,
 }
-pub(super) struct OriginalChunks {
-    entries: [Option<Entry>; 4],
+pub(super) type OriginalChunks = ChunkCache<4>;
+pub(super) struct ChunkCache<const SLOTS: usize> {
+    entries: [Option<Entry>; SLOTS],
     identity: [u8; 32],
     length: u64,
     pool: ResidentBudget,
@@ -22,13 +23,14 @@ pub(super) struct OriginalChunks {
     _headers: Reservation,
 }
 const _: () = assert!(std::mem::size_of::<OriginalChunks>() <= HEADERS);
-impl OriginalChunks {
+impl<const SLOTS: usize> ChunkCache<SLOTS> {
     pub(super) fn new(pool: &ResidentBudget, identity: [u8; 32], length: u64) -> Result<Self> {
-        if length == 0 {
+        if length == 0 || SLOTS == 0 {
             return Err("Streaming original cache requires a sealed source".into());
         }
+        let bytes = HEADERS.max(std::mem::size_of::<Self>());
         let headers = pool
-            .reserve_bytes(HEADERS, HEADERS)
+            .reserve_bytes(bytes, bytes)
             .map_err(|e| e.to_string())?;
         let mut entries = std::array::from_fn(|_| None);
         for entry in &mut entries {
@@ -87,7 +89,6 @@ impl OriginalChunks {
             check()?;
             let mut copied = 0;
             while copied < requested {
-                check()?;
                 let at = start + copied as u64;
                 let chunk = at / CHUNK as u64;
                 let begin = chunk * CHUNK as u64;
@@ -130,7 +131,7 @@ impl OriginalChunks {
                 copied += count;
                 check()?;
             }
-            check()
+            Ok(())
         })();
         if result.is_err() {
             self.failed = true;
@@ -202,7 +203,7 @@ mod tests {
             .unwrap();
             assert_eq!(&*row, &window[y * 17 * 4..(y + 1) * 17 * 4]);
         }
-        assert!(probes.get() - before > 2000);
+        assert_eq!(probes.get() - before, 513 * 2);
         assert!(fast
             .copy_prefix(
                 identity,

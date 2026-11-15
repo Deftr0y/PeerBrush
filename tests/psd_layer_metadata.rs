@@ -154,8 +154,8 @@ fn per_layer_global_mask_settings_keep_standard_layers_editable_and_survive_nati
                     original.layers[0].pixels.rgba16()
                 );
                 let mut engine = Engine::new();
-                engine.doc = loaded;
-                let layer = engine.doc.layers[0].id.clone();
+                engine.resident_state_mut().expect("resident fixture").document = loaded;
+                let layer = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
                 engine
                     .edit(
                         "human",
@@ -174,14 +174,14 @@ fn per_layer_global_mask_settings_keep_standard_layers_editable_and_survive_nati
                         "Clear selected pixel",
                     )
                     .unwrap();
-                assert_eq!(engine.doc.layers[0].pixels.get16(0, 0), [0; 4]);
+                assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].pixels.get16(0, 0), [0; 4]);
                 assert_eq!(
-                    engine.doc.layers[0].pixels.get16(1, 0),
+                    engine.resident_state().expect("resident fixture").document.layers[0].pixels.get16(1, 0),
                     original.layers[0].pixels.get16(1, 0)
                 );
                 for saved in [
-                    psd::encode(&engine.doc).unwrap(),
-                    psd::encode_psb(&engine.doc).unwrap(),
+                    psd::encode(&engine.resident_state().expect("resident fixture").document).unwrap(),
+                    psd::encode_psb(&engine.resident_state().expect("resident fixture").document).unwrap(),
                 ] {
                     assert_eq!(&saved[global_mask_range(&saved).1], settings);
                     for reopening in [saved.clone(), ordinary(&saved)] {
@@ -190,19 +190,19 @@ fn per_layer_global_mask_settings_keep_standard_layers_editable_and_survive_nati
                         assert_eq!(restored.bit_depth, depth);
                         assert_eq!(
                             restored.layers[0].pixels.rgba16(),
-                            engine.doc.layers[0].pixels.rgba16()
+                            engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16()
                         );
                         assert_eq!(
                             restored.export_png().unwrap(),
-                            engine.doc.export_png().unwrap()
+                            engine.resident_state().expect("resident fixture").document.export_png().unwrap()
                         );
                         let resaved = psd::encode(&restored).unwrap();
                         assert_eq!(&resaved[global_mask_range(&resaved).1], settings);
                     }
                 }
                 engine.undo("human").unwrap();
-                assert_eq!(engine.doc.export_png().unwrap(), original_png);
-                let undone = psd::encode(&engine.doc).unwrap();
+                assert_eq!(engine.resident_state().expect("resident fixture").document.export_png().unwrap(), original_png);
+                let undone = psd::encode(&engine.resident_state().expect("resident fixture").document).unwrap();
                 assert_eq!(&undone[global_mask_range(&undone).1], settings);
             }
         }
@@ -410,15 +410,15 @@ fn supplementary_sources_cannot_drop_or_replace_standard_global_mask_settings() 
                 assert!(psd::encode(&protected).is_err());
                 let shared = std::sync::Arc::new(std::sync::Mutex::new({
                     let mut engine = Engine::new();
-                    engine.doc = protected;
+                    engine.resident_state_mut().expect("resident fixture").document = protected;
                     engine
                 }));
                 peerbrush::server::compatible_copy(&shared, "human", Some(0)).unwrap();
                 let copied = shared.lock().unwrap();
-                assert_eq!(copied.doc.psd_global_mask, None);
-                assert_eq!(copied.doc.bit_depth, depth);
+                assert_eq!(copied.resident_state().expect("resident fixture").document.psd_global_mask, None);
+                assert_eq!(copied.resident_state().expect("resident fixture").document.bit_depth, depth);
                 assert_eq!(
-                    copied.doc.export_png().unwrap(),
+                    copied.resident_state().expect("resident fixture").document.export_png().unwrap(),
                     original.export_png().unwrap()
                 );
             }
@@ -506,8 +506,8 @@ fn protected_source_report_retains_original_tree_coordinates_and_layer_specific_
         let serialized = serde_json::to_value(&protected).unwrap();
         assert!(serialized.get("source_structure").is_none());
         let mut engine = Engine::new();
-        engine.doc = protected;
-        let observed = engine.state();
+        engine.resident_state_mut().expect("resident fixture").document = protected;
+        let observed = engine.capture_state().unwrap().project().unwrap();
         assert_eq!(
             observed["document"]["source_structure"]
                 .as_array()
@@ -521,21 +521,51 @@ fn protected_source_report_retains_original_tree_coordinates_and_layer_specific_
         assert!(engine
             .edit(
                 "human",
-                &[json!({"op":"layer.delete","layer":engine.doc.layers[0].id})],
+                &[json!({"op":"layer.delete","layer":engine.resident_state().expect("resident fixture").document.layers[0].id})],
                 None,
                 None,
                 "Protected source"
             )
             .is_err());
-        assert_eq!(engine.doc.revision, 0);
-        assert_eq!(engine.doc.export_png().unwrap(), before);
+        assert_eq!(engine.resident_state().expect("resident fixture").document.revision, 0);
+        assert_eq!(engine.resident_state().expect("resident fixture").document.export_png().unwrap(), before);
         let shared = std::sync::Arc::new(std::sync::Mutex::new(engine));
         peerbrush::server::compatible_copy(&shared, "human", Some(0)).unwrap();
         let copied = shared.lock().unwrap();
-        assert!(!copied.doc.read_only);
-        assert!(copied.doc.source_structure.is_empty());
-        assert_eq!(copied.doc.bit_depth, depth);
-        assert_eq!(copied.doc.export_png().unwrap(), before);
+        assert!(!copied.resident_state().expect("resident fixture").document.read_only);
+        assert!(copied.resident_state().expect("resident fixture").document.source_structure.is_empty());
+        assert_eq!(copied.resident_state().expect("resident fixture").document.bit_depth, depth);
+        assert_eq!(copied.resident_state().expect("resident fixture").document.export_png().unwrap(), before);
+    }
+}
+
+#[test]
+fn photoshop_unicode_layer_names_accept_terminators_and_protect_malformed_utf16() {
+    for depth in [8, 16] {
+        let mut doc = fixture(depth);
+        doc.layers[0].name = "色🎨z".into();
+        let encoders: [fn(&Document) -> Result<Vec<u8>, String>; 2] = [psd::encode, psd::encode_psb];
+        for encode in encoders {
+            let encoded = encode(&doc).unwrap();
+            let mut standard = ordinary(&encoded);
+            let payload = payload_range(&standard, b"luni");
+            let last = payload.end - 2;
+            standard[last..payload.end].copy_from_slice(&[0, 0]);
+            let terminated = psd::decode(&standard).unwrap();
+            assert!(!terminated.read_only, "{:?}", terminated.warnings);
+            assert_eq!(terminated.layers[0].name, "色🎨");
+            assert_eq!(terminated.layers[0].pixels.rgba16(), doc.layers[0].pixels.rgba16());
+            let mut uncounted_terminator = standard.clone();
+            uncounted_terminator[payload.start..payload.start + 4].copy_from_slice(&3u32.to_be_bytes());
+            let terminated = psd::decode(&uncounted_terminator).unwrap();
+            assert!(!terminated.read_only, "{:?}", terminated.warnings);
+            assert_eq!(terminated.layers[0].name, "色🎨");
+            standard[payload.start + 8..payload.start + 10].copy_from_slice(&0x007au16.to_be_bytes());
+            let protected = psd::decode(&standard).unwrap();
+            assert!(protected.read_only);
+            assert!(protected.warnings.iter().any(|warning| warning.contains("Invalid UTF-16")));
+            assert_eq!(protected.bit_depth, depth);
+        }
     }
 }
 
@@ -578,8 +608,8 @@ fn standard_full_layer_locks_survive_without_private_sources_and_use_shared_edit
         assert!(loaded.layers[0].locked);
         assert_eq!(loaded.layers[0].pixels.rgba16(), source);
         let mut engine = Engine::new();
-        engine.doc = loaded;
-        let layer = engine.doc.layers[0].id.clone();
+        engine.resident_state_mut().expect("resident fixture").document = loaded;
+        let layer = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
         for actor in ["human", "agent"] {
             assert!(engine
                 .edit(
@@ -600,7 +630,7 @@ fn standard_full_layer_locks_survive_without_private_sources_and_use_shared_edit
                 )
                 .is_err());
         }
-        assert_eq!(engine.doc.revision, 0);
+        assert_eq!(engine.resident_state().expect("resident fixture").document.revision, 0);
         engine
             .edit(
                 "human",
@@ -610,13 +640,13 @@ fn standard_full_layer_locks_survive_without_private_sources_and_use_shared_edit
                 "Unlock standard layer",
             )
             .unwrap();
-        assert!(!engine.doc.layers[0].locked);
-        let unlocked = psd::decode(&ordinary(&psd::encode(&engine.doc).unwrap())).unwrap();
+        assert!(!engine.resident_state().expect("resident fixture").document.layers[0].locked);
+        let unlocked = psd::decode(&ordinary(&psd::encode(&engine.resident_state().expect("resident fixture").document).unwrap())).unwrap();
         assert!(!unlocked.layers[0].locked);
         engine.undo("human").unwrap();
-        assert!(engine.doc.layers[0].locked);
-        assert_eq!(engine.doc.layers[0].pixels.rgba16(), source);
-        let restored = psd::decode(&ordinary(&psd::encode(&engine.doc).unwrap())).unwrap();
+        assert!(engine.resident_state().expect("resident fixture").document.layers[0].locked);
+        assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(), source);
+        let restored = psd::decode(&ordinary(&psd::encode(&engine.resident_state().expect("resident fixture").document).unwrap())).unwrap();
         assert!(restored.layers[0].locked);
     }
 }
@@ -637,11 +667,11 @@ fn standard_locked_folders_protect_children_and_partial_or_unknown_flags_remain_
         assert!(!loaded.layers[1].locked);
         assert_eq!(loaded.layers[1].parent.as_ref(), Some(&loaded.layers[0].id));
         let mut engine = Engine::new();
-        engine.doc = loaded;
+        engine.resident_state_mut().expect("resident fixture").document = loaded;
         assert!(engine
             .edit(
                 "human",
-                &[json!({"op":"layer.delete","layer":engine.doc.layers[1].id})],
+                &[json!({"op":"layer.delete","layer":engine.resident_state().expect("resident fixture").document.layers[1].id})],
                 None,
                 None,
                 "Locked ancestor"
@@ -676,8 +706,8 @@ fn benign_standard_metadata_keeps_raster_layers_editable_at_both_depths_and_surv
             original.layers[0].pixels.rgba16()
         );
         let mut engine = Engine::new();
-        engine.doc = loaded;
-        let layer = engine.doc.layers[0].id.clone();
+        engine.resident_state_mut().expect("resident fixture").document = loaded;
+        let layer = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
         engine
             .edit(
                 "human",
@@ -687,7 +717,7 @@ fn benign_standard_metadata_keeps_raster_layers_editable_at_both_depths_and_surv
                 "Preserve static metadata",
             )
             .unwrap();
-        let saved = ordinary(&psd::encode(&engine.doc).unwrap());
+        let saved = ordinary(&psd::encode(&engine.resident_state().expect("resident fixture").document).unwrap());
         for item in metadata() {
             assert_eq!(
                 &saved[payload_range(&saved, item.key.as_bytes().try_into().unwrap())],
@@ -702,7 +732,7 @@ fn benign_standard_metadata_keeps_raster_layers_editable_at_both_depths_and_surv
             original.layers[0].pixels.rgba16()
         );
         engine.undo("human").unwrap();
-        assert_eq!(engine.doc.layers[0].psd_metadata, metadata());
+        assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].psd_metadata, metadata());
     }
 }
 
@@ -821,8 +851,8 @@ fn known_layer_reader_versions_preserve_standard_metadata_native_sources_and_his
                 assert_eq!(loaded.layers[0].pixels.rgba16(), pixels);
                 assert_eq!(loaded.export_png().unwrap(), png);
                 let mut e = Engine::new();
-                e.doc = loaded;
-                let layer = e.doc.layers[0].id.clone();
+                e.resident_state_mut().expect("resident fixture").document = loaded;
+                let layer = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
                 e.edit(
                     "human",
                     &[json!({"op":"layer.update","layer":layer,"opacity":0.5})],
@@ -831,10 +861,10 @@ fn known_layer_reader_versions_preserve_standard_metadata_native_sources_and_his
                     "Preserve layer version",
                 )
                 .unwrap();
-                assert_eq!(e.undo.len(), 1);
-                assert_eq!(e.doc.layers[0].pixels.rgba16(), pixels);
+                assert_eq!(e.resident_state().expect("resident fixture").undo.len(), 1);
+                assert_eq!(e.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(), pixels);
                 e.undo("human").unwrap();
-                assert_eq!(e.doc.export_png().unwrap(), png);
+                assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), png);
                 e.edit(
                     "human",
                     &[json!({"op":"layer.duplicate","layers":[layer]})],
@@ -843,15 +873,15 @@ fn known_layer_reader_versions_preserve_standard_metadata_native_sources_and_his
                     "Duplicate retained layer version",
                 )
                 .unwrap();
-                assert_eq!(e.doc.layers.len(), 2);
-                for l in &e.doc.layers {
+                assert_eq!(e.resident_state().expect("resident fixture").document.layers.len(), 2);
+                for l in &e.resident_state().expect("resident fixture").document.layers {
                     assert!(l.psd_metadata.contains(&marker));
                 }
                 e.undo("human").unwrap();
                 let saved = if large {
-                    psd::encode_psb(&e.doc).unwrap()
+                    psd::encode_psb(&e.resident_state().expect("resident fixture").document).unwrap()
                 } else {
-                    psd::encode(&e.doc).unwrap()
+                    psd::encode(&e.resident_state().expect("resident fixture").document).unwrap()
                 };
                 assert_eq!(&saved[payload_range(&saved, b"lyvr")], marker.data);
                 for bytes in [saved.clone(), ordinary(&saved)] {
@@ -929,17 +959,17 @@ fn supplementary_metadata_must_match_each_standard_layer_even_with_hidden_filter
             if depth == 16 {
                 folder.pixels.promote16();
             }
-            folder.psd_metadata = vec![LayerMetadata {
-                key: "lyvr".into(),
-                data: 80u32.to_be_bytes().to_vec(),
-            }];
+            folder.psd_metadata = vec![
+                LayerMetadata { key: "lyvr".into(), data: 80u32.to_be_bytes().to_vec() },
+                LayerMetadata { key: "sn2P".into(), data: 1u32.to_be_bytes().to_vec() },
+            ];
             original.layers[0].parent = Some(folder.id.clone());
             second.parent = Some(folder.id.clone());
             original.layers.insert(0, folder);
             original.layers.push(second);
             if filtered {
                 let mut e = Engine::new();
-                e.doc = original;
+                e.resident_state_mut().expect("resident fixture").document = original;
                 e.edit(
                     "human",
                     &[json!({"op":"filter.add","kind":"invert"})],
@@ -948,7 +978,7 @@ fn supplementary_metadata_must_match_each_standard_layer_even_with_hidden_filter
                     "Filter retained metadata",
                 )
                 .unwrap();
-                original = e.doc;
+                original = e.resident_state().expect("resident fixture").document.clone();
             }
             let before = original.export_png().unwrap();
             for encoded in [
@@ -962,7 +992,7 @@ fn supplementary_metadata_must_match_each_standard_layer_even_with_hidden_filter
                     assert_eq!(a.psd_metadata, b.psd_metadata);
                     assert_eq!(a.pixels.rgba16(), b.pixels.rgba16());
                 }
-                for mode in 0..5 {
+                for mode in 0..6 {
                     let changed = rewrite_private_document(&encoded, |doc| match mode {
                         0 => {
                             doc["layers"][1]
@@ -982,11 +1012,14 @@ fn supplementary_metadata_must_match_each_standard_layer_even_with_hidden_filter
                         3 => {
                             doc["layers"][0]["psd_metadata"] = json!([]);
                         }
-                        _ => {
+                        4 => {
                             doc["layers"][1]["psd_metadata"]
                                 .as_array_mut()
                                 .unwrap()
                                 .remove(2);
+                        }
+                        _ => {
+                            doc["layers"][0]["psd_metadata"][1]["data"] = json!([0, 0, 0, 0]);
                         }
                     });
                     let protected = psd::decode(&changed).unwrap();
@@ -999,18 +1032,18 @@ fn supplementary_metadata_must_match_each_standard_layer_even_with_hidden_filter
                         .any(|w| w.contains("definitions were changed")));
                     assert!(psd::encode(&protected).is_err());
                     let mut e = Engine::new();
-                    e.doc = protected;
+                    e.resident_state_mut().expect("resident fixture").document = protected;
                     assert!(e
                         .edit(
                             "human",
-                            &[json!({"op":"paint.fill","layer":e.doc.layers[0].id})],
+                            &[json!({"op":"paint.fill","layer":e.resident_state().expect("resident fixture").document.layers[0].id})],
                             None,
                             None,
                             "Protected metadata"
                         )
                         .is_err());
-                    assert!(e.undo.is_empty());
-                    assert_eq!(e.doc.revision, 0);
+                    assert!(e.resident_state().expect("resident fixture").undo.is_empty());
+                    assert_eq!(e.resident_state().expect("resident fixture").document.revision, 0);
                 }
                 // Metadata property ordering is not an appearance change.
                 let changed = rewrite_private_document(&encoded, |doc| {

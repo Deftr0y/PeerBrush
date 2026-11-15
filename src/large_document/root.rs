@@ -240,6 +240,35 @@ impl PersistentRootContext {
     }
     /// Begin only when nonzero source I/O is required, outside application locks.
     pub(crate) fn begin(self: &Arc<Self>) -> Result<RootOperation, String> {
+        self.begin_mode(false)
+    }
+    /// Recovery discovery/restoration must not create a missing data root.
+    pub(crate) fn begin_existing(self: &Arc<Self>) -> Result<RootOperation, String> {
+        self.begin_mode(true)
+    }
+    /// Absence is normal before the first source write. Existing aliases or
+    /// unreadable namespaces remain errors, never an empty recovery catalog.
+    pub(crate) fn begin_existing_sources(
+        self: &Arc<Self>,
+    ) -> Result<Option<RootOperation>, String> {
+        let observation = self.begin_observation()?;
+        for path in [&self.base, &self.base.join("native-sources-v1")] {
+            match fs::symlink_metadata(path) {
+                Ok(_) => (),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    observation.check()?;
+                    return Ok(None);
+                }
+                Err(_) => return Err("Cannot inspect existing native source namespace".into()),
+            }
+            drop(Directory::open(path)?);
+        }
+        let operation = self.begin_existing()?;
+        drop(operation.existing_source_directory()?);
+        observation.check()?;
+        Ok(Some(operation))
+    }
+    fn begin_mode(self: &Arc<Self>, existing_only: bool) -> Result<RootOperation, String> {
         let operation = self.admission.begin()?;
         operation.check()?;
         self.validate()?;
@@ -250,7 +279,11 @@ impl PersistentRootContext {
         let base = match &*initialized {
             Some(base) => base.clone(),
             None => {
-                let base = Arc::new(open_or_create_base(&self.base)?);
+                let base = Arc::new(if existing_only {
+                    Directory::open(&self.base)?
+                } else {
+                    open_or_create_base(&self.base)?
+                });
                 self.validate()?;
                 *initialized = Some(base.clone());
                 base
@@ -267,7 +300,7 @@ impl PersistentRootContext {
     }
 
     /// Observation of known in-memory pixels must not initialize the data root.
-    /// This permit has no base/source-directory or mutation methods.
+    /// This permit has no base/source-directory or filesystem mutation methods.
     pub(crate) fn begin_observation(self: &Arc<Self>) -> Result<RootReadOperation, String> {
         let operation = self.admission.begin()?;
         operation.check()?;
@@ -284,8 +317,15 @@ pub(crate) struct RootReadOperation {
     operation: server::SourceOperation,
 }
 impl RootReadOperation {
+    /// Keep memory-only tab publication inside this actual instance request.
+    pub(crate) fn with_live_fence<T>(&self, commit: impl FnOnce() -> T) -> Result<T, String> {
+        self.operation.with_live_fence(commit)
+    }
+    pub(crate) fn check_active(&self) -> Result<(), String> {
+        self.operation.check()
+    }
     pub(crate) fn check(&self) -> Result<(), String> {
-        self.operation.check()?;
+        self.check_active()?;
         self.context.validate()
     }
 }
@@ -296,6 +336,12 @@ pub(crate) struct RootOperation {
     _operation: server::SourceOperation,
 }
 impl RootOperation {
+    pub(crate) fn park_activity(&mut self) {
+        self._operation.park_activity();
+    }
+    pub(crate) fn activity(&self) -> Option<server::FileOperation> {
+        self._operation.activity()
+    }
     pub(crate) fn with_live_fence<T>(&self, commit: impl FnOnce() -> T) -> Result<T, String> {
         self._operation.with_live_fence(commit)
     }
@@ -317,8 +363,11 @@ impl RootOperation {
         self._operation.check_finalization(permit, intent)?;
         self.check_held()
     }
+    pub(crate) fn check_active(&self) -> Result<(), String> {
+        self._operation.check()
+    }
     pub(crate) fn check(&self) -> Result<(), String> {
-        self._operation.check()?;
+        self.check_active()?;
         self.check_retirement()
     }
     /// Only already-admitted, proven provisional retirement may finish after
@@ -334,6 +383,12 @@ impl RootOperation {
     pub(crate) fn source_directory(&self) -> Result<Directory, String> {
         self.check()?;
         let directory = self.base.child("native-sources-v1")?;
+        self.check()?;
+        Ok(directory)
+    }
+    pub(crate) fn existing_source_directory(&self) -> Result<Directory, String> {
+        self.check()?;
+        let directory = Directory::open(&self.base.path().join("native-sources-v1"))?;
         self.check()?;
         Ok(directory)
     }

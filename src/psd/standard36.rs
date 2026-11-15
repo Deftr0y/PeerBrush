@@ -3,17 +3,59 @@
 use super::{
     bulk36::{Descriptor, Digest, MAX_CHUNK_BYTES, MAX_TILE_BYTES},
     container36::HashWriter,
-    structural::{Format, Header},
+    structural::{Format, Header, Index, Span},
 };
 use std::io::{self, Read, Seek, Write};
 pub(crate) const MAX_STANDARD_RECORDS: usize = 2 * 200 + 3;
+pub(crate) const LAYER_INFO_MISMATCH: &str =
+    "PeerBrush native Photoshop layer information or transparency marker differs from the saved layout";
+
+pub(crate) fn check_layer_info<R: Read + Seek>(
+    source: &super::row_stream::Source<R>,
+    index: &Index,
+    check: &dyn Fn() -> Result<(), String>,
+) -> Result<(), String> {
+    let active = index.active_layer_info;
+    if index.header.depth == 16 {
+        let mut layer_info = index.global_tags.iter().filter(|tag| tag.key == *b"Lr16");
+        let mut transparency = index.global_tags.iter().filter(|tag| tag.key == *b"Mt16");
+        if index.primary_layer_info.bytes != 0
+            || !layer_info.next().is_some_and(|tag| {
+                tag.signature == *b"8BIM" && tag.data == active
+            })
+            || layer_info.next().is_some()
+            || !transparency.next().is_some_and(|tag| {
+                tag.signature == *b"8BIM" && tag.data.bytes == 0
+            })
+            || transparency.next().is_some()
+        {
+            return Err(LAYER_INFO_MISMATCH.into());
+        }
+    } else if index.primary_layer_info != active {
+        return Err(LAYER_INFO_MISMATCH.into());
+    }
+    if active.bytes < 2 || index.layers.is_empty() {
+        return Err(LAYER_INFO_MISMATCH.into());
+    }
+    let mut count = [0; 2];
+    source
+        .range(Span { bytes: 2, ..active }, check)?
+        .read_exact(&mut count)
+        .map_err(|e| e.to_string())?;
+    let count = i16::from_be_bytes(count);
+    if count >= 0 || usize::from(count.unsigned_abs()) != index.layers.len() {
+        return Err(LAYER_INFO_MISMATCH.into());
+    }
+    Ok(())
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RowSource {
     Layer(usize),
-    /// Hidden fallback source bytes, without effect rendering or adjustment
+    /// Original source bytes, without effect rendering or adjustment
     /// replacement. Native hidden RGB and channel low bits remain significant.
     OriginalLayer(usize),
+    MaskBeforeDensity { layer: usize, originals: bool },
     BakedComposite,
     MergedWhiteMatte,
     Zero,
@@ -31,6 +73,11 @@ pub(crate) struct RowRequest {
 }
 pub(crate) trait NativeRows {
     fn provenance(&self) -> Digest;
+    /// The writer and readback may each prepare one independent planar pass.
+    fn prepare_merged_pass(&mut self, _check: &dyn Fn() -> Result<(), String>) -> Result<(), String> {
+        Ok(())
+    }
+    fn finish_merged_pass(&mut self) {}
     /// Fill exactly rows*width*(depth/8) bytes in channel-major native BE order.
     /// For -2 prepare actual mask steps even when the mask is disabled. Its
     /// disabled flag lives in the record, not in replacement all-unit samples.
@@ -49,6 +96,10 @@ pub(crate) struct Metadata<'a> {
 pub(crate) struct Mask {
     pub bounds: [i32; 4],
     pub enabled: bool,
+    pub linked: bool,
+    pub default: u8,
+    pub dual: bool,
+    pub density: Option<u8>,
 }
 pub(crate) struct Record<'a> {
     pub source: RowSource,
@@ -60,6 +111,12 @@ pub(crate) struct Record<'a> {
     pub clipped: bool,
     pub visible: bool,
     pub locked: bool,
+    pub invert: bool,
+    pub tone: Option<super::adjustments::ToneRecord>,
+    pub solid: Option<crate::raster::Pixel>,
+    pub standard_style: Option<super::styles::StandardStyles<'a>>,
+    pub gradient: Option<&'a serde_json::Value>,
+    pub pattern: Option<super::patterns::FillRecord>,
     pub has_clipped_layers: bool,
     pub section: u32,
     pub metadata: Vec<Metadata<'a>>,
@@ -72,11 +129,14 @@ pub(crate) struct Plan<'a> {
     provenance: Digest,
     records: Vec<Record<'a>>,
     global_mask: &'a [u8],
+    global_metadata: &'a [super::GlobalMetadata],
+    patterns: super::patterns::StandardPatterns,
     chunks: &'a [u32],
     info_raw: u64,
     info_bytes: u64,
     prefix_bytes: u64,
     layer_bytes: u64,
+    layer_rows: usize,
     composite_bytes: u64,
 }
 impl<'a> Plan<'a> {
@@ -85,6 +145,8 @@ impl<'a> Plan<'a> {
         provenance: Digest,
         records: Vec<Record<'a>>,
         global_mask: &'a [u8],
+        global_metadata: &'a [super::GlobalMetadata],
+        patterns: super::patterns::StandardPatterns,
         chunks: &'a [u32],
         check: &dyn Fn() -> Result<(), String>,
     ) -> Result<Self, String> {
@@ -104,7 +166,9 @@ impl<'a> Plan<'a> {
                 "Source36 standard plan exceeds its declared native/record envelope".into(),
             );
         }
+        super::global_metadata::validate(global_metadata)?;
         let mut info_raw = 2u64;
+        let mut layer_rows = 0;
         for record in &records {
             validate(record)?;
             let mut counter = HashWriter::new(io::sink(), 128 * 1024 * 1024, check);
@@ -113,11 +177,13 @@ impl<'a> Plan<'a> {
             info_raw = info_raw
                 .checked_add(bytes)
                 .ok_or("Source36 layer record overflow")?;
-            for (channel, bounds) in channels(record) {
-                let _ = channel;
+            for (_, bounds) in channels(record) {
                 info_raw = info_raw
                     .checked_add(encoded_bytes(bounds, header.depth)?)
                     .ok_or("Source36 layer channel size overflow")?;
+                if bounds[2] > bounds[0] {
+                    layer_rows += (bounds[3] - bounds[1]) as usize;
+                }
             }
         }
         let info_bytes = info_raw
@@ -140,6 +206,9 @@ impl<'a> Plan<'a> {
         } else {
             length_width + info_bytes + 4 + global_mask.len() as u64
         };
+        let prefix_bytes = prefix_bytes
+            + super::global_metadata::encoded_bytes(global_metadata, layout(header.format))
+            + patterns.encoded_bytes();
         let mut layer_bytes = prefix_bytes;
         for &bytes in chunks {
             check()?;
@@ -176,11 +245,14 @@ impl<'a> Plan<'a> {
             provenance,
             records,
             global_mask,
+            global_metadata,
+            patterns,
             chunks,
             info_raw,
             info_bytes,
             prefix_bytes,
             layer_bytes,
+            layer_rows,
             composite_bytes,
         })
     }
@@ -218,18 +290,33 @@ impl<'a> Plan<'a> {
         })
     }
 
-    /// Append exact standard records/channels and then every declared private
-    /// tag. Callback payload hashes/lengths are verified against actual writes.
+    #[cfg(test)]
     pub(crate) fn write_layers<W: Write + ?Sized>(
         &self,
         output: &mut W,
         provider: &mut impl NativeRows,
         scratch: &mut [u8],
         check: &dyn Fn() -> Result<(), String>,
+        progress: impl FnMut(usize, usize) -> Result<(), String>,
+        bulk: impl FnMut(usize, &mut dyn Write) -> Result<Descriptor, String>,
+    ) -> Result<WrittenLayers, String> {
+        self.write_layers_with_checks(output, provider, scratch, (check, check), progress, bulk)
+    }
+
+    /// Append exact standard records/channels and verify private tag payloads against actual writes.
+    pub(crate) fn write_layers_with_checks<W: Write + ?Sized>(
+        &self,
+        output: &mut W,
+        provider: &mut impl NativeRows,
+        scratch: &mut [u8],
+        (check, pinned): (&dyn Fn() -> Result<(), String>, &dyn Fn() -> Result<(), String>),
+        progress: impl FnMut(usize, usize) -> Result<(), String>,
         mut bulk: impl FnMut(usize, &mut dyn Write) -> Result<Descriptor, String>,
     ) -> Result<WrittenLayers, String> {
         self.check_provider(provider, scratch, check)?;
-        let mut output = HashWriter::new(output, self.layer_bytes, check);
+        let mut report_rows = row_progress(self.layer_rows, progress)?;
+        // The actual spool checks ownership before and after its writes.
+        let mut output = HashWriter::new(output, self.layer_bytes, pinned);
         if self.header.depth == 16 {
             length(&mut output, 0, self.header.format)?;
             bytes32(&mut output, self.global_mask)?;
@@ -252,11 +339,12 @@ impl<'a> Plan<'a> {
                 self.rows(
                     &mut output,
                     provider,
-                    record.source,
-                    channel,
+                    channel_source(record, channel),
+                    if channel == -3 { -2 } else { channel },
                     bounds,
                     scratch,
                     check,
+                    &mut report_rows,
                 )?;
             }
         }
@@ -266,6 +354,11 @@ impl<'a> Plan<'a> {
         } else {
             bytes32(&mut output, self.global_mask)?;
         }
+        for metadata in self.global_metadata {
+            check()?;
+            super::global_metadata::write(&mut output, metadata, layout(self.header.format))?;
+        }
+        self.patterns.write(&mut output)?;
         let mut descriptors = Vec::new();
         descriptors
             .try_reserve_exact(self.chunks.len())
@@ -276,7 +369,7 @@ impl<'a> Plan<'a> {
             output
                 .write_all(&expected.to_be_bytes())
                 .map_err(|e| e.to_string())?;
-            let mut chunk = HashWriter::new(&mut output, u64::from(expected), check);
+            let mut chunk = HashWriter::new(&mut output, u64::from(expected), pinned);
             let descriptor = bulk(ordinal, &mut chunk)?;
             let (bytes, sha256) = chunk.finish();
             if bytes != u64::from(expected)
@@ -309,6 +402,7 @@ impl<'a> Plan<'a> {
         provider: &mut impl NativeRows,
         scratch: &mut [u8],
         check: &dyn Fn() -> Result<(), String>,
+        progress: impl FnMut(usize, usize) -> Result<(), String>,
     ) -> Result<WrittenComposite, String> {
         self.check_provider(provider, scratch, check)?;
         let mut output = HashWriter::new(output, self.composite_bytes, check);
@@ -316,17 +410,24 @@ impl<'a> Plan<'a> {
             .write_all(&0u16.to_be_bytes())
             .map_err(|e| e.to_string())?;
         let bounds = [0, 0, self.header.width as i32, self.header.height as i32];
-        for channel in 0..4 {
-            self.rows(
-                &mut output,
-                provider,
-                RowSource::MergedWhiteMatte,
-                channel,
-                bounds,
-                scratch,
-                check,
-            )?;
-        }
+        provider.prepare_merged_pass(check)?;
+        let channels = (|| {
+            let mut report_rows = row_progress(self.header.height as usize * 4, progress)?;
+            (0..4).try_for_each(|channel| {
+                self.rows(
+                    &mut output,
+                    provider,
+                    RowSource::MergedWhiteMatte,
+                    channel,
+                    bounds,
+                    scratch,
+                    check,
+                    &mut report_rows,
+                )
+            })
+        })();
+        provider.finish_merged_pass();
+        channels?;
         output.flush().map_err(|e| e.to_string())?;
         check()?;
         let (bytes, sha256) = output.finish();
@@ -338,14 +439,16 @@ impl<'a> Plan<'a> {
     /// Compare the reopened standard records and every native sample against
     /// freshly prepared rows from the same captured scene. A valid zlib stream
     /// or matching whole-file checksum alone cannot substitute for this check.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn compare<R: Read + Seek>(
         &self,
         source: &super::row_stream::Source<R>,
-        index: &super::structural::Index,
+        index: &Index,
         provider: &mut impl NativeRows,
         expected: &mut [u8],
         actual: &mut [u8],
         check: &dyn Fn() -> Result<(), String>,
+        progress: impl FnMut(usize, usize) -> Result<(), String>,
     ) -> Result<ComparedStandard, String> {
         self.check_provider(provider, expected, check)?;
         if index.header != self.header
@@ -356,6 +459,11 @@ impl<'a> Plan<'a> {
             return Err("Source36 reopened standard header/record/scratch differs".into());
         }
         source.unchanged_length()?;
+        if index.active_layer_info.bytes != self.info_bytes {
+            return Err(LAYER_INFO_MISMATCH.into());
+        }
+        check_layer_info(source, index, check)?;
+        let mut report_rows = row_progress(self.layer_rows + self.header.height as usize * 4, progress)?;
         let mut samples = 0u64;
         for (record, parsed) in self.records.iter().zip(&index.layers) {
             check()?;
@@ -386,12 +494,13 @@ impl<'a> Plan<'a> {
                     .checked_add(self.compare_rows(
                         &mut rows,
                         provider,
-                        record.source,
-                        channel,
+                        channel_source(record, channel),
+                        if channel == -3 { -2 } else { channel },
                         bounds,
                         expected,
                         actual,
                         check,
+                        &mut report_rows,
                     )?)
                     .ok_or("Source36 native comparison sample count overflow")?;
                 rows.finish()?.check(source, encoding, check)?;
@@ -410,9 +519,46 @@ impl<'a> Plan<'a> {
         {
             return Err("Source36 reopened global mask differs from captured metadata".into());
         }
+        let mut retained = self.global_metadata.iter();
+        let mut saw_patterns = false;
+        for tag in &index.global_tags {
+            if tag.key == *b"Pb36"
+                || self.header.depth == 16 && matches!(&tag.key, b"Lr16" | b"Mt16")
+            {
+                continue;
+            }
+            if tag.key == *b"Patt" && !self.patterns.bytes().is_empty() {
+                let expected = ring::digest::digest(&ring::digest::SHA256, self.patterns.bytes());
+                if saw_patterns || tag.signature != *b"8BIM" || tag.data.bytes != self.patterns.bytes().len() as u64
+                    || hash_span(source, tag.data, actual, check)?.as_slice() != expected.as_ref()
+                {
+                    return Err("Source36 embedded Photoshop patterns differ from captured sources".into());
+                }
+                saw_patterns = true;
+                continue;
+            }
+            let expected = retained
+                .next()
+                .ok_or("Unexpected Source36 document metadata")?;
+            let digest: Digest = ring::digest::digest(&ring::digest::SHA256, &expected.data)
+                .as_ref()
+                .try_into()
+                .unwrap();
+            if tag.signature != *b"8BIM"
+                || tag.key.as_slice() != expected.key.as_bytes()
+                || tag.data.bytes != expected.data.len() as u64
+                || hash_span(source, tag.data, actual, check)? != digest
+            {
+                return Err("Source36 document metadata differs from captured sources".into());
+            }
+        }
+        if retained.next().is_some() || saw_patterns != !self.patterns.bytes().is_empty() {
+            return Err("Missing Source36 document metadata".into());
+        }
         let mut merged = source.rows(&index.composite, check)?;
         let bounds = [0, 0, self.header.width as i32, self.header.height as i32];
-        for channel in 0..4 {
+        provider.prepare_merged_pass(check)?;
+        let channels = (0..4).try_for_each(|channel| {
             samples = samples
                 .checked_add(self.compare_rows(
                     &mut merged,
@@ -423,9 +569,13 @@ impl<'a> Plan<'a> {
                     expected,
                     actual,
                     check,
+                    &mut report_rows,
                 )?)
                 .ok_or("Source36 native comparison sample count overflow")?;
-        }
+            Ok::<_, String>(())
+        });
+        provider.finish_merged_pass();
+        channels?;
         merged.finish()?.check(source, &index.composite, check)?;
         source.unchanged_length()?;
         self.check_provider(provider, expected, check)?;
@@ -434,6 +584,7 @@ impl<'a> Plan<'a> {
             samples,
         })
     }
+
     #[allow(clippy::too_many_arguments)]
     fn compare_rows<R: Read + Seek>(
         &self,
@@ -445,6 +596,7 @@ impl<'a> Plan<'a> {
         expected: &mut [u8],
         actual: &mut [u8],
         check: &dyn Fn() -> Result<(), String>,
+        report_rows: &mut impl FnMut(u32) -> Result<(), String>,
     ) -> Result<u64, String> {
         let (width, height) = dimensions(bounds)?;
         if width == 0 || height == 0 {
@@ -454,6 +606,7 @@ impl<'a> Plan<'a> {
         if actual.len() < row_bytes {
             return Err("Source36 native comparison row exceeds admitted scratch".into());
         }
+        let transfer = actual.len() / row_bytes * row_bytes;
         let stripe = stripe_rows(expected.len(), width, self.header.depth);
         if stripe == 0 {
             return Err("Source36 expected native stripe exceeds admitted scratch".into());
@@ -486,12 +639,15 @@ impl<'a> Plan<'a> {
                     "Source36 native comparison provider changed its captured scene".into(),
                 );
             }
-            for row in wanted.chunks_exact(row_bytes) {
-                if !rows.read_row(&mut actual[..row_bytes])? || actual[..row_bytes] != *row {
+            for batch in wanted.chunks(transfer) {
+                let actual = &mut actual[..batch.len()];
+                rows.read_rows(actual)?;
+                if &*actual != batch {
                     return Err("Source36 reopened native samples differ from current captured render/source".into());
                 }
             }
             first_row += count;
+            report_rows(count)?;
         }
         Ok(u64::from(width) * u64::from(height))
     }
@@ -516,6 +672,7 @@ impl<'a> Plan<'a> {
                 RowSource::BakedComposite => (2, 0),
                 RowSource::MergedWhiteMatte => (3, 0),
                 RowSource::Zero => (4, 0),
+                RowSource::MaskBeforeDensity { layer, originals } => (5 + u8::from(originals), layer),
             };
             hash.update(&[kind]);
             hash.update(&(index as u64).to_be_bytes());
@@ -527,6 +684,17 @@ impl<'a> Plan<'a> {
         }
         hash.update(&(self.global_mask.len() as u64).to_be_bytes());
         hash.update(self.global_mask);
+        hash.update(&(self.global_metadata.len() as u64).to_be_bytes());
+        for entry in self.global_metadata {
+            hash.update(entry.key.as_bytes());
+            hash.update(&(entry.data.len() as u64).to_be_bytes());
+            hash.update(&entry.data);
+        }
+        if !self.patterns.bytes().is_empty() {
+            hash.update(b"Patt");
+            hash.update(&(self.patterns.bytes().len() as u64).to_be_bytes());
+            hash.update(self.patterns.bytes());
+        }
         hash.update(&(self.chunks.len() as u64).to_be_bytes());
         for chunk in self.chunks {
             hash.update(&chunk.to_be_bytes());
@@ -560,6 +728,7 @@ impl<'a> Plan<'a> {
         bounds: [i32; 4],
         scratch: &mut [u8],
         check: &dyn Fn() -> Result<(), String>,
+        report_rows: &mut impl FnMut(u32) -> Result<(), String>,
     ) -> Result<(), String> {
         let (w, h) = dimensions(bounds)?;
         if w == 0 || h == 0 {
@@ -599,13 +768,24 @@ impl<'a> Plan<'a> {
             if provider.provenance() != self.provenance {
                 return Err("Source36 native provider changed its captured scene".into());
             }
-            for bytes in out.chunks(65536) {
-                output.write_all(bytes).map_err(|e| e.to_string())?;
-            }
+            output.write_all(out).map_err(|e| e.to_string())?;
             first_row += rows;
+            report_rows(rows)?;
         }
         Ok(())
     }
+}
+
+fn row_progress(
+    total: usize,
+    mut progress: impl FnMut(usize, usize) -> Result<(), String>,
+) -> Result<impl FnMut(u32) -> Result<(), String>, String> {
+    progress(0, total)?;
+    let mut completed = 0;
+    Ok(move |rows| {
+        completed += rows as usize;
+        progress(completed, total)
+    })
 }
 
 pub(crate) struct WrittenLayers {
@@ -678,6 +858,12 @@ fn encoded_bytes(bounds: [i32; 4], depth: u16) -> Result<u64, String> {
         .and_then(|n| n.checked_add(2))
         .ok_or_else(|| "Source36 raw channel length overflow".into())
 }
+fn layout(format: Format) -> super::Layout {
+    match format {
+        Format::Psd => super::Layout::Psd,
+        Format::Psb => super::Layout::Psb,
+    }
+}
 fn channels(record: &Record<'_>) -> impl Iterator<Item = (i16, [i32; 4])> {
     let bounds = record.bounds;
     let mask = record.mask;
@@ -685,16 +871,47 @@ fn channels(record: &Record<'_>) -> impl Iterator<Item = (i16, [i32; 4])> {
         .into_iter()
         .map(move |c| (c, bounds))
         .chain(mask.map(|mask| (-2, mask.bounds)))
+        .chain(mask.filter(|mask| mask.dual).map(|mask| (-3, mask.bounds)))
+}
+fn channel_source(record: &Record<'_>, channel: i16) -> RowSource {
+    if channel == -2 && record.mask.is_some_and(|mask| mask.density.is_some()) {
+        match record.source {
+            RowSource::Layer(layer) => RowSource::MaskBeforeDensity { layer, originals: false },
+            RowSource::OriginalLayer(layer) => RowSource::MaskBeforeDensity { layer, originals: true },
+            source => source,
+        }
+    } else {
+        record.source
+    }
 }
 fn validate(record: &Record<'_>) -> Result<(), String> {
     dimensions(record.bounds)?;
     if let Some(mask) = record.mask {
         dimensions(mask.bounds)?;
     }
-    if ![0, 1, 3].contains(&record.section)
+    if record.section > 3
         || record.section != 0 && record.bounds != [0; 4]
         || record.section == 3 && record.mask.is_some()
-        || record.metadata.len() > 5
+        || record.mask.is_some_and(|mask| mask.density.is_some()
+            && (mask.dual || !matches!(record.source, RowSource::Layer(_) | RowSource::OriginalLayer(_))))
+        || matches!(record.source, RowSource::MaskBeforeDensity { .. })
+        || (record.invert || record.tone.is_some()) && (record.section != 0 || record.blend == *b"pass"
+            || super::blend_name(&record.blend).is_none())
+        || record.tone.as_ref().is_some_and(|tone| record.invert || record.solid.is_some()
+            || record.gradient.is_some() || record.pattern.is_some() || !tone.valid())
+        || record.solid.is_some_and(|color| record.section != 0 || record.invert || color[3] != 255)
+        || record.standard_style.is_some_and(|overlay| record.solid.is_some() != overlay.fill || record.bounds != overlay.bounds
+            || record.mask.is_some_and(|mask| mask.dual) || record.mask.map(|mask| mask.linked) != overlay.mask_linked
+            || record.blend != overlay.layer_blend || record.opacity != overlay.layer_opacity
+            || record.clipped || record.has_clipped_layers || !matches!(record.source, RowSource::OriginalLayer(_)))
+        || record.gradient.is_some_and(|settings| record.section != 0 || record.invert || record.solid.is_some()
+            || record.blend == *b"pass" || !super::gradient_fill::representable(settings))
+        || record.pattern.is_some() && (record.section != 0 || record.invert || record.solid.is_some()
+            || record.gradient.is_some() || record.blend != *b"norm")
+        || record.metadata.len() > super::MAX_LAYER_METADATA
+        || record.section == 3 && record.metadata.iter().any(|entry| {
+            !std::str::from_utf8(&entry.key).is_ok_and(super::closing_metadata_key)
+        })
         || record.name.len() > super::canonical36::MAX_BYTES
         || record.metadata.iter().any(|m| m.bytes.len() > 128)
     {
@@ -714,7 +931,7 @@ fn write_record(
             .map_err(|e| e.to_string())?;
     }
     output
-        .write_all(&(if record.mask.is_some() { 5u16 } else { 4 }).to_be_bytes())
+        .write_all(&(channels(record).count() as u16).to_be_bytes())
         .map_err(|e| e.to_string())?;
     for (channel, bounds) in channels(record) {
         output
@@ -728,7 +945,9 @@ fn write_record(
         .write_all(&[
             record.opacity,
             u8::from(record.clipped),
-            u8::from(record.locked && record.section != 3) | if record.visible { 0 } else { 2 },
+            u8::from(record.locked && record.section != 3)
+                | if record.visible { 0 } else { 2 }
+                | if record.invert || record.tone.is_some() || record.solid.is_some() || record.gradient.is_some() || record.pattern.is_some() { 0x18 } else { 0 },
             0,
         ])
         .map_err(|e| e.to_string())?;
@@ -744,38 +963,29 @@ fn write_record(
 }
 fn write_extra(output: &mut impl Write, record: &Record<'_>) -> Result<(), String> {
     if let Some(mask) = record.mask {
-        output
-            .write_all(&20u32.to_be_bytes())
-            .map_err(|e| e.to_string())?;
-        let [l, t, r, b] = mask.bounds;
-        for value in [t, l, b, r] {
-            output
-                .write_all(&value.to_be_bytes())
-                .map_err(|e| e.to_string())?;
-        }
-        output
-            .write_all(&[255, if mask.enabled { 0 } else { 2 }, 0, 0])
-            .map_err(|e| e.to_string())?;
+        let payload = super::standard_mask_payload(
+            mask.bounds, mask.default, super::standard_mask_flags(mask.enabled, mask.linked), mask.dual, mask.density,
+        );
+        bytes32(output, &payload[..if mask.dual { 36 } else { 20 }])?;
     } else {
         output
             .write_all(&0u32.to_be_bytes())
             .map_err(|e| e.to_string())?;
     }
-    output
-        .write_all(&0u32.to_be_bytes())
-        .map_err(|e| e.to_string())?;
+    let ranges = record.metadata.iter()
+        .find(|metadata| metadata.key == super::blend_ranges::TAG)
+        .map(|metadata| super::blend_ranges::pairs(metadata.bytes));
+    bytes32(output, ranges.as_ref().map_or(&[][..], |pairs| pairs.as_flattened()))?;
     let name = if record.section == 3 {
         "</Layer group>"
     } else {
         record.name
     };
-    let bytes = name.as_bytes();
-    let n = bytes.len().min(255);
-    output.write_all(&[n as u8]).map_err(|e| e.to_string())?;
-    output.write_all(&bytes[..n]).map_err(|e| e.to_string())?;
-    pad(output, 1 + n as u64, 4)?;
-    let units =
-        u32::try_from(name.encode_utf16().count()).map_err(|_| "Source36 layer name overflow")?;
+    let legacy_name = super::legacy_layer_name(name);
+    output.write_all(&[legacy_name.len() as u8]).map_err(|e| e.to_string())?;
+    output.write_all(legacy_name).map_err(|e| e.to_string())?;
+    pad(output, 1 + legacy_name.len() as u64, 4)?;
+    let units = super::layer_name_units(name)?;
     tag_start(output, *b"luni", 4 + u64::from(units) * 2)?;
     output
         .write_all(&units.to_be_bytes())
@@ -793,10 +1003,37 @@ fn write_extra(output: &mut impl Write, record: &Record<'_>) -> Result<(), Strin
     output
         .write_all(&transfer[..used])
         .map_err(|e| e.to_string())?;
-    if record.locked && record.section != 3 {
+    if record.mask.is_some_and(|mask| !mask.linked) {
+        tag(output, *b"lmgm", &[0; 4])?;
+    }
+    if record.locked && record.section != 3 && !record.metadata.iter().any(|entry| entry.key == *b"lspf") {
         tag(output, *b"lspf", &7u32.to_be_bytes())?;
     }
-    if record.has_clipped_layers && record.section != 3 {
+    if record.invert {
+        tag(output, *b"nvrt", &[])?;
+    }
+    if let Some(tone) = &record.tone {
+        if let Some((key, bytes)) = tone.companion() {
+            tag(output, key, bytes)?;
+        }
+        let (key, bytes) = tone.parts();
+        tag(output, key, bytes)?;
+    }
+    if let Some(color) = record.solid {
+        tag(output, *b"SoCo", &super::adjustments::solid_descriptor(color))?;
+    }
+    if let Some(overlay) = &record.standard_style {
+        super::styles::write_standard_style_tag(output, overlay).map_err(|error| error.to_string())?;
+    }
+    if let Some(settings) = record.gradient {
+        tag(output, *b"GdFl", super::gradient_fill::descriptor(settings)?.bytes())?;
+    }
+    if let Some(id) = record.pattern {
+        tag(output, *b"PtFl", super::patterns::descriptor(id).bytes())?;
+    }
+    if record.has_clipped_layers && record.section != 3
+        && !record.metadata.iter().any(|metadata| metadata.key == *b"clbl")
+    {
         tag(output, *b"clbl", &[1, 0, 0, 0])?;
     }
     if record.section != 0 {
@@ -809,8 +1046,8 @@ fn write_extra(output: &mut impl Write, record: &Record<'_>) -> Result<(), Strin
             tag(output, *b"lsct", &record.section.to_be_bytes())?;
         }
     }
-    if record.section != 3 {
-        for metadata in &record.metadata {
+    for metadata in &record.metadata {
+        if metadata.key != super::blend_ranges::TAG {
             tag(output, metadata.key, metadata.bytes)?;
         }
     }
@@ -916,6 +1153,10 @@ mod tests {
             mask: Some(Mask {
                 bounds: [-1, -2, 2, 255],
                 enabled: false,
+                linked: true,
+                default: 255,
+                dual: false,
+                density: None,
             }),
             name: "Native 漆",
             blend: *b"norm",
@@ -923,6 +1164,12 @@ mod tests {
             clipped: false,
             visible: true,
             locked: false,
+            invert: false,
+            tone: None,
+            solid: None,
+            standard_style: None,
+            gradient: None,
+            pattern: None,
             has_clipped_layers: false,
             section: 0,
             metadata: vec![],
@@ -1025,7 +1272,8 @@ mod tests {
             for depth in [8, 16] {
                 let header = header(format, depth);
                 let check = || Ok(());
-                let plan = Plan::new(header, [17; 32], vec![record()], &[], &[], &check).unwrap();
+                let plan =
+                    Plan::new(header, [17; 32], vec![record()], &[], &[], Default::default(), &[], &check).unwrap();
                 let mut provider = Provider {
                     binding: [17; 32],
                     calls: 0,
@@ -1035,18 +1283,38 @@ mod tests {
                 let mut scratch = vec![0; MAX_TILE_BYTES];
                 let mut layers = vec![];
                 let mut composite = vec![];
+                let mut layer_progress = Vec::new();
+                let mut composite_progress = Vec::new();
                 let written = plan
                     .write_layers(
                         &mut layers,
                         &mut provider,
                         &mut scratch,
                         &check,
+                        |completed, total| {
+                            assert_eq!(total, 5 * 257);
+                            layer_progress.push(completed);
+                            Ok(())
+                        },
                         |_, _| unreachable!(),
                     )
                     .unwrap();
                 let merged = plan
-                    .write_composite(&mut composite, &mut provider, &mut scratch, &check)
+                    .write_composite(
+                        &mut composite,
+                        &mut provider,
+                        &mut scratch,
+                        &check,
+                        |completed, total| {
+                            assert_eq!(total, 4 * 257);
+                            composite_progress.push(completed);
+                            Ok(())
+                        },
+                    )
                     .unwrap();
+                let completed = [0, 256, 257, 513, 514, 770, 771, 1027, 1028, 1284, 1285];
+                assert_eq!(layer_progress, completed);
+                assert_eq!(composite_progress, &completed[..9]);
                 assert_eq!(written.bytes, layers.len() as u64);
                 assert_eq!(merged.bytes, composite.len() as u64);
                 assert_eq!(provider.calls, 18);
@@ -1132,6 +1400,7 @@ mod tests {
                     .unwrap()
                     .check(&source, &index.composite, &check)
                     .unwrap();
+                let mut progress = Vec::new();
                 let proof = plan
                     .compare(
                         &source,
@@ -1140,13 +1409,21 @@ mod tests {
                         &mut scratch,
                         &mut [0; 32000],
                         &check,
+                        |done, total| {
+                            progress.push((done, total));
+                            Ok(())
+                        },
                     )
                     .unwrap();
                 proof.check(&plan, &check).unwrap();
                 assert_eq!(proof.samples(), 9 * 3 * 257);
+                assert_eq!(progress.first(), Some(&(0, 9 * 257)));
+                assert_eq!(progress.last(), Some(&(9 * 257, 9 * 257)));
+                assert!(progress.windows(2).all(|p| p[0].0 < p[1].0 && p[0].1 == p[1].1));
                 let mut other = record();
                 other.name = "Different admitted metadata";
-                let other = Plan::new(header, [17; 32], vec![other], &[], &[], &check).unwrap();
+                let other =
+                    Plan::new(header, [17; 32], vec![other], &[], &[], Default::default(), &[], &check).unwrap();
                 assert!(proof.check(&other, &check).is_err());
                 let mut changed = bytes.clone();
                 let encoded = index.layers[0].channels[0].encoding.as_ref().unwrap();
@@ -1160,7 +1437,8 @@ mod tests {
                         &mut provider,
                         &mut scratch,
                         &mut [0; 32000],
-                        &check
+                        &check,
+                        |_, _| Ok(()),
                     )
                     .is_err(),
                     "Valid streams with changed low bits still fail exact render/source fidelity"
@@ -1176,6 +1454,8 @@ mod tests {
             [17; 32],
             vec![record()],
             &[],
+            &[],
+            Default::default(),
             &[],
             &check,
         )
@@ -1195,6 +1475,7 @@ mod tests {
                     &mut provider,
                     &mut scratch,
                     &check,
+                    |_, _| Ok(()),
                     |_, _| unreachable!()
                 )
                 .is_err());
@@ -1214,7 +1495,17 @@ mod tests {
             r.source = RowSource::Zero;
             records.push(r);
         }
-        let plan = Plan::new(header(Format::Psb, 8), [17; 32], records, &[], &[], &check).unwrap();
+        let plan = Plan::new(
+            header(Format::Psb, 8),
+            [17; 32],
+            records,
+            &[],
+            &[],
+            Default::default(),
+            &[],
+            &check,
+        )
+        .unwrap();
         let mut provider = Provider {
             binding: [17; 32],
             calls: 0,
@@ -1229,10 +1520,11 @@ mod tests {
             &mut provider,
             &mut scratch,
             &check,
+            |_, _| Ok(()),
             |_, _| unreachable!(),
         )
         .unwrap();
-        plan.write_composite(&mut composite, &mut provider, &mut scratch, &check)
+        plan.write_composite(&mut composite, &mut provider, &mut scratch, &check, |_, _| Ok(()))
             .unwrap();
         let bytes = assembled(plan.header(), &layers, &composite);
         assert_eq!(structural::Limits::current().layers, 200);
@@ -1255,9 +1547,13 @@ mod tests {
         r.mask = Some(Mask {
             bounds: r.bounds,
             enabled: false,
+            linked: true,
+            default: 255,
+            dual: false,
+            density: None,
         });
         let header = header(Format::Psb, 16);
-        let plan = Plan::new(header, [17; 32], vec![r], &[], &[], &check).unwrap();
+        let plan = Plan::new(header, [17; 32], vec![r], &[], &[], Default::default(), &[], &check).unwrap();
         let mut provider = Provider {
             binding: [17; 32],
             calls: 0,
@@ -1272,10 +1568,11 @@ mod tests {
             &mut provider,
             &mut scratch,
             &check,
+            |_, _| Ok(()),
             |_, _| unreachable!(),
         )
         .unwrap();
-        plan.write_composite(&mut composite, &mut provider, &mut scratch, &check)
+        plan.write_composite(&mut composite, &mut provider, &mut scratch, &check, |_, _| Ok(()))
             .unwrap();
         let bytes = assembled(header, &layers, &composite);
         assert_eq!(structural::Limits::current().coordinate, 100000);
@@ -1296,6 +1593,7 @@ mod tests {
             &mut scratch,
             &mut [0; 32000],
             &check,
+            |_, _| Ok(()),
         )
         .unwrap();
     }

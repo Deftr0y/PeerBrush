@@ -2,7 +2,7 @@
 //! Fingerprints detect accidental changes; they are not authentication hashes.
 use std::{
     fs,
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 #[path = "file_permissions.rs"]
@@ -10,6 +10,9 @@ mod permissions;
 pub(crate) use permissions::preserve as preserve_permissions;
 #[cfg(windows)]
 pub(crate) use permissions::wide_absolute_file_path;
+
+pub(crate) const RESIDENT_FILE_BYTES: u64 = 256 * 1024 * 1024;
+pub(crate) const NATIVE_FILE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 
 #[derive(Clone, Copy)]
 enum FilePolicy {
@@ -19,8 +22,8 @@ enum FilePolicy {
 impl FilePolicy {
     fn file_bytes(self) -> u64 {
         match self {
-            Self::Legacy => 256 * 1024 * 1024,
-            Self::Source36 => 64 * 1024 * 1024 * 1024,
+            Self::Legacy => RESIDENT_FILE_BYTES,
+            Self::Source36 => NATIVE_FILE_BYTES,
         }
     }
     fn backup_bytes(self) -> u64 {
@@ -74,11 +77,15 @@ pub(crate) fn open_for_identity(path: &Path) -> std::io::Result<fs::File> {
 /// This is deliberately separate from legacy file publication behavior.
 pub(crate) fn open_native_identity(path: &Path) -> std::io::Result<fs::File> {
     #[cfg(unix)]
-    let file = open_native_read(path)?;
+    {
+        open_native_read(path)
+    }
     #[cfg(not(unix))]
-    let file = open_for_identity(path)?;
-    native_regular(&file)?;
-    Ok(file)
+    {
+        let file = open_for_identity(path)?;
+        native_regular(&file)?;
+        Ok(file)
+    }
 }
 
 pub(crate) fn open_native_read(path: &Path) -> std::io::Result<fs::File> {
@@ -152,7 +159,11 @@ mod native_identity_tests {
             for name in ["fifo", "alias"] {
                 assert!(open_native_identity(&cloned.join(name)).is_err());
                 assert!(open_native_read(&cloned.join(name)).is_err());
+                assert!(crate::tool_settings::read_owned(&cloned.join(name)).is_err());
             }
+            assert_eq!(crate::tool_settings::read_owned(&cloned.join("missing")).unwrap(), None);
+            assert_eq!(crate::tool_settings::read_owned(&cloned.join("regular")).unwrap().unwrap(), b"preserve");
+            assert!(crate::tool_settings::read_owned(&cloned).is_err());
             sender.send(()).unwrap();
         });
         done.recv_timeout(Duration::from_secs(2))
@@ -175,13 +186,13 @@ mod native_identity_tests {
 }
 
 #[cfg(unix)]
-pub(crate) fn identity(file: &fs::File) -> Result<(u64, u64), String> {
+pub(crate) fn file_identity_and_links(file: &fs::File) -> Result<((u64, u64), u64), String> {
     use std::os::unix::fs::MetadataExt;
     let m = file.metadata().map_err(|e| e.to_string())?;
-    Ok((m.dev(), m.ino()))
+    Ok(((m.dev(), m.ino()), m.nlink()))
 }
 #[cfg(windows)]
-fn file_identity_and_links(file: &fs::File) -> Result<((u64, u64), u64), String> {
+pub(crate) fn file_identity_and_links(file: &fs::File) -> Result<((u64, u64), u64), String> {
     use std::os::windows::io::AsRawHandle;
     #[repr(C)]
     #[derive(Default)]
@@ -214,23 +225,14 @@ fn file_identity_and_links(file: &fs::File) -> Result<((u64, u64), u64), String>
     ))
 }
 
-#[cfg(windows)]
 pub(crate) fn identity(file: &fs::File) -> Result<(u64, u64), String> {
     file_identity_and_links(file).map(|info| info.0)
 }
-#[cfg(windows)]
 pub(crate) fn link_count(file: &fs::File) -> Result<u64, String> {
     file_identity_and_links(file).map(|info| info.1)
 }
-#[cfg(unix)]
-pub(crate) fn link_count(file: &fs::File) -> Result<u64, String> {
-    use std::os::unix::fs::MetadataExt;
-    file.metadata()
-        .map(|metadata| metadata.nlink())
-        .map_err(|error| error.to_string())
-}
 
-fn stamp(file: &fs::File) -> Result<(u64, u128), String> {
+pub(crate) fn stamp(file: &fs::File) -> Result<(u64, u128), String> {
     let m = file.metadata().map_err(|e| e.to_string())?;
     if !m.is_file() {
         return Err("Destination is not a regular file".into());
@@ -269,17 +271,87 @@ fn version_bounded(
 ) -> Result<Version, String> {
     check()?;
     let mut file = fs::File::open(path).map_err(|e| e.to_string())?;
+    let version = fingerprint_file(&mut file, policy, &mut [0u8; 64 * 1024], &check)?;
+    if version.identity != identity(&fs::File::open(path).map_err(|e| e.to_string())?)? {
+        return Err("File changed while checking its version; current work preserved".into());
+    }
+    Ok(version)
+}
+
+/// Observe the actual open decoder handle and recheck that its name still
+/// resolves to that regular file. An independently opened path is never read
+/// in place of the held source.
+pub(crate) fn native_source_version(
+    path: &Path,
+    file: &mut fs::File,
+    scratch: &mut [u8],
+    check: &dyn Fn() -> Result<(), String>,
+) -> Result<Version, String> {
+    held_source_version(path, file, FilePolicy::Source36, scratch, check)
+}
+
+pub(crate) fn resident_source_version(
+    path: &Path,
+    file: &mut fs::File,
+    scratch: &mut [u8],
+    check: &dyn Fn() -> Result<(), String>,
+) -> Result<Version, String> {
+    held_source_version(path, file, FilePolicy::Legacy, scratch, check)
+}
+
+fn held_source_version(
+    path: &Path,
+    file: &mut fs::File,
+    policy: FilePolicy,
+    scratch: &mut [u8],
+    check: &dyn Fn() -> Result<(), String>,
+) -> Result<Version, String> {
+    check()?;
+    file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+    let version = fingerprint_file(file, policy, scratch, check)?;
+    check_native_source_binding(path, file, version)?;
+    check()?;
+    Ok(version)
+}
+
+/// Verify a held file and its current name after the caller has independently
+/// bound the bytes it consumed to this exact version.
+pub(crate) fn check_native_source_binding(
+    path: &Path,
+    file: &fs::File,
+    version: Version,
+) -> Result<(), String> {
+    let named = open_native_identity(path).map_err(|e| e.to_string())?;
+    let expected_stamp = (version.bytes, version.modified);
+    if identity(file)? != version.identity
+        || stamp(file)? != expected_stamp
+        || identity(&named)? != version.identity
+        || stamp(&named)? != expected_stamp
+    {
+        return Err("File source changed while opening; current work preserved".into());
+    }
+    Ok(())
+}
+
+fn fingerprint_file(
+    file: &mut fs::File,
+    policy: FilePolicy,
+    buffer: &mut [u8],
+    check: &dyn Fn() -> Result<(), String>,
+) -> Result<Version, String> {
+    if buffer.is_empty() {
+        return Err("File version requires a read buffer".into());
+    }
     let identity = identity(&file)?;
     let before = stamp(&file)?;
     if before.0 > policy.file_bytes() {
         return Err(policy.exceeded().into());
     }
     let mut fingerprint = ring::digest::Context::new(&ring::digest::SHA256);
-    let mut buffer = [0u8; 64 * 1024];
     let mut total = 0u64;
     loop {
         check()?;
-        let n = file.read(&mut buffer).map_err(|e| e.to_string())?;
+        let n = file.read(buffer).map_err(|e| e.to_string())?;
         if n == 0 {
             break;
         }
@@ -290,10 +362,7 @@ fn version_bounded(
         fingerprint.update(&buffer[..n]);
     }
     check()?;
-    if stamp(&file)? != before
-        || total != before.0
-        || identity != self::identity(&fs::File::open(path).map_err(|e| e.to_string())?)?
-    {
+    if stamp(file)? != before || total != before.0 {
         return Err("File changed while checking its version; current work preserved".into());
     }
     Ok(Version {
@@ -399,6 +468,19 @@ impl Lease {
     pub fn acquire(path: &Path) -> Result<Self, String> {
         Self::acquire_bounded(path, FilePolicy::Legacy, || Ok(()))
     }
+    pub(crate) fn acquire_native_export(
+        path: &Path,
+        check: impl Fn() -> Result<(), String>,
+    ) -> Result<Self, String> {
+        Self::acquire_bounded(path, FilePolicy::Source36, check)
+    }
+    pub(crate) fn version_at(
+        &self,
+        path: &Path,
+        check: impl Fn() -> Result<(), String>,
+    ) -> Result<Version, String> {
+        version_bounded(path, self.policy, check)
+    }
     fn acquire_bounded(
         path: &Path,
         policy: FilePolicy,
@@ -444,7 +526,10 @@ impl Lease {
     pub fn validate(&self) -> Result<(), String> {
         self.validate_checked(|| Ok(()))
     }
-    fn validate_checked(&self, check: impl Fn() -> Result<(), String>) -> Result<(), String> {
+    pub(crate) fn validate_checked(
+        &self,
+        check: impl Fn() -> Result<(), String>,
+    ) -> Result<(), String> {
         if snapshot_bounded(&self.path, self.policy, check)? != self.expected {
             return Err(
                 "Destination changed while saving. Current work preserved; use a new Save As path."
@@ -457,7 +542,7 @@ impl Lease {
     pub fn preserve(&self) -> Result<Option<PathBuf>, String> {
         self.preserve_checked(|| Ok(()))
     }
-    fn preserve_checked(
+    pub(crate) fn preserve_checked(
         &self,
         check: impl Fn() -> Result<(), String>,
     ) -> Result<Option<PathBuf>, String> {
@@ -618,6 +703,7 @@ mod native_outcome;
 pub(crate) use native_outcome::{AccountingCreation, AccountingOutcome};
 pub(crate) use native_outcome::{
     ExternalCreationProof, ExternalCreationRole, ExternalOutcomeProof, NativeAbortReceipt,
+    NativeExistingAbortReceipt, NativeExistingDestination, NativeExistingPublicationReceipt,
     NativeNewDestination, NativePublicationReceipt,
 };
 impl NativeLease {

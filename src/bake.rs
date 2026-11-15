@@ -4,14 +4,16 @@ use crate::{
     raster::Raster,
 };
 use serde_json::Value;
+pub(crate) mod input;
 
 pub(crate) fn apply(doc: &mut Document, index: usize, c: &Value) -> Result<(), String> {
+    let plan = input::Plan::new((&*doc).into(), index, c)?;
     let before = doc.clone();
     let target = before.layers[index].id.clone();
     if c["op"] == "effect.bake" {
-        color(doc, index, c)?;
+        color(doc, &plan)?;
     } else {
-        mask(doc, index, c)?;
+        mask(doc, &plan)?;
     }
     crate::effects::invalidate(doc, std::slice::from_ref(c));
     // Check hidden/occluded targets as well as the current composite. Inexact
@@ -41,7 +43,7 @@ pub(crate) fn apply(doc: &mut Document, index: usize, c: &Value) -> Result<(), S
     }
     Ok(())
 }
-fn inexact() -> String {
+pub(crate) fn inexact() -> String {
     "This prefix cannot be baked without changing native samples. Bake a higher effect to include its dependencies, or keep the stack editable.".into()
 }
 fn isolated(doc: &Document, target: &str) -> Result<Document, String> {
@@ -63,35 +65,23 @@ fn isolated(doc: &Document, target: &str) -> Result<Document, String> {
     crate::effects::invalidate(&mut out, &[serde_json::json!({"op":"filter.delete"})]);
     Ok(out)
 }
-fn color(doc: &mut Document, index: usize, c: &Value) -> Result<(), String> {
-    let l = &doc.layers[index];
-    if l.kind == "adjustment" {
-        return Err("Adjustment effects depend on the backdrop; merge their affected layers explicitly instead".into());
-    }
-    let at = l
-        .effects
-        .iter()
-        .position(|e| Some(e.id.as_str()) == c["effect"].as_str())
-        .ok_or("Unknown effect")?;
-    if !l.effects[..=at].iter().any(|e| e.enabled && e.weight > 0.) {
+fn color(doc: &mut Document, plan: &input::Plan) -> Result<(), String> {
+    let index = plan.index;
+    let at = plan.at;
+    if !plan.active {
         doc.layers[index].effects.drain(..=at);
         return Ok(());
     }
-    let tree = crate::transform::tree_ids(doc, &[l.id.clone()]);
-    if doc.layers.iter().any(|l| tree.contains(&l.id) && l.locked) {
-        return Err("Unlock the folder and all children before baking folder content".into());
-    }
+    let tree: Vec<_> = plan
+        .tree
+        .iter()
+        .map(|&i| doc.layers[i].id.clone())
+        .collect();
     let mut prefix = doc.clone();
     prefix.layers[index].effects.truncate(at + 1);
     prefix.layers[index].effect_key = id();
-    let frame = crate::effects::canvas_frame(&prefix.layers[index]);
-    let (w, h) = crate::effects::frame(&prefix, &prefix.layers[index]);
-    if frame
-        && l.mask.is_some()
-        && (l.x != 0 || l.y != 0 || l.pixels.width != w || l.pixels.height != h)
-    {
-        return Err("Baking this expanding style would change the mask's frame. Keep it editable or explicitly merge the masked result.".into());
-    }
+    let frame = plan.canvas_frame;
+    let [w, h] = plan.size;
     let pixels = if doc.bit_depth == 16 {
         let prepared = crate::depth16::prepare(&prefix)?;
         let image = prepared[index]
@@ -126,19 +116,15 @@ fn color(doc: &mut Document, index: usize, c: &Value) -> Result<(), String> {
         .retain(|l| l.id == target || !tree.contains(&l.id));
     Ok(())
 }
-fn mask(doc: &mut Document, index: usize, c: &Value) -> Result<(), String> {
+fn mask(doc: &mut Document, plan: &input::Plan) -> Result<(), String> {
+    let index = plan.index;
+    let at = plan.at;
     let l = &doc.layers[index];
-    let m = l.mask.as_ref().ok_or("Layer has no mask")?;
-    let at = m
-        .steps
-        .iter()
-        .position(|s| Some(s.id.as_str()) == c["step"].as_str())
-        .ok_or("Unknown mask step")?;
-    if !m.steps[..=at].iter().any(|s| s.enabled && s.weight > 0.) {
+    if !plan.active {
         doc.layers[index].mask.as_mut().unwrap().steps.drain(..=at);
         return Ok(());
     }
-    let quantized = m.needs_cache();
+    let quantized = plan.quantized;
     let mut prefix = l.clone();
     prefix.mask.as_mut().unwrap().steps.truncate(at + 1);
     prefix.mask.as_mut().unwrap().cache_key = id();

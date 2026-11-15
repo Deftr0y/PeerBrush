@@ -12,7 +12,7 @@ use crate::{
         ResidentBudget,
     },
     psd::memory36::{Admitted, MetadataCharge},
-    workspace::source_runtime::{Limits, SourceRuntime},
+    workspace::source_runtime::{Limits, SourceRuntime, SourceSession},
 };
 use std::{
     cell::{Cell, RefCell},
@@ -26,17 +26,17 @@ use std::{
 thread_local! {
     static COMPLETED_TILES: RefCell<Option<Rc<Cell<usize>>>> = const { RefCell::new(None) };
 }
-struct CompletedTiles {
+pub(crate) struct CompletedTiles {
     count: Rc<Cell<usize>>,
     previous: Option<Rc<Cell<usize>>>,
 }
 impl CompletedTiles {
-    fn observe() -> Self {
+    pub(crate) fn observe() -> Self {
         let count = Rc::new(Cell::new(0));
         let previous = COMPLETED_TILES.with(|slot| slot.replace(Some(count.clone())));
         Self { count, previous }
     }
-    fn count(&self) -> usize {
+    pub(crate) fn count(&self) -> usize {
         self.count.get()
     }
 }

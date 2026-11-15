@@ -175,6 +175,10 @@ impl Placement {
             inverse,
         })
     }
+
+    pub(crate) fn is_affine(&self) -> bool {
+        self.projective.is_none() && self.warp.is_none()
+    }
 }
 pub(super) struct Sampler<'a> {
     placement: &'a Placement,
@@ -194,6 +198,16 @@ impl Sampler<'_> {
         if let Some(map) = self.inverse {
             return map.sample([f64::from(x) + 0.5, f64::from(y) + 0.5]);
         }
+        let [mut u, mut v] = self.before_shear(x, y);
+        if p.shear != [0., 0.] {
+            v -= p.shear[1] * u;
+            u -= p.shear[0] * v;
+        }
+        self.source_position([u, v])
+    }
+
+    fn before_shear(&self, x: i32, y: i32) -> [f32; 2] {
+        let p = self.placement;
         let [sin, cos] = if self.scalar {
             p.scalar_trig
         } else {
@@ -201,15 +215,63 @@ impl Sampler<'_> {
         };
         let rx = x as f32 + 0.5 - p.pivot[0] - p.delta[0];
         let ry = y as f32 + 0.5 - p.pivot[1] - p.delta[1];
-        let mut u = (rx * cos + ry * sin) / p.scale[0];
-        let mut v = (-rx * sin + ry * cos) / p.scale[1];
-        if p.shear != [0., 0.] {
-            v -= p.shear[1] * u;
-            u -= p.shear[0] * v;
+        [(rx * cos + ry * sin) / p.scale[0], (-rx * sin + ry * cos) / p.scale[1]]
+    }
+
+    fn source_position(&self, p: [f32; 2]) -> [f32; 2] {
+        std::array::from_fn(|axis| p[axis] + self.placement.pivot[axis] - self.origin[axis] as f32 - 0.5)
+    }
+
+    pub(super) fn is_affine(&self) -> bool {
+        self.placement.is_affine()
+    }
+
+    pub(super) fn sample_cost(&self) -> u64 {
+        self.placement.warp.as_ref().map_or(1, |warp| warp.sample_cost())
+    }
+
+    /// None keeps the tile for exact sampling. An empty box proves no source reads.
+    pub(super) fn source_footprint(&self, region: [i32; 4]) -> Option<[i32; 4]> {
+        if let Some(warp) = &self.placement.warp {
+            let Some(mut bounds) = warp.sample_bounds(region.map(f64::from))? else {
+                return Some([0; 4]);
+            };
+            for (axis, value) in bounds.iter_mut().enumerate() {
+                *value -= f64::from(self.origin[axis % 2]) + 0.5;
+            }
+            return Some(super::super::bilinear_bounds(bounds));
         }
-        [
-            u + p.pivot[0] - self.origin[0] as f32 - 0.5,
-            v + p.pivot[1] - self.origin[1] as f32 - 0.5,
-        ]
+        if let Some(inverse) = self.inverse {
+            return inverse.sampling_bounds(region.map(f64::from)).map(super::super::bilinear_bounds);
+        }
+        self.affine_footprint(region)
+    }
+
+    pub(super) fn affine_footprint(&self, [left, top, right, bottom]: [i32; 4]) -> Option<[i32; 4]> {
+        if !self.is_affine() {
+            return None;
+        }
+        let corners = [(left, top), (right - 1, top), (left, bottom - 1), (right - 1, bottom - 1)]
+            .map(|(x, y)| self.before_shear(x, y));
+        let extent = |axis: usize| {
+            corners.iter().fold([f32::INFINITY, f32::NEG_INFINITY], |[lo, hi], p| {
+                [lo.min(p[axis]), hi.max(p[axis])]
+            })
+        };
+        let (mut u, mut v) = (extent(0), extent(1));
+        let [sx, sy] = self.placement.shear;
+        if [sx, sy] != [0., 0.] {
+            // Bound each rounded shear operation before using it in the next.
+            let subtract = |[lo, hi]: [f32; 2], range: [f32; 2], shear: f32| {
+                let [a, b] = range.map(|n| n * shear);
+                [lo - a.max(b), hi - a.min(b)]
+            };
+            v = subtract(v, u, sy);
+            u = subtract(u, v, sx);
+        }
+        let [l, t] = self.source_position([u[0], v[0]]);
+        let [r, b] = self.source_position([u[1], v[1]]);
+        Some([l.floor() as i32, t.floor() as i32,
+            (r.floor() as i32).saturating_add(2), (b.floor() as i32).saturating_add(2)])
     }
 }

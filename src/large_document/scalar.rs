@@ -43,6 +43,9 @@ pub struct ScalarScratch {
     inner: linear::Scratch,
 }
 impl ScalarScratch {
+    pub(crate) fn filesystem_identity(&self) -> ((u64, u64), (u64, u64)) {
+        self.inner.filesystem_identity()
+    }
     pub fn abort(self, check: Check<'_>) -> Result<()> {
         self.inner.abort(check)
     }
@@ -80,6 +83,9 @@ pub struct CompletedScalar {
     inner: Arc<linear::Complete>,
 }
 impl CompletedScalar {
+    pub(crate) fn check_owner(&self) -> Result<()> {
+        self.inner.owned.check()
+    }
     pub fn frame(&self) -> [u32; 2] {
         [self.inner.spec.width, self.inner.spec.height]
     }

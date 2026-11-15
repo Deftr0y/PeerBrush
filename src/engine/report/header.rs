@@ -9,7 +9,7 @@ use serde::{ser::SerializeSeq, Serialize, Serializer};
 use serde_json::Value;
 
 #[derive(Serialize)]
-pub(super) struct Header<'a> {
+pub(crate) struct Header<'a> {
     pub file_status: &'a str,
     pub reservations: &'a [Lease],
     pub ai_change: Option<Ai<'a>>,
@@ -20,7 +20,7 @@ pub(super) struct Header<'a> {
     task_recovery: TaskRecovery<'a>,
 }
 impl<'a> Header<'a> {
-    pub(super) fn new(engine: &'a Engine, revision: u64) -> Self {
+    pub(crate) fn new(engine: &'a Engine, revision: u64) -> Self {
         Self {
             file_status: &engine.status,
             reservations: &engine.leases,
@@ -67,7 +67,7 @@ struct ProposalWire<'a> {
     created: &'a Value,
     operations: &'a [Value],
 }
-struct Proposals<'a>(&'a [Proposal]);
+pub(crate) struct Proposals<'a>(pub(crate) &'a [Proposal]);
 impl Serialize for Proposals<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
@@ -91,9 +91,15 @@ impl Serialize for Proposals<'_> {
     }
 }
 #[derive(Serialize)]
-struct TaskRecovery<'a> {
+pub(crate) struct TaskRecovery<'a> {
     active: &'a [Lease],
     recent: Tasks<'a>,
+}
+pub(crate) fn task_recovery(engine: &Engine) -> TaskRecovery<'_> {
+    TaskRecovery {
+        active: &engine.leases,
+        recent: Tasks(&engine.recent_tasks),
+    }
 }
 #[derive(Serialize)]
 struct TaskWire<'a> {

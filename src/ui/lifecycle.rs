@@ -17,7 +17,7 @@ mod tests {
     fn fixture(depth: u16) -> (PeerBrush, egui::Context, Shared, Shared) {
         let ctx = egui::Context::default();
         let mut e = Engine::new();
-        e.doc = Document::new_depth(64, 64, depth).unwrap();
+        e.resident_state_mut().expect("resident fixture").document = Document::new_depth(64, 64, depth).unwrap();
         let root = Arc::new(Mutex::new(e));
         crate::workspace::attach(&root);
         let second = crate::workspace::new_project(&root, 64, 64, depth, None).unwrap();
@@ -53,7 +53,7 @@ mod tests {
     }
     fn dirty(shared: &Shared, name: &str) {
         let mut e = shared.lock().unwrap();
-        let layer = e.doc.layers[0].id.clone();
+        let layer = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
         e.edit(
             "human",
             &[json!({"op":"layer.update","layer":layer,"name":name})],
@@ -105,12 +105,11 @@ mod tests {
             let (mut app, ctx, root, second) = fixture(depth);
             for shared in [&root, &second] {
                 let mut engine = shared.lock().unwrap();
+                let pixels = &mut engine.resident_state_mut().unwrap().document.layers[0].pixels;
                 if depth == 16 {
-                    engine.doc.layers[0]
-                        .pixels
-                        .set16(0, 0, [1001, 3003, 5007, 0]);
+                    pixels.set16(0, 0, [1001, 3003, 5007, 0]);
                 } else {
-                    engine.doc.layers[0].pixels.set(0, 0, [17, 93, 207, 0]);
+                    pixels.set(0, 0, [17, 93, 207, 0]);
                 }
             }
             dirty(&root, "Keep reviewed first artwork");
@@ -119,10 +118,11 @@ mod tests {
                 .into_iter()
                 .map(|shared| {
                     let engine = shared.lock().unwrap();
+                    let resident = engine.resident_state().unwrap();
                     (
-                        serde_json::to_value(&engine.doc).unwrap(),
-                        engine.undo.len(),
-                        engine.redo.len(),
+                        serde_json::to_value(&resident.document).unwrap(),
+                        resident.undo.len(),
+                        resident.redo.len(),
                     )
                 })
                 .collect();
@@ -179,8 +179,9 @@ mod tests {
             for (shared, (document, undo, redo)) in [&root, &second].into_iter().zip(before) {
                 let engine = shared.lock().unwrap();
                 assert!(!engine.closed);
-                assert_eq!(serde_json::to_value(&engine.doc).unwrap(), document);
-                assert_eq!((engine.undo.len(), engine.redo.len()), (undo, redo));
+                let resident = engine.resident_state().unwrap();
+                assert_eq!(serde_json::to_value(&resident.document).unwrap(), document);
+                assert_eq!((resident.undo.len(), resident.redo.len()), (undo, redo));
             }
         }
     }
@@ -200,8 +201,8 @@ mod tests {
                 .unwrap()
                 .source
                 .clone();
-            let before = serde_json::to_value(&root.lock().unwrap().doc).unwrap();
-            let other = serde_json::to_value(&second.lock().unwrap().doc).unwrap();
+            let before = serde_json::to_value(&root.lock().unwrap().resident_state().expect("resident fixture").document).unwrap();
+            let other = serde_json::to_value(&second.lock().unwrap().resident_state().expect("resident fixture").document).unwrap();
             let control = crate::saving::Control::default();
             control
                 .begin(source.document.clone(), source.revision)
@@ -272,13 +273,13 @@ mod tests {
                 .contains("canceled"));
             let e = root.lock().unwrap();
             assert!(!e.closed);
-            assert_ne!(e.doc.revision, e.saved_revision);
-            assert_eq!(e.undo.len(), 1);
-            assert_eq!(serde_json::to_value(&e.doc).unwrap(), before);
+            assert_ne!(e.resident_state().expect("resident fixture").document.revision, e.saved_revision);
+            assert_eq!(e.resident_state().expect("resident fixture").undo.len(), 1);
+            assert_eq!(serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap(), before);
             drop(e);
             assert!(!second.lock().unwrap().closed);
             assert_eq!(
-                serde_json::to_value(&second.lock().unwrap().doc).unwrap(),
+                serde_json::to_value(&second.lock().unwrap().resident_state().expect("resident fixture").document).unwrap(),
                 other
             );
             click(&mut app, &ctx, 2);
@@ -291,9 +292,9 @@ mod tests {
             let (mut app, ctx, root, second) = fixture(depth);
             let path = app.connection.state_dir.join("conflicting.psd");
             server::save(&root, &path).unwrap();
-            let before = root.lock().unwrap().doc.export_png().unwrap();
+            let before = root.lock().unwrap().resident_state().expect("resident fixture").document.export_png().unwrap();
             // Simulate another editor replacing the source: duplicate PeerBrush opens are blocked.
-            let mut newer = root.lock().unwrap().doc.clone();
+            let mut newer = root.lock().unwrap().resident_state().expect("resident fixture").document.clone();
             newer.layers[0].name = "Newer saved source".into();
             server::atomic_write(&path, &crate::psd::encode(&newer).unwrap()).unwrap();
             let saved = std::fs::read(&path).unwrap();
@@ -325,7 +326,7 @@ mod tests {
                 .contains("changed"));
             assert!(!root.lock().unwrap().closed);
             assert_eq!(std::fs::read(&path).unwrap(), saved);
-            assert_eq!(root.lock().unwrap().doc.export_png().unwrap(), before);
+            assert_eq!(root.lock().unwrap().resident_state().expect("resident fixture").document.export_png().unwrap(), before);
             click(&mut app, &ctx, 1);
             frame(&mut app, &ctx, vec![]);
             assert!(root.lock().unwrap().closed);
@@ -342,8 +343,8 @@ mod tests {
             dirty(&second, "Second unsaved");
             frame(&mut app, &ctx, vec![]);
             let before = [
-                root.lock().unwrap().doc.export_png().unwrap(),
-                second.lock().unwrap().doc.export_png().unwrap(),
+                root.lock().unwrap().resident_state().expect("resident fixture").document.export_png().unwrap(),
+                second.lock().unwrap().resident_state().expect("resident fixture").document.export_png().unwrap(),
             ];
             app.request_close(Intent::Exit);
             click(&mut app, &ctx, 1);
@@ -354,9 +355,9 @@ mod tests {
             for (shared, bytes) in [&root, &second].into_iter().zip(before) {
                 let e = shared.lock().unwrap();
                 assert!(!e.closed);
-                assert_eq!(e.doc.bit_depth, depth);
-                assert_eq!(e.doc.export_png().unwrap(), bytes);
-                assert_eq!(e.undo.len(), 1);
+                assert_eq!(e.resident_state().expect("resident fixture").document.bit_depth, depth);
+                assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), bytes);
+                assert_eq!(e.resident_state().expect("resident fixture").undo.len(), 1);
                 assert_eq!(e.saved_revision, 0);
             }
         }
@@ -366,7 +367,7 @@ mod tests {
         let (mut app, ctx, root, _) = fixture(16);
         dirty(&root, "Keep artwork");
         frame(&mut app, &ctx, vec![]);
-        let before = root.lock().unwrap().doc.clone();
+        let before = root.lock().unwrap().resident_state().expect("resident fixture").document.clone();
         app.request_close(Intent::Close(app.project_id.clone()));
         frame(&mut app, &ctx, vec![]);
         let commands = egui::Modifiers {
@@ -404,11 +405,11 @@ mod tests {
             );
         }
         assert_eq!(
-            root.lock().unwrap().doc.export_png().unwrap(),
+            root.lock().unwrap().resident_state().expect("resident fixture").document.export_png().unwrap(),
             before.export_png().unwrap()
         );
-        assert_eq!(root.lock().unwrap().doc.layers.len(), before.layers.len());
-        assert_eq!(root.lock().unwrap().undo.len(), 1);
+        assert_eq!(root.lock().unwrap().resident_state().expect("resident fixture").document.layers.len(), before.layers.len());
+        assert_eq!(root.lock().unwrap().resident_state().expect("resident fixture").undo.len(), 1);
         frame(
             &mut app,
             &ctx,
@@ -478,7 +479,7 @@ mod tests {
     #[test]
     fn successful_async_save_closes_its_original_tab_and_preserves_other_native_work() {
         let (mut app, ctx, root, second) = fixture(16);
-        root.lock().unwrap().doc.layers[0]
+        root.lock().unwrap().resident_state_mut().expect("resident fixture").document.layers[0]
             .pixels
             .set16(2, 3, [10001, 30003, 50007, 65535]);
         dirty(&root, "Save this source");
@@ -497,8 +498,8 @@ mod tests {
         assert!(app.lifecycle.is_none());
         assert!(root.lock().unwrap().closed);
         assert!(!second.lock().unwrap().closed);
-        assert_eq!(second.lock().unwrap().doc.layers[0].name, "Keep other work");
-        assert_eq!(second.lock().unwrap().undo.len(), 1);
+        assert_eq!(second.lock().unwrap().resident_state().expect("resident fixture").document.layers[0].name, "Keep other work");
+        assert_eq!(second.lock().unwrap().resident_state().expect("resident fixture").undo.len(), 1);
         assert_eq!(app.project_id, other);
         let saved = crate::psd::decode(&std::fs::read(path).unwrap()).unwrap();
         assert_eq!(saved.bit_depth, 16);
@@ -512,7 +513,7 @@ mod tests {
         let (mut app, ctx, root, _) = fixture(16);
         dirty(&root, "Keep work");
         frame(&mut app, &ctx, vec![]);
-        let doc = root.lock().unwrap().doc.clone();
+        let doc = root.lock().unwrap().resident_state().expect("resident fixture").document.clone();
         app.open_source(&doc, "rectangle");
         app.request_close(Intent::Close(app.project_id.clone()));
         assert!(app.lifecycle.is_none());
@@ -528,7 +529,7 @@ mod tests {
         assert!(app.lifecycle.as_ref().unwrap().error.is_some());
         assert!(!root.lock().unwrap().closed);
         assert_eq!(root.lock().unwrap().saved_revision, 0);
-        assert_eq!(root.lock().unwrap().undo.len(), 1);
+        assert_eq!(root.lock().unwrap().resident_state().expect("resident fixture").undo.len(), 1);
         click(&mut app, &ctx, 2);
     }
     #[test]
@@ -537,7 +538,7 @@ mod tests {
         dirty(&root, "Requested close");
         let source = {
             let e = root.lock().unwrap();
-            (e.project_id.clone(), e.doc.id.clone(), e.doc.revision)
+            (e.project_id.clone(), e.resident_state().expect("resident fixture").document.id.clone(), e.resident_state().expect("resident fixture").document.revision)
         };
         crate::workspace::lifecycle::request_close(&root, &source.0, &source.1, source.2, "human")
             .unwrap();
@@ -563,7 +564,7 @@ mod tests {
         frame(&mut app, &ctx, vec![]);
         assert!(app.lifecycle.is_none());
         assert!(!root.lock().unwrap().closed);
-        assert_eq!(root.lock().unwrap().doc.layers[0].name, "New human work");
+        assert_eq!(root.lock().unwrap().resident_state().expect("resident fixture").document.layers[0].name, "New human work");
         assert_eq!(app.project_id, other);
     }
     #[test]
@@ -630,8 +631,8 @@ mod tests {
             dirty(&root, "First native Quit edit");
             dirty(&second, "Second native Quit edit");
             let before = [
-                root.lock().unwrap().doc.clone(),
-                second.lock().unwrap().doc.clone(),
+                root.lock().unwrap().resident_state().expect("resident fixture").document.clone(),
+                second.lock().unwrap().resident_state().expect("resident fixture").document.clone(),
             ];
             let quit = crate::activation::quit_signal(&app.workspace);
             quit.store(true, Ordering::Release);
@@ -646,10 +647,10 @@ mod tests {
                 let engine = shared.lock().unwrap();
                 assert!(!engine.closed);
                 assert_eq!(
-                    serde_json::to_value(&engine.doc).unwrap(),
+                    serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap(),
                     serde_json::to_value(expected).unwrap()
                 );
-                assert_eq!(engine.undo.len(), 1);
+                assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), 1);
             }
             server::save(&root, &app.connection.state_dir.join("first.psd")).unwrap();
             server::save(&second, &app.connection.state_dir.join("second.psb")).unwrap();
@@ -667,11 +668,11 @@ mod tests {
             assert!(app.lifecycle.as_ref().unwrap().error.is_some());
             operations.fetch_sub(1, Ordering::AcqRel);
             dirty(&root, "Late human edit must survive");
-            let late = root.lock().unwrap().doc.clone();
+            let late = root.lock().unwrap().resident_state().expect("resident fixture").document.clone();
             frame(&mut app, &ctx, vec![]);
             click(&mut app, &ctx, 2);
             assert_eq!(
-                serde_json::to_value(&root.lock().unwrap().doc).unwrap(),
+                serde_json::to_value(&root.lock().unwrap().resident_state().expect("resident fixture").document).unwrap(),
                 serde_json::to_value(&late).unwrap()
             );
             assert!(!app.exit_approved);
@@ -694,12 +695,16 @@ mod tests {
         for depth in [8, 16] {
             for draft in ["color", "preferences", "export", "proposal", "live gesture"] {
                 let (mut app, ctx, root, second) = fixture(depth);
-                let before = root.lock().unwrap().doc.clone();
+                let before = root.lock().unwrap().resident_state().expect("resident fixture").document.clone();
                 match draft {
                     "color" => {
-                        app.open_color(super::super::color::Target::Foreground, [17, 41, 73, 255])
+                        app.open_color(super::super::color::Target::Foreground)
                     }
-                    "preferences" => app.project_settings = Some((96, 80, depth)),
+                    "preferences" => {
+                        let mut draft = new_canvas::ProjectDimensions::new((&before).into());
+                        draft.values = (96, 80, depth);
+                        app.project_settings = Some(draft);
+                    }
                     "export" => app.open_exports(&before),
                     "proposal" => {
                         let proposal = crate::collaboration::propose(&root, "synthetic-review", &json!({"document_id":before.id,"expected_revision":before.revision,"commands":[{"op":"layer.update","layer":before.layers[0].id,"name":"Proposed change"}]})).unwrap();
@@ -713,12 +718,12 @@ mod tests {
                 assert!(app.lifecycle.is_none() && !app.exit_approved, "{draft}");
                 assert!(!root.lock().unwrap().closed && !second.lock().unwrap().closed);
                 assert_eq!(
-                    serde_json::to_value(&root.lock().unwrap().doc).unwrap(),
+                    serde_json::to_value(&root.lock().unwrap().resident_state().expect("resident fixture").document).unwrap(),
                     serde_json::to_value(&before).unwrap()
                 );
                 assert!(match draft {
                     "color" => app.color_editor.is_some(),
-                    "preferences" => app.project_settings == Some((96, 80, depth)),
+                    "preferences" => app.project_settings.as_ref().is_some_and(|draft| draft.values == (96, 80, depth)),
                     "export" => app.export_editor.is_some(),
                     "proposal" => app.proposal_review.is_some(),
                     "live gesture" => app.live_gesture.is_some(),
@@ -862,7 +867,7 @@ impl PeerBrush {
                 || self.project_settings.is_some()
                 || self.export_editor.is_some()
                 || !self.points.is_empty()
-                || !self.selection_path.is_empty()
+                || self.selection_path_pending()
                 || self.layer_drag.is_some()
                 || self.eye_sweep.is_some()
                 || self.tab_transfer.is_some()

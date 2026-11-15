@@ -7,14 +7,6 @@ pub(super) enum Mode {
     Restore,
 }
 impl Mode {
-    pub(super) fn name(self) -> &'static str {
-        match self {
-            Self::Push => "Push",
-            Self::Expand => "Expand",
-            Self::Pinch => "Pinch",
-            Self::Restore => "Restore",
-        }
-    }
     pub(super) fn key(self) -> &'static str {
         match self {
             Self::Push => "push",
@@ -44,14 +36,19 @@ pub(super) fn toolbar(
     display_strength: f32,
     ai: bool,
 ) {
-    egui::ComboBox::from_id_salt("liquify mode")
-        .selected_text(settings.mode.name())
-        .width(76.)
-        .show_ui(ui, |ui| {
-            for mode in [Mode::Push, Mode::Expand, Mode::Pinch, Mode::Restore] {
-                ui.selectable_value(&mut settings.mode, mode, mode.name());
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 2.;
+        for (mode, icon, label) in [
+            (Mode::Push, Icon::LiquifyPush, "Push pixels with the stroke"),
+            (Mode::Expand, Icon::LiquifyExpand, "Expand pixels away from the brush center"),
+            (Mode::Pinch, Icon::LiquifyPinch, "Pinch pixels toward the brush center"),
+            (Mode::Restore, Icon::Undo, "Restore the original shape in the brush area"),
+        ] {
+            if icons::selectable(ui, icon, settings.mode == mode, label).clicked() {
+                settings.mode = mode;
             }
-        });
+        }
+    });
     controls::label(ui, "Size");
     let mut diameter = *radius * 2.;
     if tool_settings::number(
@@ -89,8 +86,8 @@ pub(super) fn toolbar(
         settings.strength = percent / 100.;
     }
 }
-pub(super) fn command(layer: &str, points: &[[f32; 2]], radius: f32, settings: &Settings) -> Value {
-    json!({"op":"liquify.stroke","layer":layer,"mode":settings.mode.key(),"points":points,"radius":radius,"strength":settings.strength})
+pub(super) fn command_fields(layer: &str, radius: f32, settings: &Settings) -> Value {
+    json!({"op":"liquify.stroke","layer":layer,"mode":settings.mode.key(),"radius":radius,"strength":settings.strength})
 }
 pub(super) fn cursor(painter: &egui::Painter, center: Pos2, radius: f32, scale: f32) {
     painter.circle_stroke(

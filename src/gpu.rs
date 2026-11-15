@@ -865,10 +865,15 @@ impl Plan {
         if radii.iter().any(|r| *r > 64) {
             return Err("GPU blur radius exceeds the shader halo".into());
         }
-        let table = (0..256)
-            .map(|i| {
-                (effects::map_value(kind, &settings, i as f32 / 255.0) * 255.0).round() as u8 as u32
-            })
+        let per_channel = effects::has_channel_mapping(kind, &settings);
+        let natural = effects::curves::Prepared::new(kind, &settings);
+        if per_channel { params.dims[2] = 5; }
+        let table = (0..if per_channel { 768 } else { 256 })
+            .map(|i| u32::from(if let Some(natural) = &natural {
+                natural.sample8(i / 256, (i % 256) as u8)
+            } else if per_channel {
+                effects::map_channel_sample(kind, &settings, i / 256, (i % 256) as u8)
+            } else { effects::map_sample(kind, &settings, i as u8) }))
             .collect();
         Ok(Some(Self {
             params,
@@ -989,13 +994,13 @@ mod tests {
         // and an egui frame complete before the release signal is sent.
         for depth in [8, 16] {
             let mut engine = crate::engine::Engine::new();
-            engine.doc = crate::engine::Document::new_depth(32, 24, depth).unwrap();
-            engine.doc.layers[0]
+            engine.resident_state_mut().expect("resident fixture").document = crate::engine::Document::new_depth(32, 24, depth).unwrap();
+            engine.resident_state_mut().expect("resident fixture").document.layers[0]
                 .pixels
                 .set16(7, 9, [60001, 12347, 35569, 45679]);
-            let before = serde_json::to_value(&engine.doc).unwrap();
-            let words = engine.doc.layers[0].pixels.rgba16();
-            let preview = engine.doc.preview(None, 32, None, false).unwrap();
+            let before = serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap();
+            let words = engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16();
+            let preview = engine.resident_state().expect("resident fixture").document.preview(None, 32, None, false).unwrap();
             let output = ctx.run(eframe::egui::RawInput::default(), |ctx| {
                 eframe::egui::CentralPanel::default().show(ctx, |ui| {
                     ui.label("PeerBrush");
@@ -1003,12 +1008,12 @@ mod tests {
             });
             assert!(!output.shapes.is_empty());
             assert_eq!(
-                engine.doc.preview(None, 32, None, false).unwrap().2,
+                engine.resident_state().expect("resident fixture").document.preview(None, 32, None, false).unwrap().2,
                 preview.2
             );
-            assert_eq!(engine.doc.layers[0].pixels.rgba16(), words);
-            assert_eq!(serde_json::to_value(&engine.doc).unwrap(), before);
-            assert!(engine.undo.is_empty() && engine.redo.is_empty());
+            assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(), words);
+            assert_eq!(serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap(), before);
+            assert!(engine.resident_state().expect("resident fixture").undo.is_empty() && engine.resident_state().expect("resident fixture").redo.is_empty());
         }
         for _ in 0..4 {
             let _ = ctx.run(Default::default(), |_| {});
@@ -1126,6 +1131,53 @@ mod tests {
         assert_eq!(plan.radii, effects::gaussian_radii(64.0).map(|r| r as u32));
         assert!(plan.radii.iter().all(|r| *r <= 64));
         assert_eq!(plan.params.bytes().len() as u64, PARAM_BYTES);
+    }
+    #[test]
+    fn levels_channel_lookup_uses_independent_shader_offsets() {
+        let settings = json!({"input_mapping":"exact","channels":[
+            {"output_black":1.,"output_white":0.}, {"output_black":0.2,"output_white":0.2},
+            {"black":17./255.,"white":18./255.,"gamma":9.99}]});
+        let mut image = Image { width:256, height:1, bytes:(0..=255u8).flat_map(|v| [v,v,v,123]).collect() };
+        let plan = Plan::new(&image,"levels",&settings,&wgpu::Limits::default()).unwrap().unwrap();
+        assert_eq!(plan.params.dims[2],5);
+        assert_eq!(plan.table.len(),768);
+        effects::apply(&mut image,"levels",&settings).unwrap();
+        for (i, pixel) in image.bytes.chunks_exact(4).enumerate() {
+            let blue = if i <= 17 { 0 } else { 255 };
+            assert_eq!(pixel,&[255-i as u8,51,blue,123]);
+            assert_eq!([plan.table[i],plan.table[256+i],plan.table[512+i]], [255-i as u32,51,u32::from(blue)]);
+        }
+    }
+    #[test]
+    #[ignore = "requires native compute adapter"]
+    fn levels_rgb_shader_matches_cpu_and_preserves_hidden_samples() {
+        let backend = headless().unwrap();
+        let settings = json!({"input_mapping":"exact","output_black":0.125,"output_white":0.625,
+            "channels":[{"output_black":1.,"output_white":0.},{"gamma":1.25},{"black":17./255.,"white":18./255.,"gamma":9.99}]});
+        let mut gpu = Image { width:256,height:2,bytes:(0..512).flat_map(|i| {
+            let v = (i%256) as u8;
+            [v,255-v,v,if i < 256 { 123 } else { 0 }]
+        }).collect() };
+        let mut cpu = Image { width:gpu.width,height:gpu.height,bytes:gpu.bytes.clone() };
+        effects::apply(&mut cpu,"levels",&settings).unwrap();
+        assert!(backend.apply(&mut gpu,"levels",&settings).unwrap());
+        assert_eq!(gpu.bytes,cpu.bytes);
+    }
+    #[test]
+    fn exact_levels_lookup_keeps_encoded_input_boundaries_without_float_projection() {
+        let source = Image { width: 256, height: 1,
+            bytes: (0..=255u8).flat_map(|v| [v,v,v,123]).collect() };
+        for gamma in [0.1, 1., 9.99] {
+            let settings = json!({"input_mapping":"exact","black":17./255.,"white":18./255.,"gamma":gamma});
+            let plan = Plan::new(&source, "levels", &settings, &wgpu::Limits::default()).unwrap().unwrap();
+            assert_eq!(&plan.table[..18], &[0; 18]);
+            assert!(plan.table[18..].iter().all(|value| *value == 255));
+            let mut cpu = Image { width: source.width, height: source.height, bytes: source.bytes.clone() };
+            effects::apply(&mut cpu, "levels", &settings).unwrap();
+            for (pixel, expected) in cpu.bytes.chunks_exact(4).zip(&plan.table) {
+                assert_eq!(pixel, &[*expected as u8,*expected as u8,*expected as u8,123]);
+            }
+        }
     }
     #[test]
     #[ignore = "requires native compute adapter"]

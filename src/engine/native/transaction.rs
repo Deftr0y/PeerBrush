@@ -90,7 +90,7 @@ impl CapturedEdit {
             .revision()
             .checked_add(1)
             .ok_or("Native revision overflow")?;
-        let candidate = restamp(&self.base, revision, &checked)?;
+        let candidate = super::wand::restamp(&self.base, revision, None, &checked)?;
         checked()?;
         Ok(PreparedDelta {
             base: self.base.key(),
@@ -790,14 +790,5 @@ pub(super) fn restamp(
     revision: u64,
     check: &dyn Fn() -> Result<()>,
 ) -> Result<NativeDocument> {
-    let metadata = copy_metadata(&source.core.metadata, source.budget(), check)?;
-    let roster = source.core.roster.clone();
-    let resident = source.budget().clone();
-    let disk = source.disk_budget().clone();
-    let core = metadata.rehome_unique(|mut metadata, _| {
-        check()?;
-        metadata.revision = revision;
-        Core::prepare(metadata, roster, resident, disk, check)
-    })?;
-    Ok(NativeDocument { core })
+    super::wand::restamp(source, revision, source.core.wand.clone(), check)
 }

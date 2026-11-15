@@ -35,16 +35,17 @@ fn native_preview_selection_and_streamed_png_match_actual_legacy_pixels() {
                 for mode in ["mask", "overlay", "cutout"] {
                     let (w, h, mut expected, area) = doc.preview(rect, edge, None, false).unwrap();
                     crate::selection::display::apply_region(&doc, w, h, &mut expected, area, mode);
-                    let frame = crate::render::native_preview::test_frame(
+                    let frame = crate::render::native_preview::test_frame_selection(
                         &scene,
                         rect,
                         edge,
                         None,
                         false,
+                        Some(mode),
                         &mut || Ok(()),
                     )
                     .unwrap();
-                    let pixels = Pixels::frame(frame, &native, Some(mode), &|| Ok(())).unwrap();
+                    let pixels = Pixels::new(frame);
                     let (png, tag) = pixels.encode(&pool, &mut || Ok(())).unwrap();
                     assert_eq!(
                         (tag.key().width, tag.key().height, tag.key().rect),
@@ -85,12 +86,15 @@ fn selection_and_png_cancel_or_admission_errors_keep_exact_source_and_owner_base
             .unwrap();
     drop(frame);
     let baseline = pool.used();
-    let frame =
-        crate::render::native_preview::test_frame(&scene, None, 48, None, false, &mut || Ok(()))
-            .unwrap();
-    let failure = Pixels::frame(frame, &native, Some("mask"), &|| {
-        Err("selection source lease ended".into())
-    })
+    let failure = crate::render::native_preview::test_frame_selection(
+        &scene,
+        None,
+        48,
+        None,
+        false,
+        Some("mask"),
+        &mut || Err("selection source lease ended".into()),
+    )
     .err()
     .unwrap();
     assert_eq!(failure, "selection source lease ended");
@@ -98,7 +102,7 @@ fn selection_and_png_cancel_or_admission_errors_keep_exact_source_and_owner_base
     let frame =
         crate::render::native_preview::test_frame(&scene, None, 48, None, false, &mut || Ok(()))
             .unwrap();
-    let pixels = Pixels::frame(frame, &native, None, &|| Ok(())).unwrap();
+    let pixels = Pixels::new(frame);
     assert!(pixels
         .encode(&pool, &mut || Err("PNG response canceled".into()))
         .is_err());

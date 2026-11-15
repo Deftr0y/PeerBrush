@@ -1,6 +1,10 @@
 //! Native access-rule preservation; no token privileges or SACL authority.
 use crate::large_document::ResidentBudget;
 use std::fs::File;
+pub(in crate::file_safety) enum Destination {
+    Backup,
+    Current,
+}
 pub(in crate::file_safety) fn supported(file: &File) -> Result<(), String> {
     #[cfg(windows)]
     {
@@ -21,6 +25,7 @@ pub(in crate::file_safety) fn supported(file: &File) -> Result<(), String> {
 pub(in crate::file_safety) fn preserve(
     source: &File,
     destination: &File,
+    purpose: Destination,
     budget: &ResidentBudget,
     check: &dyn Fn() -> Result<(), String>,
 ) -> Result<(), String> {
@@ -62,7 +67,55 @@ pub(in crate::file_safety) fn preserve(
         }
     }
     #[cfg(windows)]
-    windows::preserve(source, destination, budget)?;
+    windows::preserve(
+        source,
+        destination,
+        budget,
+        matches!(purpose, Destination::Backup),
+    )?;
+    #[cfg(not(windows))]
+    let _ = purpose;
+    check()
+}
+pub(in crate::file_safety) fn validate_current(
+    source: &File,
+    destination: &File,
+    budget: &ResidentBudget,
+    check: &dyn Fn() -> Result<(), String>,
+) -> Result<(), String> {
+    check()?;
+    supported(source)?;
+    supported(destination)?;
+    let _admission = budget
+        .reserve_bytes(256 * 1024, 256 * 1024)
+        .map_err(|e| e.to_string())?;
+    #[cfg(windows)]
+    windows::validate_current(source, destination)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let original = source
+            .metadata()
+            .map_err(|_| "Native source access rules unavailable")?;
+        let current = destination
+            .metadata()
+            .map_err(|_| "Native candidate access rules unavailable")?;
+        if (original.uid(), original.gid(), original.mode())
+            != (current.uid(), current.gid(), current.mode())
+        {
+            return Err(
+                "Native current-file ownership or permissions changed; original retained".into(),
+            );
+        }
+        #[cfg(target_os = "linux")]
+        if linux_acl(source)? != linux_acl(destination)? {
+            return Err("Native current-file ACL changed; original retained".into());
+        }
+        #[cfg(target_os = "macos")]
+        if macos_acl(source)? != macos_acl(destination)? {
+            return Err("Native current-file ACL changed; original retained".into());
+        }
+    }
     check()
 }
 #[cfg(target_os = "linux")]
@@ -298,11 +351,8 @@ mod windows {
             };
             // ACL reserved bytes and unused allocation capacity are not access
             // rules. Compare revision, ACE count, and every exact active ACE.
-            if left[0] != right[0] {
-                return Err("Native DACL revision changed".into());
-            }
-            if left[4..6] != right[4..6] {
-                return Err("Native DACL active ACE count changed".into());
+            if left[0] != right[0] || left[4..6] != right[4..6] {
+                return Ok(false);
             }
             let count = u16::from_le_bytes([left[4], left[5]]) as u32;
             for index in 0..count {
@@ -454,10 +504,36 @@ mod windows {
             assert!(!active_ace_equal(&[], &[], true));
         }
     }
+    pub(super) fn validate_current(source: &File, destination: &File) -> Result<(), String> {
+        if !Rules::read(source)?.equal(&Rules::read(destination)?)? {
+            return Err("Native current-file access descriptor differs from the original".into());
+        }
+        Ok(())
+    }
+    #[cfg(test)]
+    pub(super) fn set_protection(file: &File, protected: bool) -> Result<(), String> {
+        let rules = Rules::read(file)?;
+        if unsafe {
+            SetSecurityInfo(
+                file.as_raw_handle(),
+                1,
+                4 | if protected { 0x80000000 } else { 0x20000000 },
+                ptr::null_mut(),
+                ptr::null_mut(),
+                rules.dacl,
+                ptr::null_mut(),
+            )
+        } != 0
+        {
+            return Err("Cannot prepare native access-rule fixture".into());
+        }
+        Ok(())
+    }
     pub(super) fn preserve(
         source: &File,
         destination: &File,
         budget: &ResidentBudget,
+        freeze_inheritance: bool,
     ) -> Result<(), String> {
         // Three bounded descriptors may coexist. ACL length is native u16 and
         // owner/group SIDs are each at most68bytes; all release before this ticket.
@@ -472,22 +548,26 @@ mod windows {
                     .into(),
             );
         }
+        // A same-directory staging file can already have the exact descriptor.
+        // Reapplying an inherited DACL can change its inheritance control bits.
+        let already_current = !freeze_inheritance && before.equal(&current)?;
         drop(current);
-        // Backups reside in a separate directory. Freeze the original DACL
-        // against new inheritance there, matching the established backup rule.
-        // This is ordinary access preservation, not full descriptor copying.
-        let protection = 0x80000000;
-        if unsafe {
-            SetSecurityInfo(
-                destination.as_raw_handle(),
-                1,
-                4 | protection,
-                ptr::null_mut(),
-                ptr::null_mut(),
-                before.dacl,
-                ptr::null_mut(),
-            )
-        } != 0
+        // Only backups move to another directory and freeze inheritance there.
+        // The current file must retain the original inheritance policy.
+        let protected = freeze_inheritance || before.protected;
+        let protection = if protected { 0x80000000 } else { 0x20000000 };
+        if !already_current
+            && unsafe {
+                SetSecurityInfo(
+                    destination.as_raw_handle(),
+                    1,
+                    4 | protection,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    before.dacl,
+                    ptr::null_mut(),
+                )
+            } != 0
         {
             return Err("Cannot preserve native held access rules; original retained".into());
         }
@@ -499,11 +579,14 @@ mod windows {
         if !before.owners_equal(&saved)? {
             return Err("Native destination owner/group readback differs".into());
         }
-        if !saved.protected {
-            return Err("Native backup DACL protection readback differs".into());
+        if saved.protected != protected {
+            return Err("Native DACL inheritance protection readback differs".into());
         }
-        if !before.acl_equal(&saved, true)? {
+        if !before.acl_equal(&saved, freeze_inheritance)? {
             return Err("Native destination DACL readback differs".into());
+        }
+        if !freeze_inheritance && !before.equal(&saved)? {
+            return Err("Native current-file access descriptor readback differs".into());
         }
         Ok(())
     }
@@ -555,22 +638,27 @@ mod tests {
     }
     #[test]
     fn held_ordinary_access_rules_round_trip_before_payload_without_privilege_changes() {
-        let fixture = Fixture::new();
-        let path = fixture.root.join("source");
-        fs::write(&path, b"original stays").unwrap();
-        let source = File::open(&path).unwrap();
-        let mut output = fixture.output();
-        let pool = ResidentBudget::new(1024 * 1024).unwrap();
-        supported(&source).unwrap();
-        preserve(&source, &output, &pool, &|| Ok(())).unwrap();
-        assert_eq!(pool.used(), 0);
-        assert_eq!(output.metadata().unwrap().len(), 0);
-        output.write_all(b"private copied payload").unwrap();
-        output.sync_all().unwrap();
-        assert_eq!(fs::read(path).unwrap(), b"original stays");
-        drop(output);
-        drop(source);
-        fixture.finish();
+        for (purpose, current) in [(Destination::Backup, false), (Destination::Current, true)] {
+            let fixture = Fixture::new();
+            let path = fixture.root.join("source");
+            fs::write(&path, b"original stays").unwrap();
+            let source = File::open(&path).unwrap();
+            let mut output = fixture.output();
+            let pool = ResidentBudget::new(1024 * 1024).unwrap();
+            supported(&source).unwrap();
+            preserve(&source, &output, purpose, &pool, &|| Ok(())).unwrap();
+            if current {
+                validate_current(&source, &output, &pool, &|| Ok(())).unwrap();
+            }
+            assert_eq!(pool.used(), 0);
+            assert_eq!(output.metadata().unwrap().len(), 0);
+            output.write_all(b"private copied payload").unwrap();
+            output.sync_all().unwrap();
+            assert_eq!(fs::read(path).unwrap(), b"original stays");
+            drop(output);
+            drop(source);
+            fixture.finish();
+        }
     }
     #[test]
     fn cancelled_or_unadmitted_access_copy_keeps_destination_empty() {
@@ -581,23 +669,50 @@ mod tests {
         let output = fixture.output();
         let pool = ResidentBudget::new(1024 * 1024).unwrap();
         assert_eq!(
-            preserve(&source, &output, &pool, &|| Err(
+            preserve(&source, &output, Destination::Backup, &pool, &|| Err(
                 "exact access cancel".into()
             ))
             .unwrap_err(),
             "exact access cancel"
         );
-        assert!(
-            preserve(&source, &output, &ResidentBudget::new(1).unwrap(), &|| Ok(
-                ()
-            ))
-            .is_err()
-        );
+        assert!(preserve(
+            &source,
+            &output,
+            Destination::Backup,
+            &ResidentBudget::new(1).unwrap(),
+            &|| Ok(())
+        )
+        .is_err());
         assert_eq!(output.metadata().unwrap().len(), 0);
         assert_eq!(pool.used(), 0);
         assert_eq!(fs::read(path).unwrap(), b"original stays");
         drop(output);
         drop(source);
         fixture.finish();
+    }
+    #[cfg(windows)]
+    #[test]
+    fn current_file_retains_protected_and_inherited_dacl_policy() {
+        use std::os::windows::fs::OpenOptionsExt;
+        for protected in [false, true] {
+            let fixture = Fixture::new();
+            fs::write(fixture.root.join("source"), b"original stays").unwrap();
+            let source = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .access_mode(0xC0060000)
+                .open(fixture.root.join("source"))
+                .unwrap();
+            windows::set_protection(&source, protected).unwrap();
+            let output = fixture.output();
+            let pool = ResidentBudget::new(1024 * 1024).unwrap();
+            preserve(&source, &output, Destination::Current, &pool, &|| Ok(())).unwrap();
+            validate_current(&source, &output, &pool, &|| Ok(())).unwrap();
+            assert_eq!(output.metadata().unwrap().len(), 0);
+            assert_eq!(pool.used(), 0);
+            drop(output);
+            drop(source);
+            fixture.finish();
+        }
     }
 }

@@ -376,9 +376,9 @@ fn psd_psb_pattern_sources_are_view_only_with_exact_current_native_composites() 
                     .get("source_patterns")
                     .is_none());
                 let mut e = Engine::new();
-                e.doc = restored;
-                let before = e.doc.export_png().unwrap();
-                let id = e.doc.layers[0].id.clone();
+                e.resident_state_mut().expect("resident fixture").document = restored;
+                let before = e.resident_state().expect("resident fixture").document.export_png().unwrap();
+                let id = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
                 assert!(e
                     .edit(
                         "human",
@@ -388,8 +388,8 @@ fn psd_psb_pattern_sources_are_view_only_with_exact_current_native_composites() 
                         "Protected"
                     )
                     .is_err());
-                assert!(e.undo.is_empty());
-                assert_eq!(e.doc.export_png().unwrap(), before);
+                assert!(e.resident_state().expect("resident fixture").undo.is_empty());
+                assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), before);
             }
         }
     }
@@ -400,11 +400,11 @@ fn shared_pattern_inspection_returns_actual_native_pngs_with_source_guards_and_a
         for compression in [1, 2, 3] {
             let mut e = Engine::new();
             let (bytes, words) = fixture_alpha(depth, compression, "synthetic-pattern", true);
-            e.doc.source_patterns = patterns::decode(&bytes, "Patt", &Control::default()).unwrap();
-            e.doc.read_only = true;
-            let before = serde_json::to_value(&e.doc).unwrap();
-            let id = e.doc.id.clone();
-            let revision = e.doc.revision;
+            e.resident_state_mut().expect("resident fixture").document.source_patterns = patterns::decode(&bytes, "Patt", &Control::default()).unwrap();
+            e.resident_state_mut().expect("resident fixture").document.read_only = true;
+            let before = serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap();
+            let id = e.resident_state().expect("resident fixture").document.id.clone();
+            let revision = e.resident_state().expect("resident fixture").document.revision;
             let shared = Arc::new(Mutex::new(e));
             let request = json!({"action":"pattern_sources","document_id":id,"expected_revision":revision,"pattern_index":0});
             let result = server::dispatch(&shared, "document", &request).unwrap();
@@ -418,10 +418,10 @@ fn shared_pattern_inspection_returns_actual_native_pngs_with_source_guards_and_a
             let decoded = image::load_from_memory(&png).unwrap();
             assert_eq!(decoded.into_rgba16().into_raw(), words);
             assert_eq!(
-                serde_json::to_value(&shared.lock().unwrap().doc).unwrap(),
+                serde_json::to_value(&shared.lock().unwrap().resident_state().expect("resident fixture").document).unwrap(),
                 before
             );
-            assert!(shared.lock().unwrap().undo.is_empty());
+            assert!(shared.lock().unwrap().resident_state().expect("resident fixture").undo.is_empty());
             for patch in [
                 json!({"pattern_index":1}),
                 json!({"pattern_index":-1}),

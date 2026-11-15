@@ -11,16 +11,16 @@ use std::sync::{Arc, Mutex};
 
 fn edit(engine: &mut Engine, command: Value) {
     engine
-        .edit("human", &[command], Some(engine.doc.revision), None, "Skew")
+        .edit("human", &[command], Some(engine.resident_state().expect("resident fixture").document.revision), None, "Skew")
         .unwrap();
 }
 fn fixture(depth: u16) -> Engine {
     let mut engine = Engine::new();
-    engine.doc = Document::new_depth(48, 40, depth).unwrap();
-    engine.doc.layers[0].pixels = Raster::new_depth(12, 10, depth);
-    let id = engine.doc.layers[0].id.clone();
+    engine.resident_state_mut().expect("resident fixture").document = Document::new_depth(48, 40, depth).unwrap();
+    engine.resident_state_mut().expect("resident fixture").document.layers[0].pixels = Raster::new_depth(12, 10, depth);
+    let id = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
     edit(&mut engine, json!({"op":"mask.add","layer":id}));
-    let layer = &mut engine.doc.layers[0];
+    let layer = &mut engine.resident_state_mut().expect("resident fixture").document.layers[0];
     for y in 0..10 {
         for x in 0..12 {
             layer.pixels.set16(
@@ -39,12 +39,12 @@ fn fixture(depth: u16) -> Engine {
                 .set16(x, y, [gray, gray, gray, 65535]);
         }
     }
-    engine.undo.clear();
+    engine.resident_state_mut().expect("resident fixture").undo.clear();
     engine
 }
 fn command(engine: &Engine, fields: Value) -> Value {
     let mut command = json!({
-        "op":"transform","layer":engine.doc.layers[0].id,
+        "op":"transform","layer":engine.resident_state().expect("resident fixture").document.layers[0].id,
         "pivot":[0.,0.5],"selection_only":false
     });
     command
@@ -60,7 +60,7 @@ fn state(engine: &Engine) -> Value {
         "task":entry.task,"scopes":entry.scopes,"gesture":entry.gesture,"reverted":entry.reverted
     })).collect::<Vec<_>>()
     };
-    json!({"document":engine.doc,"undo":history(&engine.undo),"redo":history(&engine.redo)})
+    json!({"document":engine.resident_state().expect("resident fixture").document,"undo":history(&engine.resident_state().expect("resident fixture").undo),"redo":history(&engine.resident_state().expect("resident fixture").redo)})
 }
 fn mask_at(layer: &Layer, x: i32, y: i32) -> [u16; 4] {
     layer.mask.as_ref().unwrap().steps[1]
@@ -81,18 +81,18 @@ fn standard_only(bytes: &[u8]) -> Vec<u8> {
 fn native_skew_has_analytic_pixels_masks_hidden_rgb_preview_undo_and_storage_inverse() {
     for depth in [8, 16] {
         let mut engine = fixture(depth);
-        let before = engine.doc.clone();
+        let before = engine.resident_state().expect("resident fixture").document.clone();
         let unchanged = state(&engine);
         let transform = command(&engine, json!({"skew_x":45.}));
         let preview = Engine::preview_edits(before.clone(), &[transform.clone()]).unwrap();
         assert_eq!(state(&engine), unchanged);
         edit(&mut engine, transform);
-        assert_eq!(engine.undo.len(), 1);
+        assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), 1);
         assert_eq!(
-            engine.doc.export_png().unwrap(),
+            engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
             preview.export_png().unwrap()
         );
-        let layer = &engine.doc.layers[0];
+        let layer = &engine.resident_state().expect("resident fixture").document.layers[0];
         assert_eq!(layer.pixels.depth, depth);
         assert_eq!(
             layer.pixels.retained.as_ref().unwrap().pixels.as_ref(),
@@ -107,15 +107,15 @@ fn native_skew_has_analytic_pixels_masks_hidden_rgb_preview_undo_and_storage_inv
                 assert_eq!(mask_at(layer, x + y, y), mask_at(&before.layers[0], x, y));
             }
         }
-        let transformed = engine.doc.clone();
+        let transformed = engine.resident_state().expect("resident fixture").document.clone();
         engine.undo("human").unwrap();
         assert_eq!(
-            engine.doc.export_png().unwrap(),
+            engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
             before.export_png().unwrap()
         );
-        assert_eq!(engine.doc.layers[0].pixels, before.layers[0].pixels);
+        assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].pixels, before.layers[0].pixels);
         engine.redo("human").unwrap();
-        assert_eq!(engine.doc.layers[0].pixels, transformed.layers[0].pixels);
+        assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].pixels, transformed.layers[0].pixels);
         for bytes in [
             psd::encode(&transformed).unwrap(),
             psd::encode_psb(&transformed).unwrap(),
@@ -144,16 +144,16 @@ fn native_skew_has_analytic_pixels_masks_hidden_rgb_preview_undo_and_storage_inv
                 standard.export_png().unwrap(),
                 transformed.export_png().unwrap()
             );
-            engine.doc = reopened;
+            engine.resident_state_mut().expect("resident fixture").document = reopened;
             let inverse = command(&engine, json!({"skew_x":-45.}));
             edit(&mut engine, inverse);
-            assert_eq!((engine.doc.layers[0].x, engine.doc.layers[0].y), (0, 0));
+            assert_eq!((engine.resident_state().expect("resident fixture").document.layers[0].x, engine.resident_state().expect("resident fixture").document.layers[0].y), (0, 0));
             assert_eq!(
-                engine.doc.layers[0].pixels.rgba16(),
+                engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(),
                 before.layers[0].pixels.rgba16()
             );
             assert_eq!(
-                engine.doc.layers[0].mask.as_ref().unwrap().steps[1]
+                engine.resident_state().expect("resident fixture").document.layers[0].mask.as_ref().unwrap().steps[1]
                     .pixels
                     .rgba16(),
                 before.layers[0].mask.as_ref().unwrap().steps[1]
@@ -161,7 +161,7 @@ fn native_skew_has_analytic_pixels_masks_hidden_rgb_preview_undo_and_storage_inv
                     .rgba16()
             );
             assert_eq!(
-                engine.doc.export_png().unwrap(),
+                engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
                 before.export_png().unwrap()
             );
         }
@@ -189,14 +189,15 @@ fn native_skew_has_analytic_pixels_masks_hidden_rgb_preview_undo_and_storage_inv
 fn combined_skew_scale_reflection_rotation_matches_order_and_explicit_zero_is_legacy() {
     for depth in [8, 16] {
         let mut combined = fixture(depth);
-        let mut ordered = combined.clone();
+        let mut ordered = Engine::new();
+        ordered.resident_state_mut().expect("resident fixture").document = combined.resident_state().expect("resident fixture").document.clone();
         let transform = command(
             &combined,
             json!({
                 "skew_x":45.,"skew_y":-45.,"scale_x":2.,"scale_y":0.5,"mirror_x":true,"angle":90.
             }),
         );
-        let preview = Engine::preview_edits(combined.doc.clone(), &[transform.clone()]).unwrap();
+        let preview = Engine::preview_edits(combined.resident_state().expect("resident fixture").document.clone(), &[transform.clone()]).unwrap();
         edit(&mut combined, transform);
         for fields in [
             json!({"skew_x":45.}),
@@ -206,9 +207,9 @@ fn combined_skew_scale_reflection_rotation_matches_order_and_explicit_zero_is_le
             let transform = command(&ordered, fields);
             edit(&mut ordered, transform);
         }
-        assert_eq!(combined.undo.len(), 1);
-        let actual = &combined.doc.layers[0];
-        let expected = &ordered.doc.layers[0];
+        assert_eq!(combined.resident_state().expect("resident fixture").undo.len(), 1);
+        let actual = &combined.resident_state().expect("resident fixture").document.layers[0];
+        let expected = &ordered.resident_state().expect("resident fixture").document.layers[0];
         assert_eq!(
             (
                 actual.x,
@@ -277,15 +278,16 @@ fn combined_skew_scale_reflection_rotation_matches_order_and_explicit_zero_is_le
             }
         }
         assert_eq!(
-            combined.doc.export_png().unwrap(),
-            ordered.doc.export_png().unwrap()
+            combined.resident_state().expect("resident fixture").document.export_png().unwrap(),
+            ordered.resident_state().expect("resident fixture").document.export_png().unwrap()
         );
         assert_eq!(
-            combined.doc.export_png().unwrap(),
+            combined.resident_state().expect("resident fixture").document.export_png().unwrap(),
             preview.export_png().unwrap()
         );
         let mut legacy = fixture(depth);
-        let mut zero = legacy.clone();
+        let mut zero = Engine::new();
+        zero.resident_state_mut().expect("resident fixture").document = legacy.resident_state().expect("resident fixture").document.clone();
         let old = command(
             &legacy,
             json!({"angle":37.,"scale_x":1.3,"scale_y":0.8,"mirror_y":true}),
@@ -295,10 +297,10 @@ fn combined_skew_scale_reflection_rotation_matches_order_and_explicit_zero_is_le
         explicit["skew_y"] = json!(-0.);
         edit(&mut legacy, old);
         edit(&mut zero, explicit);
-        assert_eq!(zero.doc.layers[0].pixels, legacy.doc.layers[0].pixels);
+        assert_eq!(zero.resident_state().expect("resident fixture").document.layers[0].pixels, legacy.resident_state().expect("resident fixture").document.layers[0].pixels);
         assert_eq!(
-            zero.doc.export_png().unwrap(),
-            legacy.doc.export_png().unwrap()
+            zero.resident_state().expect("resident fixture").document.export_png().unwrap(),
+            legacy.resident_state().expect("resident fixture").document.export_png().unwrap()
         );
     }
 }
@@ -308,22 +310,22 @@ fn skew_preserves_linking_and_independent_mask_or_color_targets() {
     for depth in [8, 16] {
         for mask in [false, true] {
             let mut engine = fixture(depth);
-            let id = engine.doc.layers[0].id.clone();
+            let id = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
             edit(
                 &mut engine,
                 json!({"op":"mask.link","layer":id,"linked":false}),
             );
-            engine.undo.clear();
-            let before = engine.doc.clone();
+            engine.resident_state_mut().expect("resident fixture").undo.clear();
+            let before = engine.resident_state().expect("resident fixture").document.clone();
             let transform = command(&engine, json!({"skew_x":45.,"mask":mask}));
             let preview = Engine::preview_edits(before.clone(), &[transform.clone()]).unwrap();
             edit(&mut engine, transform);
-            assert_eq!(engine.undo.len(), 1);
+            assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), 1);
             assert_eq!(
-                engine.doc.export_png().unwrap(),
+                engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
                 preview.export_png().unwrap()
             );
-            let layer = &engine.doc.layers[0];
+            let layer = &engine.resident_state().expect("resident fixture").document.layers[0];
             if mask {
                 assert_eq!(layer.pixels, before.layers[0].pixels);
                 assert_eq!((layer.x, layer.y), (before.layers[0].x, before.layers[0].y));
@@ -334,7 +336,7 @@ fn skew_preserves_linking_and_independent_mask_or_color_targets() {
                 let inverse = command(&engine, json!({"skew_x":-45.,"mask":true}));
                 edit(&mut engine, inverse);
                 assert_eq!(
-                    engine.doc.layers[0].mask.as_ref().unwrap().steps[1]
+                    engine.resident_state().expect("resident fixture").document.layers[0].mask.as_ref().unwrap().steps[1]
                         .pixels
                         .rgba16(),
                     before.layers[0].mask.as_ref().unwrap().steps[1]
@@ -353,20 +355,21 @@ fn skew_preserves_linking_and_independent_mask_or_color_targets() {
                 engine.undo("human").unwrap();
             }
             assert_eq!(
-                engine.doc.export_png().unwrap(),
+                engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
                 before.export_png().unwrap()
             );
         }
         let mut color = fixture(depth);
-        let mut mask = color.clone();
+        let mut mask = Engine::new();
+        mask.resident_state_mut().expect("resident fixture").document = color.resident_state().expect("resident fixture").document.clone();
         let color_command = command(&color, json!({"skew_y":30.}));
         let mask_command = command(&mask, json!({"skew_y":30.,"mask":true}));
         edit(&mut color, color_command);
         edit(&mut mask, mask_command);
-        assert_eq!(mask.doc.layers[0].pixels, color.doc.layers[0].pixels);
+        assert_eq!(mask.resident_state().expect("resident fixture").document.layers[0].pixels, color.resident_state().expect("resident fixture").document.layers[0].pixels);
         assert_eq!(
-            mask.doc.export_png().unwrap(),
-            color.doc.export_png().unwrap()
+            mask.resident_state().expect("resident fixture").document.export_png().unwrap(),
+            color.resident_state().expect("resident fixture").document.export_png().unwrap()
         );
     }
 }
@@ -386,7 +389,7 @@ fn invalid_selected_or_guarded_skew_and_partial_batches_preserve_source_and_hist
         ] {
             let before = state(&engine);
             let transform = command(&engine, fields);
-            assert!(Engine::preview_edits(engine.doc.clone(), &[transform.clone()]).is_err());
+            assert!(Engine::preview_edits(engine.resident_state().expect("resident fixture").document.clone(), &[transform.clone()]).is_err());
             assert!(engine
                 .edit("human", &[transform], None, None, "Invalid skew")
                 .is_err());
@@ -396,16 +399,16 @@ fn invalid_selected_or_guarded_skew_and_partial_batches_preserve_source_and_hist
             let mut engine = fixture(depth);
             let mut transform = command(&engine, json!({"skew_y":15.}));
             match guard {
-                "locked" => engine.doc.layers[0].locked = true,
+                "locked" => engine.resident_state_mut().expect("resident fixture").document.layers[0].locked = true,
                 "reserved" => {
-                    let id = engine.doc.layers[0].id.clone();
+                    let id = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
                     engine
                         .reserve("other", "Reserved target", vec![Scope::layer(&id)])
                         .unwrap();
                 }
-                "stale" => transform["source_revision"] = json!(engine.doc.revision + 1),
+                "stale" => transform["source_revision"] = json!(engine.resident_state().expect("resident fixture").document.revision + 1),
                 "document" => transform["document_id"] = json!("another-document"),
-                _ => engine.doc.read_only = true,
+                _ => engine.resident_state_mut().expect("resident fixture").document.read_only = true,
             }
             let before = state(&engine);
             assert!(
@@ -422,10 +425,10 @@ fn invalid_selected_or_guarded_skew_and_partial_batches_preserve_source_and_hist
         );
         let before = state(&engine);
         let mut selected = command(&engine, json!({"skew_x":81.,"selection_only":true}));
-        let error = Engine::preview_edits(engine.doc.clone(), &[selected.clone()]).unwrap_err();
+        let error = Engine::preview_edits(engine.resident_state().expect("resident fixture").document.clone(), &[selected.clone()]).unwrap_err();
         assert!(error.contains("between -80 and 80"));
         let move_first =
-            json!({"op":"move","layer":engine.doc.layers[0].id,"dx":1,"selection_only":false});
+            json!({"op":"move","layer":engine.resident_state().expect("resident fixture").document.layers[0].id,"dx":1,"selection_only":false});
         assert!(engine
             .edit(
                 "human",
@@ -436,7 +439,7 @@ fn invalid_selected_or_guarded_skew_and_partial_batches_preserve_source_and_hist
             )
             .is_err());
         assert_eq!(state(&engine), before);
-        let mut layer = engine.doc.layers[0].clone();
+        let mut layer = engine.resident_state().expect("resident fixture").document.layers[0].clone();
         let layer_before = serde_json::to_value(&layer).unwrap();
         assert!(transform::selection_with_polygon(
             &mut layer,
@@ -445,21 +448,21 @@ fn invalid_selected_or_guarded_skew_and_partial_batches_preserve_source_and_hist
         )
         .is_err());
         assert_eq!(serde_json::to_value(&layer).unwrap(), layer_before);
-        let coverage = peerbrush::selection::current(&engine.doc).unwrap();
+        let coverage = peerbrush::selection::current(&engine.resident_state().expect("resident fixture").document).unwrap();
         assert!(transform::selection_with_coverage(&mut layer, &coverage, &selected).is_err());
         assert_eq!(serde_json::to_value(&layer).unwrap(), layer_before);
         selected["skew_x"] = json!(15.);
         selected["selection_only"] = json!(false);
         edit(&mut engine, selected);
         let old = serde_json::from_value::<Document>(before["document"].clone()).unwrap();
-        assert_eq!(engine.doc.selection, old.selection);
-        assert_eq!(engine.doc.selection_polygon, old.selection_polygon);
+        assert_eq!(engine.resident_state().expect("resident fixture").document.selection, old.selection);
+        assert_eq!(engine.resident_state().expect("resident fixture").document.selection_polygon, old.selection_polygon);
         assert_eq!(
-            serde_json::to_value(&engine.doc.selection_coverage).unwrap(),
+            serde_json::to_value(&engine.resident_state().expect("resident fixture").document.selection_coverage).unwrap(),
             serde_json::to_value(&old.selection_coverage).unwrap()
         );
         assert_eq!(
-            serde_json::to_value(&engine.doc.selection_previous).unwrap(),
+            serde_json::to_value(&engine.resident_state().expect("resident fixture").document.selection_previous).unwrap(),
             serde_json::to_value(&old.selection_previous).unwrap()
         );
     }
@@ -481,24 +484,24 @@ fn folders_sources_and_protocol_use_shared_skew_without_rasterizing_definitions(
         let mut root = Layer::new("Folder", "group", 48, 40);
         root.pixels = Raster::new_depth(48, 40, depth);
         let id = root.id.clone();
-        engine.doc.layers[0].parent = Some(id.clone());
-        let mut hidden = engine.doc.layers[0].clone();
+        engine.resident_state_mut().expect("resident fixture").document.layers[0].parent = Some(id.clone());
+        let mut hidden = engine.resident_state().expect("resident fixture").document.layers[0].clone();
         hidden.id = peerbrush::engine::id();
         hidden.visible = false;
-        engine.doc.layers.push(hidden);
-        engine.doc.layers.insert(0, root);
-        let before = engine.doc.clone();
+        engine.resident_state_mut().expect("resident fixture").document.layers.push(hidden);
+        engine.resident_state_mut().expect("resident fixture").document.layers.insert(0, root);
+        let before = engine.resident_state().expect("resident fixture").document.clone();
         let transform = command(&engine, json!({"skew_x":45.}));
         let preview = Engine::preview_edits(before.clone(), &[transform.clone()]).unwrap();
         edit(&mut engine, transform);
-        assert_eq!(engine.undo.len(), 1);
+        assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), 1);
         assert_eq!(
-            engine.doc.export_png().unwrap(),
+            engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
             preview.export_png().unwrap()
         );
         for old in before.layers.iter().filter(|layer| layer.kind == "paint") {
             let layer = engine
-                .doc
+                .resident_state().expect("resident fixture").document
                 .layers
                 .iter()
                 .find(|layer| layer.id == old.id)
@@ -514,7 +517,7 @@ fn folders_sources_and_protocol_use_shared_skew_without_rasterizing_definitions(
             }
         }
         engine.undo("human").unwrap();
-        engine.doc.layers[2].locked = true;
+        engine.resident_state_mut().expect("resident fixture").document.layers[2].locked = true;
         let before = state(&engine);
         let transform = command(&engine, json!({"skew_x":15.}));
         assert!(engine
@@ -550,43 +553,43 @@ fn folders_sources_and_protocol_use_shared_skew_without_rasterizing_definitions(
                 content,
             };
             let mut engine = Engine::new();
-            engine.doc = Document::new_depth(48, 40, depth).unwrap();
+            engine.resident_state_mut().expect("resident fixture").document = Document::new_depth(48, 40, depth).unwrap();
             edit(&mut engine, json!({"op":"source.add","source":source}));
-            engine.undo.clear();
-            let before = engine.doc.export_png().unwrap();
+            engine.resident_state_mut().expect("resident fixture").undo.clear();
+            let before = engine.resident_state().expect("resident fixture").document.export_png().unwrap();
             let transform = command(&engine, json!({"skew_x":45.}));
-            let preview = Engine::preview_edits(engine.doc.clone(), &[transform.clone()]).unwrap();
+            let preview = Engine::preview_edits(engine.resident_state().expect("resident fixture").document.clone(), &[transform.clone()]).unwrap();
             edit(&mut engine, transform);
-            assert_eq!(engine.undo.len(), 1);
+            assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), 1);
             assert_eq!(
-                engine.doc.export_png().unwrap(),
+                engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
                 preview.export_png().unwrap()
             );
             assert_eq!(
-                engine.doc.layers[0].source.as_ref().unwrap().content,
+                engine.resident_state().expect("resident fixture").document.layers[0].source.as_ref().unwrap().content,
                 source.content
             );
-            engine.doc = psd::decode(&psd::encode_psb(&engine.doc).unwrap()).unwrap();
+            engine.resident_state_mut().expect("resident fixture").document = psd::decode(&psd::encode_psb(&engine.resident_state().expect("resident fixture").document).unwrap()).unwrap();
             let inverse = command(&engine, json!({"skew_x":-45.}));
             edit(&mut engine, inverse);
             assert_eq!(
-                engine.doc.layers[0].source.as_ref().unwrap().content,
+                engine.resident_state().expect("resident fixture").document.layers[0].source.as_ref().unwrap().content,
                 source.content
             );
-            assert_eq!(engine.doc.export_png().unwrap(), before);
+            assert_eq!(engine.resident_state().expect("resident fixture").document.export_png().unwrap(), before);
         }
     }
     let engine = fixture(16);
     let transform = command(&engine, json!({"skew_x":15.,"skew_y":-10.}));
-    let request = json!({"actor":"skew-agent","document_id":engine.doc.id,
-        "expected_revision":engine.doc.revision,"commands":[transform],"feedback":"always","max_edge":48});
+    let request = json!({"actor":"skew-agent","document_id":engine.resident_state().expect("resident fixture").document.id,
+        "expected_revision":engine.resident_state().expect("resident fixture").document.revision,"commands":[transform],"feedback":"always","max_edge":48});
     let shared = Arc::new(Mutex::new(engine));
     let result = server::dispatch(&shared, "edit", &request).unwrap();
     assert!(result["images"][0]["data"]
         .as_str()
         .is_some_and(|data| !data.is_empty()));
     assert_eq!(result["images"][0]["document_rect"], json!([0, 0, 48, 40]));
-    assert_eq!(shared.lock().unwrap().undo.len(), 1);
+    assert_eq!(shared.lock().unwrap().resident_state().expect("resident fixture").undo.len(), 1);
     let discovery = server::capabilities();
     assert_eq!(
         discovery["retained_transforms"]["skew"]["selection_pixels"],

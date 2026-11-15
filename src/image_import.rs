@@ -8,13 +8,27 @@ use std::{
     path::Path,
 };
 
+pub(crate) mod bmp;
+pub(crate) mod gif;
+pub(crate) mod ico;
+pub(crate) mod jpeg;
+pub(crate) mod jxl;
+pub(crate) mod native;
+pub(crate) mod placement;
 #[path = "image_import/png_admission.rs"]
 pub(crate) mod png_admission;
 mod png_rows;
 #[path = "image_import/png_surface.rs"]
 pub(crate) mod png_surface;
+pub(crate) mod pnm;
 #[path = "image_import/prepared_png.rs"]
 pub(crate) mod prepared_png;
+pub(crate) mod qoi;
+mod source_file;
+pub(crate) mod svg;
+pub(crate) mod tga;
+pub(crate) mod tiff;
+pub(crate) mod webp;
 
 pub const EXTENSIONS: &[&str] = &[
     "png", "jpg", "jpeg", "bmp", "gif", "tif", "tiff", "webp", "jxl", "ico", "pbm", "pgm", "ppm",
@@ -61,6 +75,18 @@ pub struct Prepared {
     pub source: Option<crate::source::Source>,
 }
 
+pub(crate) fn selected_digest(command: &Value) -> Result<Option<[u8; 32]>, String> {
+    let Some(value) = command.get("source_sha256") else { return Ok(None) };
+    let bytes = value.as_array().filter(|bytes| bytes.len() == 32)
+        .ok_or("source_sha256 must contain 32 bytes")?;
+    let mut digest = [0; 32];
+    for (target, value) in digest.iter_mut().zip(bytes) {
+        *target = value.as_u64().and_then(|n| u8::try_from(n).ok())
+            .ok_or("source_sha256 must contain 32 bytes")?;
+    }
+    Ok(Some(digest))
+}
+
 fn bytes_at(bytes: &[u8], at: usize, len: usize) -> Result<&[u8], String> {
     bytes
         .get(at..at.checked_add(len).ok_or("Invalid image offset")?)
@@ -70,48 +96,6 @@ fn be32(bytes: &[u8]) -> u32 {
     u32::from_be_bytes(bytes.try_into().unwrap())
 }
 
-fn jpeg_color(bytes: &[u8]) -> Result<(), String> {
-    let mut at = 2;
-    while at < bytes.len() {
-        if bytes_at(bytes, at, 1)?[0] != 0xff {
-            return Err("Invalid JPEG marker".into());
-        }
-        while bytes_at(bytes, at, 1)?[0] == 0xff {
-            at += 1;
-        }
-        let marker = bytes_at(bytes, at, 1)?[0];
-        at += 1;
-        if matches!(marker, 0xda | 0xd9) {
-            break;
-        }
-        if matches!(marker, 0xd8 | 0xd0..=0xd7 | 0x01) {
-            continue;
-        }
-        let length = u16::from_be_bytes(bytes_at(bytes, at, 2)?.try_into().unwrap()) as usize;
-        if length < 2 {
-            return Err("Invalid JPEG segment length".into());
-        }
-        let data = bytes_at(bytes, at + 2, length - 2)?;
-        if (0xc0..=0xcf).contains(&marker) && !matches!(marker, 0xc4 | 0xc8 | 0xcc) {
-            let header = bytes_at(data, 0, 6)?;
-            if header[0] != 8 {
-                return Err(
-                    "JPEG channel precision is not supported; convert explicitly before importing"
-                        .into(),
-                );
-            }
-            if !matches!(header[5], 1 | 3) {
-                return Err(
-                    "CMYK/four-channel JPEG requires explicit RGB conversion before importing"
-                        .into(),
-                );
-            }
-            return Ok(());
-        }
-        at += length;
-    }
-    Err("JPEG contains no supported image frame header".into())
-}
 
 fn png_frames(bytes: &[u8]) -> Result<(usize, bool), String> {
     let mut at = 8;
@@ -150,138 +134,30 @@ fn png_frames(bytes: &[u8]) -> Result<(usize, bool), String> {
 }
 
 fn gif_frames(bytes: &[u8]) -> Result<usize, String> {
-    let header = bytes_at(bytes, 0, 13)?;
-    let mut at = 13;
-    if header[10] & 128 != 0 {
-        at += 3 * (1 << ((header[10] & 7) + 1));
-    }
-    let mut count = 0;
-    loop {
-        let block = bytes_at(bytes, at, 1)?[0];
-        at += 1;
-        match block {
-            0x3b => break,
-            0x21 => {
-                let label = bytes_at(bytes, at, 1)?[0];
-                at += 1;
-                if label == 0xff
-                    && bytes_at(bytes, at, 1)?[0] == 11
-                    && bytes_at(bytes, at + 1, 11)? == b"ICCRGBG1012"
-                {
-                    return Err(
-                        "GIF ICC color extensions require explicit conversion before importing"
-                            .into(),
-                    );
-                }
-            }
-            0x2c => {
-                let descriptor = bytes_at(bytes, at, 9)?;
-                at += 9;
-                if descriptor[8] & 128 != 0 {
-                    at += 3 * (1 << ((descriptor[8] & 7) + 1));
-                }
-                bytes_at(bytes, at, 1)?;
-                at += 1;
-                count += 1;
-                if count > MAX_ITEMS {
-                    return Err("GIF animation frame limit exceeded".into());
-                }
-            }
-            _ => return Err("Invalid GIF block".into()),
-        }
-        loop {
-            let len = bytes_at(bytes, at, 1)?[0] as usize;
-            at += 1;
-            bytes_at(bytes, at, len)?;
-            at += len;
-            if len == 0 {
-                break;
-            }
-        }
-    }
-    if count == 0 {
-        return Err("GIF contains no frames".into());
-    }
-    Ok(count)
+    Ok(gif::inspect(&mut Cursor::new(bytes), &|| Ok(()))?.frames)
 }
 
 fn webp_frames(bytes: &[u8]) -> Result<usize, String> {
-    let mut at = 12;
-    let mut count = 0;
-    let size = u32::from_le_bytes(bytes_at(bytes, 4, 4)?.try_into().unwrap()) as usize + 8;
-    if size != bytes.len() {
-        return Err("Invalid WebP container size".into());
-    }
-    while at < size {
-        let header = bytes_at(bytes, at, 8)?;
-        let len = u32::from_le_bytes(header[4..].try_into().unwrap()) as usize;
-        bytes_at(bytes, at + 8, len)?;
-        if &header[..4] == b"ANMF" {
-            count += 1;
-        }
-        if count > MAX_ITEMS {
-            return Err("WebP animation frame limit exceeded".into());
-        }
-        at += 8 + len + (len & 1);
-    }
-    if at != size {
-        return Err("Invalid WebP chunk alignment".into());
-    }
-    Ok(count.max(1))
+    Ok(webp::inspect(&mut Cursor::new(bytes), bytes.len() as u64, true, &|| Ok(()))?.frames)
 }
 
 // Follow the IFD chain without decoding pages. Selecting a page changes only the
 // first-IFD pointer in an owned byte buffer; offsets and the source file stay intact.
 fn tiff_offsets(bytes: &[u8]) -> Result<Vec<usize>, String> {
-    let little = match bytes_at(bytes, 0, 2)? {
-        b"II" => true,
-        b"MM" => false,
-        _ => return Err("Invalid TIFF byte order".into()),
-    };
-    let number = |at: usize, size: usize| -> Result<usize, String> {
-        let b = bytes_at(bytes, at, size)?;
-        let mut value = 0u64;
-        for &v in if little {
-            b.iter().rev().collect::<Vec<_>>()
-        } else {
-            b.iter().collect()
-        } {
-            value = (value << 8) | v as u64;
-        }
-        usize::try_from(value).map_err(|_| "TIFF offset exceeds address space".into())
-    };
-    let big = match number(2, 2)? {
-        42 => false,
-        43 => true,
-        _ => return Err("Invalid TIFF version".into()),
-    };
-    if big && (number(4, 2)? != 8 || number(6, 2)? != 0) {
-        return Err("Invalid BigTIFF header".into());
-    }
-    let (pointer, count_size, entry_size) = if big { (8, 8, 20) } else { (4, 2, 12) };
-    let mut at = number(if big { 8 } else { 4 }, pointer)?;
-    let mut offsets = Vec::new();
-    while at != 0 {
-        if offsets.len() >= MAX_ITEMS || offsets.contains(&at) {
-            return Err("TIFF page limit exceeded or cyclic page chain".into());
-        }
-        offsets.push(at);
-        let entries = number(at, count_size)?;
-        let end = entries
-            .checked_mul(entry_size)
-            .and_then(|n| n.checked_add(at))
-            .and_then(|n| n.checked_add(count_size))
-            .ok_or("Invalid TIFF directory size")?;
-        bytes_at(bytes, at, end - at)?;
-        at = number(end, pointer)?;
-    }
-    if offsets.is_empty() {
-        return Err("TIFF contains no pages".into());
-    }
-    Ok(offsets)
+    tiff::Directory::read(&mut Cursor::new(bytes), bytes.len() as u64, &|| Ok(()))?
+        .offsets()
+        .iter()
+        .map(|&offset| usize::try_from(offset).map_err(|_| "TIFF offset exceeds address space".into()))
+        .collect()
 }
 
 impl Encoded {
+    pub(crate) fn icon_sizes(&self) -> Result<Vec<[u16; 2]>, String> {
+        if self.info.choice != Some("variant") {
+            return Ok(Vec::new());
+        }
+        ico::variant_sizes(&mut Cursor::new(&self.bytes))
+    }
     fn jxl(bytes: Vec<u8>) -> Result<Self, String> {
         let info = crate::jpeg_xl::inspect(&bytes, &|| Ok(()))?;
         Ok(Self {
@@ -321,20 +197,13 @@ impl Encoded {
         {
             return Err("JPEG XL decoded metadata differs from its inspected source".into());
         }
-        let profile = &decoded.icc_profile;
-        let convert = !crate::color_profile::is_srgb_profile(profile);
-        match decoded.pixels {
-            crate::jpeg_xl::Pixels::Eight(mut pixels) => {
-                if convert {
-                    crate::color_profile::convert8(profile, &mut pixels)?;
-                }
-                Raster::from_rgba(decoded.info.width, decoded.info.height, &pixels)
+        let info = decoded.info;
+        match working_jxl_pixels(decoded, &|| Ok(()))? {
+            crate::jpeg_xl::Pixels::Eight(pixels) => {
+                Raster::from_rgba(info.width, info.height, &pixels)
             }
-            crate::jpeg_xl::Pixels::Sixteen(mut pixels) => {
-                if convert {
-                    crate::color_profile::convert16(profile, &mut pixels)?;
-                }
-                Raster::from_rgba16(decoded.info.width, decoded.info.height, &pixels)
+            crate::jpeg_xl::Pixels::Sixteen(pixels) => {
+                Raster::from_rgba16(info.width, info.height, &pixels)
             }
         }
     }
@@ -432,18 +301,10 @@ impl Encoded {
             return Err("Encoded image exceeds 128 MiB".into());
         }
         if format == ImageFormat::Jpeg {
-            jpeg_color(&bytes)?;
+            jpeg::inspect(&bytes, &|| Ok(()))?;
         }
         if format == ImageFormat::Bmp {
-            let size = u32::from_le_bytes(bytes_at(&bytes, 14, 4)?.try_into().unwrap());
-            if size >= 108 {
-                let space = u32::from_le_bytes(bytes_at(&bytes, 70, 4)?.try_into().unwrap());
-                if !matches!(space, 0x73524742 | 0x57696e20)
-                    && (space != 0 || bytes_at(&bytes, 74, 48)?.iter().any(|&v| v != 0))
-                {
-                    return Err("Calibrated/profiled BMP color encoding requires explicit RGB conversion before importing".into());
-                }
-            }
+            bmp::validate_dib(bytes.get(14..).ok_or("Truncated BMP header")?)?;
         }
         let offsets = if format == ImageFormat::Tiff {
             tiff_offsets(&bytes)?
@@ -499,11 +360,6 @@ impl Encoded {
         } else {
             None
         };
-        // The animation decoder interface produces only RGBA8. Never narrow an
-        // original PNG16 animation into an editable eight-bit frame.
-        if format == ImageFormat::Png && png.is_some_and(|p| p.1) && bit_depth == 16 {
-            return Err("16-bit APNG frames cannot be imported at their original precision; export a static PNG16 frame first".into());
-        }
         drop(decoder);
         Ok(Self {
             bytes,
@@ -599,6 +455,7 @@ impl Encoded {
                 }
                 return Ok(pixels);
             }
+            bmp::validate_dib(content)?;
         }
         let mut patched = None;
         if format == ImageFormat::Tiff && index != 0 {
@@ -645,7 +502,15 @@ impl Encoded {
             8
         };
         check_budget(width, height, depth, budget)?;
-        let profile = decoder.icc_profile().map_err(|e| e.to_string())?;
+        let profile = if format == ImageFormat::Jpeg {
+            jpeg::profile(&self.bytes, &|| control.check())?.map(std::borrow::Cow::Owned)
+        } else if format == ImageFormat::Tiff {
+            tiff::profile(&self.bytes, index, &|| control.check())?.map(std::borrow::Cow::Borrowed)
+        } else if format == ImageFormat::WebP {
+            webp::profile(&self.bytes, &|| control.check())?.map(std::borrow::Cow::Borrowed)
+        } else {
+            decoder.icc_profile().map_err(|e| e.to_string())?.map(std::borrow::Cow::Owned)
+        };
         if let Some(profile) = &profile {
             crate::color_profile::supported(profile)?;
         }
@@ -674,15 +539,7 @@ impl Encoded {
                     d.set_limits(limits()).map_err(|e| e.to_string())?;
                     DynamicImage::ImageRgba8(frame(d.into_frames(), index)?)
                 }
-                ImageFormat::Png => {
-                    let mut d = image::codecs::png::PngDecoder::new(Cursor::new(bytes))
-                        .map_err(|e| e.to_string())?;
-                    d.set_limits(limits()).map_err(|e| e.to_string())?;
-                    DynamicImage::ImageRgba8(frame(
-                        d.apng().map_err(|e| e.to_string())?.into_frames(),
-                        index,
-                    )?)
-                }
+                ImageFormat::Png => prepared_png::apng::resident(bytes, index, control)?,
                 _ => return Err("Unsupported animation container".into()),
             }
         } else {
@@ -693,13 +550,13 @@ impl Encoded {
         if depth == 16 {
             let mut words = image.into_rgba16().into_raw();
             if let Some(profile) = profile.filter(|p| !crate::color_profile::is_srgb_profile(p)) {
-                crate::color_profile::convert16(&profile, &mut words)?;
+                convert16_rows(&profile, &mut words, w, &|| Ok(()))?;
             }
             Raster::from_rgba16(w, h, &words)
         } else {
             let mut pixels = image.into_rgba8().into_raw();
             if let Some(profile) = profile.filter(|p| !crate::color_profile::is_srgb_profile(p)) {
-                crate::color_profile::convert8(&profile, &mut pixels)?;
+                convert8_rows(&profile, &mut pixels, w, &|| Ok(()))?;
             }
             Raster::from_rgba(w, h, &pixels)
         }
@@ -746,8 +603,22 @@ fn validate_color(decoder: &dyn ImageDecoder) -> Result<(), String> {
     }
     Ok(())
 }
-fn check_budget(width: u32, height: u32, depth: u16, budget: usize) -> Result<(), String> {
-    check_size(width, height)?;
+pub(crate) fn check_budget(
+    width: u32,
+    height: u32,
+    depth: u16,
+    budget: usize,
+) -> Result<(), String> {
+    check_budget_with_limits(width, height, depth, budget, crate::raster::CanvasLimits::Resident)
+}
+pub(crate) fn check_budget_with_limits(
+    width: u32,
+    height: u32,
+    depth: u16,
+    budget: usize,
+    limits: crate::raster::CanvasLimits,
+) -> Result<(), String> {
+    limits.check(width, height)?;
     // RGBA conversion and tiled storage coexist while constructing the result.
     let bytes = width as u64 * height as u64 * if depth == 16 { 16 } else { 8 };
     if bytes > budget as u64 {
@@ -759,8 +630,16 @@ fn check_budget(width: u32, height: u32, depth: u16, budget: usize) -> Result<()
     Ok(())
 }
 /// Native Windows DIB transport already supplies a decoder instead of a file.
-pub(crate) fn decoder(mut decoder: impl ImageDecoder, budget: usize) -> Result<Raster, String> {
-    decoder.set_limits(limits()).map_err(|e| e.to_string())?;
+pub(crate) fn decoder(
+    mut decoder: impl ImageDecoder,
+    budget: usize,
+    geometry: crate::raster::CanvasLimits,
+) -> Result<DynamicImage, String> {
+    let mut admission = limits();
+    admission.max_image_width = Some(geometry.edge());
+    admission.max_image_height = Some(geometry.edge());
+    admission.max_alloc = Some(budget.min(BUDGET) as u64);
+    decoder.set_limits(admission).map_err(|e| e.to_string())?;
     validate_color(&decoder)?;
     let (w, h) = decoder.dimensions();
     let depth = if decoder.color_type().bits_per_pixel()
@@ -771,7 +650,7 @@ pub(crate) fn decoder(mut decoder: impl ImageDecoder, budget: usize) -> Result<R
     } else {
         8
     };
-    check_budget(w, h, depth, budget)?;
+    check_budget_with_limits(w, h, depth, budget, geometry)?;
     let profile = decoder.icc_profile().map_err(|e| e.to_string())?;
     if let Some(profile) = &profile {
         crate::color_profile::supported(profile)?;
@@ -779,26 +658,106 @@ pub(crate) fn decoder(mut decoder: impl ImageDecoder, budget: usize) -> Result<R
     let orientation = decoder.orientation().map_err(|e| e.to_string())?;
     let mut image = DynamicImage::from_decoder(decoder).map_err(|e| e.to_string())?;
     image.apply_orientation(orientation);
-    let (w, h) = (image.width(), image.height());
+    let w = image.width();
     if depth == 16 {
-        let mut words = image.into_rgba16().into_raw();
+        let mut words = image.into_rgba16();
         if let Some(profile) = profile.filter(|p| !crate::color_profile::is_srgb_profile(p)) {
-            crate::color_profile::convert16(&profile, &mut words)?;
+            convert16_rows(&profile, &mut words, w, &|| Ok(()))?;
         }
-        Raster::from_rgba16(w, h, &words)
+        Ok(DynamicImage::ImageRgba16(words))
     } else {
-        let mut bytes = image.into_rgba8().into_raw();
+        let mut bytes = image.into_rgba8();
         if let Some(profile) = profile.filter(|p| !crate::color_profile::is_srgb_profile(p)) {
-            crate::color_profile::convert8(&profile, &mut bytes)?;
+            convert8_rows(&profile, &mut bytes, w, &|| Ok(()))?;
         }
-        Raster::from_rgba(w, h, &bytes)
+        Ok(DynamicImage::ImageRgba8(bytes))
     }
 }
+// Match the native worker's oriented-row grouping, including SIMD tails.
+// Reuse one executor and keep the conversion scratch bounded to one row.
+fn convert8_rows(
+    profile: &[u8],
+    pixels: &mut [u8],
+    width: u32,
+    check: &dyn Fn() -> Result<(), String>,
+) -> Result<(), String> {
+    let conversion = crate::color_profile::transforms(profile)?;
+    for row in pixels.chunks_exact_mut(width as usize * 4) {
+        check()?;
+        conversion.convert8(row)?;
+    }
+    Ok(())
+}
+fn convert16_rows(
+    profile: &[u8],
+    pixels: &mut [u16],
+    width: u32,
+    check: &dyn Fn() -> Result<(), String>,
+) -> Result<(), String> {
+    let conversion = crate::color_profile::transforms(profile)?;
+    for row in pixels.chunks_exact_mut(width as usize * 4) {
+        check()?;
+        conversion.convert16(row)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn working_jxl_pixels(
+    mut decoded: crate::jpeg_xl::Decoded,
+    check: &dyn Fn() -> Result<(), String>,
+) -> Result<crate::jpeg_xl::Pixels, String> {
+    use crate::jpeg_xl::Pixels;
+    check()?;
+    // Use the profile of the decoded samples, including the decoder's XYB
+    // output selection. Working sRGB needs no second transform.
+    let profile = &decoded.icc_profile;
+    if !crate::color_profile::is_srgb_profile(profile) {
+        let width = decoded.info.width;
+        match &mut decoded.pixels {
+            Pixels::Eight(pixels) => convert8_rows(profile, pixels, width, check)?,
+            Pixels::Sixteen(pixels) => convert16_rows(profile, pixels, width, check)?,
+        }
+    }
+    check()?;
+    Ok(decoded.pixels)
+}
+
 pub fn inspect(path: &Path) -> Result<Info, String> {
-    Ok(Encoded::file(path)?.info)
+    match native::OpenFormat::from_path(path) {
+        Some(native::OpenFormat::Png) => prepared_png::apng::inspect_path(path),
+        Some(native::OpenFormat::Bmp) => bmp::inspect(path),
+        Some(native::OpenFormat::Gif) => gif::inspect_file(path),
+        Some(native::OpenFormat::Jpeg) => jpeg::inspect_file(path),
+        Some(native::OpenFormat::Jxl) => jxl::inspect(path),
+        Some(native::OpenFormat::Qoi) => qoi::inspect(path),
+        Some(native::OpenFormat::Pnm) => pnm::inspect(path),
+        Some(native::OpenFormat::Tga) => tga::inspect(path),
+        Some(native::OpenFormat::Tiff) => tiff::inspect(path),
+        Some(native::OpenFormat::Webp) => webp::inspect_file(path),
+        _ => Ok(Encoded::file(path)?.info),
+    }
 }
 pub fn decode_file(path: &Path, command: &Value, budget: usize) -> Result<Raster, String> {
     Encoded::file(path)?.decode(command, budget)
+}
+pub(crate) fn jpeg_xl_patch_image(path: &Path, target: u16) -> Result<DynamicImage, String> {
+    let encoded = Encoded::file(path)?;
+    if encoded.format != Codec::Jxl {
+        return Err("Image patch source is not JPEG XL".into());
+    }
+    let info = crate::jpeg_xl::Info {
+        width: encoded.info.width,
+        height: encoded.info.height,
+        bit_depth: encoded.info.bit_depth,
+    };
+    crate::engine::image_patch_precision(info.bit_depth, target)?;
+    check_budget(info.width, info.height, target, 128 * 1024 * 1024)?;
+    let decoded = crate::jpeg_xl::decode_patch(&encoded.bytes, info)?;
+    let (width, height) = (decoded.info.width, decoded.info.height);
+    match decoded.pixels {
+        crate::jpeg_xl::Pixels::Eight(pixels) => image::ImageBuffer::from_raw(width, height, pixels).map(DynamicImage::ImageRgba8),
+        crate::jpeg_xl::Pixels::Sixteen(pixels) => image::ImageBuffer::from_raw(width, height, pixels).map(DynamicImage::ImageRgba16),
+    }.ok_or_else(|| "JPEG XL patch pixels differ from their decoded shape".into())
 }
 pub fn prepare_file(path: &Path, command: &Value, budget: usize) -> Result<Prepared, String> {
     Encoded::file(path)?.prepare(command, budget)
@@ -820,11 +779,8 @@ pub fn apply(
     if doc.layers.len() >= 100 {
         return Err("Initial version supports up to 100 layers".into());
     }
-    let parent = command
-        .get("parent")
-        .filter(|p| !p.is_null())
-        .map(|v| v.as_str().ok_or("Image parent must be a folder ID"))
-        .transpose()?;
+    let placement = placement::Placement::new(command)?;
+    let parent = placement.parent;
     if let Some(parent) = parent {
         crate::placement::unlocked(doc, parent)?;
         if !doc
@@ -835,25 +791,8 @@ pub fn apply(
             return Err("Image parent must be a folder".into());
         }
     }
-    let coordinate = |key: &str| {
-        command.get(key).map_or(Ok(0), |v| {
-            v.as_i64()
-                .filter(|n| (-100000..=100000).contains(n))
-                .map(|n| n as i32)
-                .ok_or_else(|| format!("Invalid image {key}"))
-        })
-    };
-    let (x, y) = (coordinate("x")?, coordinate("y")?);
-    let path = Path::new(command["path"].as_str().ok_or("Missing image path")?);
-    let name = command["name"]
-        .as_str()
-        .map(str::to_owned)
-        .unwrap_or_else(|| {
-            path.file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned()
-        });
+    let [x, y] = placement.origin;
+    let name = placement.name;
     if doc.bit_depth == 16 {
         pixels.promote16();
     }

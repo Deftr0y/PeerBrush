@@ -75,6 +75,15 @@ impl<T> RuntimeValue<T> {
         self.0.charge.as_ref().is_some_and(|c| c.uses_budget(pool))
     }
 }
+impl<T: Serialize + serde::de::DeserializeOwned> RuntimeValue<T> {
+    pub(crate) fn project<S: Serialize>(
+        source: &S,
+        pool: &ResidentBudget,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<Self> {
+        native::project_admitted(source, pool, false, check, Self::admitted)
+    }
+}
 
 pub(crate) struct PreparedEngineEffects {
     record: native::DocumentKey,
@@ -82,6 +91,11 @@ pub(crate) struct PreparedEngineEffects {
     serial: u64,
     status: RuntimeValue<String>,
     ai: Option<RuntimeValue<AiChange>>,
+}
+pub(crate) struct NativeCommitSide<'a> {
+    pub(crate) engine: &'a mut Engine,
+    pub(crate) seed: &'a NativeSeed,
+    pub(crate) pending: &'a mut Option<(native::PreparedCommit, PreparedEngineEffects)>,
 }
 pub(crate) struct RetiredEngineCommit {
     history: native::RetiredHistory,
@@ -92,9 +106,29 @@ pub(crate) struct RefusedEngineCommit {
     refused: native::RefusedCommit,
     effects: PreparedEngineEffects,
 }
+pub(crate) struct RetiredEngineMove {
+    _document: native::NativeDocument,
+    _status: RuntimeValue<String>,
+    _ai: Option<RuntimeValue<AiChange>>,
+}
+pub(crate) struct RefusedEngineMove {
+    refused: native::RefusedMove,
+    _effects: PreparedEngineEffects,
+}
+impl RefusedEngineMove {
+    pub(crate) fn reason(&self) -> &str {
+        self.refused.reason()
+    }
+}
 impl RefusedEngineCommit {
     pub(crate) fn reason(&self) -> &str {
         self.refused.reason()
+    }
+    /// Call after unlocking; proposal retry retains the original candidate.
+    pub(crate) fn into_refused(self) -> native::RefusedCommit {
+        let Self { refused, effects } = self;
+        drop(effects);
+        refused
     }
     pub(crate) fn abort(
         self,
@@ -119,6 +153,41 @@ impl RetiredEngineCommit {
         } = self;
         drop((_status, _ai));
         history.retire(session, cleanup)
+    }
+}
+
+/// Both engine locks and the live source fence must cover this operation.
+/// Refusal leaves both pending owners available for off-lock retirement.
+pub(crate) fn commit_native_pair(
+    mut from: NativeCommitSide<'_>,
+    mut to: NativeCommitSide<'_>,
+    actor: &str,
+) -> Result<(RetiredEngineCommit, RetiredEngineCommit)> {
+    let at = super::now();
+    from.check(actor, at)?;
+    to.check(actor, at)?;
+    Ok((from.apply(actor, at), to.apply(actor, at)))
+}
+
+impl NativeCommitSide<'_> {
+    fn check(&mut self, actor: &str, at: u64) -> Result<()> {
+        let (commit, effects) = self
+            .pending
+            .as_mut()
+            .ok_or("Native transfer edit is missing")?;
+        effects.validate(self.seed, commit.runtime_view(), actor, self.engine.ai_serial, at)?;
+        self.engine.check_native_commit(self.seed, actor, at, commit)
+    }
+
+    fn apply(self, actor: &str, at: u64) -> RetiredEngineCommit {
+        let (commit, effects) = self.pending.take().expect("checked transfer edit");
+        let history = self.engine.apply_checked_native_commit(commit);
+        let (_status, _ai) = self.engine.apply_native_effects(actor, effects, at);
+        RetiredEngineCommit {
+            history,
+            _status,
+            _ai,
+        }
     }
 }
 fn text(value: &str) -> Result<String> {
@@ -167,6 +236,35 @@ fn visuals(
     Ok(count)
 }
 impl PreparedEngineEffects {
+    fn validate(
+        &mut self,
+        seed: &NativeSeed,
+        view: native::CommitRuntime<'_>,
+        actor: &str,
+        serial: u64,
+        at: u64,
+    ) -> Result<()> {
+        if self.record != view.record
+            || self.base != view.base
+            || self.base != seed.document().key()
+            || self.serial != serial
+            || actor != view.actor
+            || !self.status.uses_budget(seed.document().budget())
+            || self
+                .ai
+                .as_ref()
+                .is_some_and(|a| !a.uses_budget(seed.document().budget()))
+        {
+            return Err("Runtime effects differ from prepared publication".into());
+        }
+        if let Some(ai) = &mut self.ai {
+            // Only the private unpublished activity owner may be stamped.
+            let owned =
+                Arc::get_mut(&mut ai.0).ok_or("Runtime activity was shared before publication")?;
+            owned.value.at = at;
+        }
+        Ok(())
+    }
     /// All payload copies/allocations precede the final Engine publication fence.
     /// Actor, label, command and scopes come from the actual prepared history.
     pub(crate) fn prepare(
@@ -174,8 +272,21 @@ impl PreparedEngineEffects {
         prepared: &native::PreparedCommit,
         check: &dyn Fn() -> Result<()>,
     ) -> Result<Self> {
+        Self::prepare_view(seed, prepared.runtime_view(), check)
+    }
+    pub(crate) fn prepare_move(
+        seed: &NativeSeed,
+        prepared: &native::PreparedMove,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<Self> {
+        Self::prepare_view(seed, prepared.runtime_view(), check)
+    }
+    fn prepare_view(
+        seed: &NativeSeed,
+        view: native::CommitRuntime<'_>,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<Self> {
         check()?;
-        let view = prepared.runtime_view();
         let base = seed.document();
         if view.base != base.key()
             || view.candidate.metadata().id() != base.metadata().id()
@@ -256,46 +367,52 @@ impl PreparedEngineEffects {
     }
 }
 impl Engine {
-    pub(crate) fn commit_native_with_effects(
+    pub(crate) fn mark_code_start(
         &mut self,
-        seed: &NativeSeed,
         actor: &str,
-        prepared: native::PreparedCommit,
-        mut effects: PreparedEngineEffects,
-    ) -> std::result::Result<RetiredEngineCommit, RefusedEngineCommit> {
-        let view = prepared.runtime_view();
-        let valid = effects.record == view.record
-            && effects.base == view.base
-            && effects.base == seed.document().key()
-            && effects.serial == self.ai_serial
-            && actor == view.actor
-            && effects.status.uses_budget(seed.document().budget())
-            && effects
-                .ai
-                .as_ref()
-                .is_none_or(|a| a.uses_budget(seed.document().budget()));
-        if !valid {
-            return Err(RefusedEngineCommit {
-                refused: prepared.refused("Runtime effects differ from prepared publication"),
-                effects,
-            });
-        }
-        let at = super::now();
-        if let Some(ai) = &mut effects.ai {
-            // This owner is private and unpublished. Finalize its small header
-            // before publication; shared or escaped owners fail closed.
-            let Some(owned) = Arc::get_mut(&mut ai.0) else {
-                return Err(RefusedEngineCommit {
-                    refused: prepared.refused("Runtime activity was shared before publication"),
-                    effects,
-                });
-            };
-            owned.value.at = at;
-        }
-        let history = match self.commit_native(seed, actor, prepared) {
-            Ok(history) => history,
-            Err(refused) => return Err(RefusedEngineCommit { refused, effects }),
+        label: &str,
+        scopes: &[Scope],
+    ) -> Result<()> {
+        let Some(document) = self.native_document() else {
+            self.mark_ai(actor, label, "canvas", scopes.to_vec());
+            self.activity = label.to_owned();
+            return Ok(());
         };
+        #[derive(Serialize)]
+        struct Borrowed<'a> {
+            serial: u64,
+            actor: &'a str,
+            label: &'a str,
+            tool: &'static str,
+            scopes: &'a [Scope],
+            at: u64,
+        }
+        let serial = self
+            .ai_serial
+            .checked_add(1)
+            .ok_or("Runtime activity serial overflow")?;
+        let value = RuntimeValue::project(
+            &Borrowed {
+                serial,
+                actor,
+                label,
+                tool: "canvas",
+                scopes,
+                at: super::now(),
+            },
+            document.budget(),
+            &|| Ok(()),
+        )?;
+        self.ai_change = Some(value);
+        self.ai_serial = serial;
+        Ok(())
+    }
+    fn apply_native_effects(
+        &mut self,
+        actor: &str,
+        effects: PreparedEngineEffects,
+        at: u64,
+    ) -> (RuntimeValue<String>, Option<RuntimeValue<AiChange>>) {
         for lease in &mut self.leases {
             if lease.owner == actor {
                 lease.expires = at.saturating_add(300);
@@ -308,6 +425,61 @@ impl Engine {
         } else {
             None
         };
+        (old_status, old_ai)
+    }
+    pub(crate) fn move_native_with_effects(
+        &mut self,
+        seed: &NativeSeed,
+        actor: &str,
+        prepared: native::PreparedMove,
+        mut effects: PreparedEngineEffects,
+    ) -> std::result::Result<RetiredEngineMove, RefusedEngineMove> {
+        let at = super::now();
+        if let Err(reason) =
+            effects.validate(seed, prepared.runtime_view(), actor, self.ai_serial, at)
+        {
+            return Err(RefusedEngineMove {
+                refused: prepared.refused(&reason),
+                _effects: effects,
+            });
+        }
+        let document = match self.move_native_history(seed, actor, prepared) {
+            Ok(document) => document,
+            Err(refused) => {
+                return Err(RefusedEngineMove {
+                    refused,
+                    _effects: effects,
+                })
+            }
+        };
+        let (old_status, old_ai) = self.apply_native_effects(actor, effects, at);
+        Ok(RetiredEngineMove {
+            _document: document,
+            _status: old_status,
+            _ai: old_ai,
+        })
+    }
+    pub(crate) fn commit_native_with_effects(
+        &mut self,
+        seed: &NativeSeed,
+        actor: &str,
+        prepared: native::PreparedCommit,
+        mut effects: PreparedEngineEffects,
+    ) -> std::result::Result<RetiredEngineCommit, RefusedEngineCommit> {
+        let at = super::now();
+        if let Err(reason) =
+            effects.validate(seed, prepared.runtime_view(), actor, self.ai_serial, at)
+        {
+            return Err(RefusedEngineCommit {
+                refused: prepared.refused(&reason),
+                effects,
+            });
+        }
+        let history = match self.commit_native(seed, actor, prepared) {
+            Ok(history) => history,
+            Err(refused) => return Err(RefusedEngineCommit { refused, effects }),
+        };
+        let (old_status, old_ai) = self.apply_native_effects(actor, effects, at);
         Ok(RetiredEngineCommit {
             history,
             _status: old_status,
@@ -319,6 +491,103 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn history_activity_uses_the_actual_cursor_candidate_actor_and_scopes() {
+        let pool = ResidentBudget::new(8 * 1024 * 1024).unwrap();
+        let disk = crate::large_document::DiskBudget::new(1024 * 1024, 4).unwrap();
+        let mut document =
+            native::NativeDocument::new_blank(4, 2, 16, &pool, &disk, &|| Ok(())).unwrap();
+        let layer = document.metadata().layer(0).unwrap().id().to_owned();
+        let descriptor = native::CommandDescriptor::from_normalized(
+            &document,
+            0,
+            &[serde_json::json!({"op":"layer.update", "layer":layer, "visible":false})],
+            &|| Ok(()),
+        )
+        .unwrap();
+        let captured = document
+            .capture_descriptor(descriptor, "worker", &[], 0, false, true)
+            .unwrap();
+        let delta = captured.visibility(&layer, false, &|| Ok(())).unwrap();
+        let mut history = native::NativeHistory::new(&pool, 4).unwrap();
+        let commit = history
+            .snapshot()
+            .prepare_commit(
+                &document,
+                delta,
+                native::HistoryRequest {
+                    actor: "worker",
+                    label: "Hide",
+                    task: None,
+                    gesture: None,
+                },
+                &|| Ok(()),
+            )
+            .unwrap_or_else(|r| panic!("{}", r.reason()));
+        fn gate(actor: &str) -> native::Publication<'_> {
+            native::Publication {
+                actor,
+                leases: &[],
+                now: 1,
+                closed: false,
+                write_available: true,
+            }
+        }
+        drop(
+            history
+                .commit(&mut document, gate("worker"), commit)
+                .unwrap(),
+        );
+        let engine = Engine::new();
+        for (direction, actor, label) in [
+            (native::Direction::Undo, "worker", "Undo AI edit"),
+            (native::Direction::Redo, "human", "Redo"),
+        ] {
+            let prepared = history
+                .snapshot()
+                .prepare_move(&document, direction, actor, &|| Ok(()))
+                .unwrap();
+            let seed = NativeSeed::capture(&engine, &document).unwrap();
+            let baseline = pool.used();
+            assert!(
+                PreparedEngineEffects::prepare_move(&seed, &prepared, &|| Err("cancelled".into()))
+                    .is_err()
+            );
+            assert_eq!(pool.used(), baseline);
+            let mut effects =
+                PreparedEngineEffects::prepare_move(&seed, &prepared, &|| Ok(())).unwrap();
+            assert_eq!(effects.status.as_str(), label);
+            assert!(effects
+                .validate(&seed, prepared.runtime_view(), "wrong actor", 0, 17)
+                .is_err());
+            effects
+                .validate(&seed, prepared.runtime_view(), actor, 0, 17)
+                .unwrap();
+            if actor == "worker" {
+                let ai = effects.ai.as_ref().unwrap();
+                assert_eq!(ai.tool, "history");
+                assert_eq!(ai.actor, actor);
+                assert_eq!(ai.label, label);
+                assert_eq!(ai.at, 17);
+                assert_eq!(ai.scopes[0].target.as_deref(), Some(layer.as_str()));
+            } else {
+                assert!(effects.ai.is_none());
+            }
+            let revision = prepared.runtime_view().candidate.metadata().revision();
+            drop(
+                history
+                    .move_cursor(&mut document, gate(actor), prepared)
+                    .unwrap(),
+            );
+            assert_eq!(document.metadata().revision(), revision);
+            assert_eq!(
+                document.metadata().layer(0).unwrap().visible(),
+                direction == native::Direction::Undo
+            );
+        }
+        drop((document, history));
+        assert_eq!(pool.used(), 0);
+    }
     #[test]
     fn runtime_clones_share_payload_and_charge_with_exact_wire() {
         let pool = ResidentBudget::new(1024 * 1024).unwrap();

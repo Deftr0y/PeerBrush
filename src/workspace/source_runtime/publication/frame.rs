@@ -16,8 +16,8 @@ pub(super) const MAX_BYTES: usize = 16 * 1024 * 1024;
 pub(super) const MAX_FACTS: usize = 4100;
 const PATH_BYTES: usize = 64 * 1024;
 const NAME_BYTES: usize = 4096;
-const MAGIC: &[u8; 16] = b"PBEXTERNAL02\0\0\0\0";
-const DOMAIN: &[u8] = b"PeerBrushExternalIntentFrame2\0";
+const MAGIC: &[u8; 16] = b"PBEXTERNAL03\0\0\0\0";
+const DOMAIN: &[u8] = b"PeerBrushExternalIntentFrame3\0";
 type Result<T> = std::result::Result<T, String>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,7 +62,20 @@ pub(super) struct IntentFrame {
     pub facts: Vec<NamedFact>,
 }
 impl IntentFrame {
+    /// Version 3 binds this additional location through its exact backup name.
+    /// It retains the original physical owner, rather than another created file.
+    pub(super) fn retained_original_name(&self) -> Option<OsString> {
+        self.backup
+            .as_ref()
+            .filter(|backup| backup.len() <= NAME_BYTES - ".original".len())
+            .map(|backup| {
+                let mut name = backup.clone();
+                name.push(".original");
+                name
+            })
+    }
     pub(super) fn validate(&self) -> Result<()> {
+        let retained = self.retained_original_name();
         if self.id == [0; 16]
             || self.owner == [0; 16]
             || self.operation == [0; 16]
@@ -78,6 +91,8 @@ impl IntentFrame {
             || self.backups.file_name() != Some(OsStr::new(".peerbrush-versions"))
             || !name(&self.temporary)
             || self.backup.as_deref().is_some_and(|n| !name(n))
+            || self.backup.is_some() != retained.is_some()
+            || retained.as_deref().is_some_and(|n| !name(n))
             || self.backup.is_some() != self.expected.is_some()
             || self.growth
                 != self
@@ -91,6 +106,11 @@ impl IntentFrame {
         let mut targets = 0;
         for entry in &self.facts {
             if !name(&entry.name)
+                || entry.role == Role::Backup
+                    && [self.backup.as_deref(), retained.as_deref()]
+                        .into_iter()
+                        .flatten()
+                        .any(|planned| super::same_native_name(planned, &entry.name))
                 || previous.is_some_and(|id| id >= entry.fact.identity)
                 || entry.role == Role::Temporary
                 || entry.role == Role::Target
@@ -536,6 +556,10 @@ mod tests {
         assert_eq!(decoded.facts[1].name, f.facts[1].name);
         assert_eq!(decoded.facts[1].fact, f.facts[1].fact);
         assert_eq!(decoded.temporary, f.temporary);
+        assert_eq!(
+            decoded.retained_original_name(),
+            Some(OsString::from("native-test.psb.original"))
+        );
         let reencoded = decoded.encode(&pool, &|| Ok(())).unwrap();
         assert_eq!(&**encoded, &**reencoded);
         drop(reencoded);
@@ -543,6 +567,28 @@ mod tests {
         assert_eq!(pool.used(), original);
         drop(encoded);
         assert_eq!(pool.used(), 0);
+    }
+    #[test]
+    fn retained_original_name_is_reserved_and_older_intent_semantics_are_refused() {
+        let pool = ResidentBudget::new(8 * 1024 * 1024).unwrap();
+        let f = frame();
+        let encoded = f.encode(&pool, &|| Ok(())).unwrap();
+        let mut previous = encoded.to_vec();
+        previous[..16].copy_from_slice(b"PBEXTERNAL02\0\0\0\0");
+        let body = previous.len() - 32;
+        let mut hash = Context::new(&SHA256);
+        hash.update(b"PeerBrushExternalIntentFrame2\0");
+        hash.update(&previous[..body]);
+        previous[body..].copy_from_slice(hash.finish().as_ref());
+        assert!(IntentFrame::decode(&previous, &pool, &|| Ok(())).is_err());
+        for planned in [
+            f.backup.clone().unwrap(),
+            f.retained_original_name().unwrap(),
+        ] {
+            let mut collision = frame();
+            collision.facts[1].name = planned;
+            assert!(collision.validate().is_err());
+        }
     }
     #[test]
     fn partial_changed_trailing_unknown_and_cancelled_frames_never_infer_debt() {

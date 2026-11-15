@@ -18,19 +18,20 @@ pub(crate) fn regional(
     layer: &Layer,
     previous: Option<Arc<Gray16>>,
     area: [i32; 4],
+    check: &crate::render::Check<'_>,
 ) -> Result<Option<Arc<Gray16>>, String> {
+    check()?;
     let Some(mask) = layer.mask.as_ref().filter(|mask| mask.needs_cache()) else {
         return Ok(None);
     };
     let (width, height) = (layer.pixels.width, layer.pixels.height);
     if uniform(mask) {
-        return Ok(Some(Arc::new(evaluate(mask, width, height)?)));
+        return Ok(Some(Arc::new(evaluate_checked(mask, width, height, check)?)));
     }
-    let output = crate::preview::regions::intersect(area, width, height);
-    let mut result = match previous {
-        Some(image) => image,
-        None => Arc::new(evaluate(mask, width, height)?),
+    let Some(mut result) = previous else {
+        return Ok(Some(Arc::new(evaluate_checked(mask, width, height, check)?)));
     };
+    let output = crate::preview::regions::intersect(area, width, height);
     if output[0] >= output[2] || output[1] >= output[3] {
         return Ok(Some(result));
     }
@@ -43,19 +44,21 @@ pub(crate) fn regional(
     let mut cropped = mask.clone();
     for step in &mut cropped.steps {
         if step.kind == "paint" {
-            step.pixels = crate::preview::regions::crop(&step.pixels, work);
+            step.pixels = crate::preview::regions::crop(&step.pixels, work, check)?;
         }
     }
-    let image = evaluate(
+    let image = evaluate_checked(
         &cropped,
         (work[2] - work[0]) as u32,
         (work[3] - work[1]) as u32,
+        check,
     )?;
     let destination = Arc::make_mut(&mut result);
     if let Some(constant) = destination.constant.take() {
         destination.words = vec![constant; width as usize * height as usize];
     }
     for y in output[1]..output[3] {
+        check()?;
         for x in output[0]..output[2] {
             destination.words[y as usize * width as usize + x as usize] =
                 image.get(x - work[0], y - work[1]);
@@ -104,6 +107,13 @@ pub(super) fn buffer_bytes(layer: &Layer) -> u64 {
         })
 }
 pub(crate) fn prepare(layer: &Layer) -> Result<Option<Arc<Gray16>>, String> {
+    prepare_checked(layer, &|| Ok(()))
+}
+pub(crate) fn prepare_checked(
+    layer: &Layer,
+    check: &crate::render::Check<'_>,
+) -> Result<Option<Arc<Gray16>>, String> {
+    check()?;
     let Some(mask) = layer.mask.as_ref().filter(|m| m.needs_cache()) else {
         return Ok(None);
     };
@@ -119,7 +129,7 @@ pub(crate) fn prepare(layer: &Layer) -> Result<Option<Arc<Gray16>>, String> {
     {
         return Ok(Some(image));
     }
-    let image = Arc::new(evaluate(mask, width, height)?);
+    let image = Arc::new(evaluate_checked(mask, width, height, check)?);
     let mut cache = cache.lock().map_err(|_| "16-bit mask cache unavailable")?;
     if let Some(existing) = cache.items.get(&key) {
         return Ok(Some(existing.clone()));
@@ -159,6 +169,7 @@ pub fn value(layer: &Layer, x: i32, y: i32, prepared: Option<&Gray16>, raw: bool
                 value = value * (1.0 - alpha) + p[0] as f64 * alpha;
             }
             "invert" => value = 65535.0 - value,
+            "density" => value = f64::from(crate::mask::density_sample(value, step.value, 65535)),
             "levels" => {
                 value = (value / 65535.0).powf(f64::from(step.value.clamp(0.1, 5.0))) * 65535.0
             }
@@ -171,7 +182,21 @@ pub fn value(layer: &Layer, x: i32, y: i32, prepared: Option<&Gray16>, raw: bool
     }
     value.clamp(0.0, 65535.0) / 65535.0
 }
+
+pub(crate) fn raw_word(layer: &Layer, x: i32, y: i32, prepared: Option<&Gray16>) -> u16 {
+    (value(layer, x, y, prepared, true) * 65535.).round() as u16
+}
+
 pub(crate) fn evaluate(mask: &Mask, width: u32, height: u32) -> Result<Gray16, String> {
+    evaluate_checked(mask, width, height, &|| Ok(()))
+}
+fn evaluate_checked(
+    mask: &Mask,
+    width: u32,
+    height: u32,
+    check: &crate::render::Check<'_>,
+) -> Result<Gray16, String> {
+    check()?;
     let count = width as usize * height as usize;
     if count as u64 * 2 > MASK_BUDGET {
         return Err("Native16 spatial mask exceeds the128 MiB mask budget".into());
@@ -179,6 +204,7 @@ pub(crate) fn evaluate(mask: &Mask, width: u32, height: u32) -> Result<Gray16, S
     let constant = uniform(mask);
     let mut values = vec![65535u16; if constant { 1 } else { count }];
     for step in mask.steps.iter().filter(|s| s.enabled && s.weight > 0.0) {
+        check()?;
         let before = (step.weight < 1.0).then(|| values.clone());
         match step.kind.as_str() {
             "fill" => {
@@ -201,6 +227,7 @@ pub(crate) fn evaluate(mask: &Mask, width: u32, height: u32) -> Result<Gray16, S
                         .min(height)
                         .min(step.pixels.height)
                     {
+                        check()?;
                         for x in left..(left + crate::raster::TILE)
                             .min(width)
                             .min(step.pixels.width)
@@ -231,12 +258,20 @@ pub(crate) fn evaluate(mask: &Mask, width: u32, height: u32) -> Result<Gray16, S
                     *v = 65535 - *v;
                 }
             }
+            "density" => {
+                for value in &mut values {
+                    *value = crate::mask::density_sample(f64::from(*value), step.value, 65535);
+                }
+            }
             "levels" => {
-                for v in &mut values {
-                    *v = ((*v as f64 / 65535.0).powf(f64::from(step.value.clamp(0.1, 5.0)))
-                        * 65535.0)
-                        .round()
-                        .clamp(0.0, 65535.0) as u16;
+                for row in values.chunks_mut((width as usize).max(1)) {
+                    check()?;
+                    for v in row {
+                        *v = ((*v as f64 / 65535.0).powf(f64::from(step.value.clamp(0.1, 5.0)))
+                            * 65535.0)
+                            .round()
+                            .clamp(0.0, 65535.0) as u16;
+                    }
                 }
             }
             "curves" | "adjust" => {
@@ -257,15 +292,15 @@ pub(crate) fn evaluate(mask: &Mask, width: u32, height: u32) -> Result<Gray16, S
                     "radius",
                     8.0,
                 )) {
-                    box_pass(&mut values, width as usize, height as usize, radius, false);
-                    box_pass(&mut values, width as usize, height as usize, radius, true);
+                    box_pass(&mut values, width as usize, height as usize, radius, false, check)?;
+                    box_pass(&mut values, width as usize, height as usize, radius, true, check)?;
                 }
             }
             "blur" if !constant && step.value >= 0.5 => {
                 let radius = (step.value.round().clamp(1.0, 64.0) as usize).div_ceil(3);
                 for _ in 0..3 {
-                    box_pass(&mut values, width as usize, height as usize, radius, false);
-                    box_pass(&mut values, width as usize, height as usize, radius, true);
+                    box_pass(&mut values, width as usize, height as usize, radius, false, check)?;
+                    box_pass(&mut values, width as usize, height as usize, radius, true, check)?;
                 }
             }
             _ => {}
@@ -278,6 +313,7 @@ pub(crate) fn evaluate(mask: &Mask, width: u32, height: u32) -> Result<Gray16, S
             }
         }
     }
+    check()?;
     Ok(Gray16 {
         width,
         height,
@@ -285,9 +321,16 @@ pub(crate) fn evaluate(mask: &Mask, width: u32, height: u32) -> Result<Gray16, S
         words: if constant { vec![] } else { values },
     })
 }
-fn box_pass(values: &mut [u16], width: usize, height: usize, radius: usize, vertical: bool) {
+fn box_pass(
+    values: &mut [u16],
+    width: usize,
+    height: usize,
+    radius: usize,
+    vertical: bool,
+    check: &crate::render::Check<'_>,
+) -> Result<(), String> {
     if radius == 0 || width == 0 || height == 0 {
-        return;
+        return Ok(());
     }
     let mut ring = vec![0u16; radius + 1];
     let count = (radius * 2 + 1) as u64;
@@ -297,6 +340,7 @@ fn box_pass(values: &mut [u16], width: usize, height: usize, radius: usize, vert
         (height, width, 1)
     };
     for line in 0..lines {
+        check()?;
         let base = if vertical { line } else { line * width };
         let first = values[base];
         let last = values[base + (length - 1) * stride];
@@ -321,6 +365,7 @@ fn box_pass(values: &mut [u16], width: usize, height: usize, radius: usize, vert
             sum -= u64::from(remove);
         }
     }
+    Ok(())
 }
 pub(super) fn image(layer: &Layer) -> Result<Option<Arc<Image16>>, String> {
     if layer.mask.is_none() {

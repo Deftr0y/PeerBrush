@@ -326,15 +326,15 @@ fn native_float_effect_sources_retain_exact_json_values_save_reopen_and_undo() {
     }
     for depth in [8, 16] {
         let mut engine = Engine::new();
-        engine.doc = Document::new_depth(3, 2, depth).unwrap();
-        engine.doc.layers[0].pixels = fixture().layers[0].pixels.clone();
+        engine.resident_state_mut().expect("resident fixture").document = Document::new_depth(3, 2, depth).unwrap();
+        engine.resident_state_mut().expect("resident fixture").document.layers[0].pixels = fixture().layers[0].pixels.clone();
         if depth == 8 {
-            engine.doc.layers[0].pixels =
-                Raster::from_rgba(3, 2, &engine.doc.layers[0].pixels.rgba()).unwrap();
+            engine.resident_state_mut().expect("resident fixture").document.layers[0].pixels =
+                Raster::from_rgba(3, 2, &engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba()).unwrap();
         }
-        let layer = engine.doc.layers[0].id.clone();
-        let original = engine.doc.layers[0].pixels.rgba16();
-        let baseline = engine.doc.export_png().unwrap();
+        let layer = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
+        let original = engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16();
+        let baseline = engine.resident_state().expect("resident fixture").document.export_png().unwrap();
         let settings = json!({
             "opacity":values[0],
             "color":[values[1],values[2],values[3]],
@@ -353,15 +353,15 @@ fn native_float_effect_sources_retain_exact_json_values_save_reopen_and_undo() {
             .edit("human", &[command], None, None, "Native float gradient")
             .unwrap();
         for (key, value) in settings.as_object().unwrap() {
-            assert_eq!(&engine.doc.layers[0].effects[0].settings[key], value);
+            assert_eq!(&engine.resident_state().expect("resident fixture").document.layers[0].effects[0].settings[key], value);
         }
-        let settings = engine.doc.layers[0].effects[0].settings.as_ref().clone();
-        assert_eq!(engine.doc.layers[0].pixels.rgba16(), original);
-        let current = engine.doc.export_png().unwrap();
+        let settings = engine.resident_state().expect("resident fixture").document.layers[0].effects[0].settings.as_ref().clone();
+        assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(), original);
+        let current = engine.resident_state().expect("resident fixture").document.export_png().unwrap();
         assert_ne!(current, baseline);
         for bytes in [
-            psd::encode(&engine.doc).unwrap(),
-            psd::encode_psb(&engine.doc).unwrap(),
+            psd::encode(&engine.resident_state().expect("resident fixture").document).unwrap(),
+            psd::encode_psb(&engine.resident_state().expect("resident fixture").document).unwrap(),
         ] {
             let reopened = psd::decode(&bytes).unwrap();
             assert!(!reopened.read_only);
@@ -373,9 +373,9 @@ fn native_float_effect_sources_retain_exact_json_values_save_reopen_and_undo() {
             assert!(!standard.read_only);
             assert_eq!(standard.export_png().unwrap(), current);
         }
-        assert_eq!(engine.undo.len(), 1);
+        assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), 1);
         engine.undo("human").unwrap();
-        assert_eq!(engine.doc.layers[0].pixels.rgba16(), original);
-        assert_eq!(engine.doc.export_png().unwrap(), baseline);
+        assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(), original);
+        assert_eq!(engine.resident_state().expect("resident fixture").document.export_png().unwrap(), baseline);
     }
 }

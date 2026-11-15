@@ -334,6 +334,33 @@ impl DiskBudget {
 }
 
 impl DiskReservation {
+    pub(crate) fn settle_source(self, receipt: super::RetiredSource) -> Result<()> {
+        let (identity, bytes, budget) = receipt.into_parts();
+        if !self.budget.same_pool(&budget) || self.bytes()? != bytes {
+            return Err(Error::Changed);
+        }
+        self.release_retired(identity)
+    }
+    pub(crate) fn settle_pending_marker(
+        self,
+        receipt: crate::workspace::source_runtime::RetiredPendingMarker,
+    ) -> Result<()> {
+        let (identity, bytes, budget) = receipt.into_parts();
+        if !self.budget.same_pool(&budget) || self.bytes()? != bytes {
+            return Err(Error::Changed);
+        }
+        self.release_retired(identity)
+    }
+    pub(crate) fn settle_checkpoint(
+        self,
+        receipt: crate::workspace::source_runtime::RetiredMarker,
+    ) -> Result<()> {
+        let (identity, bytes, budget) = receipt.into_parts();
+        if !self.budget.same_pool(&budget) || self.bytes()? != bytes {
+            return Err(Error::Changed);
+        }
+        self.release_retired(identity)
+    }
     pub fn bytes(&self) -> Result<u64> {
         self.budget
             .0

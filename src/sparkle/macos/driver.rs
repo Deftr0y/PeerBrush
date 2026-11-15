@@ -342,11 +342,9 @@ impl State {
         }
         let item = self.item.borrow().clone()?;
         // Never hold a RefCell borrow across a native property getter.
-        let version: Option<Retained<NSString>> = unsafe { msg_send![&*item, versionString] };
+        let version = appcast_release_version(&item)?;
         let signed: isize = unsafe { msg_send![&*item, signingValidationStatus] };
-        let version = text(version, 128)?;
         if signed != 1
-            || !super::installed::machine_version(&version)
             || !matches!(
                 self.native_outcome(),
                 super::coordinator::NativeOutcome::Installed { .. }
@@ -685,6 +683,19 @@ fn text(value: Option<Retained<NSString>>, limit: usize) -> Option<String> {
     (value.len() <= limit && !value.contains('\0')).then_some(value)
 }
 
+fn appcast_release_version(item: &AnyObject) -> Option<String> {
+    let build: Option<Retained<NSString>> = unsafe { msg_send![item, versionString] };
+    let display: Option<Retained<NSString>> = unsafe { msg_send![item, displayVersionString] };
+    let build = text(build, 128)?;
+    let version = text(display, 128)?;
+    if !super::installed::machine_version(&version)
+        || crate::sparkle::bundle_version(&version).as_ref() != build
+    {
+        return None;
+    }
+    Some(version)
+}
+
 define_class!(
     #[unsafe(super = NSObject)]
     #[thread_kind = MainThreadOnly]
@@ -721,12 +732,12 @@ define_class!(
                 // as if that proved it could not install on ordinary termination.
                 state.quarantine(); return;
             }
-            let version: Option<Retained<NSString>>=unsafe { msg_send![item, versionString] };
+            let version=appcast_release_version(item);
             let format: Option<Retained<NSString>>=unsafe { msg_send![item, itemDescriptionFormat] };
             let description: Option<Retained<NSString>>=unsafe { msg_send![item, itemDescription] };
             let format=text(format, 32);
             let notes=if format.as_deref()==Some("plain-text") { text(description, check::NOTES_LIMIT).unwrap_or_default() } else { String::new() };
-            let accepted=state.session.borrow_mut().found(text(version,128).unwrap_or_default(),notes);
+            let accepted=state.session.borrow_mut().found(version.unwrap_or_default(),notes);
             let cancellation=state.cancellation.borrow_mut().take(); drop(cancellation);
             if accepted {
                 let information_only: Bool=unsafe { msg_send![item, isInformationOnlyUpdate] };

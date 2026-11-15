@@ -3,7 +3,7 @@
 pub(crate) mod input;
 #[path = "brush/native.rs"]
 pub(crate) mod native;
-use crate::raster::{blend, Pixel, Raster, TILE};
+use crate::raster::{blend, project16, Pixel, Pixel16, Raster, TILE};
 use serde_json::Value;
 use std::{
     collections::{btree_map::Entry, BTreeMap, BTreeSet},
@@ -343,10 +343,7 @@ fn smooth_noise(x: f32, y: f32, seed: u32) -> f32 {
 
 /// Pressure can be a third point coordinate or a parallel array. Mouse callers omit it.
 pub fn points_from_command(c: &Value) -> Result<(Vec<[f32; 2]>, Option<Vec<f32>>), String> {
-    let values = c["points"]
-        .as_array()
-        .filter(|p| !p.is_empty() && p.len() <= 10000)
-        .ok_or("Stroke needs 1–10000 points")?;
+    let values = command_point_values(c)?;
     let mut points = Vec::new();
     points
         .try_reserve_exact(values.len())
@@ -355,41 +352,97 @@ pub fn points_from_command(c: &Value) -> Result<(Vec<[f32; 2]>, Option<Vec<f32>>
     pressures
         .try_reserve_exact(values.len())
         .map_err(|_| "Stroke pressure allocation failed")?;
-    let mut explicit = false;
-    for value in values {
-        let point = value
-            .as_array()
-            .filter(|p| p.len() == 2 || p.len() == 3)
-            .ok_or("Stroke points must be [x,y] or [x,y,pressure]")?;
-        let coordinate = |index: usize| -> Result<f32, String> {
-            let n = point[index]
-                .as_f64()
-                .filter(|n| n.is_finite() && n.abs() <= 100000.0)
-                .ok_or("Invalid stroke coordinate")?;
-            Ok(n as f32)
-        };
-        points.push([coordinate(0)?, coordinate(1)?]);
-        if point.len() == 3 {
-            explicit = true;
-            pressures.push(pressure(&point[2])?);
-        } else {
-            pressures.push(1.0);
+    let explicit = visit_stroke_samples(c, values, |point| points.push(point), |p| {
+        pressures.push(p)
+    })?;
+    if let Some((start, component, value)) =
+        command_axis(c, points.len(), *points.last().unwrap(), |start| Ok(points[start]))?
+    {
+        for point in &mut points[start..] {
+            point[component] = value;
         }
     }
-    if let Some(values) = c.get("pressures") {
+    Ok((points, explicit.then_some(pressures)))
+}
+
+/// Validate the complete stroke but retain only its projected endpoint.
+pub(crate) fn endpoint_from_command(c: &Value) -> Result<([f32; 2], f32), String> {
+    let values = command_point_values(c)?;
+    let mut end = [0.0; 2];
+    let mut last_pressure = 1.0;
+    visit_stroke_samples(c, values, |point| end = point, |p| last_pressure = p)?;
+    if let Some((_, component, value)) = command_axis(c, values.len(), end, |start| {
+        command_point(&values[start]).map(|(point, _)| point)
+    })? {
+        end[component] = value;
+    }
+    Ok((end, last_pressure))
+}
+
+fn command_point_values(c: &Value) -> Result<&[Value], String> {
+    c["points"]
+        .as_array()
+        .filter(|p| !p.is_empty() && p.len() <= 10000)
+        .map(Vec::as_slice)
+        .ok_or_else(|| "Stroke needs 1–10000 points".into())
+}
+
+fn command_point(value: &Value) -> Result<([f32; 2], Option<f32>), String> {
+    let point = value
+        .as_array()
+        .filter(|p| p.len() == 2 || p.len() == 3)
+        .ok_or("Stroke points must be [x,y] or [x,y,pressure]")?;
+    let coordinate = |index: usize| -> Result<f32, String> {
+        let n = point[index]
+            .as_f64()
+            .filter(|n| n.is_finite() && n.abs() <= 100000.0)
+            .ok_or("Invalid stroke coordinate")?;
+        Ok(n as f32)
+    };
+    Ok((
+        [coordinate(0)?, coordinate(1)?],
+        point.get(2).map(pressure).transpose()?,
+    ))
+}
+
+fn visit_stroke_samples(
+    c: &Value,
+    values: &[Value],
+    mut on_point: impl FnMut([f32; 2]),
+    mut on_pressure: impl FnMut(f32),
+) -> Result<bool, String> {
+    let parallel = c.get("pressures");
+    let mut explicit = false;
+    for value in values {
+        let (point, inline) = command_point(value)?;
+        on_point(point);
+        explicit |= inline.is_some();
+        if parallel.is_none() {
+            on_pressure(inline.unwrap_or(1.0));
+        }
+    }
+    if let Some(parallel) = parallel {
         if explicit {
             return Err("Use pressure coordinates or pressures array, not both".into());
         }
-        let values = values
+        let parallel = parallel
             .as_array()
-            .filter(|p| p.len() == points.len())
+            .filter(|p| p.len() == values.len())
             .ok_or("Pressures must match the point count")?;
-        pressures.clear();
-        for value in values {
-            pressures.push(pressure(value)?);
+        for value in parallel {
+            on_pressure(pressure(value)?);
         }
         explicit = true;
     }
+    Ok(explicit)
+}
+
+fn command_axis(
+    c: &Value,
+    count: usize,
+    end: [f32; 2],
+    anchor: impl FnOnce(usize) -> Result<[f32; 2], String>,
+) -> Result<Option<(usize, usize, f32)>, String> {
     if let Some(axis) = c.get("stroke_axis") {
         let axis = axis
             .as_str()
@@ -399,21 +452,21 @@ pub fn points_from_command(c: &Value) -> Result<(Vec<[f32; 2]>, Option<Vec<f32>>
             .get("stroke_axis_from")
             .map(|v| {
                 v.as_u64()
-                    .filter(|i| *i < points.len() as u64)
+                    .filter(|i| *i < count as u64)
                     .ok_or("Stroke axis start must index an existing point")
             })
             .transpose()?
             .unwrap_or(0) as usize;
-        let anchor = points[start];
+        let anchor = anchor(start)?;
         let horizontal = axis == "horizontal"
-            || (axis == "axis" && horizontal_axis(anchor, *points.last().unwrap()));
-        for point in &mut points[start..] {
-            point[if horizontal { 1 } else { 0 }] = anchor[if horizontal { 1 } else { 0 }];
-        }
+            || (axis == "axis" && horizontal_axis(anchor, end));
+        let component = usize::from(horizontal);
+        Ok(Some((start, component, anchor[component])))
     } else if c.get("stroke_axis_from").is_some() {
-        return Err("Stroke axis start requires a stroke axis".into());
+        Err("Stroke axis start requires a stroke axis".into())
+    } else {
+        Ok(None)
     }
-    Ok((points, explicit.then_some(pressures)))
 }
 /// Choose in document coordinates; a view's pan/zoom never changes the axis.
 pub fn horizontal_axis(a: [f32; 2], b: [f32; 2]) -> bool {
@@ -639,6 +692,22 @@ pub fn paint_with_pressure(
     clip: Option<[i32; 4]>,
     polygon: Option<&[[f32; 2]]>,
 ) -> Result<(), String> {
+    paint_native_color(
+        raster, points, pressures, settings, color.map(|value| u16::from(value) * 257),
+        erase, clip, polygon,
+    )
+}
+
+pub(crate) fn paint_native_color(
+    raster: &mut Raster,
+    points: &[[f32; 2]],
+    pressures: Option<&[f32]>,
+    settings: Settings,
+    color: Pixel16,
+    erase: bool,
+    clip: Option<[i32; 4]>,
+    polygon: Option<&[[f32; 2]]>,
+) -> Result<(), String> {
     let dabs = dabs(points, pressures, settings)?;
     if settings.opacity == 0.0 || settings.flow == 0.0 || color[3] == 0 {
         return Ok(());
@@ -655,7 +724,6 @@ pub fn paint_with_pressure(
     if raster.depth == 16 {
         let mut coverage = BTreeMap::new();
         accumulate16(&mut coverage, &dabs, settings, clip, polygon);
-        let color = color.map(|value| value as u16 * 257);
         for (key, alpha) in coverage {
             if !alpha.iter().any(|&value| value != 0) {
                 continue;
@@ -680,6 +748,7 @@ pub fn paint_with_pressure(
         }
         return Ok(());
     }
+    let color = color.map(project16);
     // Coverage has only alpha. Resolve the tile once per dab/tile intersection rather
     // than looking it up and performing copy-on-write for every covered pixel.
     let mut coverage: BTreeMap<(u32, u32), Vec<u8>> = BTreeMap::new();
@@ -935,7 +1004,7 @@ pub struct Session {
     baseline: Raster,
     raster: Raster,
     settings: Settings,
-    color: Pixel,
+    color: Pixel16,
     erase: bool,
     clip: [i32; 4],
     polygon: Option<Vec<[f32; 2]>>,
@@ -950,6 +1019,20 @@ impl Session {
         baseline: &Raster,
         settings: Settings,
         color: Pixel,
+        erase: bool,
+        clip: Option<[i32; 4]>,
+        polygon: Option<&[[f32; 2]]>,
+    ) -> Result<Self, String> {
+        Self::with_native_color(
+            baseline, settings, color.map(|value| u16::from(value) * 257), erase, clip,
+            polygon,
+        )
+    }
+
+    pub(crate) fn with_native_color(
+        baseline: &Raster,
+        settings: Settings,
+        color: Pixel16,
         erase: bool,
         clip: Option<[i32; 4]>,
         polygon: Option<&[[f32; 2]]>,
@@ -1098,7 +1181,7 @@ impl Session {
                     &mut tile,
                     alpha,
                     self.settings.opacity,
-                    self.color.map(|value| value as u16 * 257),
+                    self.color,
                     self.erase,
                 );
                 if old.is_some() || nonzero {
@@ -1109,6 +1192,7 @@ impl Session {
             return Ok(&self.raster);
         }
         if visible {
+            let color = self.color.map(project16);
             let touched = accumulate(
                 &mut self.coverage,
                 update,
@@ -1132,7 +1216,7 @@ impl Session {
                     &mut tile,
                     alpha,
                     self.settings.opacity,
-                    self.color,
+                    color,
                     self.erase,
                 );
                 if old.is_some() || nonzero {

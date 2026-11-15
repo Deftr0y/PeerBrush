@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 #[test]
 fn per_tool_preferences_are_shared_by_projects_and_never_enter_document_history_or_psd() {
     let root = Arc::new(Mutex::new(Engine::new()));
-    let original = peerbrush::psd::encode(&root.lock().unwrap().doc).unwrap();
+    let original = peerbrush::psd::encode(&root.lock().unwrap().resident_state().expect("resident fixture").document).unwrap();
     let second = workspace::new_project(&root, 32, 24, 16, None).unwrap();
     let result=server::dispatch(&root,"tool_settings",&json!({"action":"set","tool":"brush","actor":"artist","expected_tool_revision":0,"preset":"brush-pen","settings":{"radius":17.25,"opacity":0.4,"tip":"grain","seed":37}})).unwrap();
     assert_eq!(result["profile"]["settings"]["radius"], 17.25);
@@ -34,10 +34,10 @@ fn per_tool_preferences_are_shared_by_projects_and_never_enter_document_history_
     assert_eq!(eraser["profile"]["settings"]["opacity"], 1.0);
     assert_eq!(eraser["revision"], 0);
     let e = root.lock().unwrap();
-    assert_eq!(peerbrush::psd::encode(&e.doc).unwrap(), original);
-    assert!(e.undo.is_empty() && e.redo.is_empty());
+    assert_eq!(peerbrush::psd::encode(&e.resident_state().expect("resident fixture").document).unwrap(), original);
+    assert!(e.resident_state().expect("resident fixture").undo.is_empty() && e.resident_state().expect("resident fixture").redo.is_empty());
     let mut copy = Engine::new();
-    copy.doc = Document::new_depth(8, 8, 16).unwrap();
+    copy.resident_state_mut().expect("resident fixture").document = Document::new_depth(8, 8, 16).unwrap();
     let loaded = workspace::register(&root, copy, None).unwrap();
     assert!(Arc::ptr_eq(
         &loaded.lock().unwrap().tool_settings,

@@ -1,4 +1,97 @@
 use super::*;
+
+pub(super) struct ProposalFrame {
+    pub id: String,
+    state: Option<Value>,
+    draft: Option<Arc<Document>>,
+}
+
+impl ProposalFrame {
+    pub(super) fn capture(engine: &crate::engine::Engine, id: &str) -> Self {
+        let proposal = engine.proposals.iter().find(|proposal| proposal.id == id);
+        Self {
+            id: id.into(),
+            state: proposal.map(crate::collaboration::Proposal::state),
+            draft: proposal.and_then(|proposal| proposal.draft.clone()),
+        }
+    }
+
+    pub(super) fn resident_draft(&self) -> Result<Arc<Document>, String> {
+        self.draft.clone().ok_or_else(|| {
+            self.state.as_ref().and_then(|state| state["reason"].as_str())
+                .unwrap_or("Proposal not found in this project").to_owned()
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::Engine;
+
+    #[test]
+    fn proposal_preview_worker_restamps_its_copy_and_keeps_the_review_snapshot_immutable() {
+        for depth in [8, 16] {
+            let (mut app, ctx) = super::super::workspace_tests::fixture(depth);
+            app.preview_quality = preview_quality::Quality::load(Path::new(""));
+            app.set_preview_quality(true).unwrap();
+            let source = {
+                let mut engine = app.shared.lock().unwrap();
+                let resident = engine.resident_state_mut().unwrap();
+                resident.document = Engine::preview_edits(resident.document.clone(), &[json!({
+                    "op":"canvas.resize", "width":2048, "height":24, "anchor":"top_left",
+                })]).unwrap();
+                resident.document.clone()
+            };
+            app.doc_snapshot = source.clone().into();
+            let state = crate::collaboration::propose(&app.shared, "agent", &json!({
+                "document_id":source.id,"expected_revision":source.revision,
+                "commands":[{"op":"paint.fill","layer":app.selected,"rect":[3,4,11,12],"color":[17,79,151,193]}],
+            })).unwrap();
+            let id = state["id"].as_str().unwrap();
+            app.proposal_review = Some(id.into());
+            app.proposal_original = false;
+            let snapshot = ProposalFrame::capture(&app.shared.lock().unwrap(), id)
+                .resident_draft().unwrap();
+            assert!(Arc::ptr_eq(
+                &snapshot,
+                &app.shared.lock().unwrap().proposal_snapshot(id).unwrap()
+            ));
+            let frozen = serde_json::to_value(&*snapshot).unwrap();
+            let expected = snapshot.preview(None, 8192, None, false).unwrap();
+            let before = super::super::workspace_tests::source(&app);
+            for original in [false, true] {
+                app.proposal_original = original;
+                app.last_preview = None;
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                loop {
+                    app.request_preview(&ctx, &source);
+                    if !app.pending && app.canvas_pixels.is_some() {
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "Actual proposal preview did not finish"
+                    );
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                let expected = if original {
+                    source.preview(None, 8192, None, false).unwrap()
+                } else {
+                    expected.clone()
+                };
+                assert_eq!(app.canvas_pixels.as_ref().unwrap().0, 2048);
+                assert_eq!(
+                    app.canvas_pixels.as_ref().unwrap(),
+                    &(expected.0, expected.1, expected.2)
+                );
+                assert_eq!(serde_json::to_value(&*snapshot).unwrap(), frozen);
+                assert_eq!(snapshot.revision, source.revision + 1);
+                assert_eq!(super::super::workspace_tests::source(&app), before);
+            }
+        }
+    }
+}
 impl PeerBrush {
     pub(super) fn reconcile_reservation_message(&mut self) {
         if !self.message.starts_with("Reserved by ") {
@@ -23,12 +116,10 @@ impl PeerBrush {
             self.message = "Reservation released · ready to edit".into();
         }
     }
-    pub(super) fn review_document(&mut self, current: &Document) -> Option<Document> {
-        let id = self.proposal_review.as_ref()?;
-        if self.proposal_original {
-            return Some(current.clone());
-        }
-        let draft = self.shared.lock().unwrap().proposal_document(id);
+    pub(super) fn resolve_proposal_document(
+        &mut self,
+        draft: Result<Arc<Document>, String>,
+    ) -> Option<Arc<Document>> {
         match draft {
             Ok(doc) => Some(doc),
             Err(reason) => {
@@ -40,39 +131,46 @@ impl PeerBrush {
                 self.canvas_pixels = None;
                 self.canvas_selection = None;
                 self.last_preview = None;
-                Some(current.clone())
+                None
             }
         }
     }
     pub(super) fn task_history_menu(&mut self, ui: &mut egui::Ui) {
-        let (tasks, proposals, recovery, code, names) = {
-            let mut e = self.shared.lock().unwrap();
-            let p = e.proposals_state();
-            let names: HashMap<String, String> = crate::engine::view::current(&e)
-                .layers()
-                .map(|layer| (layer.id().to_owned(), layer.name().to_owned()))
-                .collect();
-            (
-                e.task_history(),
-                p,
-                e.task_recovery(),
-                e.code_states(),
-                names,
-            )
+        let pending = {
+            let Ok(mut engine) = self.shared.try_lock() else {
+                ui.ctx().request_repaint_after(Duration::from_millis(16));
+                return;
+            };
+            engine.expire();
+            engine.proposals.iter().filter(|proposal| proposal.status == "pending").count()
         };
-        let pending = proposals
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|p| p["status"] == "pending")
-            .count();
         let title = if pending == 0 {
             "AI tasks".into()
         } else {
             format!("AI tasks · {pending} to review")
         };
         ui.menu_button(RichText::new(title).color(AI_BLUE), |ui| {
-            for run in code.as_array().unwrap().iter().rev() {
+            let (tasks, proposals, recovery, code, names) = {
+                let Ok(mut engine) = self.shared.try_lock() else {
+                    ui.label("Working on this project…");
+                    ui.ctx().request_repaint_after(Duration::from_millis(16));
+                    return;
+                };
+                let proposals = engine.proposals_state();
+                let names: HashMap<String, String> = crate::engine::view::current(&engine)
+                    .layers()
+                    .map(|layer| (layer.id().to_owned(), layer.name().to_owned()))
+                    .collect();
+                (
+                    engine.task_history(),
+                    proposals,
+                    engine.task_recovery(),
+                    engine.code_states(),
+                    names,
+                )
+            };
+            if let Err(error)=&code {ui.label(RichText::new(error).color(AI_BLUE));}
+            for run in code.as_ref().ok().and_then(|code|code.as_array()).into_iter().flatten().rev() {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(format!("{} · {}",run["status"].as_str().unwrap(),run["description"].as_str().unwrap())).color(AI_BLUE))
                         .on_hover_text(run["error"].as_str().map(str::to_owned).unwrap_or_else(||scope_text_with(&run["scopes"],|id|names.get(id).map(String::as_str))));
@@ -87,7 +185,7 @@ impl PeerBrush {
                 let label=format!("{} · {}",proposal["label"].as_str().unwrap(),if pending {"Review proposal"}else{proposal["status"].as_str().unwrap()});
                 if ui.button(RichText::new(label).color(AI_BLUE)).on_hover_text(proposal["reason"].as_str().unwrap()).clicked() {
                     if (self.proposal_review.is_some()||self.live_key().is_empty())&&self.geometry.is_none()&&self.source_editor.is_none() {
-                        self.proposal_review=Some(proposal["id"].as_str().unwrap().into());self.proposal_original=false;self.proposal_error=None;self.proposal_rendered=None;self.last_preview=None;self.animation.cancel();
+                        self.proposal_review=Some(proposal["id"].as_str().unwrap().into());self.proposal_original=false;self.proposal_error=None;self.proposal_rendered=None;self.last_preview=None;self.interrupt_animation();
                     }else{self.message="Finish the current gesture or editor before reviewing a proposal".into();}
                     ui.close_menu();
                 }
@@ -222,29 +320,63 @@ impl PeerBrush {
             self.proposal_error = None;
             self.proposal_original = false;
             self.proposal_rendered = None;
-            self.animation.cancel();
+            self.interrupt_animation();
             self.texture = None;
             self.canvas_pixels = None;
             self.canvas_selection = None;
+            self.preview_epoch.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.native_dispatch.clear();
+            self.native_canvas.clear();
+            self.native_receipt = None;
+            self.pending = false;
+        }
+    }
+    pub(super) fn accept_reviewed_proposal(
+        &mut self,
+        ctx: &egui::Context,
+        doc: DocumentView<'_>,
+        id: &str,
+    ) -> Result<bool, String> {
+        if doc.native().is_some() {
+            if !self.native_proposal_canvas_current(doc) || self.proposal_original {
+                return Err("Wait for the current proposed result before accepting".into());
+            }
+            self.submit_edit_job(
+                edit_job::Request {
+                    project: self.project_id.clone(),
+                    document: doc.id().into(),
+                    revision: doc.revision(),
+                    label: "AI proposal accepted · Undo restores the previous project".into(),
+                    selection_edit: false,
+                    origin: edit_job::Origin::Proposal(egui::Id::new(id)),
+                },
+                edit_job::Commands::resident(vec![]),
+                ctx,
+            )?;
+            Ok(false)
+        } else {
+            self.shared.lock().unwrap().accept_proposal(
+                "human", id, doc.id(), doc.revision(),
+            )?;
+            self.message = "AI proposal accepted · Undo restores the previous project".into();
+            Ok(true)
         }
     }
     pub(super) fn proposal_window<'a>(
         &mut self,
         ctx: &egui::Context,
         doc: impl Into<DocumentView<'a>>,
+        frame: Option<&ProposalFrame>,
     ) {
         let doc = doc.into();
         let Some(id) = self.proposal_review.clone() else {
             return;
         };
-        let proposals = self.shared.lock().unwrap().proposals_state();
-        let Some(proposal) = proposals
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|p| p["id"] == id)
-            .cloned()
-        else {
+        let Some(frame) = frame.filter(|frame| frame.id == id) else {
+            ctx.request_repaint();
+            return;
+        };
+        let Some(proposal) = &frame.state else {
             self.close_proposal();
             return;
         };
@@ -276,18 +408,19 @@ impl PeerBrush {
                         }
                     });
                 if pending {
-                    ui.horizontal(|ui| {
-                        if ui
-                            .selectable_value(&mut self.proposal_original, true, "Original")
-                            .changed()
-                        {
-                            self.last_preview = None;
-                        }
-                        if ui
-                            .selectable_value(&mut self.proposal_original, false, "Proposed result")
-                            .changed()
-                        {
-                            self.last_preview = None;
+                    ui.horizontal_wrapped(|ui| {
+                        for (original, icon, label, help) in [
+                            (true, Icon::CanvasBounds, "Original", "Show the document before the proposed edit."),
+                            (false, Icon::Adjust, "Proposed result", "Show the rendered changes that Accept will apply."),
+                        ] {
+                            let selected = self.proposal_original == original;
+                            if icons::labeled_choice(ui, icon, label, Some(selected), 0.)
+                                .on_hover_text(help)
+                                .clicked() && !selected
+                            {
+                                self.proposal_original = original;
+                                self.last_preview = None;
+                            }
                         }
                     });
                 }
@@ -299,7 +432,9 @@ impl PeerBrush {
                         .add_enabled(
                             pending
                                 && !self.busy
+                                && !self.edit_worker.pending()
                                 && !self.proposal_original
+                                && (doc.native().is_none() || self.native_proposal_canvas_current(doc))
                                 && self.proposal_error.is_none()
                                 && self.proposal_rendered.as_deref()
                                     == Some(self.live_key().as_str()),
@@ -307,19 +442,9 @@ impl PeerBrush {
                         )
                         .clicked()
                     {
-                        let result = self.shared.lock().unwrap().accept_proposal(
-                            "human",
-                            &id,
-                            &doc.id(),
-                            doc.revision(),
-                        );
+                        let result = self.accept_reviewed_proposal(ctx, doc, &id);
                         match result {
-                            Ok(_) => {
-                                self.message =
-                                    "AI proposal accepted · Undo restores the previous project"
-                                        .into();
-                                close = true;
-                            }
+                            Ok(finished) => close = finished,
                             Err(e) => {
                                 self.proposal_error = Some(e);
                             }
@@ -327,7 +452,7 @@ impl PeerBrush {
                     }
                     if ui
                         .add_enabled(
-                            proposal["status"] != "accepted",
+                            proposal["status"] != "accepted" && !self.edit_worker.pending(),
                             egui::Button::new("Reject"),
                         )
                         .clicked()

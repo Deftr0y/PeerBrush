@@ -177,6 +177,13 @@ impl super::PeerBrush {
             }
         };
         self.pending = false;
+        self.present_native_prepared(prepared, ctx)
+    }
+    pub(super) fn present_native_prepared(
+        &mut self,
+        prepared: super::native_texture::Prepared,
+        ctx: &egui::Context,
+    ) -> Result<bool, String> {
         let previous_warning = self
             .native_canvas
             .current()
@@ -192,6 +199,7 @@ impl super::PeerBrush {
                 Err("Native display superseded".into())
             }
         })?;
+        self.native_receipt = None;
         if let Some(warning) = warning {
             self.message = warning.into();
         } else if previous_warning.is_some_and(|warning| self.message == warning) {
@@ -363,9 +371,13 @@ mod tests {
         doc.icc_profile = profile;
         doc.layers[0].kind = "fill".into();
         doc.layers[0].color = [19, 43, 71, 199];
+        let snapshot = capture_document(session, &doc);
+        (doc, snapshot)
+    }
+    fn capture_document(session: &SourceSession, doc: &Document) -> Arc<SceneSnapshot> {
         let mut collector = ZeroSources { sources: vec![] };
         let charge = MetadataCharge::reserve(&session.resident(), 1024 * 1024, &|| Ok(())).unwrap();
-        let metadata = Document36::capture(&doc, &mut collector).unwrap();
+        let metadata = Document36::capture(doc, &mut collector).unwrap();
         let pending = PendingScene::new(
             Admitted::from_parts(Arc::new(metadata), charge),
             RasterRoster::new(collector.sources).unwrap(),
@@ -386,7 +398,7 @@ mod tests {
             None,
         )
         .unwrap();
-        (doc, Arc::new(snapshot))
+        Arc::new(snapshot)
     }
     fn wait(
         presentation: &mut Presentation,
@@ -401,6 +413,103 @@ mod tests {
             }
             assert!(Instant::now() < end, "Native preview did not complete");
             std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+    #[test]
+    fn selection_modes_reach_actual_texture_uploads_with_distinct_tags_and_no_source_owners() {
+        for depth in [8, 16] {
+            for mode in ["mask", "overlay", "cutout"] {
+                let fixture = Fixture::new();
+                let (runtime, connection) = fixture.runtime_with_budget(256 * 1024 * 1024);
+                let pool = runtime.resident();
+                let session = Arc::new(runtime.begin().unwrap());
+                let mut doc = Document::new_depth(9, 7, depth).unwrap();
+                doc.layers[0].kind = "fill".into();
+                doc.layers[0].color = [19, 43, 71, 199];
+                doc.selection_polygon = Some(vec![[1., 1.], [8., 2.], [5., 6.]]);
+                doc.selection =
+                    crate::selection::bounds(doc.selection_polygon.as_ref().unwrap()).ok();
+                let original = serde_json::to_value(&doc).unwrap();
+                let scene = capture_document(&session, &doc);
+                let source = scene.key();
+                let weak_scene = Arc::downgrade(&scene);
+                let weak_session = Arc::downgrade(&session);
+                let request = Request::capture_selection(
+                    scene.clone(),
+                    session.clone(),
+                    None,
+                    48,
+                    None,
+                    false,
+                    Some(mode),
+                )
+                .unwrap();
+                let plain = Request::capture(scene.clone(), session.clone(), None, 48, None, false)
+                    .unwrap();
+                assert_ne!(plain.key(), request.key());
+                drop(plain);
+                let retirement = super::super::native_texture::Retirement::new(&pool).unwrap();
+                let mut worker = Worker::new(Arc::new(AtomicU64::new(7)));
+                let mut presentation = Presentation::default();
+                let ctx = egui::Context::default();
+                presentation
+                    .request_uploads(&mut worker, request, 7, retirement.clone(), 64, &ctx)
+                    .unwrap();
+                drop((scene, session));
+                let end = Instant::now() + Duration::from_secs(5);
+                let prepared = loop {
+                    if let Some(prepared) =
+                        presentation.take_uploads(source, doc.revision, 7).unwrap()
+                    {
+                        break prepared;
+                    }
+                    assert!(Instant::now() < end, "Selection upload did not complete");
+                    std::thread::yield_now();
+                };
+                assert!(weak_scene.upgrade().is_none());
+                assert!(weak_session.upgrade().is_none());
+                let tag = prepared.tag().clone();
+                let mut presenter = super::super::native_texture::Presenter::default();
+                presenter
+                    .present(prepared, &tag, &ctx, &mut || Ok(()))
+                    .unwrap();
+                let (w, h, mut expected, area) = doc.preview(None, 48, None, false).unwrap();
+                crate::selection::display::apply_region(&doc, w, h, &mut expected, area, mode);
+                let expected =
+                    egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &expected);
+                let delta = ctx.tex_manager().write().take_delta();
+                let ids: std::collections::HashSet<_> =
+                    presenter.current().unwrap().texture_ids().collect();
+                assert_eq!(ids.len(), 1);
+                let (_, image) = delta.set.iter().find(|(id, _)| ids.contains(id)).unwrap();
+                let egui::ImageData::Color(image) = &image.image else {
+                    panic!("Expected selection color pixels")
+                };
+                assert_eq!(image.pixels, expected.pixels, "depth{depth} {mode}");
+                assert_eq!(serde_json::to_value(&doc).unwrap(), original);
+                drop(delta);
+                presenter.clear();
+                presentation.clear();
+                worker.stop();
+                drop((
+                    presenter,
+                    presentation,
+                    worker,
+                    tag,
+                    ctx,
+                    retirement,
+                    runtime,
+                    connection,
+                ));
+                let end = Instant::now() + Duration::from_secs(5);
+                while pool.used() != 0 {
+                    assert!(
+                        Instant::now() < end,
+                        "Selection upload admission was not retired"
+                    );
+                    std::thread::yield_now();
+                }
+            }
         }
     }
     #[test]

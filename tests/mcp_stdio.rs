@@ -171,7 +171,7 @@ fn adapter_preserves_offline_tools_across_bad_metadata_and_authentication_then_r
     std::fs::write(&path, original).unwrap();
     let recovered = adapter.send(&json!({"id":5,"method":"tools/call","params":{"name":"peerbrush_observe","arguments":{"image":false}}}));
     assert_eq!(recovered["result"]["isError"], false);
-    assert_eq!(shared.lock().unwrap().doc.revision, 0);
+    assert_eq!(shared.lock().unwrap().resident_state().expect("resident fixture").document.revision, 0);
     assert!(!shared.lock().unwrap().focus_requested);
     adapter.stop();
     assert!(shared.lock().unwrap().mcp_clients.is_empty());

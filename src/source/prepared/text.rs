@@ -5,9 +5,9 @@ use crate::{
     fonts::prepared::FontOwner,
     large_document::{PinnedBytes, ResidentBudget, ScratchBytes},
     raster::{backed::Region, project16, Pixel16},
-    source::TextLayout,
+    source::text_position::{LegacyStyle, NativeCarets},
 };
-use ab_glyph::{point, Font, Glyph, PxScale, ScaleFont};
+use ab_glyph::{Font, Glyph};
 use std::sync::Arc;
 struct ReadyGlyph {
     bounds: ab_glyph::Rect,
@@ -28,6 +28,7 @@ impl TextPlan {
         font: Arc<FontOwner>,
         pool: &ResidentBudget,
         check: Check<'_>,
+        carets: Option<&mut Option<NativeCarets>>,
     ) -> Result<Self, String> {
         let Content36::Text {
             text,
@@ -46,6 +47,7 @@ impl TextPlan {
             .reserve_bytes(8 * 1024 * 1024, 8 * 1024 * 1024)
             .map_err(|e| e.to_string())?;
         let f = font.font();
+        let mut layout_carets = carets.as_ref().and_then(|_| NativeCarets::new(text, *layout, pool).ok());
         let mut work = 0;
         let mut glyphs = Vec::new();
         glyphs
@@ -58,7 +60,7 @@ impl TextPlan {
         {
             return Err("Glyph placement capacity exceeded metadata admission".into());
         }
-        if *layout == TextLayout::Shaped {
+        if layout.uses_shaping() {
             let placed = {
                 let _working = [
                     pool.reserve_bytes(64 * 1024 * 1024, 64 * 1024 * 1024)
@@ -71,6 +73,7 @@ impl TextPlan {
                 font.preflight_shaping(check)?;
                 // This callback precedes shaping's outline validation allocation.
                 super::super::shaping::layout_parts(
+                    *layout,
                     source.width,
                     text,
                     match source.definition() {
@@ -82,40 +85,31 @@ impl TextPlan {
                     *letter_spacing,
                     align,
                     f,
-                    &mut |id| font.preflight_glyph(id, check),
+                    &mut |id| match id {
+                        Some(id) => font.preflight_glyph(id, check),
+                        None => check(),
+                    },
+                    layout_carets.as_mut().map(|carets| &mut carets.map),
                 )?
             };
             for glyph in placed {
                 push(&mut glyphs, &font, glyph, &mut work, pool, check)?;
             }
         } else {
-            let scaled = f.as_scaled(PxScale::from(*size));
+            let style = LegacyStyle {
+                width: source.width,
+                size: *size,
+                line_height: *line_height,
+                letter_spacing: *letter_spacing,
+                align,
+            };
+            if let Some(carets) = &mut layout_carets {
+                carets.map.legacy_rows(text, style, f);
+            }
             for (row, line) in text.split('\n').enumerate() {
-                let mut advance = 0.;
-                let mut previous = None;
-                for ch in line.chars() {
-                    let g = scaled.glyph_id(ch);
-                    if let Some(p) = previous {
-                        advance += scaled.kern(p, g);
-                        advance += *letter_spacing;
-                    }
-                    advance += scaled.h_advance(g);
-                    previous = Some(g);
-                }
-                let start = match align.as_str() {
-                    "center" => (source.width as f32 - advance) * 0.5,
-                    "right" => source.width as f32 - advance,
-                    _ => 0.,
-                };
-                let mut x = start;
-                let mut previous = None;
-                let y = scaled.ascent() + row as f32 * scaled.height() * line_height;
-                for ch in line.chars() {
-                    let gid = scaled.glyph_id(ch);
-                    if let Some(p) = previous {
-                        x += scaled.kern(p, gid);
-                        x += *letter_spacing;
-                    }
+                let (_, placed) = style.line(f, row, line);
+                for (ch, glyph, _) in placed {
+                    let gid = glyph.id;
                     font.preflight_glyph(gid, check)?;
                     if gid.0 == 0 || (!super::super::spacing(ch) && f.outline(gid).is_none()) {
                         return Err("This text needs an unsupported glyph or outline".into());
@@ -123,17 +117,18 @@ impl TextPlan {
                     push(
                         &mut glyphs,
                         &font,
-                        gid.with_scale_and_position(*size, point(x, y)),
+                        glyph,
                         &mut work,
                         pool,
                         check,
                     )?;
-                    x += scaled.h_advance(gid);
-                    previous = Some(gid);
                 }
             }
         }
         check()?;
+        if let Some(carets) = carets {
+            *carets = layout_carets;
+        }
         Ok(Self {
             font,
             glyphs,

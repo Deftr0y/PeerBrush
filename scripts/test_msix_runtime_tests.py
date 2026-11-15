@@ -40,6 +40,9 @@ class InstallationObservation(unittest.TestCase):
             return runtime.validate_installation_observation(json.dumps(value).encode(), platform='windows',
                 family='PeerBrush.Fixture_123', expected_route=route)
         self.assertEqual(check(record), record)
+        self.assertEqual(check(dict(record, update_owner='WindowsPackage'))['update_owner'], 'WindowsPackage')
+        with self.assertRaises(ValueError):
+            check(dict(record, update_owner='PRIVATE_CANARY'))
         for route, kind, associated in [('legacy-appinstaller', 'developer', True), ('microsoft-store', 'store', False)]:
             selected = copy.deepcopy(record)
             selected['package'].update(candidate_route=route, signature_kind=kind, appinstaller_association=associated)
@@ -65,6 +68,20 @@ class InstallationObservation(unittest.TestCase):
             runtime.validate_installation_observation(b'{"schema":1,' + json.dumps(record).encode()[1:], platform='windows')
         with self.assertRaisesRegex(ValueError, 'byte bound'):
             runtime.validate_installation_observation(b' ' * (16 * 1024 + 1), platform='windows')
+
+    def test_linux_manager_acceptance_requires_matching_owner_and_build(self):
+        for owner in ('LinuxPackage', 'NixPackage'):
+            record = dict(self.record(), platform='linux', package=None, update_owner=owner)
+            if owner == 'NixPackage':
+                record['build'].update(commit='unknown', tree='unknown')
+            build = record['build'].copy()
+            runtime.require_linux_update_owner(json.dumps(record).encode(), owner, build)
+            for invalid in (dict(record, update_owner='Direct'), dict(record, update_owner='Unknown'),
+                            dict(record, build=dict(build, version='0.30.1')),
+                            dict(record, update_eligible=True),
+                            {key: value for key, value in record.items() if key != 'update_owner'}):
+                with self.subTest(owner=owner, invalid=invalid), self.assertRaises(ValueError):
+                    runtime.require_linux_update_owner(json.dumps(invalid).encode(), owner, build)
 
     @unittest.skipUnless(sys.platform == 'win32', 'Native Windows alias metadata only')
     def test_an_ordinary_file_in_a_fake_family_alias_directory_is_not_an_installed_alias(self):
@@ -122,7 +139,8 @@ class RuntimeSmoke(unittest.TestCase):
         self.assertLess(len(result.stdout), 16 * 1024)
         record = json.loads(result.stdout)
         self.assertEqual(set(record), {'schema', 'format', 'platform', 'build', 'package',
-                                      'installed_acceptance', 'update_eligible'})
+                                      'installed_acceptance', 'update_eligible', 'update_owner'})
+        self.assertIn(record['update_owner'], runtime.UPDATE_OWNERS)
         self.assertEqual(record['schema'], 1)
         self.assertEqual(record['format'], 'PeerBrushInstallationObservationV1')
         self.assertEqual(record['build']['product'], 'PeerBrush')

@@ -107,16 +107,16 @@ fn alpha_minimum_reaches_empty_tiles_and_folder_frame_with_exact_history_and_psd
     for depth in [8, 16] {
         for group in [false, true] {
             let mut e = Engine::new();
-            e.doc = Document::new_depth(271, 133, depth).unwrap();
-            let layer = e.doc.layers[0].id.clone();
+            e.resident_state_mut().expect("resident fixture").document = Document::new_depth(271, 133, depth).unwrap();
+            let layer = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
             if depth == 16 {
-                e.doc.layers[0]
+                e.resident_state_mut().expect("resident fixture").document.layers[0]
                     .pixels
                     .set16(1, 1, [10001, 30003, 50007, 12345]);
             } else {
-                e.doc.layers[0].pixels.set(1, 1, [39, 117, 195, 48]);
+                e.resident_state_mut().expect("resident fixture").document.layers[0].pixels.set(1, 1, [39, 117, 195, 48]);
             }
-            let raw = e.doc.layers[0].pixels.rgba16();
+            let raw = e.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16();
             if group {
                 edit(
                     &mut e,
@@ -124,7 +124,7 @@ fn alpha_minimum_reaches_empty_tiles_and_folder_frame_with_exact_history_and_psd
                 );
             }
             let target = e
-                .doc
+                .resident_state().expect("resident fixture").document
                 .layers
                 .iter()
                 .find(|l| {
@@ -137,14 +137,14 @@ fn alpha_minimum_reaches_empty_tiles_and_folder_frame_with_exact_history_and_psd
                 .unwrap()
                 .id
                 .clone();
-            let before = native(&e.doc);
+            let before = native(&e.resident_state().expect("resident fixture").document);
             let add = json!({"op":"effect.add","layer":target,"kind":"channel_clamp","settings":{"channel":"o","minimum":0.25,"maximum":0.75},"weight":0.5});
-            let draft = Engine::preview_edits(e.doc.clone(), &[add.clone()]).unwrap();
-            let history = e.undo.len();
+            let draft = Engine::preview_edits(e.resident_state().expect("resident fixture").document.clone(), &[add.clone()]).unwrap();
+            let history = e.resident_state().expect("resident fixture").undo.len();
             edit(&mut e, add);
-            let applied = native(&e.doc);
+            let applied = native(&e.resident_state().expect("resident fixture").document);
             assert_eq!(applied, native(&draft));
-            assert_eq!(e.undo.len(), history + 1);
+            assert_eq!(e.resident_state().expect("resident fixture").undo.len(), history + 1);
             let max = if depth == 16 { 65535.0 } else { 255.0 };
             let expected = ((max * 0.25_f64).round() * 0.5).round() as u16;
             assert_eq!(
@@ -152,7 +152,7 @@ fn alpha_minimum_reaches_empty_tiles_and_folder_frame_with_exact_history_and_psd
                 &[0, 0, 0, expected],
                 "depth {depth} group {group}"
             );
-            let bytes = psd::encode(&e.doc).unwrap();
+            let bytes = psd::encode(&e.resident_state().expect("resident fixture").document).unwrap();
             let start = bytes.windows(4).position(|w| w == b"PBR1").unwrap() + 4;
             let mut embedded = Vec::new();
             flate2::read::ZlibDecoder::new(&bytes[start..])
@@ -180,11 +180,11 @@ fn alpha_minimum_reaches_empty_tiles_and_folder_frame_with_exact_history_and_psd
                 applied
             );
             e.undo("human").unwrap();
-            assert_eq!(native(&e.doc), before);
+            assert_eq!(native(&e.resident_state().expect("resident fixture").document), before);
             e.redo("human").unwrap();
-            assert_eq!(native(&e.doc), applied);
+            assert_eq!(native(&e.resident_state().expect("resident fixture").document), applied);
             let effect = e
-                .doc
+                .resident_state().expect("resident fixture").document
                 .layers
                 .iter()
                 .find(|l| l.id == target)
@@ -196,13 +196,13 @@ fn alpha_minimum_reaches_empty_tiles_and_folder_frame_with_exact_history_and_psd
                 &mut e,
                 json!({"op":"effect.update","layer":target,"effect":effect,"enabled":false}),
             );
-            assert_eq!(native(&e.doc), before);
+            assert_eq!(native(&e.resident_state().expect("resident fixture").document), before);
             e.undo("human").unwrap();
             edit(
                 &mut e,
                 json!({"op":"effect.delete","layer":target,"effect":effect}),
             );
-            assert_eq!(native(&e.doc), before);
+            assert_eq!(native(&e.resident_state().expect("resident fixture").document), before);
         }
     }
 }
@@ -210,13 +210,13 @@ fn alpha_minimum_reaches_empty_tiles_and_folder_frame_with_exact_history_and_psd
 #[test]
 fn invalid_bounds_channel_locks_reservations_and_stale_protocol_sources_preserve_work() {
     let mut e = Engine::new();
-    e.doc = Document::new_depth(8, 8, 16).unwrap();
-    e.doc.layers[0]
+    e.resident_state_mut().expect("resident fixture").document = Document::new_depth(8, 8, 16).unwrap();
+    e.resident_state_mut().expect("resident fixture").document.layers[0]
         .pixels
         .set16(1, 1, [10001, 30003, 50007, 12345]);
-    let layer = e.doc.layers[0].id.clone();
-    let document = e.doc.id.clone();
-    let source = native(&e.doc);
+    let layer = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
+    let document = e.resident_state().expect("resident fixture").document.id.clone();
+    let source = native(&e.resident_state().expect("resident fixture").document);
     let shared = Arc::new(Mutex::new(e));
     let request = |settings| json!({"actor":"human","document_id":document,"expected_revision":0,"commands":[{"op":"effect.add","layer":layer,"kind":"channel_clamp","settings":settings}]});
     for settings in [
@@ -232,18 +232,18 @@ fn invalid_bounds_channel_locks_reservations_and_stale_protocol_sources_preserve
     ] {
         assert!(server::dispatch(&shared, "edit", &request(settings)).is_err());
         let e = shared.lock().unwrap();
-        assert_eq!(e.doc.revision, 0);
-        assert!(e.undo.is_empty());
-        assert_eq!(native(&e.doc), source);
+        assert_eq!(e.resident_state().expect("resident fixture").document.revision, 0);
+        assert!(e.resident_state().expect("resident fixture").undo.is_empty());
+        assert_eq!(native(&e.resident_state().expect("resident fixture").document), source);
     }
     assert!(server::dispatch(&shared,"edit",&json!({"actor":"human","commands":[{"op":"mask.add","layer":layer},{"op":"mask.step.add","layer":layer,"kind":"channel_clamp"}]})).is_err());
-    assert!(shared.lock().unwrap().doc.layers[0].mask.is_none());
+    assert!(shared.lock().unwrap().resident_state().expect("resident fixture").document.layers[0].mask.is_none());
     let settings = json!({"channel":"r","minimum":0.5,"maximum":0.75});
-    shared.lock().unwrap().doc.layers[0].locked = true;
+    shared.lock().unwrap().resident_state_mut().expect("resident fixture").document.layers[0].locked = true;
     assert!(server::dispatch(&shared, "edit", &request(settings.clone())).is_err());
     {
         let mut e = shared.lock().unwrap();
-        e.doc.layers[0].locked = false;
+        e.resident_state_mut().expect("resident fixture").document.layers[0].locked = false;
         e.reserve("agent", "Preserve native work", vec![Scope::layer(&layer)])
             .unwrap();
     }
@@ -251,15 +251,15 @@ fn invalid_bounds_channel_locks_reservations_and_stale_protocol_sources_preserve
     shared.lock().unwrap().leases.clear();
     server::dispatch(&shared, "edit", &request(settings.clone())).unwrap();
     assert!(server::dispatch(&shared, "edit", &request(settings)).is_err());
-    assert_eq!(shared.lock().unwrap().undo.len(), 1);
+    assert_eq!(shared.lock().unwrap().resident_state().expect("resident fixture").undo.len(), 1);
 }
 
 #[test]
 fn regional_paint_previews_match_full_clamped_native_render_and_preserve_cached_baseline() {
     for depth in [8, 16] {
         let mut e = Engine::new();
-        e.doc = Document::new_depth(271, 133, depth).unwrap();
-        let target = e.doc.layers[0].id.clone();
+        e.resident_state_mut().expect("resident fixture").document = Document::new_depth(271, 133, depth).unwrap();
+        let target = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
         edit(
             &mut e,
             json!({"op":"effect.add","layer":target,"kind":"channel_clamp","settings":{"channel":"o","minimum":0.25,"maximum":0.75}}),
@@ -268,7 +268,7 @@ fn regional_paint_previews_match_full_clamped_native_render_and_preserve_cached_
             &mut e,
             json!({"op":"effect.add","layer":target,"kind":"channel_clamp","settings":{"channel":"r","minimum":0.2,"maximum":0.7}}),
         );
-        let source = e.doc.clone();
+        let source = e.resident_state().expect("resident fixture").document.clone();
         let baseline = native(&source);
         let mut cache = Cache::default();
         cache
@@ -296,27 +296,27 @@ fn regional_paint_previews_match_full_clamped_native_render_and_preserve_cached_
 fn adjustment_targets_reject_clamps_atomically_in_engine_preview_and_psd_validation() {
     for depth in [8, 16] {
         let mut e = Engine::new();
-        e.doc = Document::new_depth(8, 8, depth).unwrap();
-        let layer = e.doc.layers[0].id.clone();
+        e.resident_state_mut().expect("resident fixture").document = Document::new_depth(8, 8, depth).unwrap();
+        let layer = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
         edit(
             &mut e,
             json!({"op":"adjustment.add","layers":[layer],"kind":"levels"}),
         );
-        let target = e.doc.layers[0].id.clone();
-        let before = serde_json::to_value(&e.doc).unwrap();
-        let history = e.undo.len();
+        let target = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
+        let before = serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap();
+        let history = e.resident_state().expect("resident fixture").undo.len();
         let command = json!({"op":"effect.add","layer":target,"kind":"channel_clamp","settings":{"channel":"o","minimum":0.25}});
-        assert!(Engine::preview_edits(e.doc.clone(), &[command.clone()]).is_err());
+        assert!(Engine::preview_edits(e.resident_state().expect("resident fixture").document.clone(), &[command.clone()]).is_err());
         assert!(e.edit("human", &[command], None, None, "Clamp").is_err());
-        assert_eq!(serde_json::to_value(&e.doc).unwrap(), before);
-        assert_eq!(e.undo.len(), history);
-        e.doc.layers[0].effects.push(effects::Effect {
+        assert_eq!(serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap(), before);
+        assert_eq!(e.resident_state().expect("resident fixture").undo.len(), history);
+        e.resident_state_mut().expect("resident fixture").document.layers[0].effects.push(effects::Effect {
             id: peerbrush::engine::id(),
             kind: "channel_clamp".into(),
             enabled: false,
             weight: 0.0,
             settings: effects::defaults("channel_clamp").into(),
         });
-        assert!(psd::validate(&e.doc).is_err());
+        assert!(psd::validate(&e.resident_state().expect("resident fixture").document).is_err());
     }
 }

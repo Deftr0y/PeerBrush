@@ -2,7 +2,7 @@
 //! coordinator must stage color, every mask and retained/source placements as
 //! one batch; this worker cannot change layer metadata or publish a document.
 use super::*;
-use crate::{edit_bounds::input::InputFrame, raster::backed::Plane};
+use crate::edit_bounds::{input::InputFrame, mask_original::MaskOriginal};
 
 pub(crate) fn stage_frame<'d, 's>(
     input: &RasterInput<'d>,
@@ -10,20 +10,22 @@ pub(crate) fn stage_frame<'d, 's>(
     session: &'s SourceSession,
     check: &mut dyn FnMut() -> Result<(), String>,
 ) -> Result<TileDraft<'d, 's>, String> {
-    stage_frame_with(input, plan, session, check, |_, bytes, _| Ok(bytes.clone()))
+    stage_frame_seed(input, plan, session, check)?.finish(check)
 }
 pub(crate) fn stage_frame_with<'d, 's>(
     input: &RasterInput<'d>,
     plan: &InputFrame,
     session: &'s SourceSession,
     check: &mut dyn FnMut() -> Result<(), String>,
+    // A bounded footprint is in row-major order. None allows edits on every tile.
+    edited_tiles: Option<&[(u32, u32)]>,
     edit: impl FnMut(
         (u32, u32),
         &PinnedBytes,
         &mut dyn FnMut() -> Result<(), String>,
     ) -> Result<PinnedBytes, String>,
 ) -> Result<TileDraft<'d, 's>, String> {
-    stage_frame_seed(input, plan, session, check, edit)?.finish(check)
+    build_frame(input, plan, session, check, edited_tiles, edit)?.finish(check)
 }
 
 pub(crate) struct FrameSeed<'d, 's> {
@@ -282,6 +284,83 @@ pub(crate) fn stage_frame_seed<'d, 's>(
     plan: &InputFrame,
     session: &'s SourceSession,
     check: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<FrameSeed<'d, 's>, String> {
+    build_frame(input, plan, session, check, Some(&[]), |_, bytes, _| {
+        Ok(bytes.clone())
+    })
+}
+
+fn tile_is_zero(
+    bytes: &[u8],
+    check: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<bool, String> {
+    let mut zero = true;
+    for part in bytes.chunks(64 * 1024) {
+        check()?;
+        zero &= part.iter().all(|b| *b == 0);
+    }
+    Ok(zero)
+}
+
+pub(crate) fn prepare_frame_tile(
+    input: &RasterInput<'_>,
+    plan: &InputFrame,
+    key: (u32, u32),
+    check: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<PinnedBytes, String> {
+    input.validate(plan.binding())?;
+    let original = MaskOriginal::capture(input)?;
+    let revealed = revealed_tile(plan, key, original.as_ref())?;
+    let reads = plan.geometry().source_reads(key)?;
+    render_frame_tile(input, plan, key, reads, revealed, check)
+}
+
+fn revealed_tile<'a, 'd>(
+    plan: &InputFrame,
+    key: (u32, u32),
+    original: Option<&'a MaskOriginal<'d>>,
+) -> Result<Option<(&'a MaskOriginal<'d>, [i32; 4])>, String> {
+    let Some(original) = original else { return Ok(None); };
+    let area = plan.tile_document_rect(key)?;
+    Ok(original.reveals(area).then_some((original, area)))
+}
+
+fn render_frame_tile(
+    input: &RasterInput<'_>,
+    plan: &InputFrame,
+    key: (u32, u32),
+    reads: Option<[i32; 4]>,
+    revealed: Option<(&MaskOriginal<'_>, [i32; 4])>,
+    check: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<PinnedBytes, String> {
+    let stride = usize::from(input.depth() / 8) * 4;
+    let length = (TILE * TILE) as usize * stride;
+    if let Some((original, area)) = revealed {
+        let projected = original.prepare(area, &mut || check().map_err(|_| Error::Cancelled))?;
+        let mut bytes = ScratchBytes::new(input.pool(), length, length).map_err(|e| e.to_string())?;
+        let row_bytes = (area[2] - area[0]) as usize * stride;
+        for (y, row) in (area[1]..area[3]).zip(bytes.chunks_exact_mut(TILE as usize * stride)) {
+            check()?;
+            projected.copy_row(y, &mut row[..row_bytes])?;
+        }
+        return Ok(bytes.freeze());
+    }
+    if let Some(rect) = reads {
+        let prepared = input.prepare_region(rect, check)?;
+        plan.geometry().render_tile(key, check, |y, row| prepared.copy_row(y, row))
+    } else {
+        ScratchBytes::new(input.pool(), length, length)
+            .map(ScratchBytes::freeze)
+            .map_err(|e| e.to_string())
+    }
+}
+
+fn build_frame<'d, 's>(
+    input: &RasterInput<'d>,
+    plan: &InputFrame,
+    session: &'s SourceSession,
+    check: &mut dyn FnMut() -> Result<(), String>,
+    edited_tiles: Option<&[(u32, u32)]>,
     mut edit: impl FnMut(
         (u32, u32),
         &PinnedBytes,
@@ -303,6 +382,17 @@ pub(crate) fn stage_frame_seed<'d, 's>(
         return Err("Native frame geometry differs from its immutable input".into());
     }
     let shape = geometry.new_shape();
+    if edited_tiles.is_some_and(|tiles| {
+        tiles
+            .iter()
+            .any(|&(x, y)| x >= shape[0].div_ceil(TILE) || y >= shape[1].div_ceil(TILE))
+            || tiles.windows(2).any(|pair| {
+                let [(x0, y0), (x1, y1)] = [pair[0], pair[1]];
+                (y0, x0) >= (y1, x1)
+            })
+    }) {
+        return Err("Native frame edits have an invalid tile footprint".into());
+    }
     let count = shape[0].div_ceil(TILE) as usize * shape[1].div_ceil(TILE) as usize;
     let admitted = count
         .checked_mul(512)
@@ -314,37 +404,70 @@ pub(crate) fn stage_frame_seed<'d, 's>(
         .map_err(|e| e.to_string())?;
     let mut fragment = None;
     let result: Result<Surface, String> = (|| {
-        let mut blocks = BTreeMap::new();
+        let mut patches = Vec::new();
+        patches
+            .try_reserve_exact(count)
+            .map_err(|_| "Native frame tile patch allocation failed")?;
+        if patches.capacity() > count {
+            return Err("Native frame tile patches exceed admission".into());
+        }
         let mut guarded = || {
             session.check()?;
             check()
         };
         let spec =
             TileSpec::new(TILE as u16, TILE as u16, input.depth()).map_err(|e| e.to_string())?;
+        let source = input.surface();
+        let original = MaskOriginal::capture(input)?;
+        if let Some(original) = &original {
+            original.admit_frame(geometry.new_origin(), shape)?;
+        }
         for key in geometry.tiles() {
-            guarded()?;
-            let prepared = geometry
+            let edited = edited_tiles.is_none_or(|tiles| {
+                tiles
+                    .binary_search_by_key(&(key.1, key.0), |&(x, y)| (y, x))
+                    .is_ok()
+            });
+            let reads = geometry
                 .source_reads(key)?
-                .map(|r| input.prepare_region(r, &mut guarded))
-                .transpose()?;
-            let bytes = geometry.render_tile(key, &mut guarded, |x, y| {
-                prepared
-                    .as_ref()
-                    .ok_or_else(|| {
-                        "Frame sampler missed its declared old-source footprint".to_owned()
-                    })?
-                    .pixel16(x, y)
-            })?;
-            let bytes = edit(key, &bytes, &mut guarded)?;
+                .filter(|&rect| source.has_physical_tiles(rect));
+            let revealed = revealed_tile(plan, key, original.as_ref())?;
+            if !edited && reads.is_none() && revealed.is_none() {
+                continue;
+            }
+            guarded()?;
+            if let Some([l, t, r, b]) = reads.filter(|_| !edited && revealed.is_none()) {
+                let edge = TILE as i32;
+                // Former edge padding must never become visible after a reframe.
+                if l % edge == 0 && t % edge == 0 && r - l == edge && b - t == edge {
+                    let coordinate = (l as u32 / TILE, t as u32 / TILE);
+                    let tile = source
+                        .physical_tile(coordinate)
+                        .ok_or("Missing native frame source tile")?;
+                    let pinned = source
+                        .prepare_tile(coordinate, &mut || guarded().map_err(|_| Error::Cancelled))
+                        .map_err(|e| e.to_string())?;
+                    let bytes = pinned.bytes().ok_or("Missing native frame source bytes")?;
+                    if !tile_is_zero(bytes, &mut guarded)? {
+                        patches.push(TilePatch::stored(
+                            key,
+                            tile.owner().clone(),
+                            tile.reference(),
+                        ));
+                    }
+                    continue;
+                }
+            }
+            let bytes = render_frame_tile(input, plan, key, reads, revealed, &mut guarded)?;
+            let bytes = if edited {
+                edit(key, &bytes, &mut guarded)?
+            } else {
+                bytes
+            };
             if !bytes.uses_budget(base.budget()) || bytes.len() != spec.bytes() {
                 return Err("Edited frame tile differs from its admitted native byte owner".into());
             }
-            let mut zero = true;
-            for part in bytes.chunks(64 * 1024) {
-                guarded()?;
-                zero &= part.iter().all(|b| *b == 0);
-            }
-            if zero {
+            if tile_is_zero(&bytes, &mut guarded)? {
                 continue;
             }
             if fragment.is_none() {
@@ -356,22 +479,16 @@ pub(crate) fn stage_frame_seed<'d, 's>(
                     guarded().map_err(|_| Error::Cancelled)
                 })
                 .map_err(|e| e.to_string())?;
-            blocks.insert(key, reference);
+            patches.push(TilePatch::stored(key, store.clone(), reference));
         }
         guarded()?;
-        if blocks.is_empty() {
-            return Surface::zero(shape[0], shape[1], input.depth()).map_err(|e| e.to_string());
-        }
-        let store = fragment
-            .as_ref()
-            .ok_or("Native frame fragment is missing")?
-            .store()
-            .clone();
-        let plane = Plane::from_blocks(shape[0], shape[1], input.depth(), store, blocks)
-            .map_err(|e| e.to_string())?;
-        // The provisional map admission remains alive until the permanent
+        // The provisional patch admission remains alive until the permanent
         // Surface index charge has been acquired successfully.
-        Surface::from_plane(plane).map_err(|e| e.to_string())
+        Surface::zero(shape[0], shape[1], input.depth())
+            .and_then(|surface| {
+                surface.with_tile_patches(&patches, base.budget(), base.disk_budget())
+            })
+            .map_err(|e| e.to_string())
     })();
     let surface = match result {
         Ok(surface) => surface,

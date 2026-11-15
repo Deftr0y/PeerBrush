@@ -3,26 +3,47 @@ use crate::engine::Document;
 pub mod backed;
 mod contours;
 mod coverage_writer;
-pub(crate) use coverage_writer::stage_rows;
+pub(crate) use coverage_writer::stage_feathered_rows;
+pub(crate) use coverage_writer::{stage_rows, stage_rows_guarded};
+#[cfg(test)]
+pub(crate) use coverage_writer::tests::CompletedTiles;
 pub mod display;
 mod flood;
+pub(crate) mod geometry;
 pub(crate) mod image_source;
 pub mod import;
 pub mod masks;
+pub(crate) mod morphology;
 mod native_tiles;
+pub(crate) use native_tiles::Rows as NativeRows;
 pub(crate) use native_tiles::Writer as NativeTileWriter;
 pub mod refine;
 pub mod regional_import;
 pub mod regional_masks;
 pub mod regional_refine;
 mod rows;
+pub(crate) mod sampling;
 mod source;
+pub(crate) mod wand;
 pub mod worker;
 pub use source::{PreparedSelection, SelectionSource};
 mod system;
 #[cfg(test)]
 mod visited;
 pub use system::*;
+
+pub(crate) const MAX_BRUSH_SEEDS: usize = 8192;
+
+/// Commands that can replace, transform or clear the active coverage. A
+/// transform without an explicit override follows the document selection.
+pub(crate) fn command_may_change_coverage(command: &serde_json::Value) -> bool {
+    match command["op"].as_str().unwrap_or_default() {
+        "move" | "transform" => command["selection_only"] != false,
+        "selection" | "path.to_selection" | "crop" | "canvas.resize" | "image.resize"
+        | "resize" | "document.settings" | "image.paste" | "layer.paste" => true,
+        op => op.starts_with("selection."),
+    }
+}
 
 pub fn rectangle(area: [i32; 4]) -> Vec<[f32; 2]> {
     vec![

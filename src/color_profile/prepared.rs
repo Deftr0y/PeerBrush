@@ -16,6 +16,58 @@ pub(crate) use display::{profile_binding, DisplayPlan, DisplayStatus};
 const CMS_BYTES: usize = 128 * 1024 * 1024;
 const TEXT_BYTES: usize = 8 * 1024 * 1024;
 
+fn reserve_cms(pool: &ResidentBudget) -> Result<[Reservation; 7], String> {
+    // Keep the allocation groups separate to respect the per-allocation bound.
+    let reserve = |mib: usize| pool.reserve_bytes(mib * 1024 * 1024, mib * 1024 * 1024)
+        .map_err(|e| e.to_string());
+    Ok([reserve(8)?, reserve(16)?, reserve(8)?, reserve(16)?, reserve(48)?, reserve(8)?, reserve(24)?])
+}
+
+pub(crate) struct GrayTable {
+    colors: Vec<[u16; 3]>,
+    _charge: Reservation,
+}
+
+impl GrayTable {
+    pub(crate) fn resident_pool() -> Result<ResidentBudget, String> {
+        ResidentBudget::new(CMS_BYTES + 1024 * 1024).map_err(|e| e.to_string())
+    }
+
+    pub(crate) fn new(profile: &[u8], pool: &ResidentBudget, check: &dyn Fn() -> Result<(), String>) -> Result<Self, String> {
+        check()?;
+        metadata_bound(profile)?;
+        let _cms = reserve_cms(pool)?;
+        let source = super::parse_color_space(profile, super::DataColorSpace::Gray, &mut |_| {})?;
+        let executor = source.create_transform_16bit(Layout::Gray, &ColorProfile::new_srgb(), Layout::Rgb,
+            TransformOptions {
+                rendering_intent: RenderingIntent::RelativeColorimetric,
+                prefer_fixed_point: false,
+                allow_use_cicp_transfer: false,
+                ..Default::default()
+            }).map_err(|e| e.to_string())?;
+        check()?;
+        let samples: Vec<u16> = (0..=u16::MAX).collect();
+        let bytes = samples.len() * std::mem::size_of::<[u16; 3]>();
+        let charge = pool.reserve_bytes(bytes, bytes).map_err(|e| e.to_string())?;
+        let mut colors = Vec::new();
+        colors.try_reserve_exact(samples.len()).map_err(|_| "Grayscale ICC table allocation refused")?;
+        if colors.capacity() > samples.len() {
+            return Err("Grayscale ICC table exceeds admission".into());
+        }
+        colors.resize(samples.len(), [0; 3]);
+        executor.transform(&samples, colors.as_flattened_mut()).map_err(|e| e.to_string())?;
+        check()?;
+        Ok(Self { colors, _charge: charge })
+    }
+
+    pub(crate) fn convert(&self, pixel: &mut [u16], depth: u16) {
+        if pixel[3] == 0 { return; }
+        let gray = if depth == 16 { pixel[0] } else { pixel[0] * 257 };
+        let rgb = self.colors[usize::from(gray)];
+        pixel[..3].copy_from_slice(&if depth == 16 { rgb } else { rgb.map(|v| u16::from(crate::raster::project16(v))) });
+    }
+}
+
 pub(crate) struct UncachedTransforms {
     transforms: Option<Transforms>,
     pool: ResidentBudget,
@@ -70,21 +122,7 @@ impl UncachedTransforms {
         if profile.len() > MAX_PROFILE_BYTES {
             return Err(Unsupported("ICC profile exceeds the4MiB limit".into()));
         }
-        // Separate allocation groups, not one >64MiB buffer. Keep every group
-        // until all executor objects are destroyed; partial admission unwinds.
-        let reserve = |mib: usize| {
-            pool.reserve_bytes(mib * 1024 * 1024, mib * 1024 * 1024)
-                .map_err(|e| Failed(e.to_string()))
-        };
-        let charges = [
-            reserve(8)?,
-            reserve(16)?,
-            reserve(8)?,
-            reserve(16)?,
-            reserve(48)?,
-            reserve(8)?,
-            reserve(24)?,
-        ];
+        let charges = reserve_cms(pool).map_err(Failed)?;
         metadata_bound(profile).map_err(Unsupported)?;
         let mut operational = false;
         let source = super::parse_observing(profile, &mut |error| {

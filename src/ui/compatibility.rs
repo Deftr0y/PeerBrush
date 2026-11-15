@@ -182,6 +182,10 @@ impl PeerBrush {
                     for layer in &report.layers {
                         let representation = match layer.standard {
                             Representation::Raster => "editable raster",
+                            Representation::Adjustment => "editable adjustment",
+                            Representation::SolidColor => "editable Solid Color fill",
+                            Representation::GradientFill => "editable Gradient Fill",
+                            Representation::PatternFill => "editable Pattern Fill",
                             Representation::Folder => "folder",
                             Representation::BakedFolderRaster => "folder baked to raster",
                             Representation::BakedIntoFolder => "included in a baked folder",
@@ -189,13 +193,14 @@ impl PeerBrush {
                             Representation::ProtectedPreview => "protected preview",
                         };
                         ui.label(format!("{} · {representation}{}", layer.name, if layer.standard_mask { " · raster mask" } else { "" }));
-                        if matches!(layer.standard, Representation::Raster | Representation::BakedFolderRaster) {
+                        if matches!(layer.standard, Representation::Raster | Representation::SolidColor | Representation::GradientFill | Representation::PatternFill | Representation::BakedFolderRaster) {
                             if let Some([left, top, right, bottom]) = layer.standard_bounds { ui.label(format!("Standard bounds: {left}, {top} → {right}, {bottom}")); }
                         }
                         if !layer.peerbrush_sources.is_empty() {
                             let definitions = layer.peerbrush_sources.iter().map(|source| match *source {
                                 "effect_stack" => "editable effects", "mask_stack" => "editable mask steps",
                                 "editable_text_vector_source" => "editable text/vector definitions",
+                                "editable_solid_color" => "editable fill color",
                                 "transform_originals" => "original pixels and transform matrices",
                                 "folder_hierarchy" => "original folder and children", _ => "original layer",
                             }).collect::<Vec<_>>().join(", ");
@@ -219,8 +224,8 @@ mod tests {
     fn fixture(depth: u16) -> (PeerBrush, egui::Context, Shared, PathBuf) {
         let ctx = egui::Context::default();
         let mut engine = Engine::new();
-        engine.doc = Document::new_depth(16, 12, depth).unwrap();
-        engine.doc.layers[0]
+        engine.resident_state_mut().expect("resident fixture").document = Document::new_depth(16, 12, depth).unwrap();
+        engine.resident_state_mut().expect("resident fixture").document.layers[0]
             .pixels
             .set16(3, 4, [12347, 23459, 34571, 65535]);
         let shared = Arc::new(std::sync::Mutex::new(engine));
@@ -231,7 +236,7 @@ mod tests {
         server::save(&shared, &path).unwrap();
         {
             let mut e = shared.lock().unwrap();
-            let layer = e.doc.layers[0].id.clone();
+            let layer = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
             e.edit(
                 "human",
                 &[json!({"op":"effect.add","layer":layer,"kind":"invert","settings":{}})],
@@ -332,7 +337,7 @@ mod tests {
     fn native_loss_review_cancel_owns_keyboard_canvas_and_cancellation_frame() {
         for depth in [8, 16] {
             let (mut app, ctx, shared, path) = fixture(depth);
-            let before = serde_json::to_value(&shared.lock().unwrap().doc).unwrap();
+            let before = serde_json::to_value(&shared.lock().unwrap().resident_state().expect("resident fixture").document).unwrap();
             let file = std::fs::read(&path).unwrap();
             app.save(false);
             frame(&mut app, &ctx, vec![]);
@@ -373,7 +378,7 @@ mod tests {
                 }],
             );
             assert_eq!(
-                serde_json::to_value(&shared.lock().unwrap().doc).unwrap(),
+                serde_json::to_value(&shared.lock().unwrap().resident_state().expect("resident fixture").document).unwrap(),
                 before
             );
             click(&mut app, &ctx, true, 1);
@@ -382,7 +387,7 @@ mod tests {
             assert!(!shared.lock().unwrap().closed);
             assert_eq!(std::fs::read(&path).unwrap(), file);
             assert_eq!(
-                serde_json::to_value(&shared.lock().unwrap().doc).unwrap(),
+                serde_json::to_value(&shared.lock().unwrap().resident_state().expect("resident fixture").document).unwrap(),
                 before
             );
             let state = app.connection.state_dir.clone();
@@ -405,15 +410,15 @@ mod tests {
                     app.switch_project(&project);
                 } else {
                     let mut e = shared.lock().unwrap();
-                    let layer = e.doc.layers[0].id.clone();
+                    let layer = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
                     e.edit("human", &[json!({"op":"paint.fill","layer":layer,"rect":[0,0,2,2],"color":[22,44,66,255]})], None,None,"Later human pixels").unwrap();
                 }
-                let current = shared.lock().unwrap().doc.export_png().unwrap();
+                let current = shared.lock().unwrap().resident_state().expect("resident fixture").document.export_png().unwrap();
                 frame(&mut app, &ctx, vec![]);
                 assert!(app.save_loss_review.is_none());
                 assert!(!app.busy);
                 assert_eq!(std::fs::read(&path).unwrap(), file);
-                assert_eq!(shared.lock().unwrap().doc.export_png().unwrap(), current);
+                assert_eq!(shared.lock().unwrap().resident_state().expect("resident fixture").document.export_png().unwrap(), current);
                 assert!(!shared.lock().unwrap().closed);
                 let state = app.connection.state_dir.clone();
                 drop(app);
@@ -426,8 +431,8 @@ mod tests {
     fn native_loss_acceptance_saves_current_native_sources_without_changing_history() {
         for depth in [8, 16] {
             let (mut app, ctx, shared, path) = fixture(depth);
-            let before = shared.lock().unwrap().doc.clone();
-            let history = shared.lock().unwrap().undo.len();
+            let before = shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
+            let history = shared.lock().unwrap().resident_state().expect("resident fixture").undo.len();
             app.save(false);
             click(&mut app, &ctx, true, 0);
             wait_save(&mut app, &ctx, &shared, before.revision);
@@ -440,8 +445,8 @@ mod tests {
             );
             assert_eq!(decoded.layers[0].effects.len(), 1);
             assert_eq!(decoded.export_png().unwrap(), before.export_png().unwrap());
-            assert_eq!(shared.lock().unwrap().undo.len(), history);
-            assert_eq!(shared.lock().unwrap().doc.revision, before.revision);
+            assert_eq!(shared.lock().unwrap().resident_state().expect("resident fixture").undo.len(), history);
+            assert_eq!(shared.lock().unwrap().resident_state().expect("resident fixture").document.revision, before.revision);
             let state = app.connection.state_dir.clone();
             drop(app);
             drop(shared);
@@ -452,7 +457,7 @@ mod tests {
     fn close_review_keeps_work_open_on_loss_cancel_and_closes_only_after_accepted_save() {
         for depth in [8, 16] {
             let (mut app, ctx, shared, path) = fixture(depth);
-            let before = shared.lock().unwrap().doc.clone();
+            let before = shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
             let file = std::fs::read(&path).unwrap();
             let project = shared.lock().unwrap().project_id.clone();
             app.request_close(lifecycle::Intent::Close(project));

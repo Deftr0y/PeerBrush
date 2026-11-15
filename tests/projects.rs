@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 fn fixture() -> (Shared, Shared) {
     let mut e = Engine::new();
-    e.doc = Document::new(12, 10).unwrap();
+    e.resident_state_mut().expect("resident fixture").document = Document::new(12, 10).unwrap();
     let root = Arc::new(Mutex::new(e));
     w::attach(&root);
     let second = w::new_project(&root, 12, 10, 8, None).unwrap();
@@ -18,12 +18,12 @@ fn fixture() -> (Shared, Shared) {
 }
 fn target(shared: &Shared) -> Value {
     let e = shared.lock().unwrap();
-    json!({"project_id":e.project_id,"document_id":e.doc.id,"expected_revision":e.doc.revision,"feedback":"request"})
+    json!({"project_id":e.project_id,"document_id":e.resident_state().expect("resident fixture").document.id,"expected_revision":e.resident_state().expect("resident fixture").document.revision,"feedback":"request"})
 }
 fn edit(root: &Shared, shared: &Shared, name: &str) -> Value {
     let mut p = target(shared);
     p["commands"] =
-        json!([{"op":"layer.update","layer":shared.lock().unwrap().doc.layers[0].id,"name":name}]);
+        json!([{"op":"layer.update","layer":shared.lock().unwrap().resident_state().expect("resident fixture").document.layers[0].id,"name":name}]);
     server::dispatch(root, "edit", &p).unwrap()
 }
 fn transfer(
@@ -36,12 +36,12 @@ fn transfer(
     let to = dest.lock().unwrap();
     let source_id = from.project_id.clone();
     let dest_id = to.project_id.clone();
-    let source_doc = from.doc.id.clone();
-    let dest_doc = to.doc.id.clone();
-    let source_rev = from.doc.revision;
-    let dest_rev = to.doc.revision;
-    let layers = vec![from.doc.layers[0].id.clone()];
-    let target = to.doc.layers[0].id.clone();
+    let source_doc = from.resident_state().expect("resident fixture").document.id.clone();
+    let dest_doc = to.resident_state().expect("resident fixture").document.id.clone();
+    let source_rev = from.resident_state().expect("resident fixture").document.revision;
+    let dest_rev = to.resident_state().expect("resident fixture").document.revision;
+    let layers = vec![from.resident_state().expect("resident fixture").document.layers[0].id.clone()];
+    let target = to.resident_state().expect("resident fixture").document.layers[0].id.clone();
     drop(to);
     drop(from);
     w::transfer(
@@ -69,18 +69,18 @@ fn targeted_background_edits_never_select_tabs_or_share_history_selection_or_dir
     let initial = w::active_id(&root);
     edit(&root, &second, "Background work");
     assert_eq!(w::active_id(&root), initial);
-    assert_eq!(root.lock().unwrap().doc.revision, 0);
+    assert_eq!(root.lock().unwrap().resident_state().expect("resident fixture").document.revision, 0);
     let mut p = target(&second);
     p["commands"] = json!([{"op":"selection","rect":[1,2,5,7],"kind":"rectangle"}]);
     server::dispatch(&root, "edit", &p).unwrap();
-    assert!(root.lock().unwrap().doc.selection.is_none());
-    assert_eq!(second.lock().unwrap().undo.len(), 2);
+    assert!(root.lock().unwrap().resident_state().expect("resident fixture").document.selection.is_none());
+    assert_eq!(second.lock().unwrap().resident_state().expect("resident fixture").undo.len(), 2);
     let mut p = target(&second);
     p["action"] = json!("undo");
     server::dispatch(&root, "history", &p).unwrap();
-    assert!(second.lock().unwrap().doc.selection.is_none());
-    assert_eq!(second.lock().unwrap().doc.layers[0].name, "Background work");
-    assert!(root.lock().unwrap().undo.is_empty());
+    assert!(second.lock().unwrap().resident_state().expect("resident fixture").document.selection.is_none());
+    assert_eq!(second.lock().unwrap().resident_state().expect("resident fixture").document.layers[0].name, "Background work");
+    assert!(root.lock().unwrap().resident_state().expect("resident fixture").undo.is_empty());
     assert_eq!(root.lock().unwrap().saved_revision, 0);
 }
 #[test]
@@ -110,13 +110,13 @@ fn ambiguous_missing_closed_and_stale_targets_never_edit_another_project() {
         .unwrap()
         .edit("human", &[], None, None, "Closed")
         .is_err());
-    assert_eq!(root.lock().unwrap().doc.layers.len(), 1);
+    assert_eq!(root.lock().unwrap().resident_state().expect("resident fixture").document.layers.len(), 1);
 }
 #[test]
 fn invalid_new_dimensions_preserve_the_open_canvas_and_project_list() {
     let (root, second) = fixture();
     edit(&root, &second, "Keep my work");
-    let before = second.lock().unwrap().state();
+    let before = second.lock().unwrap().capture_state().unwrap().project().unwrap();
     let tabs = w::state(&root);
     for (axis, value) in [
         ("width", json!(4294967308u64)),
@@ -133,7 +133,7 @@ fn invalid_new_dimensions_preserve_the_open_canvas_and_project_list() {
                 .contains("Invalid canvas size"));
         }
     }
-    assert_eq!(before, second.lock().unwrap().state());
+    assert_eq!(before, second.lock().unwrap().capture_state().unwrap().project().unwrap());
     assert_eq!(tabs, w::state(&root));
 }
 #[test]
@@ -147,7 +147,7 @@ fn targeted_mutations_need_the_observed_document_and_revision() {
     p["commands"] = json!([{"op":"layer.add","name":"Add"}]);
     edit(&root, &second, "Newer");
     assert!(server::dispatch(&root, "edit", &p).is_err());
-    assert_eq!(second.lock().unwrap().doc.layers.len(), 1);
+    assert_eq!(second.lock().unwrap().resident_state().expect("resident fixture").document.layers.len(), 1);
 }
 #[test]
 fn closing_dirty_or_reserved_projects_preserves_work_and_last_close_creates_blank_tab() {
@@ -173,7 +173,7 @@ fn closing_dirty_or_reserved_projects_preserves_work_and_last_close_creates_blan
         )
         .unwrap();
     assert!(w::close(&root, id, doc, 1, true, "human").is_err());
-    assert_eq!(second.lock().unwrap().doc.layers[0].name, "Unsaved");
+    assert_eq!(second.lock().unwrap().resident_state().expect("resident fixture").document.layers[0].name, "Unsaved");
     second.lock().unwrap().leases.clear();
     w::close(&root, id, doc, 1, true, "human").unwrap();
     let p = target(&root);
@@ -194,7 +194,7 @@ fn closing_dirty_or_reserved_projects_preserves_work_and_last_close_creates_blan
 #[test]
 fn copy_and_move_are_independently_undoable_and_move_failure_rolls_back_both_engines() {
     let (root, second) = fixture();
-    let before = serde_json::to_value(&second.lock().unwrap().doc).unwrap();
+    let before = serde_json::to_value(&second.lock().unwrap().resident_state().expect("resident fixture").document).unwrap();
     root.lock()
         .unwrap()
         .reserve(
@@ -208,33 +208,33 @@ fn copy_and_move_are_independently_undoable_and_move_failure_rolls_back_both_eng
         .unwrap();
     assert!(transfer(&root, &root, &second, true).is_err());
     assert_eq!(
-        serde_json::to_value(&second.lock().unwrap().doc).unwrap(),
+        serde_json::to_value(&second.lock().unwrap().resident_state().expect("resident fixture").document).unwrap(),
         before
     );
-    assert!(second.lock().unwrap().undo.is_empty());
+    assert!(second.lock().unwrap().resident_state().expect("resident fixture").undo.is_empty());
     assert!(second.lock().unwrap().ai_change.is_none());
     transfer(&root, &root, &second, false).unwrap();
-    assert!(root.lock().unwrap().undo.is_empty());
-    assert_eq!(second.lock().unwrap().undo.len(), 1);
+    assert!(root.lock().unwrap().resident_state().expect("resident fixture").undo.is_empty());
+    assert_eq!(second.lock().unwrap().resident_state().expect("resident fixture").undo.len(), 1);
     second.lock().unwrap().undo("human").unwrap();
     root.lock().unwrap().leases.clear();
     transfer(&root, &root, &second, true).unwrap();
-    assert!(root.lock().unwrap().doc.layers.is_empty());
-    assert_eq!(root.lock().unwrap().undo.len(), 1);
+    assert!(root.lock().unwrap().resident_state().expect("resident fixture").document.layers.is_empty());
+    assert_eq!(root.lock().unwrap().resident_state().expect("resident fixture").undo.len(), 1);
     root.lock().unwrap().undo("human").unwrap();
     second.lock().unwrap().undo("human").unwrap();
-    assert_eq!(root.lock().unwrap().doc.layers.len(), 1);
-    assert_eq!(second.lock().unwrap().doc.layers.len(), 1);
+    assert_eq!(root.lock().unwrap().resident_state().expect("resident fixture").document.layers.len(), 1);
+    assert_eq!(second.lock().unwrap().resident_state().expect("resident fixture").document.layers.len(), 1);
 }
 #[test]
 fn transfer_preview_and_paste_preserve_native_tree_masks_effects_and_standard_psd_composite() {
     let (root, second) = fixture();
     {
         let mut e = root.lock().unwrap();
-        e.doc = Document::new_depth(12, 10, 16).unwrap();
+        e.resident_state_mut().expect("resident fixture").document = Document::new_depth(12, 10, 16).unwrap();
         let mut folder = Layer::new("Native folder", "group", 12, 10);
         folder.pixels.promote16();
-        let mut child = e.doc.layers.remove(0);
+        let mut child = e.resident_state_mut().expect("resident fixture").document.layers.remove(0);
         child.parent = Some(folder.id.clone());
         child.name = "Native ink".into();
         child.pixels.set16(2, 3, [10001, 30003, 50007, 65535]);
@@ -261,12 +261,12 @@ fn transfer_preview_and_paste_preserve_native_tree_masks_effects_and_standard_ps
             enabled: true,
             settings: json!({}).into(),
         });
-        e.doc.layers = vec![folder, child];
+        e.resident_state_mut().expect("resident fixture").document.layers = vec![folder, child];
     }
     let p = target(&second);
     let s = target(&root);
-    let layers = vec![root.lock().unwrap().doc.layers[0].id.clone()];
-    let target = second.lock().unwrap().doc.layers[0].id.clone();
+    let layers = vec![root.lock().unwrap().resident_state().expect("resident fixture").document.layers[0].id.clone()];
+    let target = second.lock().unwrap().resident_state().expect("resident fixture").document.layers[0].id.clone();
     let request = w::Transfer {
         source: s["project_id"].as_str().unwrap(),
         destination: p["project_id"].as_str().unwrap(),
@@ -283,11 +283,11 @@ fn transfer_preview_and_paste_preserve_native_tree_masks_effects_and_standard_ps
     };
     let preview = w::transfer_preview(&root, &request).unwrap();
     assert_eq!(preview.bit_depth, 16);
-    assert!(second.lock().unwrap().undo.is_empty());
+    assert!(second.lock().unwrap().resident_state().expect("resident fixture").undo.is_empty());
     w::transfer(&root, &request).unwrap();
     let e = second.lock().unwrap();
     let ink = e
-        .doc
+        .resident_state().expect("resident fixture").document
         .layers
         .iter()
         .find(|l| l.name == "Native ink")
@@ -298,10 +298,10 @@ fn transfer_preview_and_paste_preserve_native_tree_masks_effects_and_standard_ps
         40001
     );
     assert_eq!(ink.effects[0].weight, 0.4);
-    assert_eq!(e.doc.export_png().unwrap(), preview.export_png().unwrap());
-    let encoded = peerbrush::psd::encode(&e.doc).unwrap();
+    assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), preview.export_png().unwrap());
+    let encoded = peerbrush::psd::encode(&e.resident_state().expect("resident fixture").document).unwrap();
     let reopened = peerbrush::psd::decode(&encoded).unwrap();
-    assert_eq!(reopened.export_png().unwrap(), e.doc.export_png().unwrap());
+    assert_eq!(reopened.export_png().unwrap(), e.resident_state().expect("resident fixture").document.export_png().unwrap());
     assert_eq!(reopened.bit_depth, 16);
 }
 #[test]
@@ -312,7 +312,7 @@ fn duplicate_opens_preserve_work_focus_existing_and_keep_independent_save_confli
     let path = dir.join("shared.psd");
     server::save(&root, &path).unwrap();
     edit(&root, &root, "Unsaved original");
-    let before = root.lock().unwrap().state();
+    let before = root.lock().unwrap().capture_state().unwrap().project().unwrap();
     let count = w::handles(&root).len();
     assert!(server::dispatch(
         &root,
@@ -323,13 +323,13 @@ fn duplicate_opens_preserve_work_focus_existing_and_keep_independent_save_confli
     .starts_with("File already open"));
     assert_eq!(w::handles(&root).len(), count);
     assert_eq!(w::active_id(&root), root.lock().unwrap().project_id);
-    assert_eq!(root.lock().unwrap().state(), before);
+    assert_eq!(root.lock().unwrap().capture_state().unwrap().project().unwrap(), before);
     // Another editor remains outside the cooperative open-file locks.
-    let mut external = root.lock().unwrap().doc.clone();
+    let mut external = root.lock().unwrap().resident_state().expect("resident fixture").document.clone();
     external.layers[0].name = "External saved work".into();
     server::atomic_write(&path, &peerbrush::psd::encode(&external).unwrap()).unwrap();
     assert!(server::save(&root, &path).unwrap_err().contains("outside"));
-    assert_eq!(root.lock().unwrap().doc.layers[0].name, "Unsaved original");
+    assert_eq!(root.lock().unwrap().resident_state().expect("resident fixture").document.layers[0].name, "Unsaved original");
     let closed = w::new_project(&root, 12, 10, 8, None).unwrap();
     let p = target(&closed);
     w::close(
@@ -402,7 +402,7 @@ fn reopening_same_psd_rejects_old_project_source_even_at_identical_saved_revisio
     assert!(server::open(&second, &path).is_err());
     server::dispatch(&root, "document", &json!({"action":"new","actor":"human","project_id":old["project_id"],"document_id":old["document_id"],"expected_revision":old["expected_revision"],"width":12,"height":10})).unwrap();
     server::open(&second, &path).unwrap();
-    assert_eq!(second.lock().unwrap().doc.revision, 0);
+    assert_eq!(second.lock().unwrap().resident_state().expect("resident fixture").document.revision, 0);
     assert!(server::dispatch(&root, "edit", &old).is_err());
     assert!(server::save_source(
         &second,
@@ -422,20 +422,20 @@ fn reopening_same_psd_rejects_old_project_source_even_at_identical_saved_revisio
 #[test]
 fn protected_sources_require_explicit_compatible_copy_before_tree_transfer() {
     let (root, second) = fixture();
-    root.lock().unwrap().doc.read_only = true;
+    root.lock().unwrap().resident_state_mut().expect("resident fixture").document.read_only = true;
     assert!(transfer(&root, &root, &second, false)
         .unwrap_err()
         .contains("compatible copy"));
-    assert!(second.lock().unwrap().undo.is_empty());
-    assert!(root.lock().unwrap().doc.read_only);
+    assert!(second.lock().unwrap().resident_state().expect("resident fixture").undo.is_empty());
+    assert!(root.lock().unwrap().resident_state().expect("resident fixture").document.read_only);
 }
 
 #[test]
 fn human_tab_reordering_is_atomic_guarded_and_keeps_native_engines_and_history() {
     for depth in [8, 16] {
         let mut e = Engine::new();
-        e.doc = Document::new_depth(12, 10, depth).unwrap();
-        e.doc.layers[0]
+        e.resident_state_mut().expect("resident fixture").document = Document::new_depth(12, 10, depth).unwrap();
+        e.resident_state_mut().expect("resident fixture").document.layers[0]
             .pixels
             .set16(3, 4, [10001, 20003, 40007, 65535]);
         let root = Arc::new(Mutex::new(e));
@@ -455,9 +455,9 @@ fn human_tab_reordering_is_atomic_guarded_and_keeps_native_engines_and_history()
             .map(|p| {
                 let e = p.lock().unwrap();
                 (
-                    peerbrush::psd::encode(&e.doc).unwrap(),
-                    e.undo.len(),
-                    e.redo.len(),
+                    peerbrush::psd::encode(&e.resident_state().expect("resident fixture").document).unwrap(),
+                    e.resident_state().expect("resident fixture").undo.len(),
+                    e.resident_state().expect("resident fixture").redo.len(),
                     e.saved_revision,
                     e.path.clone(),
                 )
@@ -513,9 +513,9 @@ fn human_tab_reordering_is_atomic_guarded_and_keeps_native_engines_and_history()
             let e = p.lock().unwrap();
             assert_eq!(
                 (
-                    peerbrush::psd::encode(&e.doc).unwrap(),
-                    e.undo.len(),
-                    e.redo.len(),
+                    peerbrush::psd::encode(&e.resident_state().expect("resident fixture").document).unwrap(),
+                    e.resident_state().expect("resident fixture").undo.len(),
+                    e.resident_state().expect("resident fixture").redo.len(),
                     e.saved_revision,
                     e.path.clone()
                 ),
@@ -524,8 +524,8 @@ fn human_tab_reordering_is_atomic_guarded_and_keeps_native_engines_and_history()
         }
         // Transfers still route by identity after reordering, independent of the active tab.
         transfer(&root, &second, &third, false).unwrap();
-        assert_eq!(second.lock().unwrap().undo.len(), 1);
-        assert_eq!(third.lock().unwrap().undo.len(), 1);
+        assert_eq!(second.lock().unwrap().resident_state().expect("resident fixture").undo.len(), 1);
+        assert_eq!(third.lock().unwrap().resident_state().expect("resident fixture").undo.len(), 1);
         assert_eq!(
             w::active_id(&root),
             state["active_project_id"].as_str().unwrap()

@@ -2,11 +2,11 @@
 //! source reads and response construction after releasing Engine/registry locks.
 #[cfg(test)]
 mod fixture;
-mod header;
-pub(crate) mod metadata;
+use crate::engine::report::header;
+pub(crate) use crate::engine::report::metadata;
 #[cfg(test)]
 mod metadata_tests;
-mod pixels;
+pub(super) mod pixels;
 #[cfg(test)]
 mod pixels_tests;
 use super::{reply::ReplyAdmission, Shared};
@@ -33,14 +33,21 @@ pub(super) fn capture(
 ) -> Result<Option<Capture>> {
     let mut engine = shared.lock().unwrap();
     crate::workspace::validate_target(&engine, p)?;
-    if !matches!(engine::view::current(&engine), DocumentView::Native(_)) {
+    capture_engine(&mut engine, admission)
+}
+
+pub(super) fn capture_engine(
+    engine: &mut engine::Engine,
+    admission: &mut ReplyAdmission,
+) -> Result<Option<Capture>> {
+    if !matches!(engine::view::current(engine), DocumentView::Native(_)) {
         return Ok(None);
     }
     engine.expire();
     let crate::engine::view::DocumentSnapshot::Native(document) = engine.doc_snapshot() else {
         return Err("Native observation snapshot authority changed".into());
     };
-    let header = header::Header::new(&engine, document.metadata().revision());
+    let header = header::Header::new(engine, document.metadata().revision());
     admission.admit_projection(document.budget(), &header)?;
     let header = serde_json::to_value(header).map_err(|e| e.to_string())?;
     let scene = engine.capture_scene(None)?.into_native()?;
@@ -69,6 +76,15 @@ struct ReadCapture {
     session: crate::workspace::source_runtime::SourceReadSession,
 }
 impl Capture {
+    pub(super) fn with_loading(mut self, control: crate::loading::Control) -> Self {
+        self.loading = Some(control);
+        self
+    }
+
+    pub(super) fn scene(&self) -> &SceneSnapshot {
+        &self.scene
+    }
+
     pub(super) fn observe(
         self,
         shared: &Shared,
@@ -76,6 +92,16 @@ impl Capture {
         admission: &mut ReplyAdmission,
     ) -> Result<Value> {
         let session = crate::workspace::native_dispatch::begin_read_scene(shared, &self.scene)?;
+        self.observe_admitted(session, p, admission)
+    }
+
+    pub(super) fn observe_admitted(
+        self,
+        session: crate::workspace::source_runtime::SourceReadSession,
+        p: &Value,
+        admission: &mut ReplyAdmission,
+    ) -> Result<Value> {
+        session.check_scene(&self.scene)?;
         ReadCapture {
             capture: self,
             session,
@@ -165,22 +191,18 @@ impl ReadCapture {
             drop(self);
             return Ok(json!({"state":header,"revision":revision,"images":[]}));
         }
-        let request = crate::render::native_preview::Request::capture(
+        let request = crate::render::native_preview::Request::capture_selection(
             self.capture.scene.clone(),
             session.clone(),
             p.get("rect").and_then(engine::rect),
             p["max_edge"].as_u64().unwrap_or(1024).clamp(32, 4096) as u32,
             p["layer"].as_str(),
             p["mask"].as_bool().unwrap_or(false),
+            p["selection_view"].as_str(),
         )?;
         let frame = request.render(&mut || session.check())?;
         drop(request);
-        let pixels = pixels::Pixels::frame(
-            frame,
-            &self.capture.document,
-            p["selection_view"].as_str(),
-            &|| session.check(),
-        )?;
+        let pixels = pixels::Pixels::new(frame);
         session.check()?;
         let ReadCapture {
             capture:

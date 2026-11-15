@@ -9,6 +9,8 @@ use std::{
 pub const BUDGET: usize = 512 * 1024 * 1024;
 pub const ENTRY_BUDGET: usize = 256 * 1024 * 1024;
 const MAGIC: &[u8; 8] = b"PBCACHE1";
+const LEGACY_OWNER: &[u8] = b"PeerBrush disposable derived cache v1";
+const OWNER: &[u8] = b"PeerBrush disposable derived cache v2";
 fn digest(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf29ce484222325, |h, b| {
         (h ^ *b as u64).wrapping_mul(0x100000001b3)
@@ -20,17 +22,24 @@ pub struct Store {
     bytes: usize,
     items: HashMap<String, (PathBuf, usize)>,
     order: VecDeque<String>,
+    owner: Option<fs::File>,
 }
 impl Store {
     pub fn new(root: PathBuf, budget: usize) -> std::io::Result<Self> {
         fs::create_dir_all(&root)?;
-        fs::write(root.join("owner"), b"PeerBrush disposable derived cache v1")?;
+        let mut owner = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(root.join("owner"))?;
+        owner.try_lock().map_err(std::io::Error::from)?;
+        owner.write_all(OWNER)?;
         Ok(Self {
             root,
             budget: budget.min(BUDGET),
             bytes: 0,
             items: HashMap::new(),
             order: VecDeque::new(),
+            owner: Some(owner),
         })
     }
     pub fn bytes(&self) -> usize {
@@ -152,51 +161,96 @@ impl Drop for Store {
             let _ = fs::remove_file(p);
         }
         let _ = fs::remove_file(self.root.join("owner"));
+        drop(self.owner.take());
         let _ = fs::remove_dir(&self.root);
     }
 }
 static DISK: OnceLock<Mutex<Option<Store>>> = OnceLock::new();
-pub fn configure(state: &Path) {
+pub(crate) fn configure(state: &Path) -> PathBuf {
     // Unique instance directory prevents stale application-version results being reused.
-    // Clean abandoned cache directories only while the workspace instance lock is held.
-    let root = state.join("derived-cache");
-    if let Ok(entries) = fs::read_dir(&root) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if entry.file_name().to_string_lossy().starts_with("instance-")
-                && entry
-                    .file_type()
-                    .is_ok_and(|t| t.is_dir() && !t.is_symlink())
-            {
-                if fs::read(p.join("owner"))
-                    .is_ok_and(|b| b == b"PeerBrush disposable derived cache v1")
-                {
-                    if let Ok(files) = fs::read_dir(&p) {
-                        for file in files.flatten() {
-                            let name = file.file_name();
-                            let name = name.to_string_lossy();
-                            if file
-                                .file_type()
-                                .is_ok_and(|t| t.is_file() && !t.is_symlink())
-                                && (name == "owner"
-                                    || name.ends_with(".cache")
-                                    || name.ends_with(".partial"))
-                            {
-                                let _ = fs::remove_file(file.path());
-                            }
-                        }
-                    }
-                    let _ = fs::remove_dir(p);
-                }
+    let current = state
+        .join("derived-cache")
+        .join(format!("instance-{}", crate::engine::id()));
+    let store = Store::new(current.clone(), BUDGET).ok();
+    *DISK.get_or_init(|| Mutex::new(None)).lock().unwrap() = store;
+    current
+}
+
+fn ordinary_directory(path: &Path) -> bool {
+    path.symlink_metadata().is_ok_and(|metadata| {
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            if metadata.file_attributes() & 0x400 != 0 {
+                return false;
             }
         }
+        metadata.is_dir()
+    })
+}
+
+/// The instance owns this cleanup until it finishes or observes shutdown.
+pub(crate) fn clean_abandoned(current: &Path, cancelled: impl Fn() -> bool) {
+    let Some(root) = current.parent().filter(|path| ordinary_directory(path)) else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    'instances: for entry in entries.flatten() {
+        if cancelled() {
+            return;
+        }
+        let path = entry.path();
+        if path == current
+            || !entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.strip_prefix("instance-"))
+                .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+            || !ordinary_directory(&path)
+        {
+            continue;
+        }
+        let marker_path = path.join("owner");
+        let Ok(owner) = crate::file_safety::open_native_read(&marker_path) else {
+            continue;
+        };
+        let mut marker = Vec::new();
+        if (&owner)
+            .take(OWNER.len() as u64 + 1)
+            .read_to_end(&mut marker)
+            .is_err()
+            || (marker != OWNER && marker != LEGACY_OWNER)
+            || owner.try_lock().is_err()
+        {
+            continue;
+        }
+        let Ok(files) = fs::read_dir(&path) else {
+            continue;
+        };
+        for file in files.flatten() {
+            if cancelled() {
+                return;
+            }
+            let name = file.file_name();
+            let name = name.to_string_lossy();
+            if (name.ends_with(".cache") || name.ends_with(".partial"))
+                && file.file_type().is_ok_and(|kind| kind.is_file())
+                && fs::remove_file(file.path())
+                    .is_err_and(|e| e.kind() != std::io::ErrorKind::NotFound)
+            {
+                // Keep the marker so a later session can retry a busy file.
+                continue 'instances;
+            }
+        }
+        if cancelled() {
+            return;
+        }
+        let _ = fs::remove_file(marker_path);
+        drop(owner);
+        let _ = fs::remove_dir(path);
     }
-    let store = Store::new(
-        root.join(format!("instance-{}", crate::engine::id())),
-        BUDGET,
-    )
-    .ok();
-    *DISK.get_or_init(|| Mutex::new(None)).lock().unwrap() = store;
 }
 pub(crate) fn spill(key: &str, w: u32, h: u32, depth: u16, bytes: &[u8]) {
     if let Some(store) = DISK
@@ -214,4 +268,51 @@ pub(crate) fn read(key: &str, w: u32, h: u32, depth: u16) -> Option<Vec<u8>> {
         .ok()?
         .as_mut()?
         .get(key, w, h, depth)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_cleanup_preserves_live_and_foreign_files_and_honors_shutdown() {
+        let root =
+            std::env::temp_dir().join(format!("peerbrush-cache-test-{}", crate::engine::id()));
+        let directory = || root.join(format!("instance-{}", crate::engine::id()));
+        let current = directory();
+        let active = directory();
+        let abandoned = directory();
+        let legacy = directory();
+        let foreign = directory();
+        let live = Store::new(active.clone(), BUDGET).unwrap();
+        fs::write(active.join("render.cache"), b"live").unwrap();
+        for (path, marker) in [
+            (&current, OWNER),
+            (&abandoned, OWNER),
+            (&legacy, LEGACY_OWNER),
+            (&foreign, b"foreign marker".as_slice()),
+        ] {
+            fs::create_dir(path).unwrap();
+            fs::write(path.join("owner"), marker).unwrap();
+            fs::write(path.join("render.cache"), b"fixture").unwrap();
+        }
+        fs::write(abandoned.join("original.psd"), b"artwork").unwrap();
+
+        clean_abandoned(&current, || true);
+        assert!(abandoned.join("render.cache").is_file());
+        assert!(abandoned.join("owner").is_file());
+
+        clean_abandoned(&current, || false);
+        assert!(!legacy.exists());
+        assert!(!abandoned.join("render.cache").exists());
+        assert_eq!(
+            fs::read(abandoned.join("original.psd")).unwrap(),
+            b"artwork"
+        );
+        for path in [current, active, foreign] {
+            assert!(path.join("render.cache").is_file());
+        }
+        drop(live);
+        fs::remove_dir_all(root).unwrap();
+    }
 }

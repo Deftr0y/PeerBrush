@@ -183,22 +183,22 @@ fn tiny_local_working_region_stays_small_on_an_eight_k_canvas_and_invalid_work_i
 #[test]
 fn editable_liquify_effect_preview_and_commit_match_without_baking_source_pixels() {
     let mut engine = Engine::new();
-    engine.doc = Document::new(64, 64).unwrap();
+    engine.resident_state_mut().expect("resident fixture").document = Document::new(64, 64).unwrap();
     let source = gradient();
-    engine.doc.layers[0].pixels = Raster::from_rgba(64, 64, &source.bytes).unwrap();
-    let layer = engine.doc.layers[0].id.clone();
+    engine.resident_state_mut().expect("resident fixture").document.layers[0].pixels = Raster::from_rgba(64, 64, &source.bytes).unwrap();
+    let layer = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
     let commands = [json!({"op":"effect.add","layer":layer,"kind":"liquify","settings":warp()})];
-    let preview = Engine::preview_edits(engine.doc.clone(), &commands).unwrap();
+    let preview = Engine::preview_edits(engine.resident_state().expect("resident fixture").document.clone(), &commands).unwrap();
     let expected = preview.preview(None, 64, None, false).unwrap().2;
     engine
         .edit("human", &commands, None, None, "Liquify")
         .unwrap();
     assert_eq!(
-        engine.doc.preview(None, 64, None, false).unwrap().2,
+        engine.resident_state().expect("resident fixture").document.preview(None, 64, None, false).unwrap().2,
         expected
     );
-    assert_eq!(engine.doc.layers[0].pixels.rgba(), source.bytes);
-    let effect = engine.doc.layers[0].effects[0].id.clone();
+    assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba(), source.bytes);
+    let effect = engine.resident_state().expect("resident fixture").document.layers[0].effects[0].id.clone();
     let mut modified = warp();
     modified["strokes"][0]["radius"] = json!(6.0);
     engine
@@ -211,16 +211,16 @@ fn editable_liquify_effect_preview_and_commit_match_without_baking_source_pixels
         )
         .unwrap();
     assert_ne!(
-        engine.doc.preview(None, 64, None, false).unwrap().2,
+        engine.resident_state().expect("resident fixture").document.preview(None, 64, None, false).unwrap().2,
         expected
     );
-    assert_eq!(engine.doc.layers[0].pixels.rgba(), source.bytes);
+    assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba(), source.bytes);
     engine.undo("human").unwrap();
     assert_eq!(
-        engine.doc.preview(None, 64, None, false).unwrap().2,
+        engine.resident_state().expect("resident fixture").document.preview(None, 64, None, false).unwrap().2,
         expected
     );
     engine.undo("human").unwrap();
-    assert!(engine.doc.layers[0].effects.is_empty());
-    assert_eq!(engine.doc.layers[0].pixels.rgba(), source.bytes);
+    assert!(engine.resident_state().expect("resident fixture").document.layers[0].effects.is_empty());
+    assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba(), source.bytes);
 }

@@ -6,7 +6,7 @@ use super::{
     manifest36::{CompletedStandard, Manifest},
     memory36::Admitted,
     row_stream::Source,
-    structural::{Ambiguity, Encoding, Index, Span},
+    structural::{Ambiguity, Compression, Encoding, Index, Span},
 };
 use ring::digest::{Context, SHA256};
 use std::cell::Cell;
@@ -16,6 +16,13 @@ use std::sync::Arc;
 pub(crate) struct VerificationLimits {
     pub bulk: BulkLimits,
     pub native_streams: usize,
+}
+
+pub(crate) enum VerificationPhase {
+    InitialChecksum,
+    EditableSources { total_bytes: u64 },
+    Streams { total: usize },
+    AfterStreamsChecksum,
 }
 
 /// Whole-source SHA must come from the caller's retained source admission and
@@ -30,9 +37,14 @@ pub(crate) fn verify<'source, 'index, R: Read + Seek, T>(
     entries: &mut [TileIndexEntry],
     raster_counts: &mut [u64],
     scratch: &mut [u8],
-    check: &dyn Fn() -> Result<(), String>,
+    checks: (
+        &dyn Fn() -> Result<(), String>,
+        &dyn Fn() -> Result<(), String>,
+    ),
+    mut progress: impl FnMut(VerificationPhase, u64) -> Result<(), String>,
     mut provisional_sink: impl FnMut(Record<'_>) -> Result<(), String>,
 ) -> Result<CompletedSource<'source, 'index, R>, String> {
+    let (check, pinned) = checks;
     check()?;
     if scratch.len() != bulk36::MAX_TILE_BYTES
         || limits.native_streams == 0
@@ -94,7 +106,13 @@ pub(crate) fn verify<'source, 'index, R: Read + Seek, T>(
         offset: 0,
         bytes: index.file_bytes,
     };
-    if hash_range(source, whole, scratch, check)? != expected_source_sha256 {
+    let layer = index.layer_and_mask;
+    let composite = index.composite.span;
+    let (whole_sha, standard_sha) =
+        hash_source_and_standard(source, whole, [layer, composite], scratch, check, |bytes| {
+            progress(VerificationPhase::InitialChecksum, bytes)
+        })?;
+    if whole_sha != expected_source_sha256 {
         return Err("Source36 source differs from its admitted whole-file SHA256".into());
     }
     let mut resource_input = source.range(resource.data, check)?;
@@ -107,14 +125,13 @@ pub(crate) fn verify<'source, 'index, R: Read + Seek, T>(
     {
         return Err("Source36 manifest resource changed after bounded inflation".into());
     }
-    let standard = manifest.verify_standard(
-        &mut source.range(index.layer_and_mask, check)?,
-        index.layer_and_mask.bytes,
-        &mut source.range(index.composite.span, check)?,
-        index.composite.span.bytes,
-        check,
-    )?;
+    let standard = manifest.verify_standard_digest(layer.bytes, composite.bytes, standard_sha)?;
     let mut verifier = BulkVerifier::new(plan, limits.bulk, entries, raster_counts, check)?;
+    let total_bytes = plan.chunks.iter().map(|chunk| u64::from(chunk.bytes)).sum();
+    let mut verified_bytes = 0;
+    if total_bytes != 0 {
+        progress(VerificationPhase::EditableSources { total_bytes }, 0)?;
+    }
     for (ordinal, tag) in index
         .global_tags
         .iter()
@@ -138,14 +155,18 @@ pub(crate) fn verify<'source, 'index, R: Read + Seek, T>(
             core: plan.core,
         };
         verifier.chunk(
-            &mut source.range(tag.data, check)?,
+            &mut source.range_with_checks(tag.data, check, pinned)?,
             header,
             scratch,
-            check,
+            pinned,
             &mut provisional_sink,
         )?;
+        check()?;
+        verified_bytes += tag.data.bytes;
+        progress(VerificationPhase::EditableSources { total_bytes }, verified_bytes)?;
     }
     let bulk = verifier.finish(check)?;
+    progress(VerificationPhase::Streams { total: streams }, 0)?;
     let mut completed_streams = 0usize;
     let mut completed_rows = 0u64;
     for layer in &index.layers {
@@ -158,19 +179,23 @@ pub(crate) fn verify<'source, 'index, R: Read + Seek, T>(
                 return Err("Source36 standard channel has an invalid native encoding".into());
             }
             completed_rows = completed_rows
-                .checked_add(finish_rows(source, encoding, scratch, check)?)
+                .checked_add(verify_stream(source, encoding, scratch, check, pinned)?)
                 .ok_or("Source36 completed row count overflow")?;
             completed_streams += 1;
+            progress(VerificationPhase::Streams { total: streams }, completed_streams as u64)?;
         }
     }
     // Merged ZIP remains one linear channel-major stream. It is never treated
     // as independently seekable compressed channel streams here.
     completed_rows = completed_rows
-        .checked_add(finish_rows(source, &index.composite, scratch, check)?)
+        .checked_add(verify_stream(source, &index.composite, scratch, check, pinned)?)
         .ok_or("Source36 completed row count overflow")?;
     completed_streams += 1;
+    progress(VerificationPhase::Streams { total: streams }, completed_streams as u64)?;
     if completed_streams != streams
-        || hash_range(source, whole, scratch, check)? != expected_source_sha256
+        || hash_range(source, whole, scratch, check, |bytes| {
+            progress(VerificationPhase::AfterStreamsChecksum, bytes)
+        })? != expected_source_sha256
     {
         return Err("Source36 source changed during complete native-stream verification".into());
     }
@@ -189,35 +214,150 @@ pub(crate) fn verify<'source, 'index, R: Read + Seek, T>(
     })
 }
 
-fn finish_rows<R: Read + Seek>(
+fn verify_stream<R: Read + Seek>(
     source: &Source<R>,
     encoding: &Encoding,
     scratch: &mut [u8],
     check: &dyn Fn() -> Result<(), String>,
+    pinned: &dyn Fn() -> Result<(), String>,
 ) -> Result<u64, String> {
     let row_bytes =
         usize::try_from(encoding.row_bytes).map_err(|_| "Source36 native row length overflow")?;
     if row_bytes > scratch.len() {
         return Err("Source36 native row exceeds admitted transfer scratch".into());
     }
-    let mut rows = source.rows(encoding, check)?;
-    for _ in 0..encoding.rows {
+    let mut rows = source.rows_with_checks(encoding, check, pinned)?;
+    if encoding.compression == Compression::Raw {
+        // Both fresh whole-file hashes cover this exact payload. Setting up
+        // the row reader verifies its header and exact byte count. The later
+        // fidelity pass reads and compares every sample at its original depth.
         check()?;
-        if !rows.read_row(&mut scratch[..row_bytes])? {
-            return Err("Source36 native row stream ended early".into());
+        return Ok(encoding.rows);
+    }
+    if row_bytes == 0 {
+        for _ in 0..encoding.rows {
+            if !rows.read_row(&mut [])? {
+                return Err("Source36 native row stream ended early".into());
+            }
+        }
+    } else {
+        let capacity = (scratch.len() / row_bytes) as u64;
+        let mut remaining = encoding.rows;
+        while remaining > 0 {
+            let count = remaining.min(capacity);
+            rows.read_rows(&mut scratch[..count as usize * row_bytes])?;
+            remaining -= count;
         }
     }
     rows.finish()?.check(source, encoding, check)?;
     Ok(encoding.rows)
 }
+
+#[cfg(test)]
+#[test]
+fn raw_stream_verification_checks_layout_without_reading_pixel_payload() {
+    use super::structural::Format;
+
+    // The outer whole-file hash reads the payload. Count just the stream
+    // verifier's reads here to catch a redundant channel pass.
+    let mut file = std::io::Cursor::new([0u8; 18]);
+    let encoding = Encoding {
+        format: Format::Psb,
+        depth: 16,
+        rows: 4,
+        row_bytes: 4,
+        row_padding: 0,
+        compression: Compression::Raw,
+        span: Span { offset: 0, bytes: 18 },
+        counts: None,
+        payload: Span { offset: 2, bytes: 16 },
+    };
+    let mut scratch = [0; 8];
+    let check = || Ok(());
+    {
+        let source = Source::new(&mut file, 18).unwrap();
+        assert_eq!(verify_stream(&source, &encoding, &mut scratch, &check, &check).unwrap(), 4);
+    }
+    assert_eq!(file.position(), 2);
+    let mut wrong_rows = encoding;
+    wrong_rows.rows -= 1;
+    let source = Source::new(&mut file, 18).unwrap();
+    assert!(verify_stream(&source, &wrong_rows, &mut scratch, &check, &check).is_err());
+}
+
 fn hash_range<R: Read + Seek>(
     source: &Source<R>,
     span: Span,
     scratch: &mut [u8],
     check: &dyn Fn() -> Result<(), String>,
+    progress: impl FnMut(u64) -> Result<(), String>,
 ) -> Result<Digest, String> {
+    let mut hash = Context::new(&SHA256);
+    scan_range(source, span, scratch, check, progress, |_, bytes| {
+        hash.update(bytes);
+    })?;
+    Ok(hash.finish().as_ref().try_into().unwrap())
+}
+
+fn hash_source_and_standard<R: Read + Seek>(
+    source: &Source<R>,
+    whole: Span,
+    [layer, composite]: [Span; 2],
+    scratch: &mut [u8],
+    check: &dyn Fn() -> Result<(), String>,
+    progress: impl FnMut(u64) -> Result<(), String>,
+) -> Result<(Digest, Digest), String> {
+    let layer_end = layer.end()?;
+    let composite_end = composite.end()?;
+    if layer.offset < whole.offset || layer_end > composite.offset || composite_end > whole.end()? {
+        return Err("Source36 standard ranges do not fit their indexed source".into());
+    }
+    let mut whole_hash = Context::new(&SHA256);
+    let mut standard_hash = bulk36::standard_hasher(layer.bytes, composite.bytes);
+    let standard_ranges = [layer.offset..layer_end, composite.offset..composite_end];
+    // Use the same authenticated observation for both bindings. The later
+    // whole-file pass still verifies the bytes after native stream checks.
+    scan_range(source, whole, scratch, check, progress, |offset, bytes| {
+        whole_hash.update(bytes);
+        let end = offset + bytes.len() as u64;
+        for range in &standard_ranges {
+            let first = offset.max(range.start);
+            let last = end.min(range.end);
+            if first < last {
+                standard_hash.update(&bytes[(first - offset) as usize..(last - offset) as usize]);
+            }
+        }
+    })?;
+    Ok((
+        whole_hash.finish().as_ref().try_into().unwrap(),
+        standard_hash.finish().as_ref().try_into().unwrap(),
+    ))
+}
+
+fn scan_range<R: Read + Seek>(
+    source: &Source<R>,
+    span: Span,
+    scratch: &mut [u8],
+    check: &dyn Fn() -> Result<(), String>,
+    mut progress: impl FnMut(u64) -> Result<(), String>,
+    mut observe: impl FnMut(u64, &[u8]),
+) -> Result<(), String> {
     source.unchanged_length()?;
-    hash_reader(&mut source.range(span, check)?, span.bytes, scratch, check)
+    let mut scanned = 0;
+    progress(0)?;
+    source.scan(span, scratch, check, |bytes| {
+        observe(span.offset + scanned, bytes);
+        scanned += bytes.len() as u64;
+        if scanned < span.bytes {
+            progress(scanned)?;
+        }
+        Ok(())
+    })?;
+    source.unchanged_length()?;
+    if scanned != 0 {
+        progress(scanned)?;
+    }
+    check()
 }
 fn hash_reader(
     input: &mut impl Read,
@@ -244,9 +384,69 @@ fn hash_reader(
     Ok(hash.finish().as_ref().try_into().unwrap())
 }
 
-/// This token exists only after required stream finish/checksum/end checks. It
-/// cannot be reconstructed from requested row counts. Keeping exact source and
-/// index borrows prevents replacing either with a same-shaped caller object.
+#[cfg(test)]
+#[test]
+fn initial_scan_hashes_only_the_indexed_standard_spans_for_the_manifest() {
+    let data: Vec<u8> = (0..24).collect();
+    let whole = Span { offset: 0, bytes: 24 };
+    let layer = Span { offset: 3, bytes: 8 };
+    let composite = Span { offset: 13, bytes: 10 };
+    let source = Source::new(std::io::Cursor::new(&data), whole.bytes).unwrap();
+    let check = || Ok(());
+    let mut reported = Vec::new();
+    let (full_sha, standard_sha) =
+        hash_source_and_standard(&source, whole, [layer, composite], &mut [0; 5], &check, |n| {
+            reported.push(n);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(reported, [0, 5, 10, 15, 20, 24]);
+    assert_eq!(full_sha.as_slice(), ring::digest::digest(&SHA256, &data).as_ref());
+    assert_eq!(
+        standard_sha,
+        bulk36::standard_digest(&mut &data[3..11], 8, &mut &data[13..23], 10, &check).unwrap()
+    );
+    for invalid in [Span { offset: 10, bytes: 4 }, Span { offset: 23, bytes: 2 }] {
+        assert!(hash_source_and_standard(
+            &source,
+            whole,
+            [layer, invalid],
+            &mut [0; 5],
+            &check,
+            |_| Ok(())
+        )
+        .is_err());
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn whole_file_hash_reports_read_bytes_and_preserves_cancellation() {
+    let data = [1u8; 9];
+    let source = Source::new(std::io::Cursor::new(&data), data.len() as u64).unwrap();
+    let whole = Span { offset: 0, bytes: 9 };
+    let mut scratch = [0; 4];
+    let mut reported = Vec::new();
+    let mut report = |bytes| {
+        reported.push(bytes);
+        Ok(())
+    };
+    let sha = hash_range(&source, whole, &mut scratch, &|| Ok(()), &mut report).unwrap();
+    assert_eq!(sha.as_slice(), ring::digest::digest(&SHA256, &data).as_ref());
+    assert_eq!(reported, [0, 4, 8, 9]);
+
+    reported.clear();
+    let result = hash_range(&source, whole, &mut scratch, &|| Ok(()), |bytes| {
+        reported.push(bytes);
+        if bytes == 4 { Err("cancelled".into()) } else { Ok(()) }
+    });
+    assert_eq!(result.unwrap_err(), "cancelled");
+    assert_eq!(reported, [0, 4]);
+}
+
+/// This token binds the checked raw layouts and completed compressed streams
+/// to the whole-file digest. It does not attest to rendered pixel fidelity.
+/// Exact source and index borrows prevent substituting a same-shaped object.
 #[must_use = "Source observations require typed/render/lease/publication validation"]
 pub(crate) struct CompletedSource<'source, 'index, R> {
     source: &'source Source<R>,
@@ -300,6 +500,7 @@ impl<R: Read + Seek> CompletedSource<'_, '_, R> {
     }
     /// Reobserve whole-file bytes before handoff. The caller separately rechecks
     /// the retained source file identity/lease and final engine revision guard.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn recheck<T>(
         &self,
         source: &Source<R>,
@@ -308,6 +509,7 @@ impl<R: Read + Seek> CompletedSource<'_, '_, R> {
         expected_whole: Digest,
         scratch: &mut [u8],
         check: &dyn Fn() -> Result<(), String>,
+        progress: impl FnMut(u64) -> Result<(), String>,
     ) -> Result<(), String> {
         self.check(source, index, manifest, expected_whole, check)?;
         self.failed.set(true);
@@ -323,6 +525,7 @@ impl<R: Read + Seek> CompletedSource<'_, '_, R> {
                 },
                 scratch,
                 check,
+                progress,
             )? != self.whole
             {
                 return Err("Source36 source changed after completed stream observations".into());
@@ -347,7 +550,7 @@ impl<R: Read + Seek> CompletedSource<'_, '_, R> {
         scratch: &mut [u8],
         check: &dyn Fn() -> Result<(), String>,
     ) -> Result<Admitted<T>, String> {
-        self.recheck(source, index, &manifest, expected_whole, scratch, check)?;
+        self.recheck(source, index, &manifest, expected_whole, scratch, check, |_| Ok(()))?;
         manifest.map_unique(|manifest, _| Ok(manifest.into_metadata()))
     }
 }
@@ -394,6 +597,7 @@ impl<R: Read + Seek> OwnedSource<'_, R> {
         binding: &super::manifest36::SourceBinding,
         scratch: &mut [u8],
         check: &dyn Fn() -> Result<(), String>,
+        progress: impl FnMut(u64) -> Result<(), String>,
     ) -> Result<(), String> {
         if self.failed.replace(true) {
             return Err("Source36 owned source completion is failed".into());
@@ -417,6 +621,7 @@ impl<R: Read + Seek> OwnedSource<'_, R> {
                 },
                 scratch,
                 check,
+                progress,
             )? != self.whole
             {
                 return Err("Source36 admitted source changed before provisional handoff".into());

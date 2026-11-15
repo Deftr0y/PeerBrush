@@ -42,11 +42,7 @@ impl Shape<'_> {
             (b[3] + half + 1.).ceil().min(frame[1] as f32).max(0.) as u32,
         ]
     }
-    pub(super) fn pixel(&self, frame: [u32; 2], x: i32, y: i32, depth: u16) -> Pixel16 {
-        if x < 0 || y < 0 || x >= frame[0] as i32 || y >= frame[1] as i32 {
-            return [0; 4];
-        }
-        let b = self.bounds(frame);
+    pub(super) fn pixel(&self, b: [u32; 4], x: i32, y: i32, depth: u16) -> Pixel16 {
         let (x, y) = (x as u32, y as u32);
         if x < b[0] || y < b[1] || x >= b[2] || y >= b[3] {
             return [0; 4];
@@ -172,10 +168,11 @@ mod tests {
                         },
                     };
                     let reference = source.render(frame[0], frame[1], depth).unwrap();
+                    let bounds = shape.bounds(frame);
                     for y in -1..=frame[1] as i32 {
                         for x in -1..=frame[0] as i32 {
                             assert_eq!(
-                                shape.pixel(frame, x, y, depth),
+                                shape.pixel(bounds, x, y, depth),
                                 reference.get16(x, y),
                                 "{kind} closed={closed} native{depth}({x},{y})"
                             );
@@ -199,12 +196,14 @@ mod tests {
         };
         let mut shifted = small;
         shifted.bounds = small.bounds.map(|v| v + 15000.);
+        let small_bounds = small.bounds([61, 67]);
+        let shifted_bounds = shifted.bounds([16000, 16000]);
         for depth in [8, 16] {
             for y in 0..64 {
                 for x in 0..61 {
                     assert_eq!(
-                        shifted.pixel([16000, 16000], x + 15000, y + 15000, depth),
-                        small.pixel([61, 67], x, y, depth)
+                        shifted.pixel(shifted_bounds, x + 15000, y + 15000, depth),
+                        small.pixel(small_bounds, x, y, depth)
                     );
                 }
             }

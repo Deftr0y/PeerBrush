@@ -1,9 +1,134 @@
 use super::*;
 use crate::{
     effects,
-    engine::{view::LayerView, Layer},
+    engine::view::LayerView,
 };
 // Bitmap bytes are displayed/imported through the original Effect, never these controls.
+struct InspectorSettings {
+    value: Value,
+    _charge: Option<Arc<crate::psd::memory36::MetadataCharge>>,
+}
+fn mask_inspector_settings(
+    doc: DocumentView<'_>,
+    step: crate::engine::view::MaskStepView<'_>,
+) -> Result<InspectorSettings, String> {
+    if let Some(native) = doc.native() {
+        let admitted: crate::psd::memory36::Admitted<Value> =
+            crate::engine::native::copy_admitted(step.settings(), native.budget(), true, &|| {
+                Ok(())
+            })?;
+        let mut result = None;
+        let moved = admitted.map_unique(|value, charge| {
+            result = Some(InspectorSettings {
+                value,
+                _charge: Some(charge.clone()),
+            });
+            Ok(())
+        })?;
+        drop(moved);
+        result.ok_or_else(|| "Mask inspector metadata could not be prepared".into())
+    } else {
+        Ok(InspectorSettings {
+            value: step.settings().clone(),
+            _charge: None,
+        })
+    }
+}
+impl InspectorSettings {
+    fn restore_bitmap(
+        &mut self,
+        doc: DocumentView<'_>,
+        effect: crate::engine::view::EffectView<'_>,
+    ) -> Result<(), String> {
+        if crate::effects::patterns::active(effect.kind(), &self.value) {
+            if let Some(png) = effect.settings().get("bitmap_png") {
+                if let Some(native) = doc.native() {
+                    let bytes = png
+                        .as_str()
+                        .ok_or("Pattern bitmap is not encoded text")?
+                        .len()
+                        .checked_mul(2)
+                        .and_then(|n| n.checked_add(1024))
+                        .filter(|n| *n <= 64 * 1024 * 1024)
+                        .ok_or("Pattern metadata exceeds admission")?;
+                    let extra = crate::psd::memory36::MetadataCharge::reserve(
+                        native.budget(),
+                        bytes,
+                        &|| Ok(()),
+                    )?;
+                    self._charge = Some(crate::psd::memory36::MetadataCharge::combine(
+                        &[
+                            self._charge
+                                .as_ref()
+                                .ok_or("Inspector admission is missing")?
+                                .clone(),
+                            extra,
+                        ],
+                        &|| Ok(()),
+                    )?);
+                }
+                self.value["bitmap_png"] = png.clone();
+            }
+        }
+        Ok(())
+    }
+}
+fn inspector_settings(
+    doc: DocumentView<'_>,
+    effect: crate::engine::view::EffectView<'_>,
+) -> Result<InspectorSettings, String> {
+    // Admit the selected metadata before cloning; bitmap bytes stay in their source owner.
+    struct Selected<'a> {
+        kind: &'a str,
+        value: &'a Value,
+    }
+    impl serde::Serialize for Selected<'_> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            use serde::ser::SerializeMap;
+            if let Some(fields) = self
+                .value
+                .as_object()
+                .filter(|_| crate::effects::patterns::active(self.kind, self.value))
+            {
+                let mut map = serializer.serialize_map(None)?;
+                for (key, value) in fields {
+                    if key != "bitmap_png" {
+                        map.serialize_entry(key, value)?;
+                    }
+                }
+                map.end()
+            } else {
+                self.value.serialize(serializer)
+            }
+        }
+    }
+    if let Some(native) = doc.native() {
+        let admitted: crate::psd::memory36::Admitted<Value> = crate::engine::native::copy_admitted(
+            &Selected {
+                kind: effect.kind(),
+                value: effect.settings(),
+            },
+            native.budget(),
+            true,
+            &|| Ok(()),
+        )?;
+        let mut result = None;
+        let moved = admitted.map_unique(|value, charge| {
+            result = Some(InspectorSettings {
+                value,
+                _charge: Some(charge.clone()),
+            });
+            Ok(())
+        })?;
+        drop(moved);
+        result.ok_or_else(|| "Inspector metadata could not be prepared".into())
+    } else {
+        Ok(InspectorSettings {
+            value: inspector_values(effect.kind(), effect.settings()),
+            _charge: None,
+        })
+    }
+}
 fn inspector_values(kind: &str, source: &Value) -> Value {
     match source
         .as_object()
@@ -23,6 +148,108 @@ pub(super) fn settings(
     ui: &mut egui::Ui,
     kind: &str,
     settings: &mut Value,
+    depth: u16,
+) -> Option<egui::Response> {
+    if kind == effects::color_lookup::KIND {
+        let (updated, response) = color_lookup_picker(ui, settings)?;
+        *settings = updated;
+        return Some(response);
+    }
+    if kind == effects::channel_mixer::KIND {
+        return channel_mixer_settings(ui, settings, None);
+    }
+    if kind == effects::black_white::KIND {
+        return black_white_settings(ui, settings, None);
+    }
+    if kind == effects::selective_color::KIND {
+        return selective_color_settings(ui, settings, None);
+    }
+    if kind == effects::photo_filter::KIND {
+        return photo_filter_settings(ui, settings, depth, None);
+    }
+    if kind == effects::gradient_map::KIND {
+        return gradient_map_settings(ui, settings, None);
+    }
+    if kind == effects::photoshop_hue_saturation::KIND {
+        return photoshop_hue_saturation_settings(ui, settings, None);
+    }
+    if !matches!(kind, "levels" | "curves") { return settings_values(ui, kind, settings, depth, false, None); }
+    let byte_composition = effects::curves::byte_composition(kind, settings)
+        || effects::levels::byte_composition(kind, settings);
+    let selected_id = ui.id().with((kind, "channel"));
+    let mut selected = ui.ctx().data(|data| data.get_temp::<usize>(selected_id)).unwrap_or(0).min(3);
+    let _ = controls::swatch_choices(
+        ui,
+        "Channel",
+        &mut selected,
+        std::iter::once(("RGB", controls::RGB_COLORS.as_slice())).chain(controls::RGB_CHANNELS),
+    );
+    ui.ctx().data_mut(|data| data.insert_temp(selected_id, selected));
+    ui.push_id((kind, "channel", selected), |ui| {
+        if selected == 0 { return settings_values(ui, kind, settings, depth, byte_composition, None); }
+        let identity = if kind == "curves" {
+            json!({"points":[[0.,0.],[1.,1.]],"interpolation":"linear"})
+        } else {
+            effects::defaults(kind)
+        };
+        let mut channel = settings.get("channels").and_then(|values| values.get(selected - 1))
+            .cloned().unwrap_or_else(|| identity.clone());
+        if kind == "levels" { channel["input_mapping"] = json!("exact"); }
+        let response = settings_values(ui, kind, &mut channel, depth, byte_composition, None);
+        if response.is_some() {
+            if settings.get("channels").is_none() {
+                settings["channels"] = Value::Array(vec![identity; 3]);
+            }
+            settings["channels"][selected - 1] = channel;
+        }
+        response
+    }).inner
+}
+
+fn posterize_choice(
+    ui: &mut egui::Ui,
+    mapping: &str,
+    label: &str,
+    help: &str,
+    selected: bool,
+    depth: u16,
+) -> egui::Response {
+    const WIDTH: usize = 64;
+    let id = egui::Id::new(("Posterize ramp", mapping, depth));
+    let texture = ui.ctx().data(|data| data.get_temp::<TextureHandle>(id))
+        .unwrap_or_else(|| {
+            // A four-level reference keeps the mapping comparison visible at any effect setting.
+            let settings = if mapping.is_empty() { json!({}) } else { json!({"mapping": mapping}) };
+            let quantizer = effects::posterize::Quantizer::new(&settings)
+                .expect("Built-in Posterize mapping");
+            let max = if depth == 16 { u16::MAX } else { 255 };
+            let mut image = egui::ColorImage::new([WIDTH, 1], Color32::BLACK);
+            for (index, pixel) in image.pixels.iter_mut().enumerate() {
+                let input = (index as u32 * u32::from(max) / (WIDTH as u32 - 1)) as u16;
+                let output = quantizer.sample(input, max);
+                let shade = if depth == 16 { crate::raster::project16(output) } else { output as u8 };
+                *pixel = Color32::from_gray(shade);
+            }
+            let texture = ui.ctx().load_texture(label, image, egui::TextureOptions::NEAREST);
+            ui.ctx().data_mut(|data| data.insert_temp(id, texture.clone()));
+            texture
+        });
+    let response = ui.add(egui::Button::image_and_text((texture.id(), Vec2::new(48., 14.)), label)
+        .selected(selected)).on_hover_text(help);
+    response.widget_info(|| egui::WidgetInfo::selected(
+        egui::WidgetType::RadioButton, response.enabled(), selected, label,
+    ));
+    icons::paint_focus(ui, &response);
+    response
+}
+
+fn settings_values(
+    ui: &mut egui::Ui,
+    kind: &str,
+    settings: &mut Value,
+    depth: u16,
+    byte_composition: bool,
+    source: Option<&Value>,
 ) -> Option<egui::Response> {
     if crate::effects::styles::contains(kind) {
         return style_settings::settings(ui, kind, settings);
@@ -31,16 +258,78 @@ pub(super) fn settings(
         return channel_clamp_settings(ui, settings);
     }
     let mut changed = None;
+    let byte_levels = kind == "levels" && byte_composition;
     if kind == "levels" {
-        changed = levels_slider(ui, settings);
+        changed = levels_slider(ui, settings, byte_levels);
     }
+    let mut posterize_mapping = match effects::posterize::source_version(kind, settings) {
+        Some(1) => "photoshop",
+        Some(_) => effects::posterize::PHOTOSHOP_NATIVE,
+        None => "",
+    };
+    if kind == "posterize" {
+        let response = ui.horizontal_wrapped(|ui| {
+            controls::label(ui, "Mapping");
+            let show_legacy = posterize_mapping == "photoshop";
+            let mut change = None;
+            for (mapping, label, help) in [
+                ("", "Nearest", "Round each channel to the nearest palette level. Swatch shows four levels."),
+                (effects::posterize::PHOTOSHOP_NATIVE, "Photoshop bins", "Use Photoshop’s bucket and palette rules at the project’s depth. Swatch shows four levels."),
+                ("photoshop", "Legacy bins", "Keep the mapping used by older PeerBrush projects. Swatch shows four levels."),
+            ] {
+                if mapping == "photoshop" && !show_legacy { continue; }
+                let selected = mapping == posterize_mapping;
+                let mut response = posterize_choice(ui, mapping, label, help, selected, depth);
+                if response.clicked() && !selected {
+                    posterize_mapping = mapping;
+                    response.mark_changed();
+                    change = Some(response);
+                }
+            }
+            change
+        }).inner;
+        if let Some(response) = response {
+            if !posterize_mapping.is_empty() {
+                settings["mapping"] = json!(posterize_mapping);
+                if settings["levels"].as_f64().is_some_and(|levels| levels > f64::from(effects::posterize::PHOTOSHOP_MAX_LEVELS)) {
+                    settings["levels"] = json!(effects::posterize::PHOTOSHOP_MAX_LEVELS);
+                }
+            } else {
+                settings.as_object_mut().unwrap().remove("mapping");
+            }
+            changed = Some(response);
+        }
+    }
+    let integer_adjustment = matches!(kind, effects::legacy_brightness::KIND
+        | effects::modern_brightness::KIND | effects::vibrance::KIND);
     let params: Vec<(&str, &str, f32, f32, &str)> = match kind {
-        "posterize" => vec![("levels", "Levels", 2.0, 256.0, "")],
+        "posterize" => vec![("levels", "Levels", 2.0,
+            if posterize_mapping.is_empty() { 256.0 } else { f32::from(effects::posterize::PHOTOSHOP_MAX_LEVELS) }, "")],
+        "threshold" => vec![("level", "Level", 1.0, 255.0, "")],
+        effects::modern_brightness::KIND => vec![
+            ("brightness", "Brightness", -150.0, 150.0, ""),
+            ("contrast", "Contrast", -50.0, 100.0, ""),
+        ],
+        effects::legacy_brightness::KIND => vec![
+            ("brightness", "Brightness", -100.0, 100.0, ""),
+            ("contrast", "Contrast", -100.0, 100.0, ""),
+        ],
+        effects::exposure::KIND => vec![
+            ("exposure", "Exposure", -20.0, 20.0, " EV"),
+            ("offset", "Offset", -0.5, 0.5, ""),
+            ("gamma", "Gamma", 0.01, 9.99, ""),
+        ],
+        effects::vibrance::KIND => vec![
+            ("vibrance", "Vibrance", -100.0, 100.0, "%"),
+            ("saturation", "Saturation", -100.0, 100.0, "%"),
+        ],
         "blur" | "gaussian" => vec![("radius", "Radius", 0.0, 64.0, " px")],
         "levels" => vec![
-            ("black", "Black", 0.0, 0.99, ""),
-            ("white", "White", 0.01, 1.0, ""),
-            ("gamma", "Gamma", 0.1, 5.0, ""),
+            ("black", "Black", 0.0, if byte_levels { 253./255. } else if effects::levels::exact(settings) { 1. - 1./65535. } else { 0.99 }, ""),
+            ("white", "White", if byte_levels { 2./255. } else if effects::levels::exact(settings) { 1./65535. } else { 0.01 }, 1.0, ""),
+            ("gamma", "Gamma", 0.1, 9.99, ""),
+            ("output_black", "Output black", 0.0, 1.0, ""),
+            ("output_white", "Output white", 0.0, 1.0, ""),
         ],
         "hsl" => vec![
             ("hue", "Hue", -180.0, 180.0, "°"),
@@ -73,74 +362,96 @@ pub(super) fn settings(
                     .as_f64()
                     .map(|x| x as f32)
                     .unwrap_or(if kind == "gaussian" { 8.0 } else { 0.0 });
-                let scale = if suffix == "%" { 100.0 } else { 1.0 };
+                let byte_endpoint = byte_levels && key != "gamma";
+                let scale = if byte_endpoint { 255. } else if suffix == "%" && !integer_adjustment { 100.0 } else { 1.0 };
                 let mut value = effects::number(settings, key, default) * scale;
-                let response = controls::range(
-                    ui,
-                    key,
-                    &mut value,
-                    min * scale..=max * scale,
-                    160.0_f32.min(ui.available_width()).max(70.),
-                    suffix,
-                    if scale == 100.0 || ["radius", "spread", "hue", "levels"].contains(&key) {
+                let width = 160.0_f32.min(ui.available_width()).max(70.);
+                let response = if kind == "hsl" && key == "hue" {
+                    hue_range(ui, key, &mut value, width, false)
+                } else {
+                    let decimals = if byte_endpoint || integer_adjustment {
+                        0
+                    } else if kind == effects::exposure::KIND && key == "offset" {
+                        4
+                    } else if kind == "levels" && effects::levels::exact(settings) && key != "gamma" {
+                        5
+                    } else if scale == 100.0 || ["radius", "spread", "levels", "level"].contains(&key) {
                         0
                     } else {
                         2
-                    },
-                    false,
-                );
-                if response.changed() || response.double_clicked() {
-                    settings[key] = if key == "levels" {
-                        json!(value.round() as u16)
-                    } else {
-                        json!(value / scale)
                     };
+                    controls::range(ui, key, &mut value, min * scale..=max * scale, width, suffix, decimals, false)
+                };
+                if response.changed() || response.double_clicked() {
+                    if let Some(source) = source {
+                        settings.clone_from(source);
+                    }
+                    if source.is_none() || response.changed() {
+                        settings[key] = if integer_adjustment {
+                            json!(value.round() as i16)
+                        } else if matches!(key, "level" | "levels") {
+                            json!(value.round() as u16)
+                        } else if byte_endpoint {
+                            json!(f64::from(value.round()) / 255.)
+                        } else {
+                            json!(value / scale)
+                        };
+                    }
                     changed = Some(response);
                 }
                 ui.end_row();
             }
         });
-    if kind == "color_balance" {
+    if matches!(kind, "color_balance" | effects::photoshop_color_balance::KIND) {
+        let photoshop = kind == effects::photoshop_color_balance::KIND;
+        let scale = if photoshop { 1. } else { 100. };
         let band_id = ui.id().with("color balance band");
         let mut selected = ui
             .ctx()
             .data(|d| d.get_temp::<usize>(band_id))
             .unwrap_or(1)
             .min(2);
-        ui.horizontal(|ui| {
-            for (i, label) in ["Shadows", "Midtones", "Highlights"]
-                .into_iter()
-                .enumerate()
-            {
-                ui.selectable_value(&mut selected, i, label);
-            }
-        });
+        const TONES: [(&str, &[Color32]); 3] = [
+            ("Shadows", &[Color32::from_gray(39)]),
+            ("Midtones", &[Color32::GRAY]),
+            ("Highlights", &[Color32::from_gray(230)]),
+        ];
+        let _ = controls::swatch_choices(ui, "Tone", &mut selected, TONES);
         ui.ctx().data_mut(|d| d.insert_temp(band_id, selected));
-        let band = ["shadows", "midtones", "highlights"][selected];
+        let band = effects::photoshop_color_balance::BANDS[selected];
         let mut values: [f32; 3] =
-            std::array::from_fn(|i| settings[band][i].as_f64().unwrap_or(0.0) as f32);
+            std::array::from_fn(|i| source.unwrap_or(settings)[band][i].as_f64().unwrap_or(0.0) as f32);
         egui::Grid::new((ui.id(), "balance axes"))
             .spacing(Vec2::new(6.0, 3.0))
             .show(ui, |ui| {
-                for (i, label) in ["Cyan ↔ Red", "Magenta ↔ Green", "Yellow ↔ Blue"]
+                const NEUTRAL: Color32 = Color32::from_gray(98);
+                for (i, (label, colors)) in [
+                    ("Cyan ↔ Red", [Color32::from_rgb(78, 213, 223), NEUTRAL, controls::RGB_COLORS[0]]),
+                    ("Magenta ↔ Green", [Color32::from_rgb(222, 115, 203), NEUTRAL, controls::RGB_COLORS[1]]),
+                    ("Yellow ↔ Blue", [Color32::from_rgb(246, 215, 106), NEUTRAL, controls::RGB_COLORS[2]]),
+                ]
                     .into_iter()
                     .enumerate()
                 {
                     controls::label(ui, label);
-                    let mut value = values[i] * 100.0;
-                    let response = controls::range(
+                    let mut value = settings[band][i].as_f64().map_or(values[i], |value| value as f32) * scale;
+                    let response = controls::color_range(
                         ui,
                         (band, i),
                         &mut value,
                         -100.0..=100.0,
                         160.0,
                         "",
-                        0,
-                        false,
+                        label,
+                        &colors,
                     );
                     if response.changed() || response.double_clicked() {
-                        values[i] = value / 100.0;
-                        settings[band] = json!(values);
+                        if let Some(source) = source { settings.clone_from(source); }
+                        if response.changed() || source.is_none() {
+                            values[i] = value / scale;
+                            settings[band] = if photoshop { json!(values.map(|value| value.round() as i16)) }
+                                else { json!(values) };
+                        }
                         changed = Some(response);
                     }
                     ui.end_row();
@@ -149,7 +460,10 @@ pub(super) fn settings(
         let mut preserve = settings["preserve_luminosity"].as_bool().unwrap_or(true);
         let response = ui.checkbox(&mut preserve, "Preserve luminosity");
         if response.changed() || response.double_clicked() {
-            settings["preserve_luminosity"] = json!(preserve);
+            if let Some(source) = source { settings.clone_from(source); }
+            if response.changed() || source.is_none() {
+                settings["preserve_luminosity"] = json!(preserve);
+            }
             changed = Some(response);
         }
     }
@@ -250,10 +564,13 @@ pub(super) fn settings(
             )
         };
         let points = settings["points"].as_array().cloned().unwrap_or_default();
+        let photoshop = byte_composition || settings["interpolation"] == effects::curves::PHOTOSHOP;
+        let spline = effects::curves::Spline::from_settings(settings);
         let line = (0..=256)
             .map(|i| {
                 let x = i as f32 / 256.0;
-                to_screen(x, effects::curve_value(settings, x))
+                let y = spline.as_ref().map_or_else(|| effects::curve_value(settings, x), |curve| curve.value(f64::from(x)) as f32);
+                to_screen(x, y)
             })
             .collect();
         ui.painter().add(egui::Shape::line(
@@ -269,18 +586,22 @@ pub(super) fn settings(
         }
         if response.double_clicked() {
             if let Some(p) = response.interact_pointer_pos() {
-                let x = ((p.x - rect.left()) / rect.width()).clamp(0.001, 0.999);
-                let y = ((rect.bottom() - p.y) / rect.height()).clamp(0.0, 1.0);
-                if points.len() < 16
+                let mut x = f64::from(((p.x - rect.left()) / rect.width()).clamp(0.001, 0.999));
+                let mut y = f64::from(((rect.bottom() - p.y) / rect.height()).clamp(0.0, 1.0));
+                if photoshop {
+                    x = (x * 255.).round() / 255.;
+                    y = (y * 255.).round() / 255.;
+                }
+                if points.len() < effects::curves::MAX_POINTS
                     && points
                         .iter()
-                        .all(|p| (p[0].as_f64().unwrap() - x as f64).abs() > 0.001)
+                        .all(|p| (p[0].as_f64().unwrap() - x).abs() > 0.001)
                 {
                     let mut updated = points.clone();
                     updated.push(json!([x, y]));
                     updated
                         .sort_by(|a, b| a[0].as_f64().unwrap().total_cmp(&b[0].as_f64().unwrap()));
-                    settings["interpolation"] = json!("smooth");
+                    settings["interpolation"] = json!(if photoshop { effects::curves::PHOTOSHOP } else { "smooth" });
                     settings["points"] = json!(updated);
                     changed = Some(response.clone());
                 }
@@ -297,7 +618,11 @@ pub(super) fn settings(
                 }) {
                     let mut updated = points.clone();
                     updated.remove(index);
-                    settings["interpolation"] = json!("smooth");
+                    if photoshop && updated.len() == 2 {
+                        settings["interpolation"] = json!("linear");
+                    } else if !photoshop {
+                        settings["interpolation"] = json!("smooth");
+                    }
                     settings["points"] = json!(updated);
                     changed = Some(response.clone());
                 }
@@ -339,10 +664,12 @@ pub(super) fn settings(
                 if let Some(index) = index {
                     let x = ((pointer.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
                     let y = ((rect.bottom() - pointer.y) / rect.height()).clamp(0.0, 1.0);
-                    let selected_x = if index == 0 {
-                        0.0
-                    } else if index + 1 == points.len() {
-                        1.0
+                    let linear_pair = points.len() == 2 && settings["interpolation"] == "linear";
+                    let record_point = if linear_pair || photoshop {
+                        drag_standard_curve_point(&points, index, x as f64, y as f64)
+                    } else { None };
+                    let selected_x = if index == 0 || index + 1 == points.len() {
+                        points[index][0].as_f64().unwrap()
                     } else {
                         bounded_curve_x(
                             x as f64,
@@ -351,8 +678,10 @@ pub(super) fn settings(
                             points[index][0].as_f64().unwrap(),
                         )
                     };
-                    settings["interpolation"] = json!("smooth");
-                    settings["points"][index] = json!([selected_x, y]);
+                    if !linear_pair && !photoshop {
+                        settings["interpolation"] = json!("smooth");
+                    }
+                    settings["points"][index] = json!(record_point.unwrap_or([selected_x, y as f64]));
                     changed = Some(response.clone());
                 }
             }
@@ -367,6 +696,23 @@ pub(super) fn settings(
     }
     changed
 }
+
+// Keep a standard curve on its coordinate grid while dragging.
+fn drag_standard_curve_point(points: &[serde_json::Value], index: usize, x: f64, y: f64) -> Option<[f64; 2]> {
+    let sample = effects::curves::grid_sample;
+    let current = points.get(index)?;
+    let current_x = sample(&current[0])?;
+    sample(&current[1])?;
+    let left = if index > 0 { sample(&points[index - 1][0])? + 1 } else { 0 };
+    let right = if index + 1 < points.len() { sample(&points[index + 1][0])?.checked_sub(1)? } else { 255 };
+    if left > current_x || current_x > right { return None; }
+    if points.len() == 2 {
+        sample(&points[1 - index][1])?;
+    }
+    let x = ((x * 255.).round() as u16).clamp(left, right);
+    Some([f64::from(x) / 255., (y * 255.).round() / 255.])
+}
+
 // Imported curves can have arbitrarily close, strictly ordered points.
 fn bounded_curve_x(x: f64, previous: f64, next: f64, original: f64) -> f64 {
     let margin = 0.01_f64.min((next - previous) * 0.25);
@@ -382,12 +728,15 @@ pub(super) fn effect_icon(kind: &str) -> Icon {
     match kind {
         "paint" => Icon::Brush,
         "fill" => Icon::Fill,
-        "levels" | "posterize" | "channel_clamp" => Icon::Levels,
-        "curves" => Icon::Curves,
+        "levels" | "posterize" | "threshold" | "channel_clamp" | effects::legacy_brightness::KIND
+        | effects::modern_brightness::KIND | effects::exposure::KIND => Icon::Levels,
+        "curves" | effects::gradient_map::KIND => Icon::Curves,
         "blur" | "gaussian" => Icon::Blur,
         "adjust" => Icon::Adjust,
-        "color_balance" => Icon::ColorBalance,
-        "hsl" => Icon::Hue,
+        "color_balance" | effects::channel_mixer::KIND | effects::black_white::KIND
+        | effects::selective_color::KIND | effects::photoshop_color_balance::KIND => Icon::ColorBalance,
+        "hsl" | effects::vibrance::KIND | effects::photo_filter::KIND
+        | effects::photoshop_hue_saturation::KIND | effects::color_lookup::KIND => Icon::Hue,
         "bloom" => Icon::Bloom,
         "liquify" => Icon::Liquify,
         "invert" => Icon::Invert,
@@ -395,13 +744,8 @@ pub(super) fn effect_icon(kind: &str) -> Icon {
         _ => Icon::Adjust,
     }
 }
-pub(super) fn menu_effect(ui: &mut egui::Ui, kind: &str, label: &str) -> egui::Response {
-    ui.horizontal(|ui| {
-        let (rect, _) = ui.allocate_exact_size(Vec2::splat(18.0), egui::Sense::hover());
-        icons::paint(ui.painter(), rect, effect_icon(kind), ui.is_enabled());
-        ui.button(label)
-    })
-    .inner
+pub(super) fn menu_effect(ui: &mut egui::Ui, kind: &str, label: &str, selection: Option<bool>) -> egui::Response {
+    icons::menu_choice(ui, effect_icon(kind), label, selection)
 }
 impl PeerBrush {
     pub(super) fn effect_picker(&mut self, ui: &mut egui::Ui, mask: bool, adjustment: bool) {
@@ -447,7 +791,7 @@ impl PeerBrush {
                     }
                     controls::label(ui, category);
                     for entry in category_entries {
-                        if menu_effect(ui, entry.kind, entry.name(mask)).clicked() {
+                        if menu_effect(ui, entry.kind, entry.name(mask), None).clicked() {
                             self.layer_cmd(
                                 if mask { "mask.step.add" } else { "effect.add" },
                                 json!({"kind":entry.kind}),
@@ -698,22 +1042,26 @@ impl PeerBrush {
         ui.label(RichText::new(if mask { "MASK EFFECTS" } else { "COLOR EFFECTS" }).size(10.).color(MUTED))
             .on_hover_text("Bottom runs first · Top runs last · Select a name for settings · Row menu for reorder, remove or bake");
     }
-    pub(super) fn mask_stack(&mut self, ui: &mut egui::Ui, doc: &Document, l: &Layer) {
-        let Some(m) = &l.mask else {
+    pub(super) fn mask_stack<'a>(
+        &mut self,
+        ui: &mut egui::Ui,
+        doc: impl Into<DocumentView<'a>>,
+        l: impl Into<LayerView<'a>>,
+    ) {
+        let doc = doc.into();
+        let l = l.into();
+        let numbers = self.animation.controls(doc, ui.input(|i| i.time));
+        let Some(m) = l.mask() else {
             return;
         };
         ui.horizontal(|ui| {
             Self::effect_heading(ui, true);
             let add = ui.menu_button("+ Add effect", |ui| {
-                self.effect_picker(ui, true, l.kind == "adjustment")
+                self.effect_picker(ui, true, l.kind() == "adjustment")
             });
             self.effect_add_rect = Some(add.response.rect);
-            let mut enabled = m.enabled;
-            if ui
-                .checkbox(&mut enabled, "On")
-                .on_hover_text("Enable or bypass the whole mask")
-                .changed()
-            {
+            let mut enabled = m.enabled();
+            if effect_visibility(ui, &mut enabled, "Layer mask").changed() {
                 self.layer_cmd("mask.toggle", json!({"enabled":enabled}), "Toggle mask");
             }
         });
@@ -722,101 +1070,149 @@ impl PeerBrush {
             .max_height((ui.available_height() - 8.0).max(24.0))
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 3.0;
-                for (index, step) in m.steps.iter().enumerate().rev() {
-                    ui.push_id(&step.id, |ui| {
+                for index in (0..m.step_count()).rev() {
+                    let step = m.step(index).unwrap();
+                    ui.push_id(&step.id(), |ui| {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 4.0;
-                            let mut enabled = step.enabled;
-                            if ui
-                                .checkbox(&mut enabled, "")
-                                .on_hover_text("Enable mask effect")
-                                .changed()
-                            {
+                            let kind = step.kind();
+                            let name = if kind == "blur" { "Feather" } else { effect_name(kind) };
+                            let mut enabled = step.enabled();
+                            if effect_visibility(ui, &mut enabled, name).changed() {
                                 self.layer_cmd(
                                     "mask.step.update",
-                                    json!({"step":step.id,"enabled":enabled}),
+                                    json!({"step":step.id(),"enabled":enabled}),
                                     "Toggle mask step",
                                 );
                             }
                             let (rect, _) =
                                 ui.allocate_exact_size(Vec2::splat(18.0), egui::Sense::hover());
-                            icons::paint(ui.painter(), rect, effect_icon(&step.kind), step.enabled);
-                            let name = if step.kind == "blur" {
-                                "Feather"
-                            } else {
-                                effect_name(&step.kind)
-                            };
+                            icons::paint(
+                                ui.painter(),
+                                rect,
+                                effect_icon(kind),
+                                step.enabled(),
+                            );
                             let title = Self::effect_title(
                                 ui,
                                 name,
-                                self.effect_is_expanded(&l.id, true, &step.id),
+                                self.effect_is_expanded(&l.id(), true, &step.id()),
                             );
-                            self.effect_bake_menu(&title, l, true, &step.id, index, doc.revision);
+                            self.effect_bake_menu(
+                                &title,
+                                l,
+                                true,
+                                &step.id(),
+                                index,
+                                doc.revision(),
+                            );
                             if title.clicked() {
-                                self.select_effect(&l.id, true, &step.id);
-                                self.mask_step = if step.kind == "paint" {
-                                    Some(step.id.clone())
+                                self.select_effect(&l.id(), true, &step.id());
+                                self.mask_step = if kind == "paint" {
+                                    Some(step.id().to_owned())
                                 } else {
                                     None
                                 };
                                 self.last_preview = None;
                             }
-                            self.effect_actions(ui, l, true, &step.id, index, doc.revision);
-                            self.effect_weight(ui, &step.id, step.weight, true);
+                            self.effect_actions(ui, l, true, &step.id(), index, doc.revision());
+                            self.effect_weight(
+                                ui,
+                                &step.id(),
+                                numbers.mask_weight(&l.id(), step),
+                                true,
+                            );
                         });
-                        if self.effect_is_expanded(&l.id, true, &step.id) {
+                        if self.effect_is_expanded(&l.id(), true, &step.id()) {
                             ui.spacing_mut().indent = 14.;
                             ui.visuals_mut().indent_has_left_vline = false;
-                            ui.indent(("effect parameters", &step.id), |ui| {
+                            ui.indent(("effect parameters", &step.id()), |ui| {
                                 ui.spacing_mut().item_spacing.y = 3.;
-                                if let Some(preview) =
-                                    self.thumbnail_for(doc, &l.id, true, Some(index))
-                                {
+                                let thumbnail = if let Some(native) = doc.native() {
+                                    match self.mask_thumbnails.get(
+                                        &self.shared,
+                                        &self.project_id,
+                                        native,
+                                        l,
+                                        index,
+                                        ui.ctx(),
+                                    ) {
+                                        Ok(texture) => texture,
+                                        Err(error) => {
+                                            ui.label(RichText::new(error).color(MUTED));
+                                            None
+                                        }
+                                    }
+                                } else {
+                                    self.thumbnail_for(
+                                        ui.ctx(),
+                                        doc.resident().unwrap(),
+                                        l.id(),
+                                        true,
+                                        Some(index),
+                                    )
+                                };
+                                if let Some(preview) = thumbnail {
                                     ui.add(egui::Image::new((preview.id(), Vec2::splat(40.0))))
                                         .on_hover_text("Result through this effect");
                                 }
-                                if ["fill", "levels", "blur"].contains(&step.kind.as_str()) {
-                                    let mut value = step.value;
-                                    let range = match step.kind.as_str() {
+                                if ["fill", "levels", "blur", "density"].contains(&step.kind()) {
+                                    let mut value = numbers.mask_value(&l.id(), step);
+                                    if step.kind() == "density" {
+                                        value *= 100. / 255.;
+                                    }
+                                    let range = match step.kind() {
                                         "fill" => 0.0..=255.0,
+                                        "density" => 0.0..=100.0,
                                         "blur" => 0.0..=64.0,
                                         _ => 0.1..=5.0,
                                     };
                                     ui.horizontal(|ui| {
                                         controls::label(
                                             ui,
-                                            if step.kind == "fill" {
-                                                "Value"
-                                            } else if step.kind == "blur" {
-                                                "Radius"
-                                            } else {
-                                                "Gamma"
+                                            match step.kind() {
+                                                "fill" => "Value",
+                                                "blur" => "Radius",
+                                                "density" => "Density",
+                                                _ => "Gamma",
                                             },
                                         );
                                         let response = controls::range(
                                             ui,
-                                            (&step.id, "value"),
+                                            (&step.id(), "value"),
                                             &mut value,
                                             range,
                                             180.0_f32.min(ui.available_width()).max(70.),
-                                            if step.kind == "blur" { " px" } else { "" },
-                                            if step.kind == "levels" { 1 } else { 0 },
+                                            match step.kind() { "blur" => " px", "density" => "%", _ => "" },
+                                            usize::from(matches!(step.kind(), "levels" | "density")),
                                             false,
                                         );
                                         if response.changed() || response.double_clicked() {
+                                            if step.kind() == "density" {
+                                                value = (value * 255. / 100.).round();
+                                            }
                                             self.layer_parameter(
-                                                json!({"step":step.id,"value":value}),
+                                                json!({"step":step.id(),"value":value}),
                                                 "Mask parameter",
                                                 &response,
                                             );
                                         }
                                     });
                                 }
-                                if ["curves", "gaussian", "adjust"].contains(&step.kind.as_str()) {
-                                    let mut values = step.settings.clone();
-                                    if let Some(response) = settings(ui, &step.kind, &mut values) {
+                                if ["curves", "gaussian", "adjust"].contains(&step.kind()) {
+                                    let mut values = match mask_inspector_settings(doc, step) {
+                                        Ok(values) => values,
+                                        Err(error) => {
+                                            ui.label(RichText::new(error).color(MUTED));
+                                            return;
+                                        }
+                                    };
+                                    numbers.mask_settings(&l.id(), step, &mut values.value);
+                                    if let Some(response) =
+                                        settings_values(ui, step.kind(), &mut values.value, doc.depth(), false, None)
+                                    {
                                         self.layer_parameter(
-                                            json!({"step":step.id,"settings":values}),
+                                            json!({"step":step.id(),"settings":values.value}),
                                             "Mask parameter",
                                             &response,
                                         );
@@ -829,37 +1225,46 @@ impl PeerBrush {
                 }
             });
     }
-    pub(super) fn color_stack(&mut self, ui: &mut egui::Ui, l: &Layer, revision: u64) {
+    pub(super) fn color_stack<'a>(
+        &mut self,
+        ui: &mut egui::Ui,
+        l: impl Into<LayerView<'a>>,
+        doc: impl Into<DocumentView<'a>>,
+    ) {
+        let l = l.into();
+        let doc = doc.into();
+        let observed = (doc.id(), doc.revision());
+        let revision = doc.revision();
+        let numbers = self.animation.controls(doc, ui.input(|i| i.time));
         ui.horizontal(|ui| {
             Self::effect_heading(ui, false);
             let add = ui.menu_button("+ Add effect", |ui| {
-                self.effect_picker(ui, false, l.kind == "adjustment");
+                self.effect_picker(ui, false, l.kind() == "adjustment");
             });
             self.effect_add_rect = Some(add.response.rect);
         });
         egui::ScrollArea::vertical()
             .id_salt("color effects")
             .max_height(
-                (ui.available_height() - if l.mask.is_none() { 38.0 } else { 8.0 }).max(24.0),
+                (ui.available_height() - if l.mask().is_none() { 38.0 } else { 8.0 }).max(24.0),
             )
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 3.0;
-                if l.effects.is_empty() {
+                if l.effect_count() == 0 {
                     ui.label(RichText::new("No color effects").size(11.).color(MUTED));
                 }
-                for (index, effect) in l.effects.iter().enumerate().rev() {
-                    ui.push_id(&effect.id, |ui| {
+                for index in (0..l.effect_count()).rev() {
+                    let effect = l.effect(index).unwrap();
+                    ui.push_id(&effect.id(), |ui| {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 4.0;
-                            let mut enabled = effect.enabled;
-                            if ui
-                                .checkbox(&mut enabled, "")
-                                .on_hover_text("Enable effect")
-                                .changed()
-                            {
+                            let kind = effect.kind();
+                            let name = effect_name(kind);
+                            let mut enabled = effect.enabled();
+                            if effect_visibility(ui, &mut enabled, name).changed() {
                                 self.layer_cmd(
                                     "effect.update",
-                                    json!({"effect":effect.id,"enabled":enabled}),
+                                    json!({"effect":effect.id(),"enabled":enabled}),
                                     "Toggle color effect",
                                 );
                             }
@@ -868,52 +1273,126 @@ impl PeerBrush {
                             icons::paint(
                                 ui.painter(),
                                 rect,
-                                effect_icon(&effect.kind),
-                                effect.enabled,
+                                effect_icon(kind),
+                                effect.enabled(),
                             );
                             let title = Self::effect_title(
                                 ui,
-                                effect_name(&effect.kind),
-                                self.effect_is_expanded(&l.id, false, &effect.id),
+                                name,
+                                self.effect_is_expanded(&l.id(), false, &effect.id()),
                             );
-                            self.effect_bake_menu(&title, l, false, &effect.id, index, revision);
+                            self.effect_bake_menu(&title, l, false, &effect.id(), index, revision);
                             if title.clicked() {
-                                self.select_effect(&l.id, false, &effect.id);
+                                self.select_effect(&l.id(), false, &effect.id());
                             }
-                            self.effect_actions(ui, l, false, &effect.id, index, revision);
-                            self.effect_weight(ui, &effect.id, effect.weight, false);
+                            self.effect_actions(ui, l, false, &effect.id(), index, revision);
+                            self.effect_weight(
+                                ui,
+                                &effect.id(),
+                                numbers.effect_weight(Some(&l.id()), effect),
+                                false,
+                            );
                         });
-                        if self.effect_is_expanded(&l.id, false, &effect.id) {
+                        if self.effect_is_expanded(&l.id(), false, &effect.id()) {
                             ui.spacing_mut().indent = 14.;
                             ui.visuals_mut().indent_has_left_vline = false;
-                            ui.indent(("effect parameters", &effect.id), |ui| {
+                            ui.indent(("effect parameters", &effect.id()), |ui| {
                                 ui.spacing_mut().item_spacing.y = 3.;
-                                if matches!(effect.kind.as_str(), "pattern_overlay" | "texture") {
-                                    pattern_source::control(self, ui, l, effect, revision);
+                                if effects::styles::shadow_kind(effect.kind()) {
+                                    let angle = doc.global_light_angle().map(u32::to_be_bytes);
+                                    let current = effects::styles::GlobalLight::for_document(effect.settings(), angle).is_some();
+                                    let choice = ui.horizontal_wrapped(|ui| {
+                                        controls::label(ui, "Shadow light");
+                                        let mut choice = None;
+                                        for (linked, icon, label, help) in [
+                                            (false, Icon::SingleLayer, "Local light", "Give this shadow its own direction. Switching to local light keeps the current direction."),
+                                            (true, Icon::Connect, "Global Light", if angle.is_some() {
+                                                "Follow the project’s Global Light."
+                                            } else {
+                                                "Create Global Light from this shadow’s current direction."
+                                            }),
+                                        ] {
+                                            let selected = current == linked;
+                                            if icons::labeled_choice(ui, icon, label, Some(selected), 0.)
+                                                .on_hover_text(help).clicked() && !selected
+                                            {
+                                                choice = Some(linked);
+                                            }
+                                        }
+                                        choice
+                                    }).inner;
+                                    if let Some(linked) = choice {
+                                        self.finish_parameter(false);
+                                        self.apply_action(
+                                            vec![json!({"op":"effect.update","layer":l.id(),"effect":effect.id(),"use_global_light":linked})],
+                                            "Change shadow light link",
+                                            Some(observed),
+                                            edit_job::Origin::Action,
+                                        );
+                                        return;
+                                    }
                                 }
-                                if effect.kind == "liquify"
+                                if effect.kind() == effects::color_lookup::KIND {
+                                    if let Some((settings, _)) = color_lookup_picker(ui, effect.settings()) {
+                                        self.finish_parameter(false);
+                                        self.apply_action(
+                                            vec![json!({"op":"effect.update","layer":l.id(),"effect":effect.id(),"settings":settings})],
+                                            "Edit Color Lookup",
+                                            Some(observed),
+                                            edit_job::Origin::Action,
+                                        );
+                                    }
+                                    return;
+                                }
+                                if matches!(effect.kind(), "pattern_overlay" | "texture") {
+                                    pattern_source::control(self, ui, l, effect, observed);
+                                }
+                                if effect.kind() == "liquify"
                                     && ui
                                         .button("Edit on canvas")
                                         .on_hover_text("Paint an editable distortion")
                                         .clicked()
                                 {
-                                    self.activate_liquify(Some(effect.id.clone()));
+                                    self.activate_liquify(Some(effect.id().to_owned()));
                                 }
-                                let mut values = inspector_values(&effect.kind, &effect.settings);
-                                let document_id = self.doc_snapshot.view().id().to_owned();
+                                let mut values = match inspector_settings(doc, effect) {
+                                    Ok(values) => values,
+                                    Err(error) => {
+                                        ui.label(RichText::new(error).color(MUTED));
+                                        return;
+                                    }
+                                };
+                                numbers.effect_settings(Some(&l.id()), effect, &mut values.value);
+                                let document_id = doc.id().to_owned();
                                 let response = ui
                                     .push_id(("settings source", document_id), |ui| {
-                                        settings(ui, &effect.kind, &mut values)
+                                        match effect.kind() {
+                                            effects::channel_mixer::KIND =>
+                                                channel_mixer_settings(ui, &mut values.value, Some(effect.settings())),
+                                            effects::black_white::KIND =>
+                                                black_white_settings(ui, &mut values.value, Some(effect.settings())),
+                                            effects::selective_color::KIND =>
+                                                selective_color_settings(ui, &mut values.value, Some(effect.settings())),
+                                            effects::photo_filter::KIND =>
+                                                photo_filter_settings(ui, &mut values.value, doc.depth(), Some(effect.settings())),
+                                            effects::gradient_map::KIND =>
+                                                gradient_map_settings(ui, &mut values.value, Some(effect.settings())),
+                                            effects::photoshop_hue_saturation::KIND =>
+                                                photoshop_hue_saturation_settings(ui, &mut values.value, Some(effect.settings())),
+                                            kind @ (effects::legacy_brightness::KIND | effects::modern_brightness::KIND
+                                                | effects::vibrance::KIND | effects::photoshop_color_balance::KIND) =>
+                                                settings_values(ui, kind, &mut values.value, doc.depth(), false, Some(effect.settings())),
+                                            kind => settings(ui, kind, &mut values.value, doc.depth()),
+                                        }
                                     })
                                     .inner;
                                 if let Some(response) = response {
-                                    if crate::effects::patterns::active(&effect.kind, &values) {
-                                        if let Some(png) = effect.settings.get("bitmap_png") {
-                                            values["bitmap_png"] = png.clone();
-                                        }
+                                    if let Err(error) = values.restore_bitmap(doc, effect) {
+                                        self.message = error.into();
+                                        return;
                                     }
                                     self.layer_parameter(
-                                        json!({"effect":effect.id,"settings":values}),
+                                        json!({"effect":effect.id(),"settings":values.value}),
                                         "Effect parameter",
                                         &response,
                                     );
@@ -925,6 +1404,7 @@ impl PeerBrush {
                 }
             });
     }
+
 }
 pub(super) fn effect_name(kind: &str) -> &str {
     effects::catalog::get(kind).map_or(kind, |entry| entry.name)
@@ -933,14 +1413,75 @@ pub(super) fn effect_name(kind: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_color_inspector_admits_selected_fields_and_preserves_bitmap_sources() {
+        use crate::engine::{
+            native::{worker, NativeDocument},
+            scene::{CapturedScene, LegacyTileCache},
+        };
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        for depth in [8, 16] {
+            let fixture = worker::tests::Fixture::new();
+            let (runtime, connection) = fixture.runtime();
+            let pool = runtime.resident();
+            let cache = LegacyTileCache::new(&pool, 32).unwrap();
+            let mut doc = Document::new_depth(12, 8, depth).unwrap();
+            let png = STANDARD.encode(crate::raster::png(1, 1, &[31, 73, 149, 255]).unwrap());
+            doc.layers[0].effects.push(crate::effects::Effect {
+                id: "pattern".into(),
+                kind: "texture".into(),
+                enabled: true,
+                weight: 0.75,
+                settings: Arc::new(json!({"pattern":"bitmap","bitmap_png":png,"bitmap_scale":2.})),
+            });
+            let staged =
+                CapturedScene::from_parts(doc.clone(), "inspector".into(), vec![], None, None)
+                    .stage(&runtime, &cache, &|| Ok(()))
+                    .unwrap();
+            let native =
+                NativeDocument::from_pending(staged.scene.into_provisional_pending().unwrap())
+                    .unwrap();
+            let view = DocumentView::from(&native);
+            let layer = view.layer(0).unwrap();
+            let effect = layer.effect(0).unwrap();
+            let original = serde_json::to_value(native.metadata()).unwrap();
+            let used = pool.used();
+            let mut settings = inspector_settings(view, effect).unwrap();
+            assert!(settings.value.get("bitmap_png").is_none());
+            assert!(pool.used() > used);
+            settings.restore_bitmap(view, effect).unwrap();
+            assert_eq!(settings.value["bitmap_png"], png);
+            drop(settings);
+            assert_eq!(pool.used(), used);
+            let available = pool.limit() - pool.used();
+            let held = pool.reserve_bytes(available, available).unwrap();
+            assert!(inspector_settings(view, effect).is_err());
+            drop(held);
+            let (mut app, ctx) = super::super::workspace_tests::fixture(depth);
+            app.select_effect(layer.id(), false, effect.id());
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(500., 800.))),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| app.color_stack(ui, layer, view));
+                },
+            );
+            assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.job.text.contains("Embedded bitmap PNG"))));
+            assert_eq!(pool.used(), used);
+            assert_eq!(serde_json::to_value(native.metadata()).unwrap(), original);
+            drop(connection);
+        }
+    }
     fn menu_fixture(depth: u16, mask: bool) -> (PeerBrush, egui::Context, String, Document) {
         let ctx = egui::Context::default();
         let mut e = crate::engine::Engine::new();
-        e.doc = Document::new_depth(32, 24, depth).unwrap();
-        e.doc.layers[0]
+        e.resident_state_mut().expect("resident fixture").document = Document::new_depth(32, 24, depth).unwrap();
+        e.resident_state_mut().expect("resident fixture").document.layers[0]
             .pixels
             .set16(10, 12, [12345, 23457, 34569, 65535]);
-        let layer = e.doc.layers[0].id.clone();
+        let layer = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
         let commands = if mask {
             vec![
                 json!({"op":"mask.add","layer":layer,"value":128}),
@@ -954,9 +1495,9 @@ mod tests {
             ]
         };
         e.edit("human", &commands, None, None, "Fixture").unwrap();
-        e.undo.clear();
+        e.resident_state_mut().expect("resident fixture").undo.clear();
         let effect = if mask {
-            e.doc.layers[0]
+            e.resident_state().expect("resident fixture").document.layers[0]
                 .mask
                 .as_ref()
                 .unwrap()
@@ -967,9 +1508,9 @@ mod tests {
                 .id
                 .clone()
         } else {
-            e.doc.layers[0].effects[0].id.clone()
+            e.resident_state().expect("resident fixture").document.layers[0].effects[0].id.clone()
         };
-        let before = e.doc.clone();
+        let before = e.resident_state().expect("resident fixture").document.clone();
         let shared = std::sync::Arc::new(std::sync::Mutex::new(e));
         let mut app = PeerBrush::init(
             &ctx,
@@ -993,7 +1534,7 @@ mod tests {
         ctx: &egui::Context,
         events: Vec<egui::Event>,
     ) -> egui::FullOutput {
-        let doc = app.shared.lock().unwrap().doc.clone();
+        let doc = app.shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
         ctx.run(
             egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(270., 800.))),
@@ -1005,7 +1546,7 @@ mod tests {
                     if app.mask {
                         app.mask_stack(ui, &doc, &doc.layers[0]);
                     } else {
-                        app.color_stack(ui, &doc.layers[0], doc.revision);
+                        app.color_stack(ui, &doc.layers[0], &doc);
                     }
                 });
             },
@@ -1051,8 +1592,8 @@ mod tests {
                 } else {
                     json!({"op":"effect.add","layer":layer,"kind":"blur","settings":{"radius":3.}})
                 }], None, None, "Fixture").unwrap();
-                app.shared.lock().unwrap().undo.clear();
-                let before = app.shared.lock().unwrap().doc.clone();
+                app.shared.lock().unwrap().resident_state_mut().expect("resident fixture").undo.clear();
+                let before = app.shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
                 let (first, second) = if mask {
                     let steps = &before.layers[0].mask.as_ref().unwrap().steps;
                     (
@@ -1122,9 +1663,9 @@ mod tests {
                 assert!(app.effect_is_expanded(&layer, mask, &second));
                 assert!(app.effect_is_selected(&layer, mask, &second));
                 let engine = app.shared.lock().unwrap();
-                assert!(engine.undo.is_empty());
+                assert!(engine.resident_state().expect("resident fixture").undo.is_empty());
                 assert_eq!(
-                    serde_json::to_value(&engine.doc).unwrap(),
+                    serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap(),
                     serde_json::to_value(&before).unwrap()
                 );
             }
@@ -1156,22 +1697,22 @@ mod tests {
                 let (mut app, ctx, effect, before) = menu_fixture(depth, mask);
                 let menu = open_invert_menu(&mut app, &ctx);
                 menu_label(&menu, "Top effects run last");
-                assert!(app.shared.lock().unwrap().undo.is_empty());
+                assert!(app.shared.lock().unwrap().resident_state().expect("resident fixture").undo.is_empty());
                 let at = menu_label(&menu, "Move up · run later");
                 menu_click(&mut app, &ctx, at);
                 let mut e = app.shared.lock().unwrap();
-                assert_eq!(e.undo.len(), 1, "{}", app.message);
+                assert_eq!(e.resident_state().expect("resident fixture").undo.len(), 1, "{}", app.message);
                 assert_ne!(
-                    e.doc.export_png().unwrap(),
+                    e.resident_state().expect("resident fixture").document.export_png().unwrap(),
                     before.export_png().unwrap(),
                     "Order must change actual noncommuting pixels"
                 );
                 assert_eq!(
-                    serde_json::to_value(&e.doc.layers[0].pixels).unwrap(),
+                    serde_json::to_value(&e.resident_state().expect("resident fixture").document.layers[0].pixels).unwrap(),
                     serde_json::to_value(&before.layers[0].pixels).unwrap()
                 );
                 if mask {
-                    let steps = &e.doc.layers[0].mask.as_ref().unwrap().steps;
+                    let steps = &e.resident_state().expect("resident fixture").document.layers[0].mask.as_ref().unwrap().steps;
                     assert_eq!(steps.last().unwrap().id, effect);
                     for original in &before.layers[0].mask.as_ref().unwrap().steps {
                         let current = steps.iter().find(|step| step.id == original.id).unwrap();
@@ -1181,10 +1722,10 @@ mod tests {
                         );
                     }
                 } else {
-                    assert_eq!(e.doc.layers[0].effects.last().unwrap().id, effect);
+                    assert_eq!(e.resident_state().expect("resident fixture").document.layers[0].effects.last().unwrap().id, effect);
                 }
                 e.undo("human").unwrap();
-                assert_eq!(e.doc.export_png().unwrap(), before.export_png().unwrap());
+                assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), before.export_png().unwrap());
             }
         }
     }
@@ -1234,9 +1775,9 @@ mod tests {
                     }
                 }
                 let e = app.shared.lock().unwrap();
-                assert!(e.undo.is_empty());
+                assert!(e.resident_state().expect("resident fixture").undo.is_empty());
                 assert_eq!(
-                    serde_json::to_value(&e.doc).unwrap(),
+                    serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap(),
                     serde_json::to_value(&before).unwrap()
                 );
                 assert_eq!(app.effect_selected, inspector);
@@ -1280,17 +1821,17 @@ mod tests {
                     ),
                 );
                 let mut e = app.shared.lock().unwrap();
-                assert_eq!(e.undo.len(), 1, "{}", app.message);
+                assert_eq!(e.resident_state().expect("resident fixture").undo.len(), 1, "{}", app.message);
                 assert_eq!(app.effect_selected, selected);
                 if mask {
                     assert_eq!(app.mask_step.as_deref(), Some(inspector.as_str()));
                 }
                 assert_eq!(
-                    serde_json::to_value(&e.doc.layers[0].pixels).unwrap(),
+                    serde_json::to_value(&e.resident_state().expect("resident fixture").document.layers[0].pixels).unwrap(),
                     serde_json::to_value(&before.layers[0].pixels).unwrap()
                 );
                 e.undo("human").unwrap();
-                assert_eq!(e.doc.export_png().unwrap(), before.export_png().unwrap());
+                assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), before.export_png().unwrap());
             }
         }
     }
@@ -1300,11 +1841,11 @@ mod tests {
             for mask in [false, true] {
                 let ctx = egui::Context::default();
                 let mut e = crate::engine::Engine::new();
-                e.doc = Document::new_depth(32, 24, depth).unwrap();
-                e.doc.layers[0]
+                e.resident_state_mut().expect("resident fixture").document = Document::new_depth(32, 24, depth).unwrap();
+                e.resident_state_mut().expect("resident fixture").document.layers[0]
                     .pixels
                     .set16(10, 12, [12345, 23457, 34569, 65535]);
-                let id = e.doc.layers[0].id.clone();
+                let id = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
                 if mask {
                     e.edit(
                         "human",
@@ -1321,8 +1862,8 @@ mod tests {
                     json!({"op":"effect.add","layer":id,"kind":"invert"})
                 };
                 e.edit("human", &[c], None, None, "Effect").unwrap();
-                e.undo.clear();
-                let before = e.doc.clone();
+                e.resident_state_mut().expect("resident fixture").undo.clear();
+                let before = e.resident_state().expect("resident fixture").document.clone();
                 let shared = std::sync::Arc::new(std::sync::Mutex::new(e));
                 let connection = crate::server::Connection {
                     port: 0,
@@ -1385,7 +1926,7 @@ mod tests {
                 );
                 let menu = draw(&mut app, vec![]);
                 assert!(menu.shapes.iter().any(|s|matches!(&s.shape,egui::Shape::Text(t) if t.galley.job.text.starts_with("Includes this effect"))));
-                assert!(shared.lock().unwrap().undo.is_empty());
+                assert!(shared.lock().unwrap().resident_state().expect("resident fixture").undo.is_empty());
                 let at = position(
                     &menu,
                     if mask {
@@ -1406,15 +1947,15 @@ mod tests {
                     vec![button(at, egui::PointerButton::Primary, false)],
                 );
                 let mut e = shared.lock().unwrap();
-                assert_eq!(e.undo.len(), 1, "{}", app.message);
-                assert_eq!(e.doc.export_png().unwrap(), before.export_png().unwrap());
+                assert_eq!(e.resident_state().expect("resident fixture").undo.len(), 1, "{}", app.message);
+                assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), before.export_png().unwrap());
                 if mask {
-                    assert_eq!(e.doc.layers[0].mask.as_ref().unwrap().steps.len(), 1);
+                    assert_eq!(e.resident_state().expect("resident fixture").document.layers[0].mask.as_ref().unwrap().steps.len(), 1);
                 } else {
-                    assert!(e.doc.layers[0].effects.is_empty());
+                    assert!(e.resident_state().expect("resident fixture").document.layers[0].effects.is_empty());
                 }
                 e.undo("human").unwrap();
-                assert_eq!(e.doc.export_png().unwrap(), before.export_png().unwrap());
+                assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), before.export_png().unwrap());
             }
         }
     }
@@ -1422,10 +1963,10 @@ mod tests {
     fn top_color_effect_is_last_without_reinterpreting_saved_sources() {
         let ctx = egui::Context::default();
         let mut e = crate::engine::Engine::new();
-        e.doc = Document::new(4, 4).unwrap();
-        e.doc.layers[0].kind = "fill".into();
-        e.doc.layers[0].color = [64, 64, 64, 255];
-        let id = e.doc.layers[0].id.clone();
+        e.resident_state_mut().expect("resident fixture").document = Document::new(4, 4).unwrap();
+        e.resident_state_mut().expect("resident fixture").document.layers[0].kind = "fill".into();
+        e.resident_state_mut().expect("resident fixture").document.layers[0].color = [64, 64, 64, 255];
+        let id = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
         e.edit(
             "human",
             &[
@@ -1437,8 +1978,9 @@ mod tests {
             "Effects",
         )
         .unwrap();
-        let source = serde_json::to_value(&e.doc.layers[0].effects).unwrap();
-        let layer = e.doc.layers[0].clone();
+        let source = serde_json::to_value(&e.resident_state().expect("resident fixture").document.layers[0].effects).unwrap();
+        let document = e.resident_state().expect("resident fixture").document.clone();
+        let layer = e.resident_state().expect("resident fixture").document.layers[0].clone();
         let shared = std::sync::Arc::new(std::sync::Mutex::new(e));
         let connection = crate::server::Connection {
             port: 0,
@@ -1454,7 +1996,8 @@ mod tests {
                 ..Default::default()
             },
             |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| app.color_stack(ui, &layer, 1));
+                egui::CentralPanel::default()
+                    .show(ctx, |ui| app.color_stack(ui, &layer, &document));
             },
         );
         let y = |label: &str| {
@@ -1492,7 +2035,8 @@ mod tests {
                 ..Default::default()
             },
             |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| app.color_stack(ui, &layer, 1));
+                egui::CentralPanel::default()
+                    .show(ctx, |ui| app.color_stack(ui, &layer, &document));
             },
         );
         assert!(selected
@@ -1509,11 +2053,11 @@ mod tests {
         );
         let e = shared.lock().unwrap();
         assert_eq!(
-            serde_json::to_value(&e.doc.layers[0].effects).unwrap(),
+            serde_json::to_value(&e.resident_state().expect("resident fixture").document.layers[0].effects).unwrap(),
             source
         );
         assert_eq!(
-            &e.doc.preview(None, 4, None, false).unwrap().2[..4],
+            &e.resident_state().expect("resident fixture").document.preview(None, 4, None, false).unwrap().2[..4],
             &[242, 242, 242, 255]
         );
     }
@@ -1530,7 +2074,7 @@ mod tests {
                 },
                 |ctx| {
                     egui::CentralPanel::default().show(ctx, |ui| {
-                        settings(ui, "curves", &mut values);
+                        settings(ui, "curves", &mut values, 8);
                     });
                 },
             )
@@ -1565,6 +2109,18 @@ mod tests {
         assert!(values["points"][1][0].as_f64().unwrap() > 0.9);
     }
     #[test]
+    fn standard_curve_drag_moves_endpoints_on_the_record_grid() {
+        let points = json!([[51. / 255., 17. / 255.], [204. / 255., 239. / 255.]]);
+        let points = points.as_array().unwrap();
+        assert_eq!(drag_standard_curve_point(points, 0, 0.3, 0.1), Some([77. / 255., 26. / 255.]));
+        assert_eq!(drag_standard_curve_point(points, 0, 1., 0.), Some([203. / 255., 0.]));
+        assert_eq!(drag_standard_curve_point(points, 1, 0., 1.), Some([52. / 255., 1.]));
+        let fine = json!([[0.123456, 0.], [1., 1.]]);
+        assert!(drag_standard_curve_point(fine.as_array().unwrap(), 0, 0.3, 0.1).is_none());
+        let spline = json!([[0.,0.],[60./255.,35./255.],[190./255.,225./255.],[1.,1.]]);
+        assert_eq!(drag_standard_curve_point(spline.as_array().unwrap(), 1, 1., 0.3), Some([189./255.,77./255.]));
+    }
+    #[test]
     fn tight_imported_curve_points_remain_strictly_ordered_when_dragged() {
         for (previous, next, original) in [
             (0.499, 0.501, 0.5),
@@ -1578,30 +2134,537 @@ mod tests {
     }
 }
 
-fn channel_clamp_settings(ui: &mut egui::Ui, settings: &mut Value) -> Option<egui::Response> {
-    let (channel, minimum, maximum) = effects::channel_clamp::parameters(settings).ok()?;
-    let mut changed = None;
+fn effect_visibility(ui: &mut egui::Ui, enabled: &mut bool, name: &str) -> egui::Response {
+    let icon = if *enabled { Icon::Eye } else { Icon::EyeOff };
+    icons::toggle(ui, icon, enabled, &format!("{name} visibility"))
+}
+
+fn channel_mixer_settings(ui: &mut egui::Ui, display: &mut Value, source: Option<&Value>) -> Option<egui::Response> {
+    use effects::channel_mixer::{Mixer, ROWS};
+    let mut mixer = Mixer::new(source.unwrap_or(display)).ok()?;
+    let id = ui.id().with("mixer output");
+    let mut selected = if mixer.monochrome { 3 } else {
+        ui.ctx().data(|data| data.get_temp::<usize>(id)).unwrap_or(0).min(2)
+    };
+    let output = controls::swatch_choices(
+        ui, "Output", &mut selected,
+        controls::RGB_CHANNELS.into_iter().chain([("Monochrome", controls::GRAYSCALE)]),
+    );
+    if selected < 3 {
+        ui.ctx().data_mut(|data| data.insert_temp(id, selected));
+    }
+    let monochrome = selected == 3;
+    let mut changed = output.filter(|_| mixer.monochrome != monochrome);
+    mixer.monochrome = monochrome;
+    egui::Grid::new((ui.id(), "mixer", selected))
+        .spacing(Vec2::new(6.0, 3.0))
+        .show(ui, |ui| {
+            for (index, label) in ["Red", "Green", "Blue", "Constant"].into_iter().enumerate() {
+                controls::label(ui, label);
+                let mut value = display[ROWS[selected]][index].as_f64()
+                    .map_or(f32::from(mixer.rows[selected][index]), |value| value as f32);
+                let response = controls::range(ui, (selected, index), &mut value, -200.0..=200.0,
+                    160.0_f32.min(ui.available_width()).max(70.), "%", 0, false);
+                if response.changed() || response.double_clicked() {
+                    if response.changed() {
+                        mixer.rows[selected][index] = value.round() as i16;
+                    }
+                    changed = Some(response);
+                }
+                ui.end_row();
+            }
+        });
+    if changed.is_some() {
+        let mut settings = mixer.settings();
+        if let Some(preset) = source.unwrap_or(display).get("preset") {
+            settings["preset"] = preset.clone();
+        }
+        *display = settings;
+    }
+    changed
+}
+
+fn black_white_settings(ui: &mut egui::Ui, display: &mut Value, source: Option<&Value>) -> Option<egui::Response> {
+    use effects::black_white::{COLORS, Settings};
+    let source = source.unwrap_or(display);
+    let adjustment = Settings::new(source).ok()?;
+    let mut edited = None;
+    egui::Grid::new((ui.id(), "black and white"))
+        .spacing(Vec2::new(6.0, 3.0))
+        .show(ui, |ui| {
+            let labels = ["Reds", "Yellows", "Greens", "Cyans", "Blues", "Magentas"];
+            for ((key, label), weight) in COLORS.into_iter().zip(labels).zip(adjustment.weights) {
+                controls::label(ui, label);
+                let mut value = effects::number(display, key, weight as f32);
+                let response = controls::range(ui, key, &mut value, -200.0..=300.0,
+                    160.0_f32.min(ui.available_width()).max(70.), "%", 0, false);
+                if response.changed() || response.double_clicked() {
+                    let value = if response.changed() { value.round() as i32 } else { weight };
+                    edited = Some((response, key, json!(value)));
+                }
+                ui.end_row();
+            }
+        });
     ui.horizontal(|ui| {
-        controls::label(ui, "Channel");
-        for (index, (key, label, hint)) in [
-            ("r", "R", "Red"),
-            ("g", "G", "Green"),
-            ("b", "B", "Blue"),
-            ("o", "O", "Opacity / alpha"),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let mut response = ui
-                .selectable_label(channel == index, label)
-                .on_hover_text(hint);
-            if response.clicked() && channel != index {
-                settings["channel"] = json!(key);
+        let mut use_tint = adjustment.use_tint;
+        let response = ui.checkbox(&mut use_tint, "Tint");
+        if response.changed() {
+            edited = Some((response, "use_tint", json!(use_tint)));
+        }
+        if use_tint {
+            let mut rgb = std::array::from_fn(|index| {
+                display["tint_color"][index].as_f64().unwrap_or(adjustment.tint[index]) / 255.
+            });
+            let before = rgb;
+            if let Some(response) = super::effect_color::control(ui, "tint", "Tint", &mut rgb, &mut 1., None, true) {
+                let tint = if rgb == before { adjustment.tint } else { rgb.map(|value| value * 255.) };
+                edited = Some((response, "tint_color", json!(tint)));
+            }
+        }
+    });
+    let (response, key, value) = edited?;
+    let mut updated = source.clone();
+    updated[key] = value;
+    *display = updated;
+    Some(response)
+}
+
+const HUE_COLORS: [Color32; 6] = [
+    controls::RGB_COLORS[0],
+    Color32::from_rgb(244, 215, 108),
+    controls::RGB_COLORS[1],
+    Color32::from_rgb(99, 211, 222),
+    controls::RGB_COLORS[2],
+    Color32::from_rgb(222, 125, 212),
+];
+const HUE_RANGES: [(&str, &[Color32]); 6] = [
+    ("Reds", &[HUE_COLORS[0]]),
+    ("Yellows", &[HUE_COLORS[1]]),
+    ("Greens", &[HUE_COLORS[2]]),
+    ("Cyans", &[HUE_COLORS[3]]),
+    ("Blues", &[HUE_COLORS[4]]),
+    ("Magentas", &[HUE_COLORS[5]]),
+];
+
+const HUE_WHEEL_RAMP: [Color32; 10] = [
+    Color32::from_rgb(255, 0, 0), Color32::from_rgb(255, 255, 0), Color32::from_rgb(0, 255, 0),
+    Color32::from_rgb(0, 255, 255), Color32::from_rgb(0, 0, 255), Color32::from_rgb(255, 0, 255),
+    Color32::from_rgb(255, 0, 0), Color32::from_rgb(255, 255, 0), Color32::from_rgb(0, 255, 0),
+    Color32::from_rgb(0, 255, 255),
+];
+
+fn hue_range(ui: &mut egui::Ui, id: impl std::hash::Hash, value: &mut f32, width: f32, colorize: bool) -> egui::Response {
+    let (limits, colors, help) = if colorize {
+        (0.0..=359.0, &HUE_WHEEL_RAMP[..7], "Choose the color applied to the image.")
+    } else {
+        (-180.0..=180.0, &HUE_WHEEL_RAMP[3..], "Rotate the hue. The ramp uses red as its reference color.")
+    };
+    controls::color_range(ui, id, value, limits, width, "°", "Hue", colors).on_hover_text(help)
+}
+
+fn hue_band_preview(ui: &mut egui::Ui, start: i16, widths: [i16; 3]) {
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(ui.available_width().max(1.), 25.), egui::Sense::hover());
+    response.on_hover_text("The raised area shows which hues receive the change and where it fades in and out.");
+    let painter = ui.painter().with_clip_rect(rect);
+    let x = |angle: f32| rect.left() + rect.width() * angle / 360.;
+    let bottom = rect.bottom() - 6.;
+    let mut spectrum = egui::Mesh::default();
+    for (sector, &color) in HUE_WHEEL_RAMP[..7].iter().enumerate() {
+        let x = x(sector as f32 * 60.);
+        spectrum.colored_vertex(egui::pos2(x, bottom), color);
+        spectrum.colored_vertex(egui::pos2(x, rect.bottom()), color);
+        if sector != 0 {
+            let i = sector as u32 * 2;
+            spectrum.add_triangle(i - 2, i, i + 1);
+            spectrum.add_triangle(i - 2, i + 1, i - 1);
+        }
+    }
+    painter.add(egui::Shape::mesh(spectrum));
+    if widths == [0; 3] {
+        return;
+    }
+    let [rise, core, fall] = widths.map(f32::from);
+    let stroke = Stroke::new(1.5, ui.visuals().text_color());
+    let top = rect.top() + 2.;
+    // Draw both copies so ranges crossing red continue at the opposite edge.
+    for start in [f32::from(start) - 360., f32::from(start)] {
+        painter.add(egui::Shape::line(vec![
+            egui::pos2(x(start), bottom),
+            egui::pos2(x(start + rise), top),
+            egui::pos2(x(start + rise + core), top),
+            egui::pos2(x(start + rise + core + fall), bottom),
+        ], stroke));
+    }
+}
+
+fn selective_color_settings(ui: &mut egui::Ui, display: &mut Value, source: Option<&Value>) -> Option<egui::Response> {
+    use effects::selective_color::{RANGES, Settings};
+    let mut settings = Settings::new(source.unwrap_or(display)).ok()?;
+    let mut changed = None;
+    ui.horizontal_wrapped(|ui| {
+        controls::label(ui, "Method");
+        for (absolute, name, help) in [
+            (false, "Relative", "Scale the correction by the remaining room in each channel."),
+            (true, "Absolute", "Scale the correction by the full range of each channel."),
+        ] {
+            let selected = settings.absolute == absolute;
+            let id = egui::Id::new(("Selective Color method swatch", absolute));
+            let texture = ui.ctx().data(|data| data.get_temp::<TextureHandle>(id))
+                .unwrap_or_else(|| {
+                    let mut example = Settings { absolute, ranges: [[0; 4]; 9] };
+                    example.ranges[7][0] = 45;
+                    let example = example.prepare();
+                    let mut image = egui::ColorImage::new([24, 2], Color32::BLACK);
+                    for (index, pixel) in image.pixels.iter_mut().enumerate() {
+                        let shade = 64 + (index % 24) as u8 * 5;
+                        let [r, g, b] = if index < 24 { [u16::from(shade); 3] }
+                            else { example.sample([u16::from(shade); 3], 255) };
+                        *pixel = Color32::from_rgb(r as u8, g as u8, b as u8);
+                    }
+                    let texture = ui.ctx().load_texture(name, image, egui::TextureOptions::NEAREST);
+                    ui.ctx().data_mut(|data| data.insert_temp(id, texture.clone()));
+                    texture
+                });
+            let mut response = ui.add(egui::Button::image_and_text((texture.id(), Vec2::new(34., 16.)), name)
+                .selected(selected)).on_hover_text(format!("{help} The sample shows neutrals above and a cyan correction below."));
+            response.widget_info(|| egui::WidgetInfo::selected(
+                egui::WidgetType::RadioButton, response.enabled(), selected, name,
+            ));
+            icons::paint_focus(ui, &response);
+            if !selected && response.clicked() {
+                settings.absolute = absolute;
                 response.mark_changed();
                 changed = Some(response);
             }
         }
     });
+    let id = ui.id().with("selective color range");
+    let mut selected = ui.ctx().data(|data| data.get_temp::<usize>(id)).unwrap_or(0).min(RANGES.len() - 1);
+    let tones: [(&str, &[Color32]); 3] = [
+        ("Whites", &[Color32::WHITE]),
+        ("Neutrals", &[Color32::GRAY]),
+        ("Blacks", &[Color32::BLACK]),
+    ];
+    let _ = controls::swatch_choices(ui, "Colors", &mut selected, HUE_RANGES.into_iter().chain(tones));
+    ui.ctx().data_mut(|data| data.insert_temp(id, selected));
+    egui::Grid::new((ui.id(), "selective color", selected))
+        .spacing(Vec2::new(6.0, 3.0))
+        .show(ui, |ui| {
+            let row = &mut settings.ranges[selected];
+            for (index, label) in ["Cyan", "Magenta", "Yellow", "Black"].into_iter().enumerate() {
+                controls::label(ui, label);
+                let mut value = display[RANGES[selected]][index].as_f64()
+                    .map_or(f32::from(row[index]), |value| value as f32);
+                let response = controls::range(ui, (selected, index), &mut value, -100.0..=100.0,
+                    160.0_f32.min(ui.available_width()).max(70.), "%", 0, false);
+                if response.changed() || response.double_clicked() {
+                    if response.changed() {
+                        row[index] = value.round() as i16;
+                    }
+                    changed = Some(response);
+                }
+                ui.end_row();
+            }
+        });
+    if changed.is_some() {
+        *display = settings.value();
+    }
+    changed
+}
+
+fn color_lookup_picker(ui: &mut egui::Ui, settings: &Value) -> Option<(Value, egui::Response)> {
+    let table = effects::color_lookup::uses_table(settings);
+    let profile = effects::color_lookup::source_size(settings, "profile") != 0;
+    let format = match settings["lut_format"].as_str() {
+        Some("3dl") => "3dl",
+        Some("look") => "look",
+        _ => "cube",
+    };
+    if table || profile {
+        let name = ["name", "file_name"].into_iter().filter_map(|field| settings[field].as_str())
+            .map(|name| name.trim_end_matches('\0').rsplit(['/', '\\']).next().unwrap_or(""))
+            .find(|name| !name.is_empty())
+            .unwrap_or(match (table, format) {
+                (false, _) => "Embedded ICC DeviceLink",
+                (true, "3dl") => "Embedded .3dl",
+                (true, "look") => "Embedded .look",
+                _ => "Embedded .cube",
+            });
+        controls::label(ui, name);
+    }
+    if table && !profile {
+        let legacy = settings["lut_format"].as_str().unwrap_or("").is_empty();
+        let table_default = if format == "3dl" { "rgb" } else { "bgr" };
+        let order = |key: &str, default| settings[key].as_str().filter(|value| !value.is_empty()).unwrap_or(default);
+        let mut data = order("data_order", "rgb");
+        let mut table_order = if legacy { table_default } else { order("table_order", table_default) };
+        const ORDERS: [(&str, &[Color32]); 2] = [
+            ("RGB", &controls::RGB_COLORS),
+            ("BGR", &[controls::RGB_COLORS[2], controls::RGB_COLORS[1], controls::RGB_COLORS[0]]),
+        ];
+        let mut changed = None;
+        for (label, order) in [("Output channel order", &mut data), ("Table axis order", &mut table_order)] {
+            let mut selected = usize::from(*order == "bgr");
+            if let Some(response) = controls::swatch_choices(ui, label, &mut selected, ORDERS) {
+                *order = ["rgb", "bgr"][selected];
+                changed = Some(response);
+            }
+        }
+        if let Some(response) = changed {
+            let mut updated = settings.clone();
+            updated["lut_format"] = json!(format);
+            updated["embed_profile"] = json!(true);
+            updated["data_order"] = json!(data);
+            updated["table_order"] = json!(table_order);
+            return Some((updated, response));
+        }
+    }
+    let mut response = ui.button("Choose lookup source…");
+    let id = response.id.with("profile error");
+    if let Some(error) = ui.ctx().data(|data| data.get_temp::<String>(id)) {
+        ui.label(RichText::new(error).color(MUTED));
+    }
+    if !response.clicked() { return None; }
+    let path = rfd::FileDialog::new().add_filter("Color Lookup", &["cube", "3dl", "look", "icc", "icm"]).pick_file()?;
+    match effects::color_lookup::read_file(&path) {
+        Ok(settings) => {
+            ui.ctx().data_mut(|data| { data.remove::<String>(id); });
+            response.mark_changed();
+            Some((settings, response))
+        }
+        Err(error) => {
+            ui.ctx().data_mut(|data| data.insert_temp(id, error));
+            ui.ctx().request_repaint();
+            None
+        }
+    }
+}
+
+fn photoshop_hue_saturation_settings(
+    ui: &mut egui::Ui,
+    display: &mut Value,
+    source: Option<&Value>,
+) -> Option<egui::Response> {
+    use effects::photoshop_hue_saturation::Settings;
+    let mut settings = Settings::new(source.unwrap_or(display)).ok()?;
+    let mut changed = None;
+    let response = ui.checkbox(&mut settings.colorize, "Colorize");
+    if response.changed() { changed = Some(response); }
+    let id = ui.id().with("hue saturation range");
+    let mut selected = ui.ctx().data(|data| data.get_temp::<usize>(id)).unwrap_or(0).min(HUE_RANGES.len());
+    if !settings.colorize {
+        let _ = controls::swatch_choices(
+            ui,
+            "Colors",
+            &mut selected,
+            std::iter::once(("Master", HUE_COLORS.as_slice())).chain(HUE_RANGES),
+        );
+        ui.ctx().data_mut(|data| data.insert_temp(id, selected));
+    }
+    let colorize = settings.colorize;
+    let (row, shown) = if colorize {
+        (&mut settings.colorization, &display["colorization"])
+    } else if selected == 0 {
+        (&mut settings.master, &display["master"])
+    } else {
+        (&mut settings.bands[selected - 1].change, &display["bands"][selected - 1]["change"])
+    };
+    egui::Grid::new((id, colorize, selected))
+        .spacing(Vec2::new(6.0, 3.0))
+        .show(ui, |ui| {
+            for (axis, label) in ["Hue", "Saturation", "Lightness"].into_iter().enumerate() {
+                controls::label(ui, label);
+                let mut value = shown[axis].as_f64().map_or(f32::from(row[axis]), |value| value as f32);
+                let (low, high, suffix) = match axis {
+                    0 if colorize => { value = value.rem_euclid(360.); (0., 359., "°") }
+                    0 => (-180., 180., "°"),
+                    1 if colorize => (0., 100., "%"),
+                    _ => (-100., 100., "%"),
+                };
+                let width = 160.0_f32.min(ui.available_width()).max(70.);
+                let control = (id, colorize, selected, axis);
+                let response = if axis == 0 {
+                    hue_range(ui, control, &mut value, width, colorize)
+                } else {
+                    controls::range(ui, control, &mut value, low..=high, width, suffix, 0, false)
+                };
+                if response.changed() || response.double_clicked() {
+                    if response.changed() {
+                        let value = value.round() as i16;
+                        row[axis] = if colorize && axis == 0 && value > 180 { value - 360 } else { value };
+                    }
+                    changed = Some(response);
+                }
+                ui.end_row();
+            }
+        });
+    if !colorize && selected > 0 {
+        let band = &mut settings.bands[selected - 1];
+        let mut start = band.range[0].rem_euclid(360);
+        let mut widths = band.widths();
+        egui::Grid::new((id, selected, "range stops"))
+            .spacing(Vec2::new(6.0, 3.0))
+            .show(ui, |ui| {
+                for (index, (name, help)) in [
+                    ("Range start", "Starting hue in degrees, with red at zero."),
+                    ("Fade in", "Degrees over which the adjustment goes from zero to full strength."),
+                    ("Core width", "Degrees that receive the full adjustment."),
+                    ("Fade out", "Degrees over which the adjustment returns to zero."),
+                ].into_iter().enumerate() {
+                    let label = ui.label(name).on_hover_text(help);
+                    let (stop, max) = if index == 0 { (&mut start, 359) } else {
+                        let max = (360 - widths.iter().sum::<i16>() + widths[index - 1]).min(359);
+                        (&mut widths[index - 1], max)
+                    };
+                    let mut value = f32::from(*stop);
+                    let response = controls::range(ui, (id, selected, "range", index), &mut value, 0.0..=f32::from(max),
+                        160.0_f32.min(ui.available_width()).max(70.), "°", 0, false)
+                        .labelled_by(label.id).on_hover_text(help);
+                    if response.changed() || response.double_clicked() {
+                        if response.changed() {
+                            *stop = value.round() as i16;
+                            let [rise, core, fall] = widths;
+                            band.range = [start, start + rise, start + rise + core, start + rise + core + fall]
+                                .map(|stop| stop.rem_euclid(360));
+                        }
+                        changed = Some(response);
+                    }
+                    ui.end_row();
+                }
+            });
+        hue_band_preview(ui, start, widths);
+    }
+    if changed.is_some() { *display = settings.value(); }
+    changed
+}
+
+fn photo_filter_settings(
+    ui: &mut egui::Ui,
+    display: &mut Value,
+    depth: u16,
+    source: Option<&Value>,
+) -> Option<egui::Response> {
+    use effects::photo_filter::{Color, Settings};
+    let mut settings = Settings::new(source.unwrap_or(display)).ok()?;
+    let mut changed = None;
+    ui.horizontal(|ui| {
+        controls::label(ui, "Filter color");
+        let before = settings.color.rgb();
+        let mut rgb = before;
+        let native_rgb = depth == 16 || matches!(settings.color, Color::Rgb(_));
+        if let Some(response) = super::effect_color::control(
+            ui, "filter color", "Filter", &mut rgb, &mut 1., None, native_rgb,
+        ) {
+            if rgb != before {
+                settings.color = if native_rgb {
+                    Color::Rgb(rgb.map(|value| (value * f64::from(u16::MAX)).round() as u16))
+                } else {
+                    Color::from_rgb(rgb)
+                };
+            }
+            changed = Some(response);
+        }
+    });
+    ui.horizontal(|ui| {
+        controls::label(ui, "Density");
+        let mut value = effects::number(display, "density", f32::from(settings.density));
+        let response = controls::range(ui, "density", &mut value, 0.0..=100.0,
+            160.0_f32.min(ui.available_width()).max(70.), "%", 0, false);
+        if response.changed() || response.double_clicked() {
+            if response.changed() {
+                settings.density = value.round() as u8;
+            }
+            changed = Some(response);
+        }
+    });
+    let response = ui.checkbox(&mut settings.preserve_luminosity, "Preserve Luminosity");
+    if response.changed() {
+        changed = Some(response);
+    }
+    if changed.is_some() {
+        *display = settings.value();
+    }
+    changed
+}
+
+fn gradient_map_settings(ui: &mut egui::Ui, display: &mut Value, source: Option<&Value>) -> Option<egui::Response> {
+    use effects::gradient_map::{Method, Settings};
+
+    let mut map = Settings::new(source.unwrap_or(display)).ok()?;
+    let mut method = map.method;
+    let mut changed = None;
+    controls::label(ui, "Interpolation");
+    ui.horizontal_wrapped(|ui| {
+        for (choice, label, help) in [
+            (Method::Classic, "Classic", "Interpolate the encoded RGB values."),
+            (Method::Linear, "Linear", "Interpolate in linear light."),
+            (Method::Perceptual, "Perceptual", "Interpolate in OKLab for more even visual transitions."),
+        ] {
+            let active = method == choice;
+            let font = egui::TextStyle::Button.resolve(ui.style());
+            let text_size = ui.painter().layout_no_wrap(label.into(), font.clone(), Color32::PLACEHOLDER).size();
+            let mut response = ui
+                .add_sized([70.0_f32.max(text_size.x + 8.), text_size.y + 24.], egui::Button::new("").selected(active))
+                .on_hover_text(format!("{label} · {help}"));
+            response.widget_info(|| {
+                egui::WidgetInfo::selected(egui::WidgetType::RadioButton, response.enabled(), active, label)
+            });
+            let inner = response.rect.shrink(4.);
+            let swatch = Rect::from_min_size(inner.min, Vec2::new(inner.width(), 12.));
+            map.method = choice;
+            let prepared = map.prepare();
+            super::gradient_stops::paint_ramp(ui.painter(), swatch, |t| {
+                let [r, g, b] = prepared.lookup(t, 255).map(|value| value as u8);
+                Color32::from_rgb(r, g, b)
+            });
+            ui.painter().text(
+                inner.center_bottom(),
+                egui::Align2::CENTER_BOTTOM,
+                label,
+                font,
+                ui.style().interact_selectable(&response, active).text_color(),
+            );
+            icons::paint_focus(ui, &response);
+            if !active && response.clicked() {
+                method = choice;
+                response.mark_changed();
+                changed = Some(response);
+            }
+        }
+    });
+    map.method = method;
+    let mut settings = map.value();
+    ui.horizontal(|ui| {
+        controls::label(ui, "Smoothness");
+        let mut value = effects::number(display, "smoothness", settings["smoothness"].as_f64().unwrap_or(1.) as f32) * 100.;
+        let response = controls::range(ui, "smoothness", &mut value, 0.0..=100.0,
+            160.0_f32.min(ui.available_width()).max(70.), "%", 1, false);
+        if response.changed() || response.double_clicked() {
+            if response.changed() {
+                settings["smoothness"] = json!((f64::from(value) * 4096. / 100.).round() / 4096.);
+            }
+            changed = Some(response);
+        }
+    });
+    changed = super::gradient_stops::map_controls(ui, &mut settings).or(changed);
+    if changed.is_some() {
+        *display = settings;
+    }
+    changed
+}
+
+fn channel_clamp_settings(ui: &mut egui::Ui, settings: &mut Value) -> Option<egui::Response> {
+    const OPACITY: (&str, &[Color32]) = ("Opacity / alpha", &[Color32::BLACK, Color32::WHITE]);
+    let (mut channel, minimum, maximum) = effects::channel_clamp::parameters(settings).ok()?;
+    let mut changed = controls::swatch_choices(
+        ui,
+        "Channel",
+        &mut channel,
+        controls::RGB_CHANNELS.into_iter().chain([OPACITY]),
+    );
+    if changed.is_some() {
+        settings["channel"] = json!(["r", "g", "b", "o"][channel]);
+    }
     egui::Grid::new((ui.id(), "clamp bounds"))
         .spacing(Vec2::new(6.0, 3.0))
         .show(ui, |ui| {
@@ -1632,7 +2695,8 @@ fn channel_clamp_settings(ui: &mut egui::Ui, settings: &mut Value) -> Option<egu
     changed
 }
 
-fn levels_slider(ui: &mut egui::Ui, settings: &mut Value) -> Option<egui::Response> {
+fn levels_slider(ui: &mut egui::Ui, settings: &mut Value, byte_levels: bool) -> Option<egui::Response> {
+    let gap = if byte_levels { 1. / 255. } else if effects::levels::exact(settings) { 1. / 65535. } else { 0.01 };
     let (rect, mut response) =
         ui.allocate_exact_size(Vec2::new(240.0, 38.0), egui::Sense::click_and_drag());
     let bar = Rect::from_min_size(rect.min, Vec2::new(rect.width(), 18.0));
@@ -1674,17 +2738,23 @@ fn levels_slider(ui: &mut egui::Ui, settings: &mut Value) -> Option<egui::Respon
         ) {
             let x = ((p.x - bar.left()) / bar.width()).clamp(0.0, 1.0);
             match index {
-                0 => black = x.min(white - 0.01).clamp(0.0, 0.99),
-                2 => white = x.max(black + 0.01).clamp(0.01, 1.0),
+                0 => {
+                    let max = if byte_levels { 253. / 255. } else { 1. - gap };
+                    black = x.min(white - gap).clamp(0.0, max);
+                    settings["black"] = if byte_levels { json!(f64::from((black * 255.).round()) / 255.) } else { json!(black) };
+                }
+                2 => {
+                    let min = if byte_levels { 2. / 255. } else { gap };
+                    white = x.max(black + gap).clamp(min, 1.0);
+                    settings["white"] = if byte_levels { json!(f64::from((white * 255.).round()) / 255.) } else { json!(white) };
+                }
                 _ => {
-                    gamma = (((x - black) / (white - black)).clamp(0.001, 0.999).ln()
+                    gamma = (((x - black) / (white - black)).clamp(0.5_f32.powf(9.99), 0.5_f32.powf(0.1)).ln()
                         / 0.5_f32.ln())
-                    .clamp(0.1, 5.0)
+                    .clamp(0.1, 9.99);
+                    settings["gamma"] = json!(gamma);
                 }
             }
-            settings["black"] = json!(black);
-            settings["white"] = json!(white);
-            settings["gamma"] = json!(gamma);
             response.mark_changed();
         }
     }
@@ -1710,6 +2780,10 @@ fn levels_slider(ui: &mut egui::Ui, settings: &mut Value) -> Option<egui::Respon
     let response = response.on_hover_text("Drag the black, midtone and white input handles");
     changed.then_some(response)
 }
+
+#[cfg(test)]
+#[path = "levels_input_tests.rs"]
+mod levels_input_tests;
 
 #[cfg(test)]
 mod bitmap_inspector_tests {
@@ -1749,7 +2823,7 @@ mod bitmap_inspector_tests {
         let png = bitmap_png(depth, 0);
         let effect = {
             let mut engine = app.shared.lock().unwrap();
-            let layer = engine.doc.layers[0].id.clone();
+            let layer = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
             engine
                 .edit(
                     "human",
@@ -1761,7 +2835,7 @@ mod bitmap_inspector_tests {
                     "Embedded inspector source",
                 )
                 .unwrap();
-            let effect = engine.doc.layers[0].effects[0].id.clone();
+            let effect = engine.resident_state().expect("resident fixture").document.layers[0].effects[0].id.clone();
             for opacity in [0.9, 0.8] {
                 engine
                     .edit(
@@ -1774,7 +2848,7 @@ mod bitmap_inspector_tests {
                     .unwrap();
             }
             engine.undo("human").unwrap();
-            assert!(!engine.undo.is_empty() && !engine.redo.is_empty());
+            assert!(!engine.resident_state().expect("resident fixture").undo.is_empty() && !engine.resident_state().expect("resident fixture").redo.is_empty());
             effect
         };
         app.select_effect(&app.selected.clone(), false, &effect);
@@ -1832,7 +2906,7 @@ mod bitmap_inspector_tests {
         for depth in [8, 16] {
             for kind in ["pattern_overlay", "texture"] {
                 let (mut app, ctx, png) = fixture(depth, kind);
-                let source = app.shared.lock().unwrap().doc.layers[0].effects[0]
+                let source = app.shared.lock().unwrap().resident_state().expect("resident fixture").document.layers[0].effects[0]
                     .settings
                     .clone();
                 let before = workspace::source(&app);
@@ -1851,11 +2925,11 @@ mod bitmap_inspector_tests {
                     frame(&mut app, &ctx, vec![]);
                     let engine = app.shared.lock().unwrap();
                     assert!(Arc::ptr_eq(
-                        &engine.doc.layers[0].effects[0].settings,
+                        &engine.resident_state().expect("resident fixture").document.layers[0].effects[0].settings,
                         &source
                     ));
                     assert_eq!(
-                        engine.doc.layers[0].effects[0].settings["bitmap_png"],
+                        engine.resident_state().expect("resident fixture").document.layers[0].effects[0].settings["bitmap_png"],
                         json!(png)
                     );
                 }
@@ -1873,9 +2947,9 @@ mod bitmap_inspector_tests {
         for depth in [8, 16] {
             for kind in ["pattern_overlay", "texture"] {
                 let (mut app, ctx, png) = fixture(depth, kind);
-                let before = app.shared.lock().unwrap().doc.clone();
+                let before = app.shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
                 let source = workspace::source(&app);
-                let history = app.shared.lock().unwrap().undo.len();
+                let history = app.shared.lock().unwrap().resident_state().expect("resident fixture").undo.len();
                 let moved = drag_opacity(&mut app, &ctx);
                 let commands = app.parameter_gesture.as_ref().unwrap().commands.clone();
                 assert_eq!(commands.len(), 1);
@@ -1898,25 +2972,25 @@ mod bitmap_inspector_tests {
                 assert_eq!(workspace::source(&app), source);
                 frame(&mut app, &ctx, vec![button(moved, false)]);
                 let mut engine = app.shared.lock().unwrap();
-                assert_eq!(engine.undo.len(), history + 1);
+                assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), history + 1);
                 assert_eq!(
-                    engine.doc.layers[0].effects[0].settings["bitmap_png"],
+                    engine.resident_state().expect("resident fixture").document.layers[0].effects[0].settings["bitmap_png"],
                     json!(png)
                 );
-                assert_eq!(engine.doc.layers[0].pixels, before.layers[0].pixels);
-                assert_eq!(engine.doc.bit_depth, depth);
+                assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].pixels, before.layers[0].pixels);
+                assert_eq!(engine.resident_state().expect("resident fixture").document.bit_depth, depth);
                 assert_eq!(
-                    engine.doc.export_png().unwrap(),
+                    engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
                     preview.export_png().unwrap()
                 );
                 engine.undo("human").unwrap();
                 assert_eq!(
-                    engine.doc.export_png().unwrap(),
+                    engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
                     before.export_png().unwrap()
                 );
                 engine.redo("human").unwrap();
                 assert_eq!(
-                    engine.doc.export_png().unwrap(),
+                    engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
                     preview.export_png().unwrap()
                 );
             }
@@ -1931,8 +3005,8 @@ mod bitmap_inspector_tests {
                 let layer = app.selected.clone();
                 if interruption == "newer" {
                     let mut engine = app.shared.lock().unwrap();
-                    let effect = engine.doc.layers[0].effects[0].id.clone();
-                    let mut settings = engine.doc.layers[0].effects[0].settings.as_ref().clone();
+                    let effect = engine.resident_state().expect("resident fixture").document.layers[0].effects[0].id.clone();
+                    let mut settings = engine.resident_state().expect("resident fixture").document.layers[0].effects[0].settings.as_ref().clone();
                     settings["bitmap_png"] = json!(bitmap_png(depth, 19001));
                     engine
                         .edit(
@@ -1976,7 +3050,7 @@ mod bitmap_inspector_tests {
                 assert!(app.parameter_gesture.is_none());
                 assert_eq!(workspace::source(&app), retained, "{depth}/{interruption}");
                 assert_eq!(json!(app.shared.lock().unwrap().leases), reservations);
-                assert_eq!(app.shared.lock().unwrap().doc.bit_depth, depth);
+                assert_eq!(app.shared.lock().unwrap().resident_state().expect("resident fixture").document.bit_depth, depth);
             }
         }
     }
@@ -2014,7 +3088,7 @@ mod native_metadata_tests {
                 }],
             });
             let mut engine = crate::engine::Engine::new();
-            engine.doc = document.clone();
+            engine.resident_state_mut().expect("resident fixture").document = document.clone();
             let mut app = PeerBrush::init(
                 &ctx,
                 Arc::new(std::sync::Mutex::new(engine)),
@@ -2062,7 +3136,7 @@ mod native_metadata_tests {
                     "Bake into layer pixels"
                 }));
                 assert_eq!(pool.used(), admitted);
-                assert_eq!(app.shared.lock().unwrap().doc.revision, 0);
+                assert_eq!(app.shared.lock().unwrap().resident_state().expect("resident fixture").document.revision, 0);
             }
         }
     }

@@ -2,7 +2,7 @@
 //! Raw fact records and journal checksums never implement this authority.
 use super::NativeExternalFile;
 use crate::{
-    large_document::{Reservation, ScratchBytes},
+    large_document::Reservation,
     psd::save36::CompletedSave36,
     workspace::source_runtime::{
         CommittedPublication, PublicationIntent, PublicationPlan, RegisteredCreation, SourceSession,
@@ -14,11 +14,20 @@ use std::{
 };
 use std::{
     fs::{self, File},
-    io::{Read, Write},
+    io::Write,
 };
 
 const OUTCOME_HEADERS: usize = 512 * 1024;
-const TRANSFER: usize = 65536;
+#[path = "native_backup_data.rs"]
+mod backup_data;
+pub(crate) use backup_data::NativeBackupData;
+#[path = "native_existing.rs"]
+mod existing;
+#[path = "native_metadata.rs"]
+mod metadata;
+pub(crate) use existing::{
+    NativeExistingAbortReceipt, NativeExistingDestination, NativeExistingPublicationReceipt,
+};
 
 fn component(name: &OsStr) -> Result<(), String> {
     if name.as_encoded_bytes().len() > 1024
@@ -81,10 +90,23 @@ fn directory(file: &File, path: &Path, expected: (u64, u64)) -> Result<(), Strin
     }
     Ok(())
 }
-fn create_temporary(parent: &File, path: &Path, name: &OsStr) -> Result<File, String> {
+fn check_target(plan: &PublicationPlan, original: Option<&File>) -> Result<(), String> {
+    match (original, plan.expected_version()) {
+        (None, None) => absent(plan.target()),
+        (Some(original), Some(expected)) => backup_data::source_matches(original, plan, expected),
+        _ => Err("Native target differs from its held original owner".into()),
+    }
+}
+fn create_temporary(
+    parent: &File,
+    path: &Path,
+    name: &OsStr,
+    preserve_access: bool,
+) -> Result<File, String> {
     component(name)?;
     #[cfg(unix)]
     {
+        let _ = preserve_access;
         use std::os::{
             fd::{AsRawFd, FromRawFd},
             unix::ffi::OsStrExt,
@@ -113,14 +135,22 @@ fn create_temporary(parent: &File, path: &Path, name: &OsStr) -> Result<File, St
     #[cfg(not(unix))]
     {
         let _ = parent;
-        super::owned_rename::staging_options()
+        let mut options = super::owned_rename::staging_options();
+        #[cfg(windows)]
+        if preserve_access {
+            use std::os::windows::fs::OpenOptionsExt;
+            // GENERIC_READ|WRITE, DELETE, READ_CONTROL and WRITE_DAC. Access
+            // rules are copied only after the zero-byte identity is registered.
+            options.access_mode(0xC0070000);
+        }
+        options
             .open(path.join(name))
             .map_err(|_| "Native exclusive temporary creation failed; names retained".into())
     }
 }
 
-/// New-destination driver only. Existing-target relocation has a separate
-/// journal/recovery contract; this type cannot accidentally select overwrite.
+/// Public creation/publication stays new-destination only. Existing staging
+/// reuses the private constructor through its separate backup/abort driver.
 /// Drop never unlinks a file or refunds the admitted intent.
 pub(crate) struct NativeNewDestination<'inventory, 'lease, 'session> {
     plan: PublicationPlan,
@@ -128,6 +158,7 @@ pub(crate) struct NativeNewDestination<'inventory, 'lease, 'session> {
     session: &'session SourceSession,
     parent: File,
     temporary: File,
+    original: Option<File>,
     temporary_id: (u64, u64),
     written: u64,
     sealed: Option<super::owned_rename::Sealed>,
@@ -165,6 +196,29 @@ impl<'inventory, 'lease, 'session> NativeNewDestination<'inventory, 'lease, 'ses
             );
         }
         drop(observed);
+        Self::create_plan(session, candidate, inventory, intent, plan, None, check)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn create_plan(
+        session: &'session SourceSession,
+        candidate: &CompletedSave36<'_>,
+        inventory: &'inventory super::NativeInventory<'lease>,
+        intent: &PublicationIntent<'_>,
+        plan: PublicationPlan,
+        original: Option<File>,
+        check: &dyn Fn() -> Result<(), String>,
+    ) -> Result<Self, String> {
+        plan.check_session(session)?;
+        candidate.check_session(session)?;
+        if plan.expected_version() != inventory.writer_lease().expected()
+            || plan.target() != inventory.writer_lease().path()
+            || candidate.bytes() != plan.candidate_bytes()
+            || candidate.sha256() != plan.candidate_sha256()
+            || !plan.uses_budgets(&session.resident(), &session.disk())
+            || !inventory.writer_budget().same_pool(&session.resident())
+        {
+            return Err("Native staging differs from its admitted source and candidate".into());
+        }
         component(plan.temporary_name())?;
         let headers = session
             .resident()
@@ -181,13 +235,19 @@ impl<'inventory, 'lease, 'session> NativeNewDestination<'inventory, 'lease, 'ses
         candidate.recheck(check)?;
         plan.check_session(session)?;
         inventory.validate(check)?;
-        absent(plan.target())?;
+        check_target(&plan, original.as_ref())?;
         absent(&parent_path.join(plan.temporary_name()))?;
         inventory
             .writer_lease()
             .check_before_native_mutation(check)?;
-        let temporary = create_temporary(&parent, parent_path, plan.temporary_name())?;
+        let temporary = create_temporary(
+            &parent,
+            parent_path,
+            plan.temporary_name(),
+            original.is_some(),
+        )?;
         super::native_regular(&temporary).map_err(|_| "Native temporary is not a regular owner")?;
+        super::owned_rename::hold_write_stamp(&temporary)?;
         #[cfg(windows)]
         {
             use std::os::windows::fs::MetadataExt;
@@ -211,6 +271,7 @@ impl<'inventory, 'lease, 'session> NativeNewDestination<'inventory, 'lease, 'ses
             session,
             parent,
             temporary,
+            original,
             temporary_id,
             written: 0,
             sealed: None,
@@ -281,12 +342,13 @@ impl<'inventory, 'lease, 'session> NativeNewDestination<'inventory, 'lease, 'ses
                 ExternalCreationRole::Temporary,
                 NativeExternalFile::observe_held(&self.temporary)?,
             )?;
-        absent(self.plan.target())
+        check_target(&self.plan, self.original.as_ref())
     }
     pub(crate) fn replay(
         &mut self,
         candidate: &CompletedSave36<'_>,
         check: &dyn Fn() -> Result<(), String>,
+        progress: &mut dyn FnMut(u64) -> Result<(), String>,
     ) -> Result<(), String> {
         let result = (|| {
             if self.creation.is_none() {
@@ -301,65 +363,43 @@ impl<'inventory, 'lease, 'session> NativeNewDestination<'inventory, 'lease, 'ses
             {
                 return Err("Native destination replay differs from the admitted candidate".into());
             }
-            let mut buffer = ScratchBytes::new(&self.session.resident(), TRANSFER, TRANSFER)
-                .map_err(|e| e.to_string())?;
-            let mut failure = None;
-            let session = self.session;
-            let mut active = || {
-                candidate
-                    .check_session(session)
-                    .and_then(|_| check())
-                    .map_err(|e| {
-                        failure = Some(e);
-                        crate::large_document::Error::Cancelled
-                    })
-            };
-            let reading = (|| -> Result<(), String> {
-                let mut cursor = candidate.cursor(0, candidate.bytes(), &mut active)?;
-                let mut hash = ring::digest::Context::new(&ring::digest::SHA256);
-                while self.written < candidate.bytes() {
-                    self.active(check)?;
-                    if self
-                        .temporary
-                        .metadata()
-                        .map_err(|_| "Native temporary metadata unavailable")?
-                        .len()
-                        != self.written
-                    {
-                        return Err("Native temporary append position changed".into());
-                    }
-                    let count = (candidate.bytes() - self.written).min(TRANSFER as u64) as usize;
-                    let got = cursor
-                        .read(&mut buffer[..count])
-                        .map_err(|e| e.to_string())?;
-                    if got != count {
-                        return Err("Native candidate replay ended early".into());
-                    }
-                    self.temporary
-                        .write_all(&buffer[..count])
-                        .map_err(|_| "Native temporary write failed; prefix retained")?;
-                    hash.update(&buffer[..count]);
-                    self.written += count as u64;
-                }
-                if cursor.read(&mut [0; 1]).map_err(|e| e.to_string())? != 0
-                    || hash.finish().as_ref() != self.plan.candidate_sha256()
+            let mut buffer = candidate.publication_buffer()?;
+            let mut hash = ring::digest::Context::new(&ring::digest::SHA256);
+            progress(0)?;
+            while self.written < candidate.bytes() {
+                self.active(check)?;
+                if self
+                    .temporary
+                    .metadata()
+                    .map_err(|_| "Native temporary metadata unavailable")?
+                    .len()
+                    != self.written
                 {
-                    return Err("Native candidate replay SHA or EOF differs".into());
+                    return Err("Native temporary append position changed".into());
                 }
-                Ok(())
-            })();
-            drop(active);
-            if let Some(error) = failure {
-                return Err(error);
+                let count = (candidate.bytes() - self.written).min(buffer.len() as u64) as usize;
+                candidate.read_publication_batch(
+                    self.session, self.written, count, &mut buffer, check,
+                )?;
+                self.temporary
+                    .write_all(&buffer[..count])
+                    .map_err(|_| "Native temporary write failed; prefix retained")?;
+                hash.update(&buffer[..count]);
+                self.written += count as u64;
+                progress(self.written)?;
             }
-            reading?;
+            if hash.finish().as_ref() != self.plan.candidate_sha256() {
+                return Err("Native candidate replay SHA differs".into());
+            }
             candidate.recheck(check)?;
             self.active(check)?;
-            let sealed = super::owned_rename::Sealed::verify(
+            super::owned_rename::finish_write_stamp(&self.temporary)?;
+            let sealed = super::owned_rename::Sealed::verify_with_buffer(
                 &self.temporary,
                 self.plan.candidate_bytes(),
                 self.plan.candidate_sha256(),
                 &self.session.resident(),
+                &mut buffer,
                 &mut || self.active(check),
             )?;
             self.inventory.validate(check)?;
@@ -392,6 +432,9 @@ impl<'inventory, 'lease, 'session> NativeNewDestination<'inventory, 'lease, 'ses
     ) -> Result<NativePublicationReceipt<'inventory, 'lease>, String> {
         committed.check_plan(&self.plan)?;
         check()?;
+        if self.plan.expected_version().is_some() || self.original.is_some() {
+            return Err("Existing native staging requires its separate replacement driver; all files retained".into());
+        }
         if self.failed || self.written != self.plan.candidate_bytes() {
             return Err("Native staged destination is incomplete".into());
         }
@@ -447,6 +490,7 @@ impl<'inventory, 'lease, 'session> NativeNewDestination<'inventory, 'lease, 'ses
             self.inventory,
             self.parent,
             self.temporary,
+            self.original,
             true,
             Some(sealed),
             self.creation
@@ -466,12 +510,13 @@ impl<'inventory, 'lease, 'session> NativeNewDestination<'inventory, 'lease, 'ses
     ) -> Result<NativeAbortReceipt<'inventory, 'lease>, String> {
         check()?;
         self.check_temporary()?;
-        absent(self.plan.target())?;
+        check_target(&self.plan, self.original.as_ref())?;
         let core = OutcomeCore::new(
             self.plan,
             self.inventory,
             self.parent,
             self.temporary,
+            self.original,
             false,
             None,
             self.creation
@@ -490,6 +535,7 @@ struct OutcomeCore<'a, 'lease> {
     inventory: &'a super::NativeInventory<'lease>,
     parent: File,
     file: File,
+    original: Option<File>,
     published: bool,
     seal: Option<super::owned_rename::Sealed>,
     fact: NativeExternalFile,
@@ -507,6 +553,7 @@ impl<'a, 'lease> OutcomeCore<'a, 'lease> {
         inventory: &'a super::NativeInventory<'lease>,
         parent: File,
         file: File,
+        original: Option<File>,
         published: bool,
         seal: Option<super::owned_rename::Sealed>,
         creation: RegisteredCreation,
@@ -514,9 +561,18 @@ impl<'a, 'lease> OutcomeCore<'a, 'lease> {
         #[cfg(windows)] pins: Vec<File>,
         check: &dyn Fn() -> Result<(), String>,
     ) -> Result<Self, String> {
+        if published && (original.is_some() || plan.expected_version().is_some()) {
+            return Err(
+                "Native replacement needs its retained-original receipt; files retained".into(),
+            );
+        }
         let fact = NativeExternalFile::observe_held(&file)?;
         let mut facts = inventory.writer_facts(check)?;
         facts.push(fact);
+        if let Some(original) = &original {
+            check_target(&plan, Some(original))?;
+            facts.push(NativeExternalFile::observe_held(original)?);
+        }
         facts.sort_by_key(|f| f.identity());
         if facts.windows(2).any(|w| w[0].identity() == w[1].identity()) {
             return Err("Native outcome identity inventory is ambiguous".into());
@@ -526,6 +582,7 @@ impl<'a, 'lease> OutcomeCore<'a, 'lease> {
             inventory,
             parent,
             file,
+            original,
             published,
             seal,
             fact,
@@ -560,9 +617,12 @@ impl<'a, 'lease> OutcomeCore<'a, 'lease> {
                 .check(&self.file)?;
             absent(&parent.join(self.plan.temporary_name()))?;
         } else {
-            absent(self.plan.target())?;
+            check_target(&self.plan, self.original.as_ref())?;
         }
         facts.push(self.fact);
+        if let Some(original) = &self.original {
+            facts.push(NativeExternalFile::observe_held(original)?);
+        }
         facts.sort_by_key(|f| f.identity());
         if facts != self.facts {
             return Err("Native outcome physical debt changed; reservation retained".into());

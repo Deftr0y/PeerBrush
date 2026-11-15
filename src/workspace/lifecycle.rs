@@ -79,9 +79,7 @@ fn update_project_ready(e: &Engine) -> Result<(), String> {
     }
     if e.file_operations.load(std::sync::atomic::Ordering::Acquire) != 0
         || e.loading.is_some()
-        || e.code_states()
-            .as_array()
-            .is_some_and(|jobs| jobs.iter().any(|job| job["running"] == true))
+        || e.has_running_code()
     {
         return Err(
             "Finish the active file, loading or code operation before restarting for an update"
@@ -317,7 +315,7 @@ mod tests {
         windows_update_readiness(&workspace).unwrap();
         {
             let mut e = shared.lock().unwrap();
-            let layer = e.doc.layers[0].id.clone();
+            let layer = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
             e.edit(
                 "human",
                 &[json!({"op":"fill","layer":layer,"rect":[1,1,2,2],"color":[1,2,3,255]})],
@@ -326,9 +324,9 @@ mod tests {
                 "Keep actual history",
             )
             .unwrap();
-            e.saved_revision = e.doc.revision;
+            e.saved_revision = e.resident_state().expect("resident fixture").document.revision;
         }
-        let before = shared.lock().unwrap().doc.revision;
+        let before = shared.lock().unwrap().resident_state().expect("resident fixture").document.revision;
         assert!(windows_update_readiness(&workspace).is_err());
         let reviewed = update_readiness(&workspace).unwrap();
         assert!(
@@ -339,10 +337,10 @@ mod tests {
         );
         let mut e = shared.lock().unwrap();
         assert!(!e.closed);
-        assert_eq!(e.doc.revision, before);
-        assert_eq!(e.undo.len(), 1);
+        assert_eq!(e.resident_state().expect("resident fixture").document.revision, before);
+        assert_eq!(e.resident_state().expect("resident fixture").undo.len(), 1);
         e.undo("human").unwrap();
-        assert_eq!(e.redo.len(), 1);
+        assert_eq!(e.resident_state().expect("resident fixture").redo.len(), 1);
     }
     #[test]
     fn checkpoint_publication_reuses_atomic_source_and_write_guards_without_closing() {
@@ -353,7 +351,7 @@ mod tests {
         std::fs::create_dir(&directory).unwrap();
         {
             let mut engine = Engine::new();
-            engine.doc = Document::new_depth(8, 6, 8).unwrap();
+            engine.resident_state_mut().expect("resident fixture").document = Document::new_depth(8, 6, 8).unwrap();
             let root = Arc::new(Mutex::new(engine));
             let workspace = attach(&root);
             let second = new_project(&root, 8, 6, 16, None).unwrap();
@@ -365,12 +363,12 @@ mod tests {
             for (shared, path) in projects.into_iter().zip(&paths) {
                 {
                     let mut e = shared.lock().unwrap();
-                    if e.doc.bit_depth == 16 {
-                        e.doc.layers[0].pixels.set16(0, 0, [1001, 3003, 5007, 0]);
+                    if e.resident_state().expect("resident fixture").document.bit_depth == 16 {
+                        e.resident_state_mut().expect("resident fixture").document.layers[0].pixels.set16(0, 0, [1001, 3003, 5007, 0]);
                     } else {
-                        e.doc.layers[0].pixels.set(0, 0, [17, 93, 207, 0]);
+                        e.resident_state_mut().expect("resident fixture").document.layers[0].pixels.set(0, 0, [17, 93, 207, 0]);
                     }
-                    let layer = e.doc.layers[0].id.clone();
+                    let layer = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
                     e.edit("human", &[json!({"op":"fill","layer":layer,"rect":[1,1,3,3],"color":[41,83,127,173]})],None,None,"Keep real undo").unwrap();
                     e.edit(
                         "human",
@@ -381,7 +379,7 @@ mod tests {
                     )
                     .unwrap();
                     e.undo("human").unwrap();
-                    assert!(!e.undo.is_empty() && !e.redo.is_empty());
+                    assert!(!e.resident_state().expect("resident fixture").undo.is_empty() && !e.resident_state().expect("resident fixture").redo.is_empty());
                     e.reserve("human", "Keep human ownership", vec![Scope::layer(&layer)])
                         .unwrap();
                 }
@@ -394,8 +392,8 @@ mod tests {
                     "before":h.before,"after":h.after,"actor":h.actor,"label":h.label,"task":h.task,
                     "scopes":h.scopes,"gesture":h.gesture,"reverted":h.reverted
                 })).collect::<Vec<_>>();
-                assert!(!e.undo.is_empty() && !e.redo.is_empty() && !e.leases.is_empty());
-                json!({"project":e.project_id,"document":e.doc,"undo":history(&e.undo),"redo":history(&e.redo),
+                assert!(!e.resident_state().expect("resident fixture").undo.is_empty() && !e.resident_state().expect("resident fixture").redo.is_empty() && !e.leases.is_empty());
+                json!({"project":e.project_id,"document":e.resident_state().expect("resident fixture").document,"undo":history(&e.resident_state().expect("resident fixture").undo),"redo":history(&e.resident_state().expect("resident fixture").redo),
                     "leases":e.leases,"saved":e.saved_revision,"path":e.path,
                     "closed":e.closed,"file_bytes":std::fs::read(path).unwrap(),
                     "owner_path":e.file_ownership.as_ref().map(|owner|&owner.path),
@@ -483,7 +481,7 @@ mod tests {
     fn update_exit_keeps_original_operation_diagnostics_and_precedence_without_closing_projects() {
         for depth in [8, 16] {
             let mut engine = Engine::new();
-            engine.doc = Document::new_depth(8, 6, depth).unwrap();
+            engine.resident_state_mut().expect("resident fixture").document = Document::new_depth(8, 6, depth).unwrap();
             let root = Arc::new(Mutex::new(engine));
             let workspace = attach(&root);
             let second = new_project(&root, 8, 6, depth, None).unwrap();
@@ -516,7 +514,7 @@ mod tests {
             // retain priority over an in-flight project operation for updates.
             let name = {
                 let mut e = second.lock().unwrap();
-                let layer = e.doc.layers[0].id.clone();
+                let layer = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
                 e.edit(
                     "human",
                     &[json!({"op":"layer.update","layer":layer,"name":"Human work"})],
@@ -525,18 +523,18 @@ mod tests {
                     "Keep human work",
                 )
                 .unwrap();
-                assert_ne!(e.doc.revision, e.saved_revision);
+                assert_ne!(e.resident_state().expect("resident fixture").document.revision, e.saved_revision);
                 reviewed
                     .iter_mut()
                     .find(|row| row.project == project)
                     .unwrap()
-                    .revision = e.doc.revision;
-                e.doc.name.clone()
+                    .revision = e.resident_state().expect("resident fixture").document.revision;
+                e.resident_state().expect("resident fixture").document.name.clone()
             };
             let snapshot = |shared: &Shared| {
                 let e = shared.lock().unwrap();
-                json!({"document":e.doc,"png":e.doc.export_png().unwrap(),
-                    "undo":e.undo.len(),"redo":e.redo.len(),"saved":e.saved_revision,"closed":e.closed})
+                json!({"document":e.resident_state().expect("resident fixture").document,"png":e.resident_state().expect("resident fixture").document.export_png().unwrap(),
+                    "undo":e.resident_state().expect("resident fixture").undo.len(),"redo":e.resident_state().expect("resident fixture").redo.len(),"saved":e.saved_revision,"closed":e.closed})
             };
             let before = snapshot(&second);
             assert_eq!(
@@ -551,7 +549,7 @@ mod tests {
             // Keep the dirty project in the ordinary human path; a fresh saved
             // workspace exercises the original final workspace/recovery guard.
             let root = Arc::new(Mutex::new(Engine::new()));
-            root.lock().unwrap().doc = Document::new_depth(8, 6, depth).unwrap();
+            root.lock().unwrap().resident_state_mut().expect("resident fixture").document = Document::new_depth(8, 6, depth).unwrap();
             let workspace = attach(&root);
             let reviewed = update_readiness(&workspace).unwrap();
             let before = snapshot(&root);
@@ -582,7 +580,7 @@ mod tests {
             for discard in [false, true] {
                 for exit in [false, true] {
                     let mut engine = Engine::new();
-                    engine.doc = Document::new_depth(8, 6, depth).unwrap();
+                    engine.resident_state_mut().expect("resident fixture").document = Document::new_depth(8, 6, depth).unwrap();
                     let root = Arc::new(Mutex::new(engine));
                     let workspace = attach(&root);
                     let second = new_project(&root, 8, 6, depth, None).unwrap();
@@ -590,20 +588,20 @@ mod tests {
                     let mut before = vec![];
                     for shared in [&root, &second] {
                         let mut e = shared.lock().unwrap();
-                        e.doc.layers[0]
+                        e.resident_state_mut().expect("resident fixture").document.layers[0]
                             .pixels
                             .set16(2, 3, [12001, 23003, 34007, 45009]);
                         if discard {
-                            let layer = e.doc.layers[0].id.clone();
+                            let layer = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
                             e.edit("human", &[json!({"op":"layer.update","layer":layer,"name":"Reviewed unsaved source"})], None, None, "Keep work").unwrap();
                         }
                         reviewed.push(Reviewed {
                             project: e.project_id.clone(),
-                            document: e.doc.id.clone(),
-                            revision: e.doc.revision,
+                            document: e.resident_state().expect("resident fixture").document.id.clone(),
+                            revision: e.resident_state().expect("resident fixture").document.revision,
                             discard,
                         });
-                        before.push((e.doc.clone(), e.undo.len(), e.redo.len(), e.saved_revision));
+                        before.push((e.resident_state().expect("resident fixture").document.clone(), e.resident_state().expect("resident fixture").undo.len(), e.resident_state().expect("resident fixture").redo.len(), e.saved_revision));
                     }
                     let close = || {
                         if exit {
@@ -636,9 +634,9 @@ mod tests {
                         assert!(!e.closed);
                         assert_eq!(
                             (
-                                serde_json::to_value(&e.doc).unwrap(),
-                                e.undo.len(),
-                                e.redo.len(),
+                                serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap(),
+                                e.resident_state().expect("resident fixture").undo.len(),
+                                e.resident_state().expect("resident fixture").redo.len(),
                                 e.saved_revision,
                             ),
                             (

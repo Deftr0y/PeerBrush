@@ -7,6 +7,8 @@ use crate::{
     raster::{backed::Region, project16, surface::Surface, TILE},
 };
 use serde_json::Value;
+#[path = "regional_masks/native.rs"]
+pub(crate) mod native;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Frame {
@@ -83,6 +85,9 @@ pub fn prepare<S: Source>(
     if selection.is_some_and(|s| matches!(s, SelectionSource::All)) {
         return Err("Select an area before creating its mask".into());
     }
+    if matches!(selection, Some(SelectionSource::Coverage(coverage)) if !coverage.uses_budget(&pool)) {
+        return Err("Selection source uses a different payload ledger".into());
+    }
     if selection.is_none() && !source.has_mask() {
         return Err("Add a mask before refining it".into());
     }
@@ -94,7 +99,6 @@ pub fn prepare<S: Source>(
     for top in (0..frame.height).step_by(TILE as usize) {
         for left in (0..frame.width).step_by(TILE as usize) {
             check().map_err(|e| e.to_string())?;
-            tile.fill(0);
             let right = (left + TILE).min(frame.width);
             let bottom = (top + TILE).min(frame.height);
             let region = Region::new([left as i32, top as i32, right as i32, bottom as i32])
@@ -109,26 +113,42 @@ pub fn prepare<S: Source>(
             {
                 return Err("Prepared mask differs from captured source footprint".into());
             }
-            let selected = selection
-                .map(|s| {
-                    s.prepare_region(
-                        Region::new([
-                            left as i32 + frame.origin[0],
-                            top as i32 + frame.origin[1],
-                            right as i32 + frame.origin[0],
-                            bottom as i32 + frame.origin[1],
-                        ])?,
-                        &pool,
-                        &mut || check(),
-                    )
-                })
+            let selection_region = selection.map(|_| Region::new([
+                left as i32 + frame.origin[0], top as i32 + frame.origin[1],
+                right as i32 + frame.origin[0], bottom as i32 + frame.origin[1],
+            ])).transpose().map_err(|e| e.to_string())?;
+            if matches!(mode, Combine::Replace | Combine::Intersect)
+                && selection.zip(selection_region).is_some_and(|(selected, region)| !selected.may_cover(region.bounds()))
+            {
+                writer.opaque_black_tile(left / TILE, top / TILE, &mut tile, &mut || check())
+                    .map_err(|e| e.to_string())?;
+                #[cfg(test)]
+                tests::observe_completed_tile();
+                continue;
+            }
+            tile.fill(0);
+            let selected = selection.zip(selection_region)
+                .map(|(s, region)| s.prepare_region(region, &pool, &mut || check()))
                 .transpose()
                 .map_err(|e| e.to_string())?;
+            let width = (right - left) as usize;
+            let mut coverage = [0; TILE as usize];
             for y in top..bottom {
                 check().map_err(|e| e.to_string())?;
+                if let Some(selected) = &selected {
+                    selected.copy_row(y as i32 + frame.origin[1], &mut coverage[..width])
+                        .map_err(|e| e.to_string())?;
+                }
+                let y_in_tile = (y - top) as usize;
+                if selected.is_some() && mode == Combine::Replace {
+                    for (x, &new) in coverage[..width].iter().enumerate() {
+                        put(&mut tile, frame.depth, x, y_in_tile, u16::from(new) * 257, true);
+                    }
+                    continue;
+                }
                 for x in left..right {
-                    // Preserve the existing command's first rounding at65535 BEFORE
-                    // native combination and target-depth projection.
+                    let x_in_tile = (x - left) as usize;
+                    // Round the evaluated mask to native words before combining coverage.
                     let old = if frame.depth == 16 {
                         let value = mask.value16(x as i32, y as i32)?;
                         if !value.is_finite() || !(0.0..=1.0).contains(&value) {
@@ -142,12 +162,8 @@ pub fn prepare<S: Source>(
                         }
                         (value * 65535.).round() as u16
                     };
-                    let value = if let Some(selected) = &selected {
-                        let new = (selected
-                            .value(x as i32 + frame.origin[0], y as i32 + frame.origin[1])
-                            .map_err(|e| e.to_string())?
-                            * 65535.)
-                            .round() as u16;
+                    let value = if selected.is_some() {
+                        let new = u16::from(coverage[x_in_tile]) * 257;
                         match mode {
                             Combine::Replace => new,
                             Combine::Add => old.max(new),
@@ -162,8 +178,8 @@ pub fn prepare<S: Source>(
                     put(
                         &mut tile,
                         frame.depth,
-                        (x - left) as usize,
-                        (y - top) as usize,
+                        x_in_tile,
+                        y_in_tile,
                         value,
                         selection.is_some(),
                     );
@@ -172,6 +188,8 @@ pub fn prepare<S: Source>(
             writer
                 .tile(left / TILE, top / TILE, &tile, &mut || check())
                 .map_err(|e| e.to_string())?;
+            #[cfg(test)]
+            tests::observe_completed_tile();
         }
     }
     drop(tile);
@@ -224,13 +242,18 @@ fn opaque(
     let mut tile = ScratchBytes::new(&store.resident_budget(), n, n).map_err(|e| e.to_string())?;
     for top in (0..input.height()).step_by(TILE as usize) {
         for left in (0..input.width()).step_by(TILE as usize) {
-            tile.fill(0);
             let right = (left + TILE).min(input.width());
             let bottom = (top + TILE).min(input.height());
+            let rect = [left as i32, top as i32, right as i32, bottom as i32];
+            if !input.has_physical_tiles(rect) {
+                writer.opaque_black_tile(left / TILE, top / TILE, &mut tile, &mut || check())
+                    .map_err(|e| e.to_string())?;
+                continue;
+            }
+            tile.fill(0);
             let view = input
                 .prepare_region(
-                    Region::new([left as i32, top as i32, right as i32, bottom as i32])
-                        .map_err(|e| e.to_string())?,
+                    Region::new(rect).map_err(|e| e.to_string())?,
                     &mut || check(),
                 )
                 .map_err(|e| e.to_string())?;
@@ -257,8 +280,39 @@ fn opaque(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+    };
+    thread_local! { static COMPLETED_TILES:RefCell<Option<Rc<Cell<usize>>>>=const {RefCell::new(None)}; }
+    pub(crate) struct CompletedTiles {
+        count: Rc<Cell<usize>>,
+        previous: Option<Rc<Cell<usize>>>,
+    }
+    impl CompletedTiles {
+        pub(crate) fn observe() -> Self {
+            let count = Rc::new(Cell::new(0));
+            let previous = COMPLETED_TILES.with(|slot| slot.replace(Some(count.clone())));
+            Self { count, previous }
+        }
+        pub(crate) fn count(&self) -> usize {
+            self.count.get()
+        }
+    }
+    impl Drop for CompletedTiles {
+        fn drop(&mut self) {
+            COMPLETED_TILES.with(|slot| *slot.borrow_mut() = self.previous.take());
+        }
+    }
+    pub(super) fn observe_completed_tile() {
+        COMPLETED_TILES.with(|slot| {
+            if let Some(count) = slot.borrow().as_ref() {
+                count.set(count.get() + 1);
+            }
+        });
+    }
     use crate::{
         engine::{id, Document, Mask, MaskStep},
         large_document::{Limits, Reservation},

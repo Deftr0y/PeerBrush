@@ -61,6 +61,19 @@ def macos_sparkle_required(sources):
     return required
 
 
+def release_version_order(version):
+    """Compare stable application cores in the order the release lines ship."""
+    major, minor, patch = map(int, version.split('.'))
+    if (major, minor) == (0, 4):
+        return (0, 30, 1, patch)
+    return (major, minor, 0, patch)
+
+
+def macos_bundle_version(version):
+    # The installed build number must advance past 0.30.1.
+    return '1.4.' + version.removeprefix('0.4.') if version.startswith('0.4.') else version
+
+
 def macos_info(version, sparkle=False, check_pins=None, check_layout=False):
     numeric = r'(?:0|[1-9][0-9]*)'
     parsed = re.fullmatch(r'(' + numeric + r'\.' + numeric + r'\.' + numeric + r')(-dev\.' + numeric + r')?', version)
@@ -69,7 +82,7 @@ def macos_info(version, sparkle=False, check_pins=None, check_layout=False):
     info = {'CFBundleIdentifier': 'com.peerbrush.PeerBrush', 'CFBundleName': 'PeerBrush',
             'CFBundleDisplayName': 'PeerBrush', 'CFBundleExecutable': 'peerbrush',
             'CFBundlePackageType': 'APPL', 'CFBundleShortVersionString': parsed[1],
-            'CFBundleVersion': parsed[1], 'LSMinimumSystemVersion': '11.0',
+            'CFBundleVersion': macos_bundle_version(parsed[1]), 'LSMinimumSystemVersion': '11.0',
             'NSHighResolutionCapable': True, 'CFBundleIconFile': 'PeerBrush.icns',
             'CFBundleDocumentTypes': [{'CFBundleTypeName': name, 'CFBundleTypeRole': 'Editor',
                                       'LSHandlerRank': 'Alternate', 'CFBundleTypeIconFile': 'PeerBrush.icns',
@@ -107,8 +120,28 @@ EXTRA_CRATE_NOTICES = {"ring": {
     "LICENSE-BoringSSL", "LICENSE-other-bits", "src/polyfill/once_cell/LICENSE-APACHE",
     "src/polyfill/once_cell/LICENSE-MIT", "third_party/fiat/LICENSE",
 }}
+# These crate archives omit the upstream workspace's license files.
+UPSTREAM_NOTICE_GROUPS = {
+    "accesskit": (
+        {"accesskit-0.17.1", "accesskit_atspi_common-0.10.1", "accesskit_consumer-0.26.0",
+         "accesskit_macos-0.18.1", "accesskit_unix-0.13.1", "accesskit_windows-0.24.1",
+         "accesskit_winit-0.23.1"},
+        ("AUTHORS", "LICENSE-APACHE", "LICENSE-MIT", "LICENSE.chromium"),
+    ),
+    "atspi": ({"atspi-proxies-0.6.0"}, ("LICENSE-APACHE2.txt", "LICENSE-MIT.txt")),
+    "zbus": ({"zbus_xml-4.0.0"}, ("LICENSE-MIT",)),
+}
 NOTICE_NAMES |= {name + suffix for name in tuple(NOTICE_NAMES) for suffix in (".txt", ".md", ".rst")}
 
+
+def upstream_notice_paths(packages):
+    locked = {f"{package['name']}-{package['version']}" for package in packages}
+    return {
+        f"packaging/notices/{group}/{name}": f"licenses/{group}/{name}"
+        for group, (crates, names) in UPSTREAM_NOTICE_GROUPS.items()
+        if locked & crates
+        for name in names
+    }
 
 
 def relative_path(value):
@@ -223,6 +256,11 @@ def dependency_notices(root, bundle, registry, manifest, rust_docs=None):
     notices = bundle / "licenses"
     rows = ["# Third-party notices", "", "Dependencies retain their original licenses. Sources and checksums are pinned by Cargo.lock in the included project source archive. This list covers downloaded dependencies; not every crate is linked into this platform binary.", ""]
     packages = tomllib.loads(regular_file(root, "Cargo.lock").read_text(encoding="utf-8"))["package"]
+    for name, destination in upstream_notice_paths(packages).items():
+        if name not in manifest["source"]:
+            raise ValueError("Missing committed upstream crate notice")
+        copy_file(root, name, bundle / relative_path(destination))
+        rows.append(f"- [{destination}]({destination}) from the pinned upstream source")
     for package in packages:
         if "source" not in package:
             continue

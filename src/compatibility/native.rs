@@ -148,7 +148,7 @@ pub(super) fn report(
         sources
             .try_reserve_exact(8)
             .map_err(|_| "Native save-report source allocation refused")?;
-        if matches!(record.source, RowSource::OriginalLayer(_)) {
+        if matches!(record.source, RowSource::OriginalLayer(_)) && !record.invert && record.tone.is_none() {
             sources.push("original_layer");
         }
         let mut loss = |code, message| {
@@ -158,7 +158,14 @@ pub(super) fn report(
                 message,
             })
         };
-        if layer.effects().len() != 0 {
+        if record.tone.is_some() {
+            if let Some(message) = standard_adjustment_approximation(crate::engine::view::LayerView::Native(layer)) {
+                loss(LossCode::AdjustmentRenderingApproximate, message);
+            }
+        }
+        if layer.effects().len() != 0 && !record.invert && record.tone.is_none()
+            && record.gradient.is_none() && record.pattern.is_none() && record.standard_style.is_none()
+        {
             sources.push("effect_stack");
             if layer
                 .effects()
@@ -176,16 +183,16 @@ pub(super) fn report(
             sources.push("editable_text_vector_source");
             loss(LossCode::EditableSourceRasterized, "Text, vector or path definitions have a standard raster appearance; editable definitions require PeerBrush sources. Photoshop text/vector objects are not written.");
         }
+        if layer.kind() == "fill" && record.solid.is_none() && record.gradient.is_none() && record.pattern.is_none() {
+            sources.push("editable_solid_color");
+            loss(LossCode::EditableSourceRasterized, FILL_RASTERIZED);
+        }
         if let Some(mask) = layer.mask() {
-            sources.extend(["mask_stack", "mask_link"]);
-            if !mask.linked() {
-                loss(LossCode::MaskLinkPrivate, "The unlinked mask choice is retained in PeerBrush sources. Photoshop mask-link editing behavior is not written or verified; another editor may link the mask. Standard mask pixels and the current composite are preserved.");
-            }
-            if mask.steps().len() > 1
-                || mask
-                    .steps()
-                    .any(|s| s.kind() != "paint" || !s.enabled() || s.weight() != 1.)
-            {
+            sources.push("mask_stack");
+            if mask_steps_baked(
+                MaskView::Native(mask), record.mask.is_some(),
+                record.mask.is_some_and(|mask| mask.density.is_some()),
+            ) {
                 loss(LossCode::MaskStackBaked, "Mask steps are combined into a standard raster mask. Editable step settings require PeerBrush sources.");
             }
         }
@@ -206,6 +213,14 @@ pub(super) fn report(
             parent: layer.parent().map(Into::into),
             standard: if record.section == 1 {
                 Representation::Folder
+            } else if record.invert || record.tone.is_some() {
+                Representation::Adjustment
+            } else if record.solid.is_some() {
+                Representation::SolidColor
+            } else if record.gradient.is_some() {
+                Representation::GradientFill
+            } else if record.pattern.is_some() {
+                Representation::PatternFill
             } else {
                 Representation::Raster
             },

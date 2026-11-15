@@ -5,7 +5,7 @@ pub(crate) mod input;
 pub(crate) mod native;
 use crate::{
     engine::{Document, Layer},
-    raster::{blend, check_size, Pixel, Raster, TILE},
+    raster::{blend, check_size, project16, Pixel16, Raster, TILE},
 };
 use serde_json::Value;
 use std::{collections::btree_map::Entry, sync::Arc};
@@ -13,7 +13,7 @@ use std::{collections::btree_map::Entry, sync::Arc};
 fn fill_tiles(
     raster: &mut Raster,
     area: [i32; 4],
-    color: Pixel,
+    color: Pixel16,
     origin: [i32; 2],
     polygon: Option<&[[f32; 2]]>,
 ) {
@@ -22,22 +22,16 @@ fn fill_tiles(
 fn fill_tiles_mode(
     raster: &mut Raster,
     area: [i32; 4],
-    color: Pixel,
+    color: Pixel16,
     origin: [i32; 2],
     polygon: Option<&[[f32; 2]]>,
     literal: bool,
 ) {
     if raster.depth == 16 {
-        fill_tiles16(
-            raster,
-            area,
-            color.map(|v| v as u16 * 257),
-            origin,
-            polygon,
-            literal,
-        );
+        fill_tiles16(raster, area, color, origin, polygon, literal);
         return;
     }
+    let color = color.map(project16);
     if color[3] == 0 && !literal {
         return;
     }
@@ -187,7 +181,10 @@ fn fill_tiles16(
 /// source and pixels for one undo record; this helper never records history.
 pub(crate) fn prepare_visual_baseline(doc: &mut Document, command: &Value) -> Result<(), String> {
     let op = command["op"].as_str().unwrap_or("");
-    if !matches!(op, "paint.fill" | "paint.clear_selection") || command["mask"] == true {
+    let selected_fill = op == "fill" && doc.selection.is_some();
+    if (!matches!(op, "paint.fill" | "paint.clear_selection") && !selected_fill)
+        || command["mask"] == true
+    {
         return Ok(());
     }
     if op == "paint.clear_selection" && doc.selection.is_none_or(|r| r[0] >= r[2] || r[1] >= r[3]) {
@@ -247,10 +244,24 @@ pub(crate) fn materialize_visual_layer(layer: &mut Layer) -> Result<(), String> 
     }
     let mut pixels = Raster::new_depth(layer.pixels.width, layer.pixels.height, layer.pixels.depth);
     let area = [0, 0, pixels.width as i32, pixels.height as i32];
-    fill_tiles_mode(&mut pixels, area, layer.color, [0, 0], None, true);
+    fill_tiles_mode(&mut pixels, area, layer.color.map(expand_byte), [0, 0], None, true);
     layer.pixels = pixels;
     layer.kind = "paint".into();
     Ok(())
+}
+
+fn expand_byte(value: u8) -> u16 {
+    u16::from(value) * 257
+}
+
+fn foreground_color(command: &Value, depth: u16) -> Result<Pixel16, String> {
+    if command.get("color16").is_none() {
+        let values = command["color"].as_array().ok_or("Fill color must be RGBA")?;
+        if values.len() != 4 || values.iter().any(|v| v.as_u64().is_none_or(|n| n > 255)) {
+            return Err("Fill color must contain four byte values".into());
+        }
+    }
+    crate::engine::raster_color(command, depth)
 }
 
 pub fn apply(doc: &mut Document, command: &Value) -> Result<(), String> {
@@ -260,6 +271,7 @@ pub fn apply(doc: &mut Document, command: &Value) -> Result<(), String> {
         .iter()
         .position(|l| l.id == target)
         .ok_or("Layer no longer exists")?;
+    let color = foreground_color(command, doc.bit_depth)?;
     let mut area = command
         .get("rect")
         .and_then(crate::engine::rect)
@@ -282,18 +294,6 @@ pub fn apply(doc: &mut Document, command: &Value) -> Result<(), String> {
     if area[0] >= area[2] || area[1] >= area[3] {
         return Ok(());
     }
-    let values = command["color"]
-        .as_array()
-        .ok_or("Fill color must be RGBA")?;
-    if values.len() != 4 || values.iter().any(|v| v.as_u64().is_none_or(|v| v > 255)) {
-        return Err("Fill color must contain four byte values".into());
-    }
-    let mut color: Pixel = [
-        values[0].as_u64().unwrap() as u8,
-        values[1].as_u64().unwrap() as u8,
-        values[2].as_u64().unwrap() as u8,
-        values[3].as_u64().unwrap() as u8,
-    ];
     let mask = command["mask"].as_bool().unwrap_or(false);
     let polygon = crate::selection::polygon(doc).map(Vec::from);
     if doc.layers[index].kind == "group" && !mask {
@@ -307,22 +307,10 @@ pub fn apply(doc: &mut Document, command: &Value) -> Result<(), String> {
         doc.layers.insert(index + 1, child);
         return Ok(());
     }
-    if mask {
-        color = [color[0], color[0], color[0], color[3]];
-    }
     let layer = &mut doc.layers[index];
     let mask_step = if mask {
         let m = layer.mask.as_ref().ok_or("Layer has no mask")?;
-        Some(
-            if let Some(step) = command.get("step").and_then(Value::as_str) {
-                m.steps
-                    .iter()
-                    .position(|s| s.id == step && s.kind == "paint")
-            } else {
-                m.steps.iter().rposition(|s| s.kind == "paint")
-            }
-            .ok_or("Add a paint step to the mask")?,
-        )
+        Some(crate::mask::paint_step_index(m, command.get("step").and_then(Value::as_str))?)
     } else {
         None
     };
@@ -338,7 +326,7 @@ pub fn apply(doc: &mut Document, command: &Value) -> Result<(), String> {
     // Legacy fill sources remain intact until an explicit raster edit needs materialized pixels.
     if layer.kind == "fill" && (!mask || expanded) {
         let bounds = [0, 0, layer.pixels.width as i32, layer.pixels.height as i32];
-        fill_tiles(&mut layer.pixels, bounds, layer.color, [0, 0], None);
+        fill_tiles(&mut layer.pixels, bounds, layer.color.map(expand_byte), [0, 0], None);
         layer.kind = "paint".into();
     }
     if expanded {
@@ -411,7 +399,7 @@ pub fn clear_selection(doc: &mut Document, command: &Value) -> Result<(), String
         }
         if !mask && layer.kind == "fill" {
             let area = [0, 0, layer.pixels.width as i32, layer.pixels.height as i32];
-            fill_tiles(&mut layer.pixels, area, layer.color, [0, 0], None);
+            fill_tiles(&mut layer.pixels, area, layer.color.map(expand_byte), [0, 0], None);
             layer.kind = "paint".into();
         }
         let (ox, oy) = (layer.x, layer.y);

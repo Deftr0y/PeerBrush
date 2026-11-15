@@ -219,6 +219,19 @@ impl Panel {
             .open(&mut open).resizable(true).default_width(480.).show(ctx, |ui| {
                 ui.label(format!("Installed version {}", env!("CARGO_PKG_VERSION")));
                 ui.label(self.owner.description());
+                match self.owner {
+                    Owner::ScoopPackage => {
+                        ui.monospace("scoop update peerbrush");
+                    }
+                    Owner::HomebrewPackage => {
+                        ui.monospace("brew upgrade --cask peerbrush");
+                    }
+                    Owner::NixPackage => {
+                        ui.label("For a Nix profile install, find the package name, then upgrade it.");
+                        ui.monospace("nix profile list\nnix profile upgrade <name>");
+                    }
+                    _ => {}
+                }
                 #[cfg(target_os = "macos")]
                 {
                     let message = self.native_updater.message();
@@ -328,14 +341,18 @@ impl Panel {
                 let mut preferences = self.store.preferences.clone();
                 ui.add_enabled_ui(self.store.error.is_none() && self.receiver.is_none(), |ui| {
                     ui.checkbox(&mut preferences.automatic_checks, "Check official releases daily");
-                    ui.horizontal(|ui| {
-                        ui.label("Channel");
-                        egui::ComboBox::from_id_salt("update_channel")
-                            .selected_text(match preferences.channel { Channel::Stable => "Stable", Channel::Preview => "Preview" })
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut preferences.channel, Channel::Stable, "Stable");
-                                ui.selectable_value(&mut preferences.channel, Channel::Preview, "Preview, including prereleases");
-                            });
+                    ui.horizontal_wrapped(|ui| {
+                        controls::label(ui, "Release channel");
+                        for (channel, icon, label, help) in [
+                            (Channel::Stable, Icon::Check, "Stable", "Check published stable releases."),
+                            (Channel::Preview, Icon::Eye, "Preview, including prereleases", "Check published stable releases and prereleases."),
+                        ] {
+                            if icons::labeled_choice(ui, icon, label, Some(preferences.channel == channel), 0.)
+                                .on_hover_text(help).clicked()
+                            {
+                                preferences.channel = channel;
+                            }
+                        }
                     });
                 });
                 if preferences != self.store.preferences {
@@ -597,6 +614,9 @@ impl PeerBrush {
         self.updates.tick(ctx, idle);
     }
     pub(super) fn update_interaction_active(&self) -> bool {
+        self.interaction_active(self.source_editor.is_some())
+    }
+    pub(super) fn interaction_active(&self, source_active: bool) -> bool {
         self.busy
             || self.connecting
             || !self.jobs.is_empty()
@@ -609,7 +629,7 @@ impl PeerBrush {
             || self.parameter_gesture.is_some()
             || self.live_gesture.is_some()
             || !self.points.is_empty()
-            || !self.selection_path.is_empty()
+            || self.selection_path_pending()
             || self.gizmo_handle != 0
             || self.layer_drag.is_some()
             || self.eye_sweep.is_some()
@@ -617,7 +637,7 @@ impl PeerBrush {
             || self.tab_transfer_committing
             || self.free_transform.is_some()
             || self.geometry.is_some()
-            || self.source_editor.is_some()
+            || source_active
             || self.filter_editor.is_some()
             || self.refinement.is_some()
             || self.rename_edit.is_some()
@@ -683,7 +703,16 @@ mod tests {
 
     #[test]
     fn actual_menu_preference_channel_and_later_clicks_persist_without_changing_artwork() {
-        for (depth, owner) in [(8, Owner::Direct), (16, Owner::WindowsAppInstaller)] {
+        for (depth, owner) in [
+            (8, Owner::Direct),
+            (16, Owner::WindowsAppInstaller),
+            (8, Owner::NixPackage),
+            (16, Owner::NixPackage),
+            (8, Owner::ScoopPackage),
+            (16, Owner::ScoopPackage),
+            (8, Owner::HomebrewPackage),
+            (16, Owner::HomebrewPackage),
+        ] {
             let directory =
                 std::env::temp_dir().join(format!("pb-update-controls-{}", crate::engine::id()));
             std::fs::create_dir(&directory).unwrap();
@@ -701,14 +730,14 @@ mod tests {
                 .unwrap();
             {
                 let mut engine = app.shared.lock().unwrap();
-                engine.doc = Document::new_depth(32, 24, depth).unwrap();
-                app.selected = engine.doc.layers[0].id.clone();
+                engine.resident_state_mut().expect("resident fixture").document = Document::new_depth(32, 24, depth).unwrap();
+                app.selected = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
                 for point in [[8, 8], [16, 16]] {
                     engine.edit("human", &[json!({"op":"paint","layer":app.selected,"points":[point],"radius":3,"color":[233,84,32,255]})], None, None, "Existing stroke").unwrap();
                 }
                 engine.undo("human").unwrap();
             }
-            let before = serde_json::to_value(&app.shared.lock().unwrap().doc).unwrap();
+            let before = serde_json::to_value(&app.shared.lock().unwrap().resident_state().expect("resident fixture").document).unwrap();
             let frame = |app: &mut PeerBrush, events| {
                 ctx.run(
                     egui::RawInput {
@@ -752,11 +781,7 @@ mod tests {
             );
             assert!(app.updates.store.preferences.automatic_checks);
             let output = frame(&mut app, vec![]);
-            frame(
-                &mut app,
-                click(label(&output, "Stable").expect("Actual channel selector")),
-            );
-            let output = frame(&mut app, vec![]);
+            assert!(label(&output, "Stable").is_some());
             frame(
                 &mut app,
                 click(
@@ -781,8 +806,8 @@ mod tests {
             assert!(reloaded.preferences.automatic_checks);
             assert_eq!(reloaded.preferences.channel, Channel::Preview);
             let engine = app.shared.lock().unwrap();
-            assert_eq!(serde_json::to_value(&engine.doc).unwrap(), before);
-            assert_eq!((engine.undo.len(), engine.redo.len()), (1, 1));
+            assert_eq!(serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap(), before);
+            assert_eq!((engine.resident_state().expect("resident fixture").undo.len(), engine.resident_state().expect("resident fixture").redo.len()), (1, 1));
             assert!(!engine.closed);
             drop(engine);
             std::fs::remove_dir_all(directory).unwrap();
@@ -822,7 +847,7 @@ mod tests {
         let (mut app, ctx) = super::super::tests::fixture();
         {
             let mut engine = app.shared.lock().unwrap();
-            let layer = engine.doc.layers[0].id.clone();
+            let layer = engine.resident_state().unwrap().document.layers[0].id.clone();
             engine
                 .edit(
                     "human",
@@ -833,7 +858,9 @@ mod tests {
                 )
                 .unwrap();
         }
-        let before = serde_json::to_value(&app.shared.lock().unwrap().doc).unwrap();
+        let before = serde_json::to_value(
+            &app.shared.lock().unwrap().resident_state().unwrap().document,
+        ).unwrap();
         app.updates.native_updater.queue_verification_for_test(&ctx);
         app.request_close(super::super::lifecycle::Intent::Exit);
         assert!(app.lifecycle.is_some());
@@ -851,8 +878,9 @@ mod tests {
         assert!(app.updates.native_updater.view().cancelled);
         let engine = app.shared.lock().unwrap();
         assert!(!engine.closed);
-        assert_eq!(serde_json::to_value(&engine.doc).unwrap(), before);
-        assert_eq!(engine.undo.len(), 1);
+        let resident = engine.resident_state().unwrap();
+        assert_eq!(serde_json::to_value(&resident.document).unwrap(), before);
+        assert_eq!(resident.undo.len(), 1);
     }
 
     fn newer_report() -> Report {
@@ -878,15 +906,15 @@ mod tests {
             app.updates = Panel::load(&directory);
             {
                 let mut engine = app.shared.lock().unwrap();
-                engine.doc = Document::new_depth(16, 16, depth).unwrap();
-                let layer = engine.doc.layers[0].id.clone();
+                engine.resident_state_mut().expect("resident fixture").document = Document::new_depth(16, 16, depth).unwrap();
+                let layer = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
                 engine.edit("human", &[json!({"op":"paint","layer":layer,"points":[[8,8]],"radius":3,"color":[233,84,32,255]})], None, None, "Unsaved human stroke").unwrap();
             }
             let (before, history) = {
                 let engine = app.shared.lock().unwrap();
                 (
-                    serde_json::to_value(&engine.doc).unwrap(),
-                    engine.undo.len(),
+                    serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap(),
+                    engine.resident_state().expect("resident fixture").undo.len(),
                 )
             };
             assert!(crate::workspace::lifecycle::update_readiness(&app.workspace).is_err());
@@ -917,8 +945,8 @@ mod tests {
             let _ = ctx.run(Default::default(), |ctx| app.updates_tick(ctx));
             assert!(app.updates.open);
             let engine = app.shared.lock().unwrap();
-            assert_eq!(serde_json::to_value(&engine.doc).unwrap(), before);
-            assert_eq!(engine.undo.len(), history);
+            assert_eq!(serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap(), before);
+            assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), history);
             assert!(!engine.closed);
             drop(engine);
             std::fs::remove_dir_all(directory).unwrap();
@@ -929,13 +957,13 @@ mod tests {
     fn update_dialog_and_live_gesture_blocker_preserve_native_artwork_and_history() {
         for depth in [8, 16] {
             let (mut app, ctx) = super::super::tests::fixture();
-            app.shared.lock().unwrap().doc = Document::new_depth(16, 16, depth).unwrap();
+            app.shared.lock().unwrap().resident_state_mut().expect("resident fixture").document = Document::new_depth(16, 16, depth).unwrap();
             let (before, revision, history) = {
                 let engine = app.shared.lock().unwrap();
                 (
-                    engine.doc.export_png().unwrap(),
-                    engine.doc.revision,
-                    engine.undo.len(),
+                    engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
+                    engine.resident_state().expect("resident fixture").document.revision,
+                    engine.resident_state().expect("resident fixture").undo.len(),
                 )
             };
             assert!(app.update_restart_blocker().is_none());
@@ -956,9 +984,9 @@ mod tests {
                 |ctx| app.updates_dialog(ctx),
             );
             let engine = app.shared.lock().unwrap();
-            assert_eq!(engine.doc.export_png().unwrap(), before);
-            assert_eq!(engine.doc.revision, revision);
-            assert_eq!(engine.undo.len(), history);
+            assert_eq!(engine.resident_state().expect("resident fixture").document.export_png().unwrap(), before);
+            assert_eq!(engine.resident_state().expect("resident fixture").document.revision, revision);
+            assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), history);
             assert!(!engine.closed);
         }
     }

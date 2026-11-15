@@ -1,14 +1,14 @@
 //! Disjoint preview rows use bounded CPU parallelism while effect workers retain headroom.
+pub(crate) mod mask_thumbnail;
 pub(crate) mod native_preview;
 pub(crate) mod region;
+pub(crate) mod sample;
+pub(crate) mod magnetic;
 use crate::raster::{Pixel, Pixel16};
+pub(crate) type Check<'a> = dyn Fn() -> Result<(), String> + Sync + 'a;
+
 pub(crate) fn rgba8(width: u32, height: u32, sample: impl Fn(u32, u32) -> Pixel + Sync) -> Vec<u8> {
-    let mut bytes = vec![0; width as usize * height as usize * 4];
-    if width != 0 && height != 0 {
-        area8(&mut bytes, width, [0, 0, width, height], sample)
-            .expect("Valid full preview dimensions");
-    }
-    bytes
+    rgba(width, height, &|| Ok(()), sample).expect("Valid full preview dimensions")
 }
 
 pub(crate) fn rgba16(
@@ -16,12 +16,21 @@ pub(crate) fn rgba16(
     height: u32,
     sample: impl Fn(u32, u32) -> Pixel16 + Sync,
 ) -> Vec<u16> {
-    let mut words = vec![0; width as usize * height as usize * 4];
+    rgba(width, height, &|| Ok(()), sample).expect("Valid full preview dimensions")
+}
+
+pub(crate) fn rgba<T: Copy + Default + Send>(
+    width: u32,
+    height: u32,
+    check: &Check<'_>,
+    sample: impl Fn(u32, u32) -> [T; 4] + Sync,
+) -> Result<Vec<T>, String> {
+    check()?;
+    let mut data = vec![T::default(); width as usize * height as usize * 4];
     if width != 0 && height != 0 {
-        area(&mut words, width, [0, 0, width, height], sample)
-            .expect("Valid full preview dimensions");
+        area(&mut data, width, [0, 0, width, height], check, sample)?;
     }
-    words
+    Ok(data)
 }
 
 /// Update a rectangle on the original sample grid, leaving all other bytes intact.
@@ -29,15 +38,17 @@ pub(crate) fn area8(
     bytes: &mut [u8],
     width: u32,
     bounds: [u32; 4],
+    check: &Check<'_>,
     sample: impl Fn(u32, u32) -> Pixel + Sync,
 ) -> Result<(), String> {
-    area(bytes, width, bounds, sample)
+    area(bytes, width, bounds, check, sample)
 }
 
 fn area<T: Copy + Send>(
     data: &mut [T],
     width: u32,
     bounds: [u32; 4],
+    check: &Check<'_>,
     sample: impl Fn(u32, u32) -> [T; 4] + Sync,
 ) -> Result<(), String> {
     let stride = (width as usize)
@@ -64,10 +75,12 @@ fn area<T: Copy + Send>(
     let rows = ((bounds[3] - bounds[1]) as usize).div_ceil(workers).max(1);
     let region = &mut data[bounds[1] as usize * stride..bounds[3] as usize * stride];
     std::thread::scope(|scope| {
+        let mut jobs = Vec::new();
         for (index, chunk) in region.chunks_mut(rows * stride).enumerate() {
             let sample = &sample;
             let mut fill = move || {
                 for (row, data) in chunk.chunks_mut(stride).enumerate() {
+                    check()?;
                     let y = bounds[1] + (index * rows + row) as u32;
                     for (x, pixel) in data[bounds[0] as usize * 4..bounds[2] as usize * 4]
                         .chunks_exact_mut(4)
@@ -76,20 +89,49 @@ fn area<T: Copy + Send>(
                         pixel.copy_from_slice(&sample(bounds[0] + x as u32, y));
                     }
                 }
+                Ok::<_, String>(())
             };
             if workers == 1 {
-                fill();
+                fill()?;
             } else {
-                scope.spawn(fill);
+                jobs.push(scope.spawn(fill));
             }
         }
-    });
-    Ok(())
+        for job in jobs {
+            job.join().expect("Preview row worker panicked")?;
+        }
+        check()
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn superseded_rgba_rows_stop_without_returning_a_partial_frame() {
+        let edge = 512;
+        for depth in [8, 16] {
+            let samples = AtomicUsize::new(0);
+            let check = || {
+                if samples.load(Ordering::SeqCst) == 0 {
+                    Ok(())
+                } else {
+                    Err("Superseded frame".into())
+                }
+            };
+            let note_sample = || { samples.fetch_add(1, Ordering::SeqCst); };
+            let result = if depth == 8 {
+                rgba(edge, edge, &check, |_, _| { note_sample(); [19u8; 4] }).map(drop)
+            } else {
+                rgba(edge, edge, &check, |_, _| { note_sample(); [23459u16; 4] }).map(drop)
+            };
+            assert_eq!(result.unwrap_err(), "Superseded frame");
+            assert!((1..=edge as usize * 4).contains(&samples.load(Ordering::SeqCst)));
+        }
+    }
+
     #[test]
     fn parallel_regions_match_serial_coordinates_and_preserve_outside_pixels() {
         let (w, h) = (517, 523);
@@ -104,10 +146,10 @@ mod tests {
                 expected[at..at + 4].copy_from_slice(&sample(x, y));
             }
         }
-        area8(&mut got, w, bounds, sample).unwrap();
+        area8(&mut got, w, bounds, &|| Ok(()), sample).unwrap();
         assert_eq!(got, expected);
         let before = got.clone();
-        assert!(area8(&mut got, w, [0, 0, w, h + 1], sample).is_err());
+        assert!(area8(&mut got, w, [0, 0, w, h + 1], &|| Ok(()), sample).is_err());
         assert_eq!(got, before);
     }
     #[test]

@@ -5,10 +5,148 @@ use peerbrush::{
 use serde_json::json;
 fn setup() -> (Engine, String) {
     let mut e = Engine::new();
-    e.doc = Document::new(32, 24).unwrap();
-    let id = e.doc.layers[0].id.clone();
-    e.doc.layers[0].pixels.set(5, 6, [200, 70, 20, 255]);
+    e.resident_state_mut().expect("resident fixture").document = Document::new(32, 24).unwrap();
+    let id = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
+    e.resident_state_mut().expect("resident fixture").document.layers[0].pixels.set(5, 6, [200, 70, 20, 255]);
     (e, id)
+}
+
+#[test]
+fn image_paste_keeps_clipping_units_intact_and_reserves_selection_and_moved_layers() {
+    use peerbrush::engine::{Layer, Scope};
+    for nested in [false, true] {
+        for target in ["base", "clip"] {
+            let mut engine = Engine::new();
+            engine.resident_state_mut().expect("resident fixture").document = Document::new_depth(8, 8, 16).unwrap();
+            let base = &mut engine.resident_state_mut().expect("resident fixture").document.layers[0];
+            base.id = "base".into();
+            base.name = "Base".into();
+            base.blend = "multiply".into();
+            let mut clip = Layer::new("Clip", "paint", 8, 8);
+            clip.id = "clip".into();
+            clip.clip_to = Some("base".into());
+            clip.pixels = peerbrush::raster::Raster::new_depth(8, 8, 16);
+            engine.resident_state_mut().expect("resident fixture").document.layers.insert(0, clip);
+            if nested {
+                for l in &mut engine.resident_state_mut().expect("resident fixture").document.layers {
+                    l.parent = Some("folder".into());
+                }
+                let mut folder = Layer::new("Folder", "group", 8, 8);
+                folder.id = "folder".into();
+                folder.pixels = peerbrush::raster::Raster::new_depth(8, 8, 16);
+                engine.resident_state_mut().expect("resident fixture").document.layers.insert(0, folder);
+            }
+            engine.resident_state_mut().expect("resident fixture").document.selection = Some([1, 1, 3, 3]);
+            let image = Image {
+                width: 1,
+                height: 1,
+                bytes: vec![255; 4],
+                samples16: None,
+                origin: Some([-1, 2]),
+            };
+            let command = image.command(target).unwrap();
+            let before = engine.resident_state().expect("resident fixture").document.clone();
+            for reserved in ["@selection", "base", "clip"] {
+                let lease = engine
+                    .reserve("other", "Keep work", vec![Scope::layer(reserved)])
+                    .unwrap();
+                assert!(engine
+                    .edit("human", &[command.clone()], None, None, "Paste")
+                    .unwrap_err()
+                    .contains("Reserved"));
+                assert_eq!(
+                    serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap(),
+                    serde_json::to_value(&before).unwrap()
+                );
+                engine.leases.retain(|l| l.id != lease.id);
+            }
+            if !nested {
+                for locked in ["base", "clip"] {
+                    engine
+                        .resident_state_mut().expect("resident fixture").document
+                        .layers
+                        .iter_mut()
+                        .find(|l| l.id == locked)
+                        .unwrap()
+                        .locked = true;
+                    assert!(clipboard::paste(&mut engine.resident_state_mut().expect("resident fixture").document, &command)
+                        .unwrap_err()
+                        .contains("Unlock"));
+                    engine
+                        .resident_state_mut().expect("resident fixture").document
+                        .layers
+                        .iter_mut()
+                        .find(|l| l.id == locked)
+                        .unwrap()
+                        .locked = false;
+                }
+            }
+            engine
+                .edit("human", &[command], None, None, "Paste")
+                .unwrap();
+            peerbrush::psd::validate(&engine.resident_state().expect("resident fixture").document).unwrap();
+            let base = engine
+                .resident_state().expect("resident fixture").document
+                .layers
+                .iter()
+                .position(|l| l.id == "base")
+                .unwrap();
+            let clip = engine
+                .resident_state().expect("resident fixture").document
+                .layers
+                .iter()
+                .position(|l| l.id == "clip")
+                .unwrap();
+            assert_eq!(base, clip + 1);
+            assert_eq!(engine.resident_state().expect("resident fixture").document.layers[clip - 1].name, "Pasted image");
+            assert_eq!(
+                engine.resident_state().expect("resident fixture").document.layers[clip].parent,
+                engine.resident_state().expect("resident fixture").document.layers[base].parent
+            );
+            assert_eq!(engine.resident_state().expect("resident fixture").document.layers[clip].clip_to.as_deref(), Some("base"));
+            assert!(engine.resident_state().expect("resident fixture").document.selection.is_none());
+            engine.undo("human").unwrap();
+            assert_eq!(
+                serde_json::to_value(&engine.resident_state().expect("resident fixture").document.layers).unwrap(),
+                serde_json::to_value(&before.layers).unwrap()
+            );
+            assert_eq!(engine.resident_state().expect("resident fixture").document.selection, before.selection);
+        }
+    }
+}
+
+#[test]
+fn image_paste_rejects_cyclic_or_overdeep_ancestors_before_decoding() {
+    use peerbrush::engine::Layer;
+    let mut doc = Document::new(1, 1).unwrap();
+    doc.layers[0].id = "leaf".into();
+    for index in 0..16 {
+        let mut folder = Layer::new("Folder", "group", 1, 1);
+        folder.id = format!("g{index}");
+        doc.layers.last_mut().unwrap().parent = Some(folder.id.clone());
+        doc.layers.push(folder);
+    }
+    let image = Image {
+        width: 1,
+        height: 1,
+        bytes: vec![255; 4],
+        samples16: None,
+        origin: None,
+    };
+    let valid = image.command("leaf").unwrap();
+    let mut good = doc.clone();
+    clipboard::paste(&mut good, &valid).unwrap();
+    doc.layers.last_mut().unwrap().parent = Some("leaf".into());
+    assert!(clipboard::paste(&mut doc, &valid)
+        .unwrap_err()
+        .contains("nesting"));
+    let mut extra = Layer::new("Extra", "group", 1, 1);
+    extra.id = "extra".into();
+    doc.layers.last_mut().unwrap().parent = Some(extra.id.clone());
+    doc.layers.push(extra);
+    assert!(clipboard::paste(&mut doc, &valid)
+        .unwrap_err()
+        .contains("nesting"));
 }
 #[test]
 fn copy_area_bakes_color_and_mask_then_pastes_at_its_position_with_one_undo() {
@@ -24,10 +162,10 @@ fn copy_area_bakes_color_and_mask_then_pastes_at_its_position_with_one_undo() {
         "setup",
     )
     .unwrap();
-    e.doc.selection = Some([4, 5, 8, 9]);
-    e.undo.clear();
-    let before = e.doc.clone();
-    let image = Image::copy(&e.doc, &id, false, false).unwrap();
+    e.resident_state_mut().expect("resident fixture").document.selection = Some([4, 5, 8, 9]);
+    e.resident_state_mut().expect("resident fixture").undo.clear();
+    let before = e.resident_state().expect("resident fixture").document.clone();
+    let image = Image::copy(&e.resident_state().expect("resident fixture").document, &id, false, false).unwrap();
     assert_eq!(
         (image.width, image.height, image.origin),
         (4, 4, Some([4, 5]))
@@ -37,23 +175,23 @@ fn copy_area_bakes_color_and_mask_then_pastes_at_its_position_with_one_undo() {
         .edit("human", &[image.command(&id).unwrap()], None, None, "Paste")
         .unwrap();
     assert_eq!(result["created"].as_array().unwrap().len(), 2);
-    let folder = &e.doc.layers[0];
-    let pasted = &e.doc.layers[1];
+    let folder = &e.resident_state().expect("resident fixture").document.layers[0];
+    let pasted = &e.resident_state().expect("resident fixture").document.layers[1];
     assert_eq!(folder.kind, "group");
     assert_eq!(pasted.kind, "paint");
     assert_eq!(pasted.parent.as_deref(), Some(folder.id.as_str()));
-    assert_eq!(e.doc.layers[2].parent, pasted.parent);
+    assert_eq!(e.resident_state().expect("resident fixture").document.layers[2].parent, pasted.parent);
     assert_eq!((pasted.x, pasted.y), (4, 5));
     assert_eq!(pasted.pixels.get(1, 1), [55, 185, 235, 128]);
-    assert!(e.doc.selection.is_none());
-    assert_eq!(e.undo.len(), 1);
+    assert!(e.resident_state().expect("resident fixture").document.selection.is_none());
+    assert_eq!(e.resident_state().expect("resident fixture").undo.len(), 1);
     e.undo("human").unwrap();
-    assert_eq!(e.doc.layers.len(), 1);
-    assert!(e.doc.layers[0].parent.is_none());
-    assert_eq!(e.doc.selection, before.selection);
+    assert_eq!(e.resident_state().expect("resident fixture").document.layers.len(), 1);
+    assert!(e.resident_state().expect("resident fixture").document.layers[0].parent.is_none());
+    assert_eq!(e.resident_state().expect("resident fixture").document.selection, before.selection);
     e.redo("human").unwrap();
-    assert_eq!(e.doc.layers.len(), 3);
-    let round = peerbrush::psd::decode(&peerbrush::psd::encode(&e.doc).unwrap()).unwrap();
+    assert_eq!(e.resident_state().expect("resident fixture").document.layers.len(), 3);
+    let round = peerbrush::psd::decode(&peerbrush::psd::encode(&e.resident_state().expect("resident fixture").document).unwrap()).unwrap();
     assert_eq!(round.layers[1].pixels.get(1, 1), [55, 185, 235, 128]);
 }
 #[test]
@@ -67,7 +205,7 @@ fn external_image_centers_in_selected_folder_and_sibling_paste_keeps_parent() {
         "Folder",
     )
     .unwrap();
-    let group = e.doc.layers[0].id.clone();
+    let group = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
     let image = Image {
         width: 2,
         height: 2,
@@ -83,9 +221,9 @@ fn external_image_centers_in_selected_folder_and_sibling_paste_keeps_parent() {
         "Paste",
     )
     .unwrap();
-    let pasted = e.doc.layers[1].id.clone();
-    assert_eq!((e.doc.layers[1].x, e.doc.layers[1].y), (15, 11));
-    assert_eq!(e.doc.layers[1].parent.as_deref(), Some(group.as_str()));
+    let pasted = e.resident_state().expect("resident fixture").document.layers[1].id.clone();
+    assert_eq!((e.resident_state().expect("resident fixture").document.layers[1].x, e.resident_state().expect("resident fixture").document.layers[1].y), (15, 11));
+    assert_eq!(e.resident_state().expect("resident fixture").document.layers[1].parent.as_deref(), Some(group.as_str()));
     e.edit(
         "human",
         &[image.command(&pasted).unwrap()],
@@ -94,10 +232,10 @@ fn external_image_centers_in_selected_folder_and_sibling_paste_keeps_parent() {
         "Paste",
     )
     .unwrap();
-    assert_eq!(e.doc.layers.len(), 4);
-    assert_eq!(e.doc.layers[1].parent.as_deref(), Some(group.as_str()));
+    assert_eq!(e.resident_state().expect("resident fixture").document.layers.len(), 4);
+    assert_eq!(e.resident_state().expect("resident fixture").document.layers[1].parent.as_deref(), Some(group.as_str()));
     assert!(e
-        .doc
+        .resident_state().expect("resident fixture").document
         .layers
         .iter()
         .find(|l| l.id == id)
@@ -116,11 +254,11 @@ fn paste_obeys_locks_reservations_revisions_and_rolls_back_invalid_pixels() {
         samples16: None,
     };
     let command = image.command(&id).unwrap();
-    e.doc.layers[0].locked = true;
+    e.resident_state_mut().expect("resident fixture").document.layers[0].locked = true;
     assert!(e
         .edit("human", &[command.clone()], None, None, "Paste")
         .is_err());
-    e.doc.layers[0].locked = false;
+    e.resident_state_mut().expect("resident fixture").document.layers[0].locked = false;
     let lease = e
         .reserve("AI", "paint", vec![peerbrush::engine::Scope::layer(&id)])
         .unwrap();
@@ -137,9 +275,9 @@ fn paste_obeys_locks_reservations_revisions_and_rolls_back_invalid_pixels() {
             "Paste"
         )
         .is_err());
-    assert_eq!(e.doc.layers.len(), 1);
-    assert_eq!(e.doc.revision, 0);
-    assert!(e.undo.is_empty());
+    assert_eq!(e.resident_state().expect("resident fixture").document.layers.len(), 1);
+    assert_eq!(e.resident_state().expect("resident fixture").document.revision, 0);
+    assert!(e.resident_state().expect("resident fixture").undo.is_empty());
     e.edit(
         "AI",
         &[json!({"op":"layer.update","layer":id,"opacity":0.5})],
@@ -149,21 +287,21 @@ fn paste_obeys_locks_reservations_revisions_and_rolls_back_invalid_pixels() {
     )
     .unwrap();
     assert!(e.edit("human", &[command], Some(0), None, "Paste").is_err());
-    assert_eq!(e.doc.layers.len(), 1);
+    assert_eq!(e.resident_state().expect("resident fixture").document.layers.len(), 1);
 }
 #[test]
 fn merged_copy_uses_composite_and_rejects_an_empty_selection() {
     let (mut e, id) = setup();
-    e.doc.selection = Some([4, 5, 8, 9]);
-    let copied = Image::copy(&e.doc, &id, false, true).unwrap();
+    e.resident_state_mut().expect("resident fixture").document.selection = Some([4, 5, 8, 9]);
+    let copied = Image::copy(&e.resident_state().expect("resident fixture").document, &id, false, true).unwrap();
     assert_eq!(
         copied.bytes,
-        e.doc.preview(e.doc.selection, 8192, None, false).unwrap().2
+        e.resident_state().expect("resident fixture").document.preview(e.resident_state().expect("resident fixture").document.selection, 8192, None, false).unwrap().2
     );
-    e.doc.selection = Some([4, 5, 4, 9]);
-    assert!(Image::copy(&e.doc, &id, false, false).is_err());
+    e.resident_state_mut().expect("resident fixture").document.selection = Some([4, 5, 4, 9]);
+    assert!(Image::copy(&e.resident_state().expect("resident fixture").document, &id, false, false).is_err());
     // Validate arbitrary incoming bytes before any source grouping is changed.
-    let mut doc = e.doc.clone();
+    let mut doc = e.resident_state().expect("resident fixture").document.clone();
     assert!(clipboard::paste(
         &mut doc,
         &json!({"op":"image.paste","layer":id,"png":"bad"})
@@ -191,8 +329,8 @@ fn windows_clipboard_transports_preserve_pixels_precision_ownership_and_atomic_p
     let station = isolated_clipboard::Station::new();
     let mut native = arboard::Clipboard::new().unwrap();
     let (mut e, id) = setup();
-    e.doc.selection = Some([4, 5, 8, 9]);
-    let expected = Image::copy(&e.doc, &id, false, false).unwrap();
+    e.resident_state_mut().expect("resident fixture").document.selection = Some([4, 5, 8, 9]);
+    let expected = Image::copy(&e.resident_state().expect("resident fixture").document, &id, false, false).unwrap();
     let worker = clipboard::Worker::new(eframe::egui::Context::default());
     let dimensions = |size| {
         let sequence = clipboard_win::seq_num();
@@ -206,7 +344,7 @@ fn windows_clipboard_transports_preserve_pixels_precision_ownership_and_atomic_p
     assert_eq!(clipboard_win::seq_num(), sequence);
     worker
         .request(clipboard::Request::Copy {
-            doc: e.doc.clone(),
+            doc: e.resident_state().expect("resident fixture").document.clone(),
             target: id.clone(),
             mask: false,
             merged: false,
@@ -232,7 +370,7 @@ fn windows_clipboard_transports_preserve_pixels_precision_ownership_and_atomic_p
         .unwrap();
     dimensions([3, 2]);
     let shared = Arc::new(Mutex::new(e));
-    let document = shared.lock().unwrap().doc.id.clone();
+    let document = shared.lock().unwrap().resident_state().expect("resident fixture").document.id.clone();
     worker
         .request(clipboard::Request::Paste {
             document,
@@ -245,23 +383,23 @@ fn windows_clipboard_transports_preserve_pixels_precision_ownership_and_atomic_p
     reply.result.unwrap();
     let e = shared.lock().unwrap();
     let layer = e
-        .doc
+        .resident_state().expect("resident fixture").document
         .layers
         .iter()
         .find(|l| Some(&l.id) == reply.selected.as_ref())
         .unwrap();
     assert_eq!((layer.x, layer.y), (14, 11));
     assert_eq!(layer.pixels.rgba(), pixels);
-    assert_eq!(e.undo.len(), 1);
+    assert_eq!(e.resident_state().expect("resident fixture").undo.len(), 1);
     drop(e);
     let paste = |target: &str| {
         let e = shared.lock().unwrap();
         worker
             .request(clipboard::Request::Paste {
-                document: e.doc.id.clone(),
+                document: e.resident_state().expect("resident fixture").document.id.clone(),
                 shared: shared.clone(),
                 target: target.into(),
-                revision: e.doc.revision,
+                revision: e.resident_state().expect("resident fixture").document.revision,
             })
             .unwrap();
         drop(e);
@@ -273,7 +411,7 @@ fn windows_clipboard_transports_preserve_pixels_precision_ownership_and_atomic_p
     let root = shared
         .lock()
         .unwrap()
-        .doc
+        .resident_state().expect("resident fixture").document
         .layers
         .iter()
         .find(|l| l.name == "Paint 1")
@@ -281,7 +419,7 @@ fn windows_clipboard_transports_preserve_pixels_precision_ownership_and_atomic_p
         .id
         .clone();
     undo();
-    let baseline = shared.lock().unwrap().doc.clone();
+    let baseline = shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
 
     // An old 24-bit CF_DIB bitmap, without a file header or registered PNG.
     let mut dib = vec![0u8; 40];
@@ -304,7 +442,7 @@ fn windows_clipboard_transports_preserve_pixels_precision_ownership_and_atomic_p
         shared
             .lock()
             .unwrap()
-            .doc
+            .resident_state().expect("resident fixture").document
             .layers
             .iter()
             .find(|l| Some(&l.id) == reply.selected.as_ref())
@@ -328,25 +466,25 @@ fn windows_clipboard_transports_preserve_pixels_precision_ownership_and_atomic_p
     reply.result.unwrap();
     {
         let e = shared.lock().unwrap();
-        assert_eq!(e.doc.bit_depth, 16);
-        assert!(e.doc.layers.iter().all(|l| l.pixels.depth == 16));
+        assert_eq!(e.resident_state().expect("resident fixture").document.bit_depth, 16);
+        assert!(e.resident_state().expect("resident fixture").document.layers.iter().all(|l| l.pixels.depth == 16));
         let l = e
-            .doc
+            .resident_state().expect("resident fixture").document
             .layers
             .iter()
             .find(|l| Some(&l.id) == reply.selected.as_ref())
             .unwrap();
         assert_eq!(l.pixels.rgba16(), words);
         assert_eq!((l.x, l.y), (15, 11));
-        let loaded = peerbrush::psd::decode(&peerbrush::psd::encode(&e.doc).unwrap()).unwrap();
-        assert_eq!(loaded.export_png().unwrap(), e.doc.export_png().unwrap());
+        let loaded = peerbrush::psd::decode(&peerbrush::psd::encode(&e.resident_state().expect("resident fixture").document).unwrap()).unwrap();
+        assert_eq!(loaded.export_png().unwrap(), e.resident_state().expect("resident fixture").document.export_png().unwrap());
     }
     undo();
     assert_eq!(
-        shared.lock().unwrap().doc.export_png().unwrap(),
+        shared.lock().unwrap().resident_state().expect("resident fixture").document.export_png().unwrap(),
         baseline.export_png().unwrap()
     );
-    assert_eq!(shared.lock().unwrap().doc.bit_depth, 8);
+    assert_eq!(shared.lock().unwrap().resident_state().expect("resident fixture").document.bit_depth, 8);
 
     // Explorer-style image file copying uses CF_HDROP, including batches.
     let file =
@@ -362,7 +500,7 @@ fn windows_clipboard_transports_preserve_pixels_precision_ownership_and_atomic_p
         shared
             .lock()
             .unwrap()
-            .doc
+            .resident_state().expect("resident fixture").document
             .layers
             .iter()
             .find(|l| Some(&l.id) == reply.selected.as_ref())
@@ -376,11 +514,11 @@ fn windows_clipboard_transports_preserve_pixels_precision_ownership_and_atomic_p
     let reply = paste(&root);
     reply.result.unwrap();
     assert_eq!(reply.selected_layers.len(), 2);
-    assert_eq!(shared.lock().unwrap().undo.len(), 1);
+    assert_eq!(shared.lock().unwrap().resident_state().expect("resident fixture").undo.len(), 1);
     assert!(reply.selected_layers.iter().all(|id| shared
         .lock()
         .unwrap()
-        .doc
+        .resident_state().expect("resident fixture").document
         .layers
         .iter()
         .find(|l| l.id == *id)
@@ -393,10 +531,10 @@ fn windows_clipboard_transports_preserve_pixels_precision_ownership_and_atomic_p
     let reply = paste(&root);
     assert!(reply.result.is_err());
     assert_eq!(
-        shared.lock().unwrap().doc.export_png().unwrap(),
+        shared.lock().unwrap().resident_state().expect("resident fixture").document.export_png().unwrap(),
         baseline.export_png().unwrap()
     );
-    assert!(shared.lock().unwrap().undo.is_empty());
+    assert!(shared.lock().unwrap().resident_state().expect("resident fixture").undo.is_empty());
     std::fs::remove_file(file).unwrap();
     std::fs::remove_file(bad).unwrap();
 
@@ -404,14 +542,14 @@ fn windows_clipboard_transports_preserve_pixels_precision_ownership_and_atomic_p
     // An external copy of identical display bytes must supersede that cache.
     let native_copy = {
         let mut e = shared.lock().unwrap();
-        e.doc = Document::new_depth(32, 24, 16).unwrap();
-        e.doc.layers[0]
+        e.resident_state_mut().expect("resident fixture").document = Document::new_depth(32, 24, 16).unwrap();
+        e.resident_state_mut().expect("resident fixture").document.layers[0]
             .pixels
             .set16(5, 6, [12347, 23459, 34571, 40001]);
-        e.doc.selection = Some([4, 5, 8, 9]);
-        Image::copy(&e.doc, &e.doc.layers[0].id, false, false).unwrap()
+        e.resident_state_mut().expect("resident fixture").document.selection = Some([4, 5, 8, 9]);
+        Image::copy(&e.resident_state().expect("resident fixture").document, &e.resident_state().expect("resident fixture").document.layers[0].id, false, false).unwrap()
     };
-    let doc = shared.lock().unwrap().doc.clone();
+    let doc = shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
     let root = doc.layers[0].id.clone();
     worker
         .request(clipboard::Request::Copy {
@@ -428,7 +566,7 @@ fn windows_clipboard_transports_preserve_pixels_precision_ownership_and_atomic_p
     {
         let e = shared.lock().unwrap();
         let l = e
-            .doc
+            .resident_state().expect("resident fixture").document
             .layers
             .iter()
             .find(|l| Some(&l.id) == reply.selected.as_ref())
@@ -448,7 +586,7 @@ fn windows_clipboard_transports_preserve_pixels_precision_ownership_and_atomic_p
     reply.result.unwrap();
     let e = shared.lock().unwrap();
     let l = e
-        .doc
+        .resident_state().expect("resident fixture").document
         .layers
         .iter()
         .find(|l| Some(&l.id) == reply.selected.as_ref())
@@ -501,15 +639,15 @@ fn windows_clipboard_cut_keeps_native_sources_placement_and_separate_undo() {
     let worker = clipboard::Worker::default();
     for depth in [8, 16] {
         let mut engine = Engine::new();
-        engine.doc = Document::new_depth(32, 24, depth).unwrap();
-        engine.doc.layers[0]
+        engine.resident_state_mut().expect("resident fixture").document = Document::new_depth(32, 24, depth).unwrap();
+        engine.resident_state_mut().expect("resident fixture").document.layers[0]
             .pixels
             .set16(5, 6, [12347, 23459, 34571, 40001]);
-        engine.doc.layers[0]
+        engine.resident_state_mut().expect("resident fixture").document.layers[0]
             .pixels
             .set16(20, 10, [54321, 32109, 10987, 65535]);
-        engine.doc.selection = Some([4, 5, 8, 9]);
-        let before = engine.doc.clone();
+        engine.resident_state_mut().expect("resident fixture").document.selection = Some([4, 5, 8, 9]);
+        let before = engine.resident_state().expect("resident fixture").document.clone();
         let target = before.layers[0].id.clone();
         let expected = Image::copy(&before, &target, false, false).unwrap();
         let shared = Arc::new(Mutex::new(engine));
@@ -525,13 +663,13 @@ fn windows_clipboard_cut_keeps_native_sources_placement_and_separate_undo() {
         station.receive(&worker.replies).result.unwrap();
         let revision = {
             let engine = shared.lock().unwrap();
-            assert_eq!(engine.doc.layers[0].pixels.get16(5, 6), [0; 4]);
+            assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].pixels.get16(5, 6), [0; 4]);
             assert_eq!(
-                engine.doc.layers[0].pixels.get16(20, 10),
+                engine.resident_state().expect("resident fixture").document.layers[0].pixels.get16(20, 10),
                 before.layers[0].pixels.get16(20, 10)
             );
-            assert_eq!(engine.undo.len(), 1);
-            engine.doc.revision
+            assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), 1);
+            engine.resident_state().expect("resident fixture").document.revision
         };
         let sequence = clipboard_win::seq_num();
         let size = worker.image_dimensions().unwrap();
@@ -549,7 +687,7 @@ fn windows_clipboard_cut_keeps_native_sources_placement_and_separate_undo() {
         reply.result.unwrap();
         let mut engine = shared.lock().unwrap();
         let pasted = engine
-            .doc
+            .resident_state().expect("resident fixture").document
             .layers
             .iter()
             .find(|layer| Some(&layer.id) == reply.selected.as_ref())
@@ -559,26 +697,26 @@ fn windows_clipboard_cut_keeps_native_sources_placement_and_separate_undo() {
         if depth == 16 {
             assert_eq!(pasted.pixels.rgba16(), expected.samples16.unwrap());
         }
-        assert_eq!(engine.undo.len(), 2);
-        let pasted_png = engine.doc.export_png().unwrap();
+        assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), 2);
+        let pasted_png = engine.resident_state().expect("resident fixture").document.export_png().unwrap();
         let reopened =
-            peerbrush::psd::decode(&peerbrush::psd::encode(&engine.doc).unwrap()).unwrap();
+            peerbrush::psd::decode(&peerbrush::psd::encode(&engine.resident_state().expect("resident fixture").document).unwrap()).unwrap();
         assert_eq!(reopened.export_png().unwrap(), pasted_png);
         engine.undo("human").unwrap();
-        assert_eq!(engine.doc.layers.len(), 1);
-        assert_eq!(engine.doc.layers[0].pixels.get16(5, 6), [0; 4]);
+        assert_eq!(engine.resident_state().expect("resident fixture").document.layers.len(), 1);
+        assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].pixels.get16(5, 6), [0; 4]);
         engine.undo("human").unwrap();
         assert_eq!(
-            serde_json::to_value(&engine.doc.layers).unwrap(),
+            serde_json::to_value(&engine.resident_state().expect("resident fixture").document.layers).unwrap(),
             serde_json::to_value(&before.layers).unwrap()
         );
         assert_eq!(
-            engine.doc.export_png().unwrap(),
+            engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
             before.export_png().unwrap()
         );
         engine.redo("human").unwrap();
         engine.redo("human").unwrap();
-        assert_eq!(engine.doc.export_png().unwrap(), pasted_png);
+        assert_eq!(engine.resident_state().expect("resident fixture").document.export_png().unwrap(), pasted_png);
     }
 }
 
@@ -596,8 +734,8 @@ fn native16_image_paste_promotes_existing_sources_atomically_and_undoes_depth() 
         "Sources",
     )
     .unwrap();
-    e.undo.clear();
-    let before = e.doc.clone();
+    e.resident_state_mut().expect("resident fixture").undo.clear();
+    let before = e.resident_state().expect("resident fixture").document.clone();
     assert!(before.layers[0].pixels.retained.is_some());
     let words = vec![12347, 23459, 34571, 40001];
     let image = Image {
@@ -613,23 +751,23 @@ fn native16_image_paste_promotes_existing_sources_atomically_and_undoes_depth() 
     };
     let mut invalid = image.command(&id).unwrap();
     invalid["origin"] = json!([1.5, 0]);
-    assert!(clipboard::paste(&mut e.doc, &invalid).is_err());
+    assert!(clipboard::paste(&mut e.resident_state_mut().expect("resident fixture").document, &invalid).is_err());
     assert_eq!(
-        serde_json::to_value(&e.doc).unwrap(),
+        serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap(),
         serde_json::to_value(&before).unwrap()
     );
     e.edit(
         "human",
         &[image.command(&id).unwrap()],
-        Some(e.doc.revision),
+        Some(e.resident_state().expect("resident fixture").document.revision),
         None,
         "Paste",
     )
     .unwrap();
-    assert_eq!(e.doc.bit_depth, 16);
-    assert_eq!(e.doc.layers[1].pixels.rgba16(), words);
-    assert!(e.doc.layers.iter().all(|l| l.pixels.depth == 16));
-    let old = e.doc.layers.iter().find(|l| l.id == id).unwrap();
+    assert_eq!(e.resident_state().expect("resident fixture").document.bit_depth, 16);
+    assert_eq!(e.resident_state().expect("resident fixture").document.layers[1].pixels.rgba16(), words);
+    assert!(e.resident_state().expect("resident fixture").document.layers.iter().all(|l| l.pixels.depth == 16));
+    let old = e.resident_state().expect("resident fixture").document.layers.iter().find(|l| l.id == id).unwrap();
     let original = &before.layers[0];
     assert_eq!(
         old.pixels.rgba16(),
@@ -653,9 +791,9 @@ fn native16_image_paste_promotes_existing_sources_atomically_and_undoes_depth() 
         .as_ref()
         .is_some_and(|r| r.pixels.depth == 16));
     e.undo("human").unwrap();
-    assert_eq!(e.doc.bit_depth, 8);
+    assert_eq!(e.resident_state().expect("resident fixture").document.bit_depth, 8);
     assert_eq!(
-        serde_json::to_value(&e.doc.layers).unwrap(),
+        serde_json::to_value(&e.resident_state().expect("resident fixture").document.layers).unwrap(),
         serde_json::to_value(&before.layers).unwrap()
     );
 }
@@ -687,18 +825,18 @@ fn image_paste_into_empty_document_never_redirects_a_stale_nonempty_target() {
         "Delete",
     )
     .unwrap();
-    let before = e.doc.clone();
+    let before = e.resident_state().expect("resident fixture").document.clone();
     e.edit(
         "human",
         &[image.command(&id).unwrap()],
-        Some(e.doc.revision),
+        Some(e.resident_state().expect("resident fixture").document.revision),
         None,
         "Paste",
     )
     .unwrap();
-    assert_eq!(e.doc.layers.len(), 1);
-    assert!(e.doc.layers[0].parent.is_none());
-    assert_eq!(e.doc.layers[0].pixels.rgba(), image.bytes);
+    assert_eq!(e.resident_state().expect("resident fixture").document.layers.len(), 1);
+    assert!(e.resident_state().expect("resident fixture").document.layers[0].parent.is_none());
+    assert_eq!(e.resident_state().expect("resident fixture").document.layers[0].pixels.rgba(), image.bytes);
     e.undo("human").unwrap();
-    assert_eq!(e.doc.layers.len(), before.layers.len());
+    assert_eq!(e.resident_state().expect("resident fixture").document.layers.len(), before.layers.len());
 }

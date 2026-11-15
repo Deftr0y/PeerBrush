@@ -1,12 +1,19 @@
 pub(crate) mod authority;
 pub mod backed;
+mod document_settings;
+mod image_patch;
+pub(crate) use image_patch::precision as image_patch_precision;
 pub mod native;
+pub(crate) mod primitive;
+pub(crate) mod report;
 pub(crate) mod reframe_scope;
 pub(crate) mod runtime_value;
 pub use runtime_value::RuntimeValue;
+pub use authority::ResidentAuthority;
+pub use report::StateCapture;
 pub mod scene;
 pub(crate) mod view;
-use crate::raster::{blend, check_size, Pixel, Raster};
+use crate::raster::{blend, Pixel, Raster};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -141,6 +148,7 @@ impl Layer {
                     v = v * (1.0 - a) + p[0] as f32 * a;
                 }
                 "invert" => v = 255.0 - v,
+                "density" => v = f32::from(crate::mask::density_sample(f64::from(v), step.value, 255)),
                 "levels" => {
                     v = ((v / 255.0).powf(step.value.clamp(0.1, 5.0)) * 255.0).clamp(0.0, 255.0)
                 }
@@ -170,9 +178,37 @@ pub struct Document {
     pub icc_profile: Option<std::sync::Arc<Vec<u8>>>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub srgb_tagged: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub psd_intentionally_untagged: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub psd_rgb8_multiply: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub psd_resolution: Option<[u8; 16]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub psd_print_scale: Option<[u8; 14]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub psd_pixel_aspect: Option<[u8; 12]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub psd_grid: Option<[u8; 16]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub psd_layer_id_seed: Option<[u8; 4]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub psd_print_flags: Option<[u8; 9]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub psd_print_flags_info: Option<[u8; 10]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub psd_copyright: Option<[u8; 1]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub psd_file_info: Option<std::sync::Arc<Vec<u8>>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub psd_global_angle: Option<[u8; 4]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub psd_global_altitude: Option<[u8; 4]>,
     /// Preferred per-layer Photoshop mask settings, retained as standard data.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub psd_global_mask: Option<crate::psd::GlobalMaskSettings>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub psd_global_metadata: Vec<crate::psd::GlobalMetadata>,
     pub layers: Vec<Layer>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub filters: Vec<crate::effects::Effect>,
@@ -197,7 +233,14 @@ pub struct Document {
 }
 impl Document {
     pub fn new(w: u32, h: u32) -> Result<Self, String> {
-        check_size(w, h)?;
+        Self::new_with_limits(w, h, crate::raster::CanvasLimits::Resident)
+    }
+    pub(crate) fn new_with_limits(
+        w: u32,
+        h: u32,
+        limits: crate::raster::CanvasLimits,
+    ) -> Result<Self, String> {
+        limits.check(w, h)?;
         Ok(Self {
             id: id(),
             name: "Untitled.psd".into(),
@@ -207,7 +250,21 @@ impl Document {
             bit_depth: 8,
             icc_profile: None,
             srgb_tagged: false,
+            psd_intentionally_untagged: false,
+            psd_rgb8_multiply: false,
+            psd_resolution: None,
+            psd_print_scale: None,
+            psd_pixel_aspect: None,
+            psd_grid: None,
+            psd_layer_id_seed: None,
+            psd_print_flags: None,
+            psd_print_flags_info: None,
+            psd_copyright: None,
+            psd_file_info: None,
+            psd_global_angle: None,
+            psd_global_altitude: None,
             psd_global_mask: None,
+            psd_global_metadata: vec![],
             layers: vec![Layer::new("Paint 1", "paint", w, h)],
             filters: vec![],
             selection: None,
@@ -256,7 +313,7 @@ impl Document {
                 }
             }
         }
-        if self.layers.iter().any(|l| {
+        if !self.psd_intentionally_untagged && self.layers.iter().any(|l| {
             l.effects
                 .iter()
                 .any(|e| crate::effects::patterns::active(&e.kind, &e.settings))
@@ -271,19 +328,34 @@ impl Document {
         target: Option<&str>,
         mask: bool,
     ) -> Result<(u32, u32, Vec<u8>, [i32; 4]), String> {
+        self.preview_checked(rect, edge, target, mask, &|| Ok(()))
+    }
+    pub(crate) fn preview_checked(
+        &self,
+        rect: Option<[i32; 4]>,
+        edge: u32,
+        target: Option<&str>,
+        mask: bool,
+        check: &crate::render::Check<'_>,
+    ) -> Result<(u32, u32, Vec<u8>, [i32; 4]), String> {
         if self.bit_depth == 16 {
-            return crate::depth16::preview(self, rect, edge, target, mask);
+            return crate::depth16::preview_checked(self, rect, edge, target, mask, check);
         }
-        let (w, h, mut bytes, rect) = self.preview_native8(rect, edge, target, mask)?;
+        let (w, h, mut bytes, rect) = self.preview_native8_checked(rect, edge, target, mask, check)?;
         if !mask {
             if let Some(profile) = self.icc_profile.as_deref() {
                 // Unsupported profiles retain raw feedback with a visible warning.
                 // Explicit conversion uses the strict, fallible path instead.
                 if crate::color_profile::supported(profile).is_ok() {
-                    crate::color_profile::convert8(profile, &mut bytes)?;
+                    // Keep CMS row boundaries identical to the native renderer.
+                    for row in bytes.chunks_exact_mut(w as usize * 4) {
+                        check()?;
+                        crate::color_profile::convert8(profile, row)?;
+                    }
                 }
             }
         }
+        check()?;
         Ok((w, h, bytes, rect))
     }
     pub(crate) fn preview_native8(
@@ -293,6 +365,17 @@ impl Document {
         target: Option<&str>,
         mask: bool,
     ) -> Result<(u32, u32, Vec<u8>, [i32; 4]), String> {
+        self.preview_native8_checked(rect, edge, target, mask, &|| Ok(()))
+    }
+    pub(crate) fn preview_native8_checked(
+        &self,
+        rect: Option<[i32; 4]>,
+        edge: u32,
+        target: Option<&str>,
+        mask: bool,
+        check: &crate::render::Check<'_>,
+    ) -> Result<(u32, u32, Vec<u8>, [i32; 4]), String> {
+        check()?;
         let mut rect = rect.unwrap_or([0, 0, self.width as i32, self.height as i32]);
         rect[0] = rect[0].clamp(0, self.width as i32 - 1);
         rect[1] = rect[1].clamp(0, self.height as i32 - 1);
@@ -304,13 +387,13 @@ impl Document {
         let w = ((rw as f32 * scale).round() as u32).max(1);
         let h = ((rh as f32 * scale).round() as u32).max(1);
         if target.is_none() && !mask && crate::filters::active(self) {
-            let image = crate::filters::prepare8(self)?;
-            let bytes = crate::render::rgba8(w, h, |x, y| {
+            let image = crate::filters::prepare8_checked(self, check)?;
+            let bytes = crate::render::rgba(w, h, check, |x, y| {
                 image.get(
                     rect[0] + (x as f32 / scale) as i32,
                     rect[1] + (y as f32 / scale) as i32,
                 )
-            });
+            })?;
             return Ok((w, h, bytes, rect));
         }
         let layer = if let Some(target) = target {
@@ -323,19 +406,21 @@ impl Document {
         } else {
             None
         };
-        crate::mask::validate_budget(&self.layers)?;
-        let prepared: Vec<_> = self
-            .layers
-            .iter()
-            .map(|l| {
-                l.mask
-                    .as_ref()
-                    .and_then(|m| m.prepare(l.pixels.width, l.pixels.height))
-            })
-            .collect();
-        let colors = crate::effects::prepare(self, &prepared)?;
+        if let Some(layer) = layer.filter(|_| mask) {
+            let prepared = crate::mask::prepare_layers(std::slice::from_ref(layer), check)?;
+            let bytes = crate::render::rgba(w, h, check, |x, y| {
+                let sx = rect[0] + (x as f32 / scale) as i32;
+                let sy = rect[1] + (y as f32 / scale) as i32;
+                let gray = (layer.mask_value_prepared(sx - layer.x, sy - layer.y, prepared[0].as_deref(), true) * 255.) as u8;
+                [gray, gray, gray, 255]
+            })?;
+            return Ok((w, h, bytes, rect));
+        }
+        let prepared = crate::mask::prepare_layers(&self.layers, check)?;
+        let colors = crate::effects::prepare_checked(self, &prepared, check)?;
+        check()?;
         // Downsampled whole-document previews only; full-resolution export stays on the CPU.
-        if target.is_none() && !mask && scale < 1.0 {
+        if target.is_none() && !mask && scale < 1.0 && !self.psd_rgb8_multiply {
             let xs: Vec<_> = (0..w)
                 .map(|x| rect[0] + (x as f32 / scale) as i32)
                 .collect();
@@ -343,25 +428,18 @@ impl Document {
                 .map(|y| rect[1] + (y as f32 / scale) as i32)
                 .collect();
             if let Some(bytes) = crate::gpu::composite::try_render(self, &colors, &xs, &ys) {
+                check()?;
                 return Ok((w, h, bytes, rect));
             }
         }
         let target_index = target.and_then(|id| self.layers.iter().position(|l| l.id == id));
         let plan = crate::compositor::Plan::new(self, &prepared, &colors);
         let root = plan.group(None);
-        let bytes = crate::render::rgba8(w, h, |x, y| {
+        let bytes = crate::render::rgba(w, h, check, |x, y| {
             let sx = rect[0] + (x as f32 / scale) as i32;
             let sy = rect[1] + (y as f32 / scale) as i32;
             let p = if let Some(l) = layer {
-                if mask {
-                    let m = (l.mask_value_prepared(
-                        sx - l.x,
-                        sy - l.y,
-                        target_index.and_then(|i| prepared[i].as_deref()),
-                        true,
-                    ) * 255.0) as u8;
-                    [m, m, m, 255]
-                } else if let Some(image) = target_index.and_then(|i| colors[i].as_ref()) {
+                if let Some(image) = target_index.and_then(|i| colors[i].as_ref()) {
                     if crate::effects::canvas_frame(l) {
                         image.get(sx, sy)
                     } else {
@@ -386,7 +464,7 @@ impl Document {
                 plan.sample(root, sx, sy)
             };
             p
-        });
+        })?;
         Ok((w, h, bytes, rect))
     }
     pub fn export_png(&self) -> Result<Vec<u8>, String> {
@@ -451,27 +529,24 @@ pub struct AiChange {
     pub scopes: Vec<Scope>,
     pub at: u64,
 }
-#[derive(Clone)]
 pub struct Engine {
     pub project_id: String,
     pub closed: bool,
     pub(crate) workspace: Option<std::sync::Weak<std::sync::Mutex<crate::workspace::Workspace>>>,
     pub(crate) workspace_owner:
         Option<std::sync::Arc<std::sync::Mutex<crate::workspace::Workspace>>>,
-    pub doc: Document,
+    pub(crate) authority: authority::DocumentAuthority,
     pub leases: Vec<Lease>,
-    pub undo: Vec<History>,
-    pub redo: Vec<History>,
-    pub(crate) truncated_tasks: BTreeSet<(String, String)>,
     pub changes: Vec<(u64, Vec<Scope>)>,
     pub saved_revision: u64,
-    /// Runtime I/O survives engine clones; never serialized into project sources.
+    /// Runtime I/O is shared with workers; never serialized into project sources.
     pub(crate) file_operations: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     pub feedback: BTreeMap<String, String>,
     pub path: Option<std::path::PathBuf>,
     pub status: runtime_value::RuntimeValue<String>,
     pub file_version: Option<crate::file_safety::Version>,
     pub(crate) file_ownership: Option<std::sync::Arc<crate::file_ownership::Ownership>>,
+    pub(crate) file_state_charge: Option<std::sync::Arc<crate::psd::memory36::MetadataCharge>>,
     pub capture_ui: Option<std::path::PathBuf>,
     /// A human-requested native close review; never serialized into documents.
     pub native_close_review: Option<(String, u64)>,
@@ -492,14 +567,81 @@ pub struct Engine {
     pub(crate) recent_tasks: Vec<crate::collaboration::TaskRecord>,
     pub(crate) code_jobs: Vec<crate::code::Job>,
 }
+/// Resident rollback only. Runtime services, file ownership and proposal owners
+/// stay with their one live Engine throughout a cross-project transaction.
+pub(crate) struct ResidentCheckpoint {
+    document: Document,
+    undo: Vec<History>,
+    redo: Vec<History>,
+    truncated: BTreeSet<(String, String)>,
+    changes: Vec<(u64, Vec<Scope>)>,
+    leases: Vec<Lease>,
+    ai_change: Option<runtime_value::RuntimeValue<AiChange>>,
+    ai_serial: u64,
+    status: runtime_value::RuntimeValue<String>,
+}
+impl ResidentCheckpoint {
+    pub(crate) fn restore(self, engine: &mut Engine) -> Result<(), String> {
+        let state = engine.authority.resident_state_mut()?;
+        state.document = self.document;
+        state.undo = self.undo;
+        state.redo = self.redo;
+        state.truncated_tasks = self.truncated;
+        engine.changes = self.changes;
+        for lease in &mut engine.leases {
+            if let Some(before) = self
+                .leases
+                .iter()
+                .find(|before| before.id == lease.id && before.owner == lease.owner)
+            {
+                lease.expires = lease.expires.min(before.expires);
+            }
+        }
+        engine.ai_change = self.ai_change;
+        engine.ai_serial = self.ai_serial;
+        engine.status = if self.status.starts_with("Reserved by")
+            && self.leases.iter().any(|before| {
+                !engine
+                    .leases
+                    .iter()
+                    .any(|lease| before.id == lease.id && before.owner == lease.owner)
+            }) {
+            "Reservation released · ready to edit".into()
+        } else {
+            self.status
+        };
+        engine.expire();
+        Ok(())
+    }
+}
 impl Engine {
+    pub(crate) fn resident_checkpoint(&self) -> Result<ResidentCheckpoint, String> {
+        let state = self.authority.resident_state()?;
+        Ok(ResidentCheckpoint {
+            document: state.document.clone(),
+            undo: state.undo.clone(),
+            redo: state.redo.clone(),
+            truncated: state.truncated_tasks.clone(),
+            changes: self.changes.clone(),
+            leases: self.leases.clone(),
+            ai_change: self.ai_change.clone(),
+            ai_serial: self.ai_serial,
+            status: self.status.clone(),
+        })
+    }
     /// An explicit resident-only route. Native callers must use a captured
     /// source/metadata view and a prepared worker instead of materializing pixels.
     pub(crate) fn resident(&self) -> Result<&Document, String> {
-        Ok(&self.doc)
+        self.authority.resident()
+    }
+    pub fn resident_state(&self) -> Result<&ResidentAuthority, String> {
+        self.authority.resident_state()
+    }
+    pub fn resident_state_mut(&mut self) -> Result<&mut ResidentAuthority, String> {
+        self.authority.resident_state_mut()
     }
     pub(crate) fn into_resident_document(self) -> Result<Document, String> {
-        Ok(self.doc)
+        Ok(self.authority.into_resident()?.document)
     }
     /// Isolated edit against the captured revision. Keep the live write guards
     /// and preset resolution; the draft needs no earlier history or file owner.
@@ -514,34 +656,39 @@ impl Engine {
         Ok(draft)
     }
     pub(crate) fn doc_snapshot(&self) -> view::DocumentSnapshot {
-        self.doc.clone().into()
+        self.authority.snapshot()
     }
     pub(crate) fn history_lengths(&self) -> [usize; 2] {
-        [self.undo.len(), self.redo.len()]
+        self.authority.history_lengths()
     }
     pub(crate) fn history_entries(&self) -> authority::HistoryEntries<'_> {
-        authority::HistoryEntries::Resident(self.undo.iter())
+        self.authority.history_entries()
     }
     /// Capture strong immutable owners under the engine lock; staging and source
     /// I/O must happen only after releasing that lock and the root/registry locks.
-    pub fn capture_scene(
-        &self,
-        preview: Option<&Document>,
-    ) -> Result<scene::CapturedScene, String> {
+    pub fn capture_scene(&self, preview: Option<&Document>) -> Result<scene::CapturedScene, String> {
         if self.closed {
             return Err("Cannot capture a closed project".into());
         }
-        let document = preview.unwrap_or(&self.doc);
-        if document.id != self.doc.id || document.revision != self.doc.revision {
-            return Err("Preview does not belong to the captured project revision".into());
+        if let Some(document) = self.native_document() {
+            if preview.is_some() {
+                return Err("Native previews require their captured prepared-output envelope".into());
+            }
+            return scene::CapturedScene::from_native(scene::SceneSnapshot::capture_native(
+                &self.project_id,
+                document,
+                &self.leases,
+                self.file_version,
+                self.file_ownership.clone(),
+            )?);
         }
-        Ok(scene::CapturedScene::from_parts(
-            document.clone(),
+        self.authority.capture_scene(
+            preview,
             self.project_id.clone(),
             self.leases.clone(),
             self.file_version,
             self.file_ownership.clone(),
-        ))
+        )
     }
 }
 fn num(v: &Value, key: &str, default: f64) -> f64 {
@@ -558,6 +705,26 @@ pub(crate) fn color(v: &Value) -> Pixel {
             .unwrap_or(if i == 3 { 255 } else { 0 })
             .min(255) as u8
     })
+}
+pub(crate) fn raster_color(command: &Value, depth: u16) -> Result<crate::raster::Pixel16, String> {
+    use crate::raster::Pixel16;
+    let exact = matches!(
+        command["op"].as_str(),
+        Some("paint" | "paint.fill" | "shape" | "gradient" | "smudge")
+    );
+    let mut rgba = if let Some(value) = command.get("color16").filter(|_| exact) {
+        if depth != 16 {
+            return Err("color16 requires a 16-bit raster target".into());
+        }
+        <Pixel16 as serde::Deserialize>::deserialize(value)
+            .map_err(|_| "color16 must contain four RGBA integers from 0 to 65535")?
+    } else {
+        color(command).map(|value| u16::from(value) * 257)
+    };
+    if command["mask"] == true {
+        rgba = [rgba[0], rgba[0], rgba[0], rgba[3]];
+    }
+    Ok(rgba)
 }
 pub fn rect(v: &Value) -> Option<[i32; 4]> {
     let a = v.as_array()?;
@@ -605,30 +772,26 @@ pub(crate) fn activity_tool(command: &Value) -> &'static str {
 }
 
 #[derive(Default)]
-struct SelectionGesture {
+struct SelectionGesture<'a> {
     source: Option<(
-        Value,
+        &'a Value,
         Option<[i32; 4]>,
         Option<Vec<[f32; 2]>>,
         Vec<String>,
         Option<crate::selection::Coverage>,
     )>,
 }
-impl SelectionGesture {
-    fn prepare(&mut self, doc: &mut Document, command: &Value) {
+impl<'a> SelectionGesture<'a> {
+    fn prepare(&mut self, doc: &mut Document, command: &'a Value) {
         if !matches!(command["op"].as_str(), Some("move" | "transform"))
             || command["selection_only"] == false
         {
             self.source = None;
             return;
         }
-        let mut signature = command.clone();
-        if let Some(object) = signature.as_object_mut() {
-            object.remove("layer");
-        }
         let target = command["layer"].as_str().unwrap_or("").to_owned();
         if let Some((previous, bounds, polygon, targets, coverage)) = &mut self.source {
-            if *previous == signature && !targets.contains(&target) {
+            if crate::transform::shares_selection(previous, command) && !targets.contains(&target) {
                 doc.selection = *bounds;
                 doc.selection_polygon = polygon.clone();
                 doc.selection_coverage = coverage.clone();
@@ -637,7 +800,7 @@ impl SelectionGesture {
             }
         }
         self.source = Some((
-            signature,
+            command,
             doc.selection,
             doc.selection_polygon.clone(),
             vec![target],
@@ -664,39 +827,47 @@ impl Engine {
         let mut selection_gesture = SelectionGesture::default();
         let resolved = crate::transform::resolve_commands(resolved)?;
         for command in &resolved {
-            selection_gesture.prepare(&mut engine.doc, command);
+            selection_gesture.prepare(&mut engine.authority.resident_state_mut()?.document, command);
             if command["op"] == "image.import" {
                 engine.validate_source(command)?;
-                engine.doc.wand_source = None;
+                engine.authority.resident_state_mut()?.document.wand_source = None;
                 engine.apply_import(command, None, &mut imported_bytes)?;
             } else {
                 engine.apply(command)?;
             }
         }
-        engine.doc.ensure_depth();
-        crate::compositor::validate_clipping(&engine.doc)?;
-        crate::mask::validate_budget(&engine.doc.layers)?;
-        crate::effects::validate_budget(&engine.doc)?;
-        if engine.doc.bit_depth == 16 {
-            crate::depth16::validate_budget(&engine.doc)?;
+        engine.authority.resident_state_mut()?.document.ensure_depth();
+        crate::compositor::validate_clipping(&engine.authority.resident_state()?.document)?;
+        crate::mask::validate_budget(&engine.authority.resident_state()?.document.layers)?;
+        crate::effects::validate_budget(&engine.authority.resident_state()?.document)?;
+        if engine.authority.resident_state()?.document.bit_depth == 16 {
+            crate::depth16::validate_budget(&engine.authority.resident_state()?.document)?;
         }
-        crate::effects::invalidate(&mut engine.doc, &commands);
+        crate::effects::invalidate(&mut engine.authority.resident_state_mut()?.document, &commands);
         engine.into_resident_document()
     }
     pub fn new() -> Self {
         Self::from_document(Document::new(1024, 768).unwrap())
     }
     pub(crate) fn from_document(doc: Document) -> Self {
+        Self::from_authority(authority::DocumentAuthority::from_resident(doc))
+    }
+    pub(crate) fn from_native(
+        doc: native::NativeDocument,
+        history_limit: usize,
+    ) -> Result<Self, String> {
+        Ok(Self::from_authority(
+            authority::DocumentAuthority::from_native(doc, history_limit)?,
+        ))
+    }
+    fn from_authority(authority: authority::DocumentAuthority) -> Self {
         Self {
             project_id: id(),
             closed: false,
             workspace: None,
             workspace_owner: None,
-            doc,
+            authority,
             leases: vec![],
-            undo: vec![],
-            redo: vec![],
-            truncated_tasks: BTreeSet::new(),
             changes: vec![],
             saved_revision: 0,
             file_operations: Default::default(),
@@ -705,6 +876,7 @@ impl Engine {
             status: "Ready".into(),
             file_version: None,
             file_ownership: None,
+            file_state_charge: None,
             capture_ui: None,
             native_close_review: None,
             capture_panel: None,
@@ -772,56 +944,36 @@ impl Engine {
             .into(),
         );
     }
-    pub fn state(&mut self) -> Value {
-        let mut result = self.state_core();
+    /// Capture metadata owners only; project the result after unlocking Engine.
+    pub fn capture_state(&mut self) -> Result<StateCapture, String> {
+        self.expire();
+        if let Some(document) = self.native_document() {
+            let header = RuntimeValue::project(
+                &report::header::Header::new(self, document.metadata().revision()),
+                document.budget(),
+                &|| Ok(()),
+            )?;
+            let scene = Arc::new(self.capture_scene(None)?.into_native()?);
+            return Ok(StateCapture::native(
+                scene,
+                header,
+                self.saving.clone(),
+                self.loading.clone(),
+            ));
+        }
+        let mut result = self.state_core()?;
         result["project_id"] = json!(self.project_id);
         result["closed"] = json!(self.closed);
         result["proposals"] = json!(self.proposals.iter().map(|p| p.state()).collect::<Vec<_>>());
         result["task_recovery"] = self.task_recovery();
-        result
+        Ok(StateCapture::resident(result))
     }
-    fn state_core(&mut self) -> Value {
-        self.expire();
-        json!({"saving":self.saving.as_ref().map(|c| c.status()),"loading":self.loading.as_ref().map(|c|{let s=c.status();json!({"stage":s.stage,"completed":s.completed,"total":s.total})}),"file_status":self.status,"document":{"id":self.doc.id,"name":self.doc.name,"width":self.doc.width,"height":self.doc.height,"revision":self.doc.revision,"bit_depth":self.doc.bit_depth,"color_profile":crate::color_profile::summary(self.doc.icc_profile.as_deref().map(Vec::as_slice)),"read_only":self.doc.read_only,"warnings":self.doc.warnings,"source_structure":self.doc.source_structure,"source_patterns":self.doc.source_patterns,"filters":self.doc.filters,"selection":self.doc.selection,"selection_polygon":crate::selection::polygon(&self.doc)},"layers":self.doc.layers.iter().map(|l|json!({"id":l.id,"name":l.name,"kind":l.kind,"parent":l.parent,"clip_to":l.clip_to,"visible":l.visible,"locked":l.locked,"opacity":l.opacity,"blend":l.blend,"bounds":[l.x,l.y,l.x+l.pixels.width as i32,l.y+l.pixels.height as i32],"effects":l.effects,"source":l.source,"path_document_nodes":crate::path::observe(l),"transform_source":crate::retained::observe(&l.pixels),"mask":l.mask.as_ref().map(|m|json!({"enabled":m.enabled,"linked":m.linked,"steps":m.steps.iter().map(|s|json!({"id":s.id,"kind":s.kind,"enabled":s.enabled,"weight":s.weight,"value":s.value,"settings":s.settings,"transform_source":crate::retained::observe(&s.pixels)})).collect::<Vec<_>>()}))})).collect::<Vec<_>>(),"reservations":self.leases,"ai_change":self.ai_change,"dirty":self.doc.revision!=self.saved_revision})
+    fn state_core(&mut self) -> Result<Value, String> {
+        let doc = self.authority.resident()?;
+        Ok(json!({"saving":self.saving.as_ref().map(|c| c.status()),"loading":self.loading.as_ref().map(|c|{let s=c.status();json!({"stage":s.stage,"completed":s.completed,"total":s.total})}),"file_status":self.status,"document":{"id":doc.id,"name":doc.name,"width":doc.width,"height":doc.height,"revision":doc.revision,"bit_depth":doc.bit_depth,"global_light_angle":doc.psd_global_angle.map(u32::from_be_bytes),"color_profile":crate::color_profile::summary(doc.icc_profile.as_deref().map(Vec::as_slice)),"read_only":doc.read_only,"warnings":doc.warnings,"source_structure":doc.source_structure,"source_patterns":doc.source_patterns,"filters":doc.filters,"selection":doc.selection,"selection_polygon":crate::selection::polygon(&doc)},"layers":doc.layers.iter().map(|l|json!({"id":l.id,"name":l.name,"kind":l.kind,"parent":l.parent,"clip_to":l.clip_to,"visible":l.visible,"locked":l.locked,"opacity":l.opacity,"fill_opacity":crate::psd::fill_opacity::value(&l.psd_metadata),"blend_clipped_as_group":crate::psd::clipping::grouped(&l.psd_metadata),"blend_if":crate::psd::blend_ranges::value(&l.psd_metadata),"blend_channels":crate::psd::blend_channels::enabled(&l.psd_metadata),"color_label":crate::psd::layer_color_label(&l.psd_metadata),"blend":l.blend,"bounds":[l.x,l.y,l.x+l.pixels.width as i32,l.y+l.pixels.height as i32],"effects":l.effects,"source":l.source,"path_document_nodes":crate::path::observe(l),"transform_source":crate::retained::observe(&l.pixels),"mask":l.mask.as_ref().map(|m|json!({"enabled":m.enabled,"linked":m.linked,"steps":m.steps.iter().map(|s|json!({"id":s.id,"kind":s.kind,"enabled":s.enabled,"weight":s.weight,"value":s.value,"settings":s.settings,"transform_source":crate::retained::observe(&s.pixels)})).collect::<Vec<_>>()}))})).collect::<Vec<_>>(),"reservations":self.leases,"ai_change":self.ai_change,"dirty":doc.revision!=self.saved_revision}))
     }
     pub fn scope_overlap(&self, a: &Scope, b: &Scope) -> bool {
-        let visibility = |s: &Scope| {
-            s.target
-                .as_ref()
-                .is_some_and(|t| t.starts_with("@visibility:"))
-        };
-        if visibility(a) || visibility(b) {
-            return visibility(a) && visibility(b) && a.target == b.target;
-        }
-        if let (Some(x), Some(y)) = (&a.target, &b.target) {
-            if x != y {
-                let ancestor = |child: &str, parent: &str| {
-                    let mut cur = Some(child);
-                    for _ in 0..=16 {
-                        let Some(id) = cur else {
-                            return false;
-                        };
-                        if id == parent {
-                            return true;
-                        }
-                        cur = self
-                            .doc
-                            .layers
-                            .iter()
-                            .find(|l| l.id == id)
-                            .and_then(|l| l.parent.as_deref());
-                    }
-                    false
-                };
-                if !ancestor(x, y) && !ancestor(y, x) {
-                    return false;
-                }
-                let mut a = a.clone();
-                a.target = None;
-                return a.overlap(b);
-            }
-        }
-        a.overlap(b)
+        view::scope_overlap(self.authority.view(), a, b)
     }
     pub fn reserve(
         &mut self,
@@ -869,14 +1021,22 @@ impl Engine {
         Ok(())
     }
     pub fn scopes(&self, c: &Value) -> Vec<Scope> {
-        let mut scopes = self.command_scopes(c);
-        if self.doc.selection.is_some()
+        if let Some(document) = self.native_document() {
+            return native::CommandDescriptor::from_normalized(document, document.metadata().revision(), std::slice::from_ref(c), &|| Ok(()))
+                .map(|descriptor| descriptor.scopes().to_vec())
+                .unwrap_or_else(|_| vec![Scope { target: None, rect: None }]);
+        }
+        let Ok(doc) = self.authority.resident() else {
+            return vec![Scope { target: None, rect: None }];
+        };
+        let mut scopes = Self::resident_command_scopes(doc, c);
+        if doc.selection.is_some()
             && matches!(c["op"].as_str(), Some("move" | "transform"))
             && c["selection_only"] != false
         {
             if let Some(layer) = c["layer"]
                 .as_str()
-                .and_then(|id| self.doc.layers.iter().find(|layer| layer.id == id))
+                .and_then(|id| doc.layers.iter().find(|layer| layer.id == id))
             {
                 if let Some(mask) = &layer.mask {
                     for scope in &mut scopes {
@@ -895,7 +1055,7 @@ impl Engine {
                 }
             }
         }
-        if self.doc.selection.is_some()
+        if doc.selection.is_some()
             && (c["op"] == "paint.clear_selection"
                 || (matches!(c["op"].as_str(), Some("move" | "transform"))
                     && c["selection_only"] != false))
@@ -903,19 +1063,51 @@ impl Engine {
             scopes.push(Scope::layer("@selection"));
         }
         if c["op"] == "mask.from_selection"
-            || (c["op"] == "mask.add" && self.doc.selection.is_some())
+            || (c["op"] == "mask.add" && doc.selection.is_some())
         {
             scopes.push(Scope::layer("@selection"));
         }
         scopes
     }
-    fn command_scopes(&self, c: &Value) -> Vec<Scope> {
+    pub(crate) fn resident_command_scopes(doc: &Document, c: &Value) -> Vec<Scope> {
         let op = text(c, "op", "");
-        if op.starts_with("filter.") {
+        if op.starts_with("filter.") || document_settings::may_promote(doc.bit_depth, c)
+            || document_settings::may_initialize_global_light(doc.psd_global_angle, c)
+        {
             return vec![Scope {
                 target: None,
                 rect: None,
             }];
+        }
+        if matches!(op, "image.paste" | "layer.paste") {
+            let layer = |i: usize| {
+                let l = &doc.layers[i];
+                crate::clipboard::paste::Layer {
+                    id: &l.id,
+                    parent: l.parent.as_deref(),
+                    kind: &l.kind,
+                    clip_to: l.clip_to.as_deref(),
+                    locked: l.locked,
+                }
+            };
+            let plan = if op == "layer.paste" {
+                crate::clipboard::paste::Plan::layers(
+                    text(c, "layer", ""),
+                    doc.layers.len(),
+                    1,
+                    layer,
+                )
+            } else {
+                crate::clipboard::paste::Plan::new(c, doc.layers.len(), layer)
+            };
+            return plan
+                .map(|plan| plan.scopes(doc.layers.len(), layer))
+                .unwrap_or_else(|_| {
+                    vec![Scope {
+                        target: None,
+                        rect: None,
+                    }]
+                });
         }
         let target = c.get("layer").and_then(Value::as_str).map(String::from);
         if matches!(op, "path.to_selection" | "path.to_mask") {
@@ -944,7 +1136,7 @@ impl Engine {
         }
         if ["move", "transform"].contains(&op)
             && target.as_ref().is_some_and(|t| {
-                self.doc
+                doc
                     .layers
                     .iter()
                     .any(|l| l.id == *t && l.kind == "group")
@@ -954,7 +1146,7 @@ impl Engine {
         }
         if op == "layer.merge" {
             return crate::merge::requested(c)
-                .and_then(|ids| crate::merge::resolve(&self.doc, &ids))
+                .and_then(|ids| crate::merge::resolve(&doc, &ids))
                 .map(|ids| ids.into_iter().map(|id| Scope::layer(&id)).collect())
                 .unwrap_or_else(|_| {
                     vec![Scope {
@@ -1007,7 +1199,7 @@ impl Engine {
             if op == "layer.clip" {
                 if let Some(t) = target
                     .as_ref()
-                    .and_then(|t| self.doc.layers.iter().find(|l| l.id == *t))
+                    .and_then(|t| doc.layers.iter().find(|l| l.id == *t))
                     .and_then(|l| l.clip_to.clone())
                 {
                     targets.push(t);
@@ -1029,20 +1221,32 @@ impl Engine {
                 })
                 .collect();
         }
+        if op == "fill"
+            && c["mask"] != true
+            && target.as_deref().is_some_and(|id| {
+                doc.layers.iter().any(|layer| {
+                    layer.id == id
+                        && (layer.kind == "group"
+                            || (layer.kind == "fill" && doc.selection.is_none()))
+                })
+            })
+        {
+            return vec![Scope { target, rect: None }];
+        }
         if matches!(op, "paint.fill" | "paint.clear_selection") {
             let layer = target
                 .as_deref()
-                .and_then(|id| self.doc.layers.iter().find(|l| l.id == id));
+                .and_then(|id| doc.layers.iter().find(|l| l.id == id));
             if layer.is_some_and(|l| l.kind == "group") && c["mask"] != true {
                 return vec![Scope { target, rect: None }];
             }
             let mut area = if op == "paint.clear_selection" {
-                self.doc.selection
+                doc.selection
             } else {
-                c.get("rect").and_then(rect).or(self.doc.selection)
+                c.get("rect").and_then(rect).or(doc.selection)
             }
-            .unwrap_or([0, 0, self.doc.width as i32, self.doc.height as i32]);
-            if let Some(selection) = self.doc.selection {
+            .unwrap_or([0, 0, doc.width as i32, doc.height as i32]);
+            if let Some(selection) = doc.selection {
                 area = [
                     area[0].max(selection[0]),
                     area[1].max(selection[1]),
@@ -1056,10 +1260,7 @@ impl Engine {
             }];
         }
         if op == "image.place" && c["new_layer"] == false {
-            return vec![Scope {
-                target,
-                rect: c.get("rect").and_then(rect),
-            }];
+            return vec![Scope { target, rect: None }];
         }
         if [
             "new",
@@ -1068,6 +1269,7 @@ impl Engine {
             "canvas.resize",
             "image.resize",
             "document.settings",
+            "document.global_light",
             "layer.add",
             "layer.reorder",
             "layer.delete",
@@ -1092,7 +1294,12 @@ impl Engine {
         }
         let mut area = if ["paint", "smudge", "clone", "heal", "liquify.stroke"].contains(&op) {
             c.get("points").and_then(Value::as_array).map(|p| {
-                let r = num(c, "radius", 10.0) as f32 + 2.0;
+                let r = if op == "liquify.stroke" {
+                    crate::liquify::command::radius(c)
+                } else {
+                    num(c, "radius", 10.0)
+                } as f32
+                    + 2.0;
                 let mut a = [f32::MAX, f32::MAX, f32::MIN, f32::MIN];
                 for point in p {
                     if let Some(pair) = point.as_array() {
@@ -1120,13 +1327,12 @@ impl Engine {
             area = c["rect"]
                 .as_array()
                 .and_then(|_| rect(&c["rect"]))
-                .or(self.doc.selection);
+                .or(doc.selection);
         }
         if op == "transform" && c.get("warp").is_some() {
             match crate::warp::parse(c) {
                 Ok(Some(_)) => {
-                    let area = self
-                        .doc
+                    let area = doc
                         .selection
                         .filter(|_| c["selection_only"] != false)
                         .and_then(|b| {
@@ -1151,8 +1357,7 @@ impl Engine {
         if op == "transform" && c.get("projective").is_some() {
             match crate::projective::combined(c) {
                 Ok(Some(map)) => {
-                    let area = self
-                        .doc
+                    let area = doc
                         .selection
                         .filter(|_| c["selection_only"] != false)
                         .and_then(|b| {
@@ -1172,7 +1377,7 @@ impl Engine {
             }
         }
         if ["move", "transform"].contains(&op) && c["selection_only"] != false {
-            if let Some(b) = self.doc.selection {
+            if let Some(b) = doc.selection {
                 let moving = op == "move";
                 let [dx, dy] = if moving {
                     [num(c, "dx", 0.).round(), num(c, "dy", 0.).round()]
@@ -1230,15 +1435,14 @@ impl Engine {
                         cos = 0.;
                     }
                     let rectangle = crate::selection::rectangle(b);
-                    let covered = self
-                        .doc
+                    let covered = doc
                         .selection_coverage
                         .as_ref()
                         .is_some_and(|coverage| coverage.bounds == b);
                     let points = if covered {
                         rectangle.as_slice()
                     } else {
-                        crate::selection::polygon(&self.doc).unwrap_or(&rectangle)
+                        crate::selection::polygon(&doc).unwrap_or(&rectangle)
                     };
                     for &p in points {
                         let [x, y] = crate::transform::selected_point(
@@ -1264,7 +1468,7 @@ impl Engine {
             if ["move", "transform"].contains(&op) {
                 return a;
             }
-            self.doc.selection.map_or(a, |b| {
+            doc.selection.map_or(a, |b| {
                 [
                     a[0].max(b[0]),
                     a[1].max(b[1]),
@@ -1295,7 +1499,7 @@ impl Engine {
         gesture: Option<&str>,
     ) -> Result<Value, String> {
         self.edit_transaction(
-            actor, commands, expected, task, label, gesture, None, None, None, None, None,
+            actor, commands, expected, task, label, gesture, None, None, None, None, None, None,
         )
     }
     pub(crate) fn edit_prepared_merge(
@@ -1314,6 +1518,7 @@ impl Engine {
             "Merge layers",
             None,
             Some(prepared),
+            None,
             None,
             None,
             None,
@@ -1341,6 +1546,24 @@ impl Engine {
             None,
             None,
             None,
+            None,
+        )
+    }
+    pub(crate) fn paste_resident_images(
+        &mut self,
+        actor: &str,
+        commands: &[Value],
+        revision: u64,
+        pixels: Vec<Raster>,
+    ) -> Result<Value, String> {
+        if commands.len() != pixels.len()
+            || commands.iter().any(|command| command["op"] != "image.paste")
+        {
+            return Err("Prepared clipboard pixels require one image.paste command per image".into());
+        }
+        self.edit_transaction(
+            actor, commands, Some(revision), None, "Paste images", None,
+            None, None, None, None, None, Some(pixels.into_iter()),
         )
     }
     pub(crate) fn commit_proposal(
@@ -1349,9 +1572,9 @@ impl Engine {
     ) -> Result<Value, String> {
         let doc = proposal
             .draft
-            .clone()
+            .as_ref()
             .ok_or("This proposal is no longer available")?;
-        if proposal.document != self.doc.id || proposal.revision != self.doc.revision {
+        if proposal.document != self.authority.resident_state()?.document.id || proposal.revision != self.authority.resident_state()?.document.revision {
             return Err("Proposal source changed; request a fresh proposal".into());
         }
         self.edit_transaction(
@@ -1363,7 +1586,8 @@ impl Engine {
             None,
             None,
             None,
-            Some(doc),
+            Some((**doc).clone()),
+            None,
             None,
             None,
         )
@@ -1379,13 +1603,14 @@ impl Engine {
         self.edit_transaction(
             actor,
             commands,
-            Some(self.doc.revision),
+            Some(self.authority.resident_state()?.document.revision),
             Some(task),
             label,
             None,
             None,
             None,
             Some(doc),
+            None,
             None,
             None,
         )
@@ -1416,13 +1641,15 @@ impl Engine {
             None,
             Some(pixels.into()),
             None,
+            None,
         )
     }
     fn validate_source(&self, c: &Value) -> Result<(), String> {
+        let document = self.authority.view();
         if c.get("source_revision")
-            .is_some_and(|r| r.as_u64() != Some(self.doc.revision))
+            .is_some_and(|r| r.as_u64() != Some(document.revision()))
             || c.get("document_id")
-                .is_some_and(|id| id.as_str() != Some(self.doc.id.as_str()))
+                .is_some_and(|id| id.as_str() != Some(document.id()))
         {
             return Err(
                 "The source project changed. Review it again before applying this result.".into(),
@@ -1450,7 +1677,7 @@ impl Engine {
         if *imported_bytes > crate::image_import::BUDGET {
             return Err("Image batch exceeds 256 MiB".into());
         }
-        crate::image_import::apply(&mut self.doc, c, pixels)
+        crate::image_import::apply(&mut self.authority.resident_state_mut()?.document, c, pixels)
     }
     fn edit_transaction(
         &mut self,
@@ -1465,9 +1692,10 @@ impl Engine {
         prepared_doc: Option<Document>,
         mut imports: Option<std::collections::VecDeque<crate::image_import::Prepared>>,
         pixels: Option<backed::PreparedPixels>,
+        mut pasted_images: Option<std::vec::IntoIter<Raster>>,
     ) -> Result<Value, String> {
         self.ensure_write_available()?;
-        if self.doc.read_only {
+        if self.authority.resident_state()?.document.read_only {
             return Err("This PSD is read-only. Create a compatible copy first.".into());
         }
         if commands.is_empty() || commands.len() > 100 {
@@ -1489,24 +1717,24 @@ impl Engine {
             if commands.len() != 1 {
                 return Err("Prepared pixels require exactly one command".into());
             }
-            pixels.validate(&self.doc, &commands[0])?;
+            pixels.validate(&self.authority.resident_state()?.document, &commands[0])?;
         }
-        let before = self.doc.clone();
+        let before = self.authority.resident_state()?.document.clone();
         let mut scopes = vec![];
         for c in commands {
             scopes.extend(self.scopes(c));
         }
         self.check(actor, &scopes)?;
         if let Some(rev) = expected {
-            if rev > self.doc.revision {
+            if rev > self.authority.resident_state()?.document.revision {
                 return Err("Revision is from the future".into());
             }
-            if rev < self.doc.revision {
+            if rev < self.authority.resident_state()?.document.revision {
                 let earliest = self
                     .changes
                     .first()
                     .map(|x| x.0)
-                    .unwrap_or(self.doc.revision);
+                    .unwrap_or(self.authority.resident_state()?.document.revision);
                 if rev + 1 < earliest
                     || self.changes.iter().filter(|x| x.0 > rev).any(|(_, other)| {
                         scopes
@@ -1533,19 +1761,19 @@ impl Engine {
             if doc.id != before.id || doc.revision != before.revision + 1 {
                 return Err("Proposal source changed; request a fresh proposal".into());
             }
-            doc.name = self.doc.name.clone();
-            self.doc = doc;
+            doc.name = self.authority.resident_state()?.document.name.clone();
+            self.authority.resident_state_mut()?.document = doc;
         } else {
             for c in commands {
-                selection_gesture.prepare(&mut self.doc, c);
+                selection_gesture.prepare(&mut self.authority.resident_state_mut()?.document, c);
                 if let Err(error) = self.validate_source(c) {
-                    self.doc = before;
+                    self.authority.resident_state_mut()?.document = before;
                     return Err(error);
                 }
                 if c["op"] != "selection.wand_update"
                     && !(c["op"] == "selection" && c["kind"] == "wand")
                 {
-                    self.doc.wand_source = None;
+                    self.authority.resident_state_mut()?.document.wand_source = None;
                 }
                 let applied = if c["op"] == "image.import" {
                     let pixels = imports
@@ -1557,10 +1785,15 @@ impl Engine {
                         })
                         .transpose();
                     pixels.and_then(|pixels| self.apply_import(c, pixels, &mut imported_bytes))
+                } else if let Some(images) = &mut pasted_images {
+                    crate::clipboard::paste_with_pixels(
+                        &mut self.authority.resident_state_mut()?.document, c,
+                        || images.next().ok_or_else(|| "Missing prepared clipboard pixels".into()),
+                    )
                 } else if c["op"] == "layer.paste" {
                     if let Some(snapshot) = clipboard.take() {
                         crate::layer_clipboard::paste(
-                            &mut self.doc,
+                            &mut self.authority.resident_state_mut()?.document,
                             &snapshot,
                             text(c, "layer", ""),
                         )
@@ -1572,7 +1805,7 @@ impl Engine {
                     }
                 } else if c["op"] == "layer.merge" {
                     if let Some(prepared) = prepared.take() {
-                        prepared.apply(&mut self.doc)
+                        prepared.apply(&mut self.authority.resident_state_mut()?.document)
                     } else {
                         self.apply(c)
                     }
@@ -1582,14 +1815,14 @@ impl Engine {
                     self.apply(c)
                 };
                 if let Err(err) = applied {
-                    self.doc = before;
+                    self.authority.resident_state_mut()?.document = before;
                     return Err(err);
                 }
             }
         }
-        self.doc.ensure_depth();
+        self.authority.resident_state_mut()?.document.ensure_depth();
         let bytes: usize = self
-            .doc
+            .authority.resident_state()?.document
             .layers
             .iter()
             .map(|l| {
@@ -1606,47 +1839,48 @@ impl Engine {
             })
             .sum();
         if bytes > 512 * 1024 * 1024 {
-            self.doc = before;
+            self.authority.resident_state_mut()?.document = before;
             return Err(
                 "Document exceeded the initial 512 MiB raster budget; edit was rolled back.".into(),
             );
         }
-        if let Err(error) = crate::mask::validate_budget(&self.doc.layers) {
-            self.doc = before;
+        if let Err(error) = crate::mask::validate_budget(&self.authority.resident_state()?.document.layers) {
+            self.authority.resident_state_mut()?.document = before;
             return Err(error);
         }
-        if let Err(error) = crate::effects::validate_budget(&self.doc) {
-            self.doc = before;
+        if let Err(error) = crate::effects::validate_budget(&self.authority.resident_state()?.document) {
+            self.authority.resident_state_mut()?.document = before;
             return Err(error);
         }
-        if let Err(error) = crate::compositor::validate_clipping(&self.doc) {
-            self.doc = before;
+        if let Err(error) = crate::compositor::validate_clipping(&self.authority.resident_state()?.document) {
+            self.authority.resident_state_mut()?.document = before;
             return Err(error);
         }
-        if self.doc.bit_depth == 16 {
-            if let Err(error) = crate::depth16::validate_budget(&self.doc) {
-                self.doc = before;
+        if self.authority.resident_state()?.document.bit_depth == 16 {
+            if let Err(error) = crate::depth16::validate_budget(&self.authority.resident_state()?.document) {
+                self.authority.resident_state_mut()?.document = before;
                 return Err(error);
             }
         }
         if let Some(pixels) = &pixels {
             if let Err(error) = pixels.check_cancelled() {
-                self.doc = before;
+                self.authority.resident_state_mut()?.document = before;
                 return Err(error);
             }
         }
-        crate::effects::invalidate(&mut self.doc, commands);
-        self.doc.revision = before.revision + 1;
-        let revision = self.doc.revision;
+        crate::effects::invalidate(&mut self.authority.resident_state_mut()?.document, commands);
+        self.authority.resident_state_mut()?.document.revision = before.revision + 1;
+        let revision = self.authority.resident_state()?.document.revision;
         let created: Vec<String> = self
-            .doc
+            .authority.resident_state()?.document
             .layers
             .iter()
             .filter(|l| !before.layers.iter().any(|old| old.id == l.id))
             .map(|l| l.id.clone())
             .collect();
+        let document = &self.authority.resident_state()?.document;
         let created_roots = pasted_roots.unwrap_or_else(|| {
-            self.doc
+            document
                 .layers
                 .iter()
                 .filter(|l| {
@@ -1681,22 +1915,23 @@ impl Engine {
         let tool = activity_tool(command);
         self.mark_ai(actor, label, tool, visual_scopes);
         let continuous = gesture.is_some()
-            && self.undo.last().is_some_and(|h| {
+            && self.authority.resident_state()?.undo.last().is_some_and(|h| {
                 h.actor == actor
                     && h.task.as_deref() == task
                     && h.gesture.as_deref() == gesture
                     && h.after.revision == before.revision
                     && h.after.id == before.id
             });
+        let after = self.authority.resident_state()?.document.clone();
         if continuous {
-            let history = self.undo.last_mut().unwrap();
-            history.after = self.doc.clone();
+            let history = self.authority.resident_state_mut()?.undo.last_mut().unwrap();
+            history.after = after;
             history.scopes.extend(scopes.clone());
             history.scopes.dedup();
         } else {
-            self.undo.push(History {
+            self.authority.resident_state_mut()?.undo.push(History {
                 before,
-                after: self.doc.clone(),
+                after,
                 actor: actor.into(),
                 label: label.into(),
                 task: task.map(String::from),
@@ -1706,7 +1941,7 @@ impl Engine {
             });
         }
         self.trim_history();
-        self.redo.clear();
+        self.authority.resident_state_mut()?.redo.clear();
         self.changes.push((revision, scopes));
         if self.changes.len() > 200 {
             self.changes.remove(0);
@@ -1718,7 +1953,7 @@ impl Engine {
         }
         self.status = label.into();
         Ok(
-            json!({"revision":revision,"applied":commands.len(),"created":created,"created_roots":created_roots,"layers":self.doc.layers.iter().map(|l|json!({"id":l.id,"name":l.name})).collect::<Vec<_>>()}),
+            json!({"revision":revision,"applied":commands.len(),"created":created,"created_roots":created_roots,"layers":self.authority.resident_state()?.document.layers.iter().map(|l|json!({"id":l.id,"name":l.name})).collect::<Vec<_>>()}),
         )
     }
     fn apply(&mut self, c: &Value) -> Result<(), String> {
@@ -1730,20 +1965,23 @@ impl Engine {
         pixels: Option<&backed::PreparedPixels>,
     ) -> Result<(), String> {
         if c["op"] != "selection.wand_update" && !(c["op"] == "selection" && c["kind"] == "wand") {
-            self.doc.wand_source = None;
+            self.authority.resident_state_mut()?.document.wand_source = None;
         }
         // Reframe before taking native-original and soft-selection baselines. The
         // outer transaction still owns the complete pre-gesture undo snapshot.
-        self.doc.ensure_depth();
-        crate::fill::prepare_visual_baseline(&mut self.doc, c)?;
-        crate::edit_bounds::prepare(&mut self.doc, c)?;
-        let before = crate::retained::has_originals(&self.doc).then(|| self.doc.clone());
+        self.authority.resident_state_mut()?.document.ensure_depth();
+        crate::fill::prepare_visual_baseline(&mut self.authority.resident_state_mut()?.document, c)?;
+        crate::edit_bounds::prepare(&mut self.authority.resident_state_mut()?.document, c)?;
+        let document = &self.authority.resident_state()?.document;
+        let before = crate::retained::has_originals(document).then(|| document.clone());
         self.apply_retained(c, pixels)?;
         if let Some(before) = before {
             let whole_transform = matches!(c["op"].as_str(), Some("move" | "transform"))
                 && (before.selection.is_none() || c["selection_only"] == false);
             if !whole_transform {
-                crate::retained::reconcile(&before, &mut self.doc);
+                let after = &mut self.authority.resident_state_mut()?.document;
+                crate::retained::reconcile(&before, after);
+                crate::edit_bounds::mask_original::reconcile_resident(&before, after, c)?;
             }
         }
         Ok(())
@@ -1753,15 +1991,7 @@ impl Engine {
         c: &Value,
         pixels: Option<&backed::PreparedPixels>,
     ) -> Result<(), String> {
-        if c.get("source_revision")
-            .is_some_and(|r| r.as_u64() != Some(self.doc.revision))
-            || c.get("document_id")
-                .is_some_and(|id| id.as_str() != Some(self.doc.id.as_str()))
-        {
-            return Err(
-                "The source project changed. Review it again before applying this result.".into(),
-            );
-        }
+        self.validate_source(c)?;
         if matches!(
             c["op"].as_str(),
             Some(
@@ -1778,15 +2008,19 @@ impl Engine {
                     | "pixels.replace"
             )
         ) {
-            if let Some(coverage) = self
-                .doc
+            let document = &self.authority.resident_state()?.document;
+            if let Some(coverage) = document
                 .selection_coverage
                 .clone()
-                .filter(|m| self.doc.selection == Some(m.bounds))
+                .filter(|m| document.selection == Some(m.bounds))
             {
-                let before = self.doc.clone();
+                let before = self.authority.resident_state()?.document.clone();
                 self.apply_inner(c, pixels)?;
-                crate::selection::restrict_document(&mut self.doc, &before, &coverage);
+                crate::selection::restrict_document(
+                    &mut self.authority.resident_state_mut()?.document,
+                    &before,
+                    &coverage,
+                );
                 return Ok(());
             }
         }
@@ -1800,7 +2034,7 @@ impl Engine {
         let mut linked;
         let c = if matches!(c["op"].as_str(), Some("move" | "transform"))
             && c["mask"] == true
-            && self.doc.layers.iter().any(|layer| {
+            && self.authority.resident_state()?.document.layers.iter().any(|layer| {
                 c["layer"].as_str() == Some(layer.id.as_str())
                     && layer.mask.as_ref().is_some_and(|mask| mask.linked)
             }) {
@@ -1810,42 +2044,53 @@ impl Engine {
         } else {
             c
         };
-        self.doc.ensure_depth();
+        self.authority.resident_state_mut()?.document.ensure_depth();
         let op = text(c, "op", "");
         let target = text(c, "layer", "");
         if op.starts_with("filter.") {
-            return crate::filters::apply(&mut self.doc, c);
+            return crate::filters::apply(&mut self.authority.resident_state_mut()?.document, c);
         }
         if op == "source.add" {
-            return crate::source::add(&mut self.doc, c);
+            return crate::source::add(&mut self.authority.resident_state_mut()?.document, c);
         }
         if op == "path.create" {
-            return crate::path::create(&mut self.doc, c);
+            return crate::path::create(&mut self.authority.resident_state_mut()?.document, c);
         }
         if op == "path.to_selection" {
-            return crate::path::to_selection(&mut self.doc, c);
+            return crate::path::to_selection(&mut self.authority.resident_state_mut()?.document, c);
         }
         if ["crop", "canvas.resize", "image.resize", "resize"].contains(&op) {
-            return crate::geometry::apply(&mut self.doc, c);
+            return crate::geometry::apply(&mut self.authority.resident_state_mut()?.document, c);
         }
         if c.get("rect")
             .is_some_and(|r| !r.is_null() && rect(r).is_none())
         {
             return Err("Invalid rectangle coordinates".into());
         }
+        if op == "document.global_light" {
+            let angle = document_settings::global_light_angle(c)?;
+            let document = &mut self.authority.resident_state_mut()?.document;
+            if document.psd_global_angle != Some(angle.to_be_bytes()) {
+                for effect in document.layers.iter_mut().flat_map(|layer| &mut layer.effects).chain(&mut document.filters) {
+                    if let Some(light) = crate::effects::styles::GlobalLight::for_document(&effect.settings, document.psd_global_angle) {
+                        light.set_angle(Arc::make_mut(&mut effect.settings), angle);
+                    }
+                }
+                document.psd_global_angle = Some(angle.to_be_bytes());
+            }
+            return Ok(());
+        }
         if op == "document.settings" {
-            let w = c["width"].as_u64().unwrap_or(self.doc.width as u64);
-            let h = c["height"].as_u64().unwrap_or(self.doc.height as u64);
-            if w > u32::MAX as u64 || h > u32::MAX as u64 {
-                return Err("Invalid canvas dimensions".into());
-            }
-            check_size(w as u32, h as u32)?;
-            let depth = c["bit_depth"].as_u64().unwrap_or(self.doc.bit_depth as u64);
-            if ![8, 16].contains(&depth) {
-                return Err("Choose 8 or 16 bit channels".into());
-            }
+            let settings = document_settings::Settings::new(
+                [self.authority.resident_state()?.document.width, self.authority.resident_state()?.document.height],
+                self.authority.resident_state()?.document.bit_depth,
+                c,
+                crate::raster::CanvasLimits::Resident,
+            )?;
+            let [w, h] = settings.size;
+            let depth = settings.depth;
             if depth == 8
-                && self.doc.layers.iter().any(|l| {
+                && self.authority.resident_state()?.document.layers.iter().any(|l| {
                     l.effects.iter().any(|e| {
                         crate::effects::patterns::from_settings(&e.kind, &e.settings)
                             .ok()
@@ -1854,10 +2099,10 @@ impl Engine {
                     })
                 })
             {
-                return Err("Replace 16-bit bitmap patterns with explicitly converted 8-bit PNGs before lowering document precision".into());
+                return Err(document_settings::PATTERN_PRECISION.into());
             }
-            if depth != self.doc.bit_depth as u64 {
-                for layer in &mut self.doc.layers {
+            if depth != self.authority.resident_state()?.document.bit_depth {
+                for layer in &mut self.authority.resident_state_mut()?.document.layers {
                     layer.pixels.retained = None;
                     layer.pixels.convert_depth(depth as u16);
                     if let Some(mask) = &mut layer.mask {
@@ -1869,51 +2114,55 @@ impl Engine {
                     }
                 }
             }
-            self.doc.width = w as u32;
-            self.doc.height = h as u32;
-            self.doc.bit_depth = depth as u16;
-            self.doc.selection = None;
-            self.doc.selection_polygon = None;
-            self.doc.selection_coverage = None;
-            self.doc.selection_previous = None;
+            self.authority.resident_state_mut()?.document.width = w as u32;
+            self.authority.resident_state_mut()?.document.height = h as u32;
+            self.authority.resident_state_mut()?.document.bit_depth = depth as u16;
+            self.authority.resident_state_mut()?.document.selection = None;
+            self.authority.resident_state_mut()?.document.selection_polygon = None;
+            self.authority.resident_state_mut()?.document.selection_coverage = None;
+            self.authority.resident_state_mut()?.document.selection_previous = None;
             return Ok(());
         }
         if op == "adjustment.add" {
-            crate::adjustment::add(&mut self.doc, c)?;
+            crate::adjustment::add(&mut self.authority.resident_state_mut()?.document, c)?;
             return Ok(());
         }
         if op == "layer.duplicate_selection" {
-            crate::layer_clipboard::duplicate_selection(&mut self.doc, c)?;
+            crate::layer_clipboard::duplicate_selection(&mut self.authority.resident_state_mut()?.document, c)?;
             return Ok(());
         }
         if op == "layer.duplicate" {
             let ids = crate::grouping::requested(c)?;
-            crate::layer_clipboard::duplicate(&mut self.doc, &ids)?;
+            crate::layer_clipboard::duplicate_with_ids(
+                &mut self.authority.resident_state_mut()?.document,
+                &ids,
+                c.get("root_ids"),
+            )?;
             return Ok(());
         }
         if op == "group.create_selected" {
             let ids = crate::grouping::requested(c)?;
-            crate::grouping::create(&mut self.doc, &ids, text(c, "name", "Folder"))?;
+            crate::grouping::create(&mut self.authority.resident_state_mut()?.document, &ids, text(c, "name", "Folder"))?;
             return Ok(());
         }
         if op == "layer.merge" {
             // Earlier commands in the same batch may have changed effect sources.
-            crate::effects::invalidate(&mut self.doc, &[json!({"op":"layer.merge"})]);
+            crate::effects::invalidate(&mut self.authority.resident_state_mut()?.document, &[json!({"op":"layer.merge"})]);
             let ids = crate::merge::requested(c)?;
-            let prepared = crate::merge::prepare(&self.doc, &ids, c["name"].as_str())?;
-            return prepared.apply(&mut self.doc);
+            let prepared = crate::merge::prepare(&self.authority.resident_state()?.document, &ids, c["name"].as_str())?;
+            return prepared.apply(&mut self.authority.resident_state_mut()?.document);
         }
         if op == "image.paste" {
-            return crate::clipboard::paste(&mut self.doc, c);
+            return crate::clipboard::paste(&mut self.authority.resident_state_mut()?.document, c);
         }
         if op == "image.place" {
-            return crate::placement::place(&mut self.doc, c);
+            return crate::placement::place(&mut self.authority.resident_state_mut()?.document, c);
         }
         if op == "image.import" {
             return self.apply_import(c, None, &mut 0);
         }
         if op == "new" {
-            self.doc = Document::new(
+            self.authority.resident_state_mut()?.document = Document::new(
                 num(c, "width", 1024.0) as u32,
                 num(c, "height", 768.0) as u32,
             )?;
@@ -1925,12 +2174,13 @@ impl Engine {
                     || c.get("mode").is_some()
                     || c.get("feather").is_some()))
         {
-            return crate::selection::apply(&mut self.doc, c);
+            return crate::selection::apply(&mut self.authority.resident_state_mut()?.document, c);
         }
         if op == "selection" {
-            self.doc.selection_previous = crate::selection::current(&self.doc)
-                .or_else(|| self.doc.selection_previous.clone());
-            self.doc.selection_coverage = None;
+            let document = &mut self.authority.resident_state_mut()?.document;
+            document.selection_previous = crate::selection::current(document)
+                .or_else(|| document.selection_previous.clone());
+            self.authority.resident_state_mut()?.document.selection_coverage = None;
             if let Some(polygon) = c.get("polygon").filter(|p| !p.is_null()) {
                 let points: Vec<[f32; 2]> = serde_json::from_value(polygon.clone())
                     .map_err(|_| "Selection polygon must contain [x,y] points")?;
@@ -1938,16 +2188,16 @@ impl Engine {
                 if c.get("rect").and_then(rect).is_some_and(|r| r != bounds) {
                     return Err("Selection rectangle must match its polygon bounds".into());
                 }
-                self.doc.selection = Some(bounds);
-                self.doc.selection_polygon = Some(points);
+                self.authority.resident_state_mut()?.document.selection = Some(bounds);
+                self.authority.resident_state_mut()?.document.selection_polygon = Some(points);
             } else {
-                self.doc.selection = c.get("rect").and_then(rect);
-                self.doc.selection_polygon = None;
+                self.authority.resident_state_mut()?.document.selection = c.get("rect").and_then(rect);
+                self.authority.resident_state_mut()?.document.selection_polygon = None;
             }
             return Ok(());
         }
         if op == "layer.add" {
-            if self.doc.layers.len() >= 100 {
+            if self.authority.resident_state()?.document.layers.len() >= 100 {
                 return Err("Initial version supports up to 100 layers".into());
             }
             let kind = text(c, "kind", "paint");
@@ -1957,15 +2207,15 @@ impl Engine {
             let mut layer = Layer::new(
                 text(c, "name", "New layer"),
                 kind,
-                self.doc.width,
-                self.doc.height,
+                self.authority.resident_state()?.document.width,
+                self.authority.resident_state()?.document.height,
             );
             if c.get("color").is_some() {
                 layer.color = color(c);
             }
             if let Some(parent) = c.get("parent").and_then(Value::as_str) {
                 if !self
-                    .doc
+                    .authority.resident_state()?.document
                     .layers
                     .iter()
                     .any(|l| l.id == parent && l.kind == "group")
@@ -1974,27 +2224,27 @@ impl Engine {
                 }
                 layer.parent = Some(parent.into());
             }
-            self.doc.layers.insert(0, layer);
+            self.authority.resident_state_mut()?.document.layers.insert(0, layer);
             return Ok(());
         }
         let i = self
-            .doc
+            .authority.resident_state()?.document
             .layers
             .iter()
             .position(|l| l.id == target)
             .ok_or_else(|| format!("Unknown layer: {target}"))?;
         if visibility_only(c) {
-            self.doc.layers[i].visible =
+            self.authority.resident_state_mut()?.document.layers[i].visible =
                 c["visible"].as_bool().ok_or("Visibility must be boolean")?;
             return Ok(());
         }
-        let mut parent = self.doc.layers[i].parent.as_deref();
+        let mut parent = self.authority.resident_state()?.document.layers[i].parent.as_deref();
         for _ in 0..16 {
             let Some(pid) = parent else {
                 break;
             };
             let p = self
-                .doc
+                .authority.resident_state()?.document
                 .layers
                 .iter()
                 .find(|l| l.id == pid)
@@ -2004,28 +2254,28 @@ impl Engine {
             }
             parent = p.parent.as_deref();
         }
-        if self.doc.layers[i].locked && op != "layer.update" {
+        if self.authority.resident_state()?.document.layers[i].locked && op != "layer.update" {
             return Err("Layer is locked".into());
         }
         if op == "source.update" {
-            return crate::source::update(&mut self.doc.layers[i], c);
+            return crate::source::update(&mut self.authority.resident_state_mut()?.document.layers[i], c);
         }
         if matches!(op, "effect.bake" | "mask.step.bake") {
-            return crate::bake::apply(&mut self.doc, i, c);
+            return crate::bake::apply(&mut self.authority.resident_state_mut()?.document, i, c);
         }
         if op == "path.to_mask" {
-            return crate::path::to_mask(&mut self.doc, i, c);
+            return crate::path::to_mask(&mut self.authority.resident_state_mut()?.document, i, c);
         }
         if op.starts_with("path.") {
-            return crate::path::update(&mut self.doc.layers[i], c);
+            return crate::path::update(&mut self.authority.resident_state_mut()?.document.layers[i], c);
         }
         if op == "source.rasterize" {
-            if self.doc.layers[i].source.take().is_none() {
+            if self.authority.resident_state_mut()?.document.layers[i].source.take().is_none() {
                 return Err("This layer has no editable source".into());
             }
             return Ok(());
         }
-        if self.doc.layers[i].source.is_some() {
+        if self.authority.resident_state()?.document.layers[i].source.is_some() {
             if op == "transform"
                 && (crate::projective::parse(c)?.is_some() || crate::warp::parse(c)?.is_some())
             {
@@ -2052,7 +2302,7 @@ impl Engine {
                 return Err("Edit this layer's text/vector properties, paint its mask, or explicitly rasterize it first".into());
             }
             if matches!(op, "move" | "transform")
-                && (mask || (self.doc.selection.is_some() && c["selection_only"] != false))
+                && (mask || (self.authority.resident_state()?.document.selection.is_some() && c["selection_only"] != false))
             {
                 return Err("Transform the complete editable text/vector layer with selection_only:false, or rasterize it for a pixel/mask transform".into());
             }
@@ -2061,7 +2311,7 @@ impl Engine {
             let mut ids = vec![target.to_string()];
             loop {
                 let count = ids.len();
-                for l in &self.doc.layers {
+                for l in &self.authority.resident_state()?.document.layers {
                     if l.parent.as_ref().map(|p| ids.contains(p)).unwrap_or(false)
                         && !ids.contains(&l.id)
                     {
@@ -2073,34 +2323,34 @@ impl Engine {
                 }
             }
             if self
-                .doc
+                .authority.resident_state()?.document
                 .layers
                 .iter()
                 .any(|l| ids.contains(&l.id) && l.locked)
             {
                 return Err("Unlock the selected layers and their children before deleting".into());
             }
-            if self.doc.layers.iter().any(|l| {
+            if self.authority.resident_state()?.document.layers.iter().any(|l| {
                 l.clip_to.as_ref().is_some_and(|b| ids.contains(b)) && !ids.contains(&l.id)
             }) {
                 return Err("Release clipping or select the complete clipping group before deleting its base".into());
             }
-            self.doc.layers.retain(|l| !ids.contains(&l.id));
+            self.authority.resident_state_mut()?.document.layers.retain(|l| !ids.contains(&l.id));
             return Ok(());
         }
         if op == "layer.clip" {
             let base = c.get("base").and_then(Value::as_str).map(String::from);
-            self.doc.layers[i].clip_to = base;
-            crate::compositor::validate_clipping(&self.doc)?;
+            self.authority.resident_state_mut()?.document.layers[i].clip_to = base;
+            crate::compositor::validate_clipping(&self.authority.resident_state()?.document)?;
             return Ok(());
         }
         if op == "layer.reorder" {
             let at = num(c, "index", 0.0) as usize;
-            if at >= self.doc.layers.len() {
+            if at >= self.authority.resident_state()?.document.layers.len() {
                 return Err("Invalid layer index".into());
             }
-            let l = self.doc.layers.remove(i);
-            self.doc.layers.insert(at, l);
+            let l = self.authority.resident_state_mut()?.document.layers.remove(i);
+            self.authority.resident_state_mut()?.document.layers.insert(at, l);
             return Ok(());
         }
         if op == "layer.parent" {
@@ -2112,7 +2362,7 @@ impl Engine {
                     return Err("A group cannot contain itself".into());
                 }
                 let node = self
-                    .doc
+                    .authority.resident_state()?.document
                     .layers
                     .iter()
                     .find(|l| l.id == pid && l.kind == "group")
@@ -2126,11 +2376,11 @@ impl Engine {
                     return Err("Group nesting limit exceeded".into());
                 }
             }
-            self.doc.layers[i].parent = parent.map(String::from);
+            self.authority.resident_state_mut()?.document.layers[i].parent = parent.map(String::from);
             return Ok(());
         }
         if op == "layer.update" {
-            let l = &mut self.doc.layers[i];
+            let l = &mut self.authority.resident_state_mut()?.document.layers[i];
             if l.locked && c.get("locked") != Some(&Value::Bool(false)) {
                 return Err("Unlock the layer before changing it".into());
             }
@@ -2142,6 +2392,9 @@ impl Engine {
             }
             if let Some(v) = c.get("locked").and_then(Value::as_bool) {
                 l.locked = v;
+                if !v {
+                    l.psd_metadata.retain(|entry| entry.key != "lspf");
+                }
             }
             if let Some(v) = c.get("opacity").and_then(Value::as_f64) {
                 l.opacity = (v as f32).clamp(0.0, 1.0);
@@ -2155,19 +2408,24 @@ impl Engine {
             if c.get("color").is_some() {
                 l.color = color(c);
             }
+            crate::psd::fill_opacity::update(&mut l.psd_metadata, c)?;
+            crate::psd::clipping::update(&mut l.psd_metadata, c)?;
+            crate::psd::blend_ranges::update(&mut l.psd_metadata, c)?;
+            crate::psd::blend_channels::update(&mut l.psd_metadata, c)?;
+            crate::psd::update_layer_color_label(&mut l.psd_metadata, c)?;
             return Ok(());
         }
         if op == "mask.add" {
-            if self.doc.layers[i].mask.is_some() {
+            if self.authority.resident_state()?.document.layers[i].mask.is_some() {
                 return Err("Layer already has a mask".into());
             }
-            if self.doc.selection.is_some() {
+            if self.authority.resident_state()?.document.selection.is_some() {
                 let mut command = c.clone();
                 command["op"] = json!("mask.from_selection");
                 command["mode"] = json!("replace");
-                return crate::selection::masks::apply(&mut self.doc, i, &command);
+                return crate::selection::masks::apply(&mut self.authority.resident_state_mut()?.document, i, &command);
             }
-            let layer = &mut self.doc.layers[i];
+            let layer = &mut self.authority.resident_state_mut()?.document.layers[i];
             layer.mask = Some(Mask {
                 linked: true,
                 enabled: true,
@@ -2204,16 +2462,16 @@ impl Engine {
             return Ok(());
         }
         if op == "mask.remove" {
-            self.doc.layers[i].mask = None;
+            self.authority.resident_state_mut()?.document.layers[i].mask = None;
             return Ok(());
         }
         if op == "mask.refine" || op == "mask.from_selection" {
-            return crate::selection::masks::apply(&mut self.doc, i, c);
+            return crate::selection::masks::apply(&mut self.authority.resident_state_mut()?.document, i, c);
         }
         if op == "mask.from_color" {
-            if self.doc.bit_depth == 16 {
-                let image = crate::depth16::layer_image(&self.doc, i)?;
-                let mask = crate::depth16::mask_image(&self.doc, i)?;
+            if self.authority.resident_state()?.document.bit_depth == 16 {
+                let image = crate::depth16::layer_image(&self.authority.resident_state()?.document, i)?;
+                let mask = crate::depth16::mask_image(&self.authority.resident_state()?.document, i)?;
                 let source = crate::effects::Image {
                     width: image.width,
                     height: image.height,
@@ -2224,15 +2482,15 @@ impl Engine {
                         .collect(),
                 };
                 return crate::smart_mask::from_color_with_native(
-                    &mut self.doc.layers[i],
+                    &mut self.authority.resident_state_mut()?.document.layers[i],
                     &source,
                     c,
                     mask.as_deref(),
                 );
             }
-            let l = &self.doc.layers[i];
+            let l = &self.authority.resident_state()?.document.layers[i];
             let masks = self
-                .doc
+                .authority.resident_state()?.document
                 .layers
                 .iter()
                 .map(|l| {
@@ -2241,17 +2499,17 @@ impl Engine {
                         .and_then(|m| m.prepare(l.pixels.width, l.pixels.height))
                 })
                 .collect::<Vec<_>>();
-            let colors = crate::effects::prepare(&self.doc, &masks)?;
+            let colors = crate::effects::prepare(&self.authority.resident_state()?.document, &masks)?;
             let source = if let Some(image) = &colors[i] {
                 image.clone()
             } else {
                 let (w, h) = if l.kind == "group" {
-                    (self.doc.width, self.doc.height)
+                    (self.authority.resident_state()?.document.width, self.authority.resident_state()?.document.height)
                 } else {
                     (l.pixels.width, l.pixels.height)
                 };
                 let bytes = if l.kind == "group" {
-                    self.doc.preview(None, w.max(h), Some(&l.id), false)?.2
+                    self.authority.resident_state()?.document.preview(None, w.max(h), Some(&l.id), false)?.2
                 } else if l.kind == "fill" {
                     (0..w as usize * h as usize).flat_map(|_| l.color).collect()
                 } else {
@@ -2274,11 +2532,13 @@ impl Engine {
             } else {
                 source
             };
-            crate::smart_mask::from_color(&mut self.doc.layers[i], &source, c)?;
+            crate::smart_mask::from_color(&mut self.authority.resident_state_mut()?.document.layers[i], &source, c)?;
             return Ok(());
         }
         if op.starts_with("effect.") {
-            let l = &mut self.doc.layers[i];
+            use crate::effects::styles::{apply_global_light_request, global_light_request};
+            let doc = &mut self.authority.resident_state_mut()?.document;
+            let l = &mut doc.layers[i];
             match op {
                 "effect.add" => {
                     if l.effects.len() >= 32 {
@@ -2289,7 +2549,9 @@ impl Engine {
                         .get("settings")
                         .cloned()
                         .unwrap_or_else(|| crate::effects::defaults(kind));
-                    let settings = crate::effects::normalized(kind, &settings)?;
+                    let mut settings = crate::effects::normalized(kind, &settings)?;
+                    let global = global_light_request(kind, c)?;
+                    apply_global_light_request(&mut settings, &mut doc.psd_global_angle, global);
                     l.effects.push(crate::effects::Effect {
                         weight: crate::effects::command_weight(c)?,
                         id: id(),
@@ -2304,6 +2566,7 @@ impl Engine {
                         .iter_mut()
                         .find(|e| e.id == text(c, "effect", ""))
                         .ok_or("Unknown effect")?;
+                    let global = global_light_request(&e.kind, c)?;
                     if let Some(v) = c.get("enabled").and_then(Value::as_bool) {
                         e.enabled = v;
                     }
@@ -2311,7 +2574,11 @@ impl Engine {
                         e.weight = crate::effects::command_weight(c)?;
                     }
                     if let Some(settings) = c.get("settings") {
-                        e.settings = crate::effects::normalized(&e.kind, settings)?.into();
+                        let mut settings = crate::effects::normalized(&e.kind, settings)?;
+                        apply_global_light_request(&mut settings, &mut doc.psd_global_angle, global);
+                        e.settings = settings.into();
+                    } else if global.is_some() {
+                        apply_global_light_request(Arc::make_mut(&mut e.settings), &mut doc.psd_global_angle, global);
                     }
                 }
                 "effect.delete" => {
@@ -2340,7 +2607,7 @@ impl Engine {
             return Ok(());
         }
         if op.starts_with("mask.") {
-            let l = &mut self.doc.layers[i];
+            let l = &mut self.authority.resident_state_mut()?.document.layers[i];
             let m = l.mask.as_mut().ok_or("Layer has no mask")?;
             if op != "mask.toggle" {
                 m.cache_key = id();
@@ -2359,44 +2626,15 @@ impl Engine {
                     if m.steps.len() >= 32 {
                         return Err("Initial mask stack supports up to 32 steps".into());
                     }
-                    let kind = text(c, "kind", "invert");
-                    if !crate::effects::catalog::get(kind).is_some_and(|entry| entry.supports(true))
-                    {
-                        return Err(
-                            "Unsupported mask effect; inspect the shared effect catalog".into()
-                        );
-                    }
+                    let definition = crate::mask::commands::NewStep::parse(c)?;
                     m.steps.push(MaskStep {
-                        weight: crate::effects::command_weight(c)?,
+                        weight: definition.weight,
                         id: id(),
-                        kind: kind.into(),
+                        kind: definition.kind.into(),
                         enabled: true,
-                        value: mask_parameter(
-                            kind,
-                            num(
-                                c,
-                                "value",
-                                if kind == "levels" {
-                                    1.0
-                                } else if kind == "blur" {
-                                    8.0
-                                } else {
-                                    255.0
-                                },
-                            ),
-                        )?,
+                        value: definition.value,
                         pixels: Raster::new_depth(l.pixels.width, l.pixels.height, l.pixels.depth),
-                        settings: if ["curves", "adjust", "gaussian"].contains(&kind) {
-                            let effect_kind = if kind == "gaussian" { "blur" } else { kind };
-                            let v = c
-                                .get("settings")
-                                .cloned()
-                                .unwrap_or_else(|| crate::effects::defaults(effect_kind));
-                            crate::effects::validate(effect_kind, &v)?;
-                            v
-                        } else {
-                            Value::Null
-                        },
+                        settings: definition.settings.into_owned(),
                     });
                 }
                 "mask.step.update" => {
@@ -2405,23 +2643,18 @@ impl Engine {
                         .iter_mut()
                         .find(|s| s.id == text(c, "step", ""))
                         .ok_or("Unknown mask step")?;
-                    if let Some(v) = c.get("enabled").and_then(Value::as_bool) {
+                    let update = crate::mask::commands::StepUpdate::parse(&s.kind, c)?;
+                    if let Some(v) = update.enabled {
                         s.enabled = v;
                     }
-                    if let Some(settings) = c.get("settings") {
-                        let kind = if s.kind == "gaussian" {
-                            "blur"
-                        } else {
-                            s.kind.as_str()
-                        };
-                        crate::effects::validate(kind, settings)?;
+                    if let Some(settings) = update.settings {
                         s.settings = settings.clone();
                     }
-                    if c.get("weight").is_some() {
-                        s.weight = crate::effects::command_weight(c)?;
+                    if let Some(weight) = update.weight {
+                        s.weight = weight;
                     }
-                    if c.get("value").is_some() {
-                        s.value = mask_parameter(&s.kind, num(c, "value", 1.0))?;
+                    if let Some(value) = update.value {
+                        s.value = value;
                     }
                 }
                 "mask.step.delete" => m.steps.retain(|s| s.id != text(c, "step", "")),
@@ -2442,41 +2675,27 @@ impl Engine {
             };
             return Ok(());
         }
-        if self.doc.layers[i].kind == "adjustment"
+        if self.authority.resident_state()?.document.layers[i].kind == "adjustment"
             && (!c["mask"].as_bool().unwrap_or(false)
                 || ["move", "transform", "liquify.stroke"].contains(&op))
         {
             return Err("Edit the adjustment effect settings or paint on its mask".into());
         }
         if op == "liquify.stroke" {
-            if c["mask"].as_bool().unwrap_or(false) {
-                return Err("Liquify currently edits color; choose the Color channel".into());
-            }
-            let (points, pressures) = crate::brush::points_from_command(c)?;
-            if pressures.is_some() {
-                return Err("Liquify uses radius and strength, not per-point pressure".into());
-            }
-            let l = &self.doc.layers[i];
+            let l = &self.authority.resident_state()?.document.layers[i];
             let x = if l.kind == "group" { 0 } else { l.x };
             let y = if l.kind == "group" { 0 } else { l.y };
-            let points: Vec<_> = points
-                .iter()
-                .map(|p| [p[0] - x as f32, p[1] - y as f32])
-                .collect();
-            let selection = self
-                .doc
-                .selection
-                .map(|s| [s[0] - x, s[1] - y, s[2] - x, s[3] - y]);
-            let polygon = crate::selection::polygon(&self.doc).map(|p| {
-                p.iter()
-                    .map(|p| [p[0] - x as f32, p[1] - y as f32])
-                    .collect::<Vec<_>>()
-            });
-            let coverage = self
-                .doc
+            let mut stroke = crate::liquify::command::stroke(
+                c,
+                [x, y],
+                self.authority.resident_state()?.document.selection,
+                crate::selection::polygon(&self.authority.resident_state()?.document),
+            )?;
+            let document = &self.authority.resident_state()?.document;
+            let coverage = document
                 .selection_coverage
                 .as_ref()
-                .filter(|m| self.doc.selection == Some(m.bounds))
+                .filter(|m| document.selection == Some(m.bounds))
                 .map(|m| m.local(x, y));
             if coverage
                 .as_ref()
@@ -2484,23 +2703,16 @@ impl Engine {
             {
                 return Ok(());
             }
-            let stroke = json!({"coverage":coverage,"mode":text(c,"mode","push"),"points":points,"radius":num(c,"radius",40.),"strength":num(c,"strength",0.5),"selection":selection,"polygon":polygon});
-            let l = &mut self.doc.layers[i];
-            let at = if let Some(effect) = c["effect"].as_str() {
+            stroke["coverage"] = json!(coverage);
+            let l = &mut self.authority.resident_state_mut()?.document.layers[i];
+            let at = if let Some(at) = crate::liquify::command::target(
+                c,
                 l.effects
                     .iter()
-                    .position(|e| e.id == effect && e.kind == "liquify" && e.enabled)
-                    .ok_or("Choose an enabled liquify effect")?
-            } else if let Some(at) = l
-                .effects
-                .iter()
-                .rposition(|e| e.kind == "liquify" && e.enabled)
-            {
+                    .map(|e| (e.id.as_str(), e.kind.as_str(), e.enabled)),
+            )? {
                 at
             } else {
-                if l.effects.len() >= 32 {
-                    return Err("Effect stack limit: 32".into());
-                }
                 l.effects.push(crate::effects::Effect {
                     weight: 1.0,
                     id: id(),
@@ -2510,42 +2722,38 @@ impl Engine {
                 });
                 l.effects.len() - 1
             };
-            let mut settings = crate::effects::normalized("liquify", &l.effects[at].settings)?;
-            settings["strokes"]
-                .as_array_mut()
-                .ok_or("Invalid liquify stroke list")?
-                .push(stroke);
-            crate::liquify::validate(&settings)?;
-            l.effects[at].settings = settings.into();
+            l.effects[at].settings =
+                crate::liquify::command::append(&l.effects[at].settings, stroke)?.into();
             return Ok(());
         }
         if op == "paint.fill" {
-            return crate::fill::apply(&mut self.doc, c);
+            return crate::fill::apply(&mut self.authority.resident_state_mut()?.document, c);
         }
         if op == "paint.clear_selection" {
-            return crate::fill::clear_selection(&mut self.doc, c);
+            return crate::fill::clear_selection(&mut self.authority.resident_state_mut()?.document, c);
         }
-        let selection_coverage = self
-            .doc
+        let document = &self.authority.resident_state()?.document;
+        let selection_coverage = document
             .selection_coverage
             .clone()
-            .filter(|m| self.doc.selection == Some(m.bounds));
-        let selection_polygon = crate::selection::polygon(&self.doc).map(Vec::from);
-        let selection = self.doc.selection;
-        let canvas = [0, 0, self.doc.width as i32, self.doc.height as i32];
+            .filter(|m| document.selection == Some(m.bounds));
+        let selection_polygon = crate::selection::polygon(&self.authority.resident_state()?.document).map(Vec::from);
+        let selection = self.authority.resident_state()?.document.selection;
+        let canvas = [0, 0, self.authority.resident_state()?.document.width as i32, self.authority.resident_state()?.document.height as i32];
         if op == "fill"
-            && self.doc.layers[i].kind == "group"
+            && self.authority.resident_state()?.document.layers[i].kind == "group"
             && !c["mask"].as_bool().unwrap_or(false)
         {
-            if self.doc.layers.len() >= 100 {
+            if self.authority.resident_state()?.document.layers.len() >= 100 {
                 return Err("Initial version supports up to 100 layers".into());
             }
-            let mut child = Layer::new("Foreground fill", "paint", self.doc.width, self.doc.height);
+            let mut child = Layer::new("Foreground fill", "paint", self.authority.resident_state()?.document.width, self.authority.resident_state()?.document.height);
             child.parent = Some(target.into());
-            let area = selection.unwrap_or([0, 0, self.doc.width as i32, self.doc.height as i32]);
+            child.pixels = Raster::new_depth(self.authority.resident_state()?.document.width, self.authority.resident_state()?.document.height, self.authority.resident_state()?.document.bit_depth);
+            let area = selection.unwrap_or([0, 0, self.authority.resident_state()?.document.width as i32, self.authority.resident_state()?.document.height as i32]);
             let col = color(c);
-            for y in area[1].max(0)..area[3].min(self.doc.height as i32) {
-                for x in area[0].max(0)..area[2].min(self.doc.width as i32) {
+            for y in area[1].max(0)..area[3].min(self.authority.resident_state()?.document.height as i32) {
+                for x in area[0].max(0)..area[2].min(self.authority.resident_state()?.document.width as i32) {
                     if selection_polygon.as_ref().is_some_and(|points| {
                         !crate::selection::contains(points, x as f32 + 0.5, y as f32 + 0.5)
                     }) {
@@ -2554,22 +2762,22 @@ impl Engine {
                     child.pixels.set(x, y, col);
                 }
             }
-            self.doc.layers.insert(i + 1, child);
+            self.authority.resident_state_mut()?.document.layers.insert(i + 1, child);
             return Ok(());
         }
-        if ["move", "transform"].contains(&op) && self.doc.layers[i].kind == "group" {
-            return crate::transform::folder(&mut self.doc, target, c);
+        if ["move", "transform"].contains(&op) && self.authority.resident_state()?.document.layers[i].kind == "group" {
+            return crate::transform::folder(&mut self.authority.resident_state_mut()?.document, target, c);
         }
         if ["clone", "heal"].contains(&op) {
-            return crate::retouch::apply(&mut self.doc, i, c);
+            return crate::retouch::apply(&mut self.authority.resident_state_mut()?.document, i, c);
         }
-        let layer = &mut self.doc.layers[i];
+        let layer = &mut self.authority.resident_state_mut()?.document.layers[i];
         if ["move", "transform"].contains(&op) && c["selection_only"].as_bool() != Some(false) {
             if let Some(coverage) = selection_coverage {
                 let transformed = crate::transform::selection_with_coverage(layer, &coverage, c)?;
-                self.doc.selection = Some(transformed.bounds);
-                self.doc.selection_polygon = None;
-                self.doc.selection_coverage = Some(transformed);
+                self.authority.resident_state_mut()?.document.selection = Some(transformed.bounds);
+                self.authority.resident_state_mut()?.document.selection_polygon = None;
+                self.authority.resident_state_mut()?.document.selection_coverage = Some(transformed);
                 return Ok(());
             }
             if let Some(area) = selection {
@@ -2577,8 +2785,8 @@ impl Engine {
                     selection_polygon.unwrap_or_else(|| crate::selection::rectangle(area));
                 let (bounds, polygon) =
                     crate::transform::selection_with_polygon(layer, &polygon, c)?;
-                self.doc.selection = Some(bounds);
-                self.doc.selection_polygon = Some(polygon);
+                self.authority.resident_state_mut()?.document.selection = Some(bounds);
+                self.authority.resident_state_mut()?.document.selection_polygon = Some(polygon);
                 return Ok(());
             }
         }
@@ -2590,20 +2798,13 @@ impl Engine {
         if ["move", "transform"].contains(&op) {
             return crate::transform::layer(layer, c);
         }
-        if op == "fill" && !c["mask"].as_bool().unwrap_or(false) {
-            if layer.kind == "fill" && selection.is_none() {
-                layer.color = color(c);
-                return Ok(());
-            }
-            if layer.kind == "fill" {
-                let col = layer.color;
-                for y in 0..layer.pixels.height {
-                    for x in 0..layer.pixels.width {
-                        layer.pixels.set(x as i32, y as i32, col);
-                    }
-                }
-                layer.kind = "paint".into();
-            }
+        if op == "fill"
+            && !c["mask"].as_bool().unwrap_or(false)
+            && layer.kind == "fill"
+            && selection.is_none()
+        {
+            layer.color = color(c);
+            return Ok(());
         }
         if (layer.kind == "group" || layer.kind == "fill" || layer.kind == "adjustment")
             && !c.get("mask").and_then(Value::as_bool).unwrap_or(false)
@@ -2612,8 +2813,6 @@ impl Engine {
         }
         if ["paint", "smudge"].contains(&op) {
             let (mut points, pressures) = crate::brush::points_from_command(c)?;
-            let mut brush = color(c);
-            let is_mask = c.get("mask").and_then(Value::as_bool).unwrap_or(false);
             let clip = selection.map(|s| {
                 [
                     s[0] - layer.x,
@@ -2624,10 +2823,6 @@ impl Engine {
             });
             let x = layer.x;
             let y = layer.y;
-            if is_mask {
-                let v = brush[0];
-                brush = [v, v, v, brush[3]];
-            }
             let mut settings = crate::brush::Settings::from_command(c)?;
             settings.texture_origin = [x, y];
             for point in &mut points {
@@ -2635,6 +2830,7 @@ impl Engine {
                 point[1] -= y as f32;
             }
             let raster = edit_raster(layer, c)?;
+            let color = raster_color(c, raster.depth)?;
             let polygon = selection_polygon.as_ref().map(|points| {
                 points
                     .iter()
@@ -2642,22 +2838,22 @@ impl Engine {
                     .collect::<Vec<_>>()
             });
             if op == "smudge" {
-                crate::smudge::paint(
+                crate::smudge::paint_native_color(
                     raster,
                     &points,
                     pressures.as_deref(),
                     settings,
-                    brush,
+                    color,
                     clip,
                     polygon.as_deref(),
                 )?;
             } else {
-                crate::brush::paint_with_pressure(
+                crate::brush::paint_native_color(
                     raster,
                     &points,
                     pressures.as_deref(),
                     settings,
-                    brush,
+                    color,
                     c["erase"].as_bool().unwrap_or(false),
                     clip,
                     polygon.as_deref(),
@@ -2667,10 +2863,6 @@ impl Engine {
         }
         if op == "fill" || op == "shape" || op == "gradient" {
             let area = c.get("rect").and_then(rect).or(selection).unwrap_or(canvas);
-            let mut col = color(c);
-            if c.get("mask").and_then(Value::as_bool).unwrap_or(false) {
-                col = [col[0], col[0], col[0], col[3]];
-            }
             let (lx, ly, lw, lh) = (
                 layer.x,
                 layer.y,
@@ -2678,6 +2870,7 @@ impl Engine {
                 layer.pixels.height as i32,
             );
             let raster = edit_raster(layer, c)?;
+            let primitive = primitive::Primitive::new(c, area, raster.depth)?;
             let mut clip = area;
             if let Some(s) = selection {
                 clip = [
@@ -2696,37 +2889,13 @@ impl Engine {
                     }
                     let tx = xx - lx;
                     let ty = yy - ly;
-                    let mut col = col;
-                    if op == "shape" && text(c, "kind", "rectangle") == "ellipse" {
-                        let rx = (area[2] - area[0]) as f32 / 2.0;
-                        let ry = (area[3] - area[1]) as f32 / 2.0;
-                        if rx <= 0.0
-                            || ry <= 0.0
-                            || ((xx as f32 - area[0] as f32 - rx) / rx).powi(2)
-                                + ((yy as f32 - area[1] as f32 - ry) / ry).powi(2)
-                                > 1.0
-                        {
-                            continue;
-                        }
+                    if !primitive.contains(xx, yy) {
+                        continue;
                     }
                     if raster.depth == 16 {
-                        let mut native = col.map(|v| u16::from(v) * 257);
-                        if op == "gradient" {
-                            let t = (xx - area[0]) as f64 / (area[2] - area[0]).max(1) as f64;
-                            native[3] = (f64::from(native[3]) * (1.0 - t)).round() as u16;
-                        }
-                        raster.set16(
-                            tx,
-                            ty,
-                            crate::raster::blend16(raster.get16(tx, ty), native, 1.0, "normal"),
-                        );
+                        raster.set16(tx, ty, primitive.blend16(xx, yy, raster.get16(tx, ty)));
                     } else {
-                        if op == "gradient" {
-                            let t = (xx - area[0]) as f32 / (area[2] - area[0]).max(1) as f32;
-                            col[3] = (col[3] as f32 * (1.0 - t)) as u8;
-                        }
-                        let dst = raster.get(tx, ty);
-                        raster.set(tx, ty, blend(dst, col, 1.0, "normal"));
+                        raster.set(tx, ty, primitive.blend8(xx, yy, raster.get(tx, ty)));
                     }
                 }
             }
@@ -2736,38 +2905,79 @@ impl Engine {
             return Err("This operation does not support masks; use paint, fill, shape, gradient, or mask effects.".into());
         }
         if op == "adjust" {
+            let origin = [layer.x, layer.y];
+            let frame = [
+                layer.x,
+                layer.y,
+                layer.x + layer.pixels.width as i32,
+                layer.y + layer.pixels.height as i32,
+            ];
+            let area = c.get("rect").and_then(rect).or(selection).unwrap_or(frame);
+            let primitive = primitive::Primitive::new(c, area, layer.pixels.depth)?;
+            let selected = selection.unwrap_or(frame);
+            let clip = [
+                area[0].max(selected[0]).max(frame[0]),
+                area[1].max(selected[1]).max(frame[1]),
+                area[2].min(selected[2]).min(frame[2]),
+                area[3].min(selected[3]).min(frame[3]),
+            ];
+            let tile_clip = |tx: u32, ty: u32| {
+                let left = origin[0] + (tx * crate::raster::TILE) as i32;
+                let top = origin[1] + (ty * crate::raster::TILE) as i32;
+                [
+                    clip[0].max(left),
+                    clip[1].max(top),
+                    clip[2].min(left + crate::raster::TILE as i32),
+                    clip[3].min(top + crate::raster::TILE as i32),
+                ]
+            };
+            let contains = |x, y| {
+                selection_polygon
+                    .as_ref()
+                    .is_none_or(|p| crate::selection::contains(p, x as f32 + 0.5, y as f32 + 0.5))
+            };
+            // Adjust stored RGB, including transparent samples, without filling
+            // sparse holes or changing physical padding.
             if layer.pixels.depth == 16 {
-                let brightness = num(c, "brightness", 0.0).clamp(-1.0, 1.0);
-                let contrast = num(c, "contrast", 1.0).clamp(0.0, 3.0);
-                let saturation = num(c, "saturation", 1.0).clamp(0.0, 3.0);
-                for tile in layer.pixels.samples16.values_mut() {
-                    for p in Arc::make_mut(tile).chunks_exact_mut(4) {
-                        let gray = f64::from(p[0]) * 0.2126
-                            + f64::from(p[1]) * 0.7152
-                            + f64::from(p[2]) * 0.0722;
-                        for c in 0..3 {
-                            p[c] = ((gray + (f64::from(p[c]) - gray) * saturation - 32767.5)
-                                * contrast
-                                + 32767.5
-                                + brightness * 65535.0)
-                                .clamp(0.0, 65535.0)
-                                .round() as u16;
+                for (&(tx, ty), tile) in &mut layer.pixels.samples16 {
+                    let [l, t, r, b] = tile_clip(tx, ty);
+                    if l >= r || t >= b {
+                        continue;
+                    }
+                    let tile = Arc::make_mut(tile);
+                    for y in t..b {
+                        for x in l..r {
+                            if !contains(x, y) {
+                                continue;
+                            }
+                            let at = (((y - origin[1]) as u32 % crate::raster::TILE
+                                * crate::raster::TILE
+                                + (x - origin[0]) as u32 % crate::raster::TILE)
+                                * 4) as usize;
+                            let before = std::array::from_fn(|c| tile[at + c]);
+                            tile[at..at + 4].copy_from_slice(&primitive.blend16(x, y, before));
                         }
                     }
                 }
-                return Ok(());
-            }
-            let brightness = num(c, "brightness", 0.0).clamp(-1.0, 1.0) as f32;
-            let contrast = num(c, "contrast", 1.0).clamp(0.0, 3.0) as f32;
-            let saturation = num(c, "saturation", 1.0).clamp(0.0, 3.0) as f32;
-            for tile in layer.pixels.tiles.values_mut() {
-                for p in Arc::make_mut(tile).chunks_exact_mut(4) {
-                    let gray = p[0] as f32 * 0.2126 + p[1] as f32 * 0.7152 + p[2] as f32 * 0.0722;
-                    for c in 0..3 {
-                        p[c] = ((gray + (p[c] as f32 - gray) * saturation - 127.5) * contrast
-                            + 127.5
-                            + brightness * 255.0)
-                            .clamp(0.0, 255.0) as u8;
+            } else {
+                for (&(tx, ty), tile) in &mut layer.pixels.tiles {
+                    let [l, t, r, b] = tile_clip(tx, ty);
+                    if l >= r || t >= b {
+                        continue;
+                    }
+                    let tile = Arc::make_mut(tile);
+                    for y in t..b {
+                        for x in l..r {
+                            if !contains(x, y) {
+                                continue;
+                            }
+                            let at = (((y - origin[1]) as u32 % crate::raster::TILE
+                                * crate::raster::TILE
+                                + (x - origin[0]) as u32 % crate::raster::TILE)
+                                * 4) as usize;
+                            let before = std::array::from_fn(|c| tile[at + c]);
+                            tile[at..at + 4].copy_from_slice(&primitive.blend8(x, y, before));
+                        }
                     }
                 }
             }
@@ -2776,84 +2986,56 @@ impl Engine {
         if op == "pixels.replace" {
             return if let Some(pixels) = pixels {
                 crate::code::replace_pixels_bytes(
-                    &mut self.doc,
+                    &mut self.authority.resident_state_mut()?.document,
                     c,
                     pixels.bytes(),
                     crate::code::SampleOrder::Big,
                 )
             } else {
-                crate::code::replace_pixels(&mut self.doc, c)
+                crate::code::replace_pixels(&mut self.authority.resident_state_mut()?.document, c)
             };
         }
         if op == "image.patch" {
-            let path = text(c, "path", "");
-            let img = image::ImageReader::open(path)
-                .map_err(|e| e.to_string())?
-                .with_guessed_format()
-                .map_err(|e| e.to_string())?;
-            let mut limits = image::Limits::default();
-            limits.max_image_width = Some(8192);
-            limits.max_image_height = Some(8192);
-            limits.max_alloc = Some(128 * 1024 * 1024);
-            let mut img = img;
-            img.limits(limits);
-            let img = img.decode().map_err(|e| e.to_string())?;
-            let ox = num(c, "x", 0.0) as i32 - layer.x;
-            let oy = num(c, "y", 0.0) as i32 - layer.y;
-            if layer.pixels.depth == 16 {
-                for (x, y, p) in img.to_rgba16().enumerate_pixels() {
-                    let tx = ox + x as i32;
-                    let ty = oy + y as i32;
-                    layer.pixels.set16(
-                        tx,
-                        ty,
-                        crate::raster::blend16(layer.pixels.get16(tx, ty), p.0, 1.0, "normal"),
-                    );
-                }
-                return Ok(());
-            }
-            let img = img.to_rgba8();
-            for (x, y, p) in img.enumerate_pixels() {
-                let tx = ox + x as i32;
-                let ty = oy + y as i32;
-                layer
-                    .pixels
-                    .set(tx, ty, blend(layer.pixels.get(tx, ty), p.0, 1.0, "normal"));
-            }
-            return Ok(());
+            return image_patch::apply(
+                layer,
+                c,
+                selection,
+                selection_polygon.as_deref(),
+                selection_coverage.as_ref(),
+            );
         }
         Err(format!("Unsupported operation: {op}"))
     }
     pub fn undo(&mut self, actor: &str) -> Result<(), String> {
         self.ensure_write_available()?;
-        let h = self.undo.last().ok_or("Nothing to undo")?.clone();
+        let h = self.authority.resident_state()?.undo.last().ok_or("Nothing to undo")?.clone();
         if actor != "human" && h.actor != actor {
             return Err("Latest change belongs to another participant. Observe again or inspect selective task undo.".into());
         }
         self.check(actor, &h.scopes)?;
-        let revision = self.doc.revision + 1;
-        self.doc = h.before.clone();
-        crate::selection::restore_wand_revision(&mut self.doc, revision);
-        self.undo.pop();
+        let revision = self.authority.resident_state()?.document.revision.checked_add(1).ok_or("Document revision overflow")?;
+        self.authority.resident_state_mut()?.document = h.before.clone();
+        crate::selection::restore_wand_revision(&mut self.authority.resident_state_mut()?.document, revision);
+        self.authority.resident_state_mut()?.undo.pop();
         self.changes.push((revision, h.scopes.clone()));
         self.mark_ai(actor, "Undo AI edit", "history", h.scopes.clone());
-        self.redo.push(h);
+        self.authority.resident_state_mut()?.redo.push(h);
         Ok(())
     }
     pub fn redo(&mut self, actor: &str) -> Result<(), String> {
         self.ensure_write_available()?;
-        let h = self.redo.last().ok_or("Nothing to redo")?.clone();
+        let h = self.authority.resident_state()?.redo.last().ok_or("Nothing to redo")?.clone();
         if actor != "human" && h.actor != actor {
             return Err("Redo belongs to another participant".into());
         }
         self.check(actor, &h.scopes)?;
-        let revision = self.doc.revision + 1;
-        self.doc = h.after.clone();
-        crate::selection::restore_wand_revision(&mut self.doc, revision);
-        self.redo.pop();
+        let revision = self.authority.resident_state()?.document.revision.checked_add(1).ok_or("Document revision overflow")?;
+        self.authority.resident_state_mut()?.document = h.after.clone();
+        crate::selection::restore_wand_revision(&mut self.authority.resident_state_mut()?.document, revision);
+        self.authority.resident_state_mut()?.redo.pop();
         self.changes.push((revision, h.scopes.clone()));
         self.mark_ai(actor, "Redo AI edit", "history", h.scopes.clone());
-        self.undo.push(h);
+        self.authority.resident_state_mut()?.undo.push(h);
         Ok(())
     }
     pub(crate) fn release_file_ownership(&mut self) {
@@ -2894,13 +3076,13 @@ impl Engine {
         )?;
         // Reopening the same serialized PSD is still a new runtime source.
         doc.id = id();
-        self.doc = doc;
+        self.authority.resident_state_mut()?.document = doc;
         self.path = path;
-        self.saved_revision = self.doc.revision;
-        self.undo.clear();
-        self.redo.clear();
+        self.saved_revision = self.authority.resident_state()?.document.revision;
+        self.authority.resident_state_mut()?.undo.clear();
+        self.authority.resident_state_mut()?.redo.clear();
         self.changes.clear();
-        self.truncated_tasks.clear();
+        self.authority.resident_state_mut()?.truncated_tasks.clear();
         self.ai_change = None;
         self.proposals.clear();
         self.recent_tasks.clear();
@@ -2913,7 +3095,7 @@ impl Default for Engine {
     }
 }
 
-fn mask_parameter(kind: &str, value: f64) -> Result<f32, String> {
+pub(crate) fn mask_parameter(kind: &str, value: f64) -> Result<f32, String> {
     let range = match kind {
         "blur" => 0.0..=64.0,
         "levels" => 0.1..=5.0,
@@ -2925,6 +3107,9 @@ fn mask_parameter(kind: &str, value: f64) -> Result<f32, String> {
             range.start(),
             range.end()
         ));
+    }
+    if kind == "density" && value.fract() != 0. {
+        return Err("Mask density requires an integer sample from 0 to 255".into());
     }
     Ok(value as f32)
 }
@@ -2939,14 +3124,8 @@ pub(crate) fn edit_raster<'a>(
     {
         let mask = layer.mask.as_mut().ok_or("Layer has no mask")?;
         let requested = command.get("step").and_then(Value::as_str);
-        let step = if let Some(id) = requested {
-            mask.steps
-                .iter_mut()
-                .find(|s| s.id == id && s.kind == "paint")
-        } else {
-            mask.steps.iter_mut().rev().find(|s| s.kind == "paint")
-        };
-        Ok(&mut step.ok_or("Add a paint step to the mask")?.pixels)
+        let index = crate::mask::paint_step_index(mask, requested)?;
+        Ok(&mut mask.steps[index].pixels)
     } else {
         Ok(&mut layer.pixels)
     }

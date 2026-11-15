@@ -65,10 +65,11 @@ pub(crate) fn reparent_view(
     if moving.is_empty() {
         return Err("Choose layers to move".into());
     }
+    let moving_ids: HashSet<_> = moving.iter().map(String::as_str).collect();
     let mut ancestor = parent;
     let mut depth = 0;
     while let Some(id) = ancestor {
-        if moving.iter().any(|s| s == id) {
+        if moving_ids.contains(id) {
             return Err("A folder cannot be dropped into itself or its children".into());
         }
         let layer = doc
@@ -84,15 +85,15 @@ pub(crate) fn reparent_view(
             return Err("Group nesting limit exceeded".into());
         }
     }
-    let held: Vec<_> = doc
-        .layers()
-        .enumerate()
-        .filter(|(_, l)| moving.iter().any(|id| id == l.id()))
-        .map(|(i, _)| i)
-        .collect();
-    let mut order: Vec<_> = (0..doc.layer_count())
-        .filter(|i| !held.contains(i))
-        .collect();
+    let mut held = Vec::with_capacity(moving.len());
+    let mut order = Vec::with_capacity(doc.layer_count());
+    for (index, layer) in doc.layers().enumerate() {
+        if moving_ids.contains(layer.id()) {
+            held.push(index);
+        } else {
+            order.push(index);
+        }
+    }
     let at = before
         .and_then(|id| order.iter().position(|&i| doc.layer(i).unwrap().id() == id))
         .unwrap_or_else(|| {
@@ -106,12 +107,9 @@ pub(crate) fn reparent_view(
                 .map(|i| i + 1)
                 .unwrap_or(order.len())
         });
-    for (n, &index) in held.iter().enumerate() {
-        order.insert(at + n, index);
-    }
-    let changed = order.iter().enumerate().any(|(old, &new)| {
-        old != new || held.contains(&new) && doc.layer(new).unwrap().parent() != parent
-    });
+    drop(order.splice(at..at, held.iter().copied()));
+    let changed = order.iter().copied().ne(0..doc.layer_count())
+        || held.iter().any(|&index| doc.layer(index).unwrap().parent() != parent);
     let plan = TreeOrder {
         order,
         moving: held.into_iter().collect(),
@@ -256,6 +254,12 @@ pub(crate) mod presentation_tests {
                     Some(ids[3].as_str()),
                 ),
                 (vec![ids[3].clone()], None, None),
+                (
+                    vec![ids[4].clone(), ids[3].clone()],
+                    Some(ids[0].as_str()),
+                    Some(ids[1].as_str()),
+                ),
+                (vec![ids[4].clone()], Some(ids[0].as_str()), None),
             ];
             for (case, (moving, parent, before)) in cases.into_iter().enumerate() {
                 let (plan, commands) =
@@ -267,6 +271,8 @@ pub(crate) mod presentation_tests {
                     1 => &[0, 2, 3, 1, 4, 5],
                     2 => &[0, 1, 2, 3, 4, 5],
                     3 => &[0, 1, 2, 4, 5, 3],
+                    4 => &[0, 3, 4, 1, 2, 5],
+                    5 => &[0, 1, 2, 3, 4, 5],
                     _ => unreachable!(),
                 };
                 assert_eq!(plan.indices(), expected_order);
@@ -287,11 +293,24 @@ pub(crate) mod presentation_tests {
                         json!({"op":"layer.reorder","layer":ids[3],"index":5}),
                         json!({"op":"layer.reorder","layer":ids[3],"index":5}),
                     ],
+                    4 => vec![
+                        json!({"op":"layer.parent","layer":ids[3],"parent":ids[0]}),
+                        json!({"op":"layer.parent","layer":ids[4],"parent":ids[0]}),
+                        json!({"op":"layer.reorder","layer":ids[3],"index":5}),
+                        json!({"op":"layer.reorder","layer":ids[4],"index":5}),
+                        json!({"op":"layer.reorder","layer":ids[3],"index":1}),
+                        json!({"op":"layer.reorder","layer":ids[4],"index":2}),
+                    ],
+                    5 => vec![
+                        json!({"op":"layer.parent","layer":ids[4],"parent":ids[0]}),
+                        json!({"op":"layer.reorder","layer":ids[4],"index":5}),
+                        json!({"op":"layer.reorder","layer":ids[4],"index":4}),
+                    ],
                     _ => unreachable!(),
                 };
                 assert_eq!(commands, expected);
                 let mut engine = crate::engine::Engine::new();
-                engine.doc = doc.clone();
+                engine.resident_state_mut().expect("resident fixture").document = doc.clone();
                 if !commands.is_empty() {
                     engine
                         .edit("human", &commands, None, None, "Move layers")
@@ -304,10 +323,10 @@ pub(crate) mod presentation_tests {
                         plan.parent(index, layer),
                         resident.layers[position].parent.as_deref()
                     );
-                    assert_eq!(resident.layers[position].id, engine.doc.layers[position].id);
+                    assert_eq!(resident.layers[position].id, engine.resident_state().expect("resident fixture").document.layers[position].id);
                     assert_eq!(
                         resident.layers[position].parent,
-                        engine.doc.layers[position].parent
+                        engine.resident_state().expect("resident fixture").document.layers[position].parent
                     );
                 }
                 assert_eq!(pool.used(), admitted);

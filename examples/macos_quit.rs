@@ -89,12 +89,13 @@ mod native {
 
     fn snapshot(root: &Shared) -> Value {
         let engine = root.lock().unwrap();
-        json!({"document": engine.doc, "undo": engine.undo.len(), "redo": engine.redo.len(), "saved_revision": engine.saved_revision})
+        let resident = engine.resident_state().unwrap();
+        json!({"document": resident.document, "undo": resident.undo.len(), "redo": resident.redo.len(), "saved_revision": engine.saved_revision})
     }
 
     fn dirty(root: &Shared, name: &str) {
         let mut engine = root.lock().unwrap();
-        let layer = engine.doc.layers[0].id.clone();
+        let layer = engine.resident_state().unwrap().document.layers[0].id.clone();
         engine
             .edit(
                 "human",
@@ -220,15 +221,15 @@ mod native {
                 && !directory.join("complete.json").exists()
         );
         let mut engine = Engine::new();
-        engine.doc = Document::new_depth(32, 24, 8).unwrap();
+        engine.resident_state_mut().unwrap().document = Document::new_depth(32, 24, 8).unwrap();
         let root = Arc::new(Mutex::new(engine));
         let second = workspace::new_project(&root, 32, 24, 16, None).unwrap();
-        root.lock().unwrap().doc.layers[0]
-            .pixels
-            .set16(1, 1, [12001, 23003, 34007, 45009]);
-        second.lock().unwrap().doc.layers[0]
-            .pixels
-            .set16(1, 1, [12001, 23003, 34007, 45009]);
+        for project in [&root, &second] {
+            let mut engine = project.lock().unwrap();
+            engine.resident_state_mut().unwrap().document.layers[0]
+                .pixels
+                .set16(1, 1, [12001, 23003, 34007, 45009]);
+        }
         dirty(&root, "Native8 unsaved work");
         dirty(&second, "Native16 unsaved work");
         activation::enable(&root);
@@ -274,8 +275,9 @@ mod native {
         for (shared, depth) in captured.into_iter().zip([8, 16]) {
             let engine = shared.lock().unwrap();
             assert!(engine.closed);
-            assert_eq!(engine.doc.bit_depth, depth);
-            assert_eq!(engine.doc.revision, engine.saved_revision);
+            let doc = &engine.resident_state().unwrap().document;
+            assert_eq!(doc.bit_depth, depth);
+            assert_eq!(doc.revision, engine.saved_revision);
         }
         fs::File::create_new(directory.join("complete.json")).unwrap()
             .write_all(br#"{"native_depths":[8,16],"delegate_preserved":true,"dirty_cancel_preserved":true,"normal_exit_returned":true}"#).unwrap();

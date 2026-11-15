@@ -311,6 +311,12 @@ pub(crate) struct Mapping {
     _charges: Vec<Reservation>,
 }
 impl Mapping {
+    pub(crate) fn validate_frame(&self, frame: Frame, pool: &ResidentBudget) -> Result<(), String> {
+        if self.plan.frame.dimensions() != frame.dimensions() || !self.plan.pool.same_pool(pool) {
+            return Err("Liquify mapping differs from its captured frame or resident pool".into());
+        }
+        Ok(())
+    }
     pub(crate) fn source_position(&self, x: i32, y: i32) -> Result<Option<[f32; 2]>, String> {
         let [w, h] = self.plan.frame.dimensions();
         if x < 0 || y < 0 || x >= w as i32 || y >= h as i32 {
@@ -835,11 +841,8 @@ mod tests {
         let actual = mapping
             .sample(x, y, 16, |sx, sy| Ok(image.get(sx, sy)))
             .unwrap();
-        let expected = crate::depth16::color::sample(
-            &image,
-            f64::from(position[0]),
-            f64::from(position[1]),
-        );
+        let expected =
+            crate::depth16::color::sample(&image, f64::from(position[0]), f64::from(position[1]));
         assert_eq!(actual, expected);
         assert_eq!(actual, [12347, 33559, 51237, 0]);
         drop(mapping);

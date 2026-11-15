@@ -146,10 +146,7 @@ impl Surface {
         match &*self.storage {
             SurfaceStorage::Zero => true,
             SurfaceStorage::Stored(plane, _) => plane.store().uses_disk_budget(budget),
-            SurfaceStorage::Resolved(index) => index
-                .entries
-                .iter()
-                .all(|tile| tile.owner().uses_disk_budget(budget)),
+            SurfaceStorage::Resolved(index) => index.disk.same_pool(budget),
         }
     }
 
@@ -163,18 +160,10 @@ impl Surface {
             SurfaceStorage::Zero => RegionPixels::Zero,
             SurfaceStorage::Stored(plane, _) => RegionPixels::Pinned(plane.pin(region, check)?),
             SurfaceStorage::Resolved(index) => {
-                let [left, top, right, bottom] = region.bounds();
-                let x0 = left.max(0).min(self.width as i32) as u32 / super::TILE;
-                let y0 = top.max(0).min(self.height as i32) as u32 / super::TILE;
-                let x1 = (right.max(0).min(self.width as i32) as u32).div_ceil(super::TILE);
-                let y1 = (bottom.max(0).min(self.height as i32) as u32).div_ceil(super::TILE);
-                if u64::from(x1.saturating_sub(x0)) * u64::from(y1.saturating_sub(y0)) > 128 {
-                    return Err(Error::Budget);
-                }
-                let count = (x1.saturating_sub(x0) as usize) * (y1.saturating_sub(y0) as usize);
-                let mut tiles = RegionPins::new(&index.budget, count)?;
-                for y in y0..y1 {
-                    for x in x0..x1 {
+                let [xs, ys] = region.tile_ranges(self.width, self.height);
+                let mut tiles = RegionPins::new(&index.budget, xs.len() * ys.len())?;
+                for y in ys {
+                    for x in xs.clone() {
                         let tile = self.prepare_tile((x, y), check)?;
                         if let Some(pixels) = tile.pixels {
                             tiles.push((x, y), pixels)?;
@@ -191,14 +180,49 @@ impl Surface {
             }
         };
         check()?;
-        Ok(SurfaceRegion {
+        Ok(self.region_view(region, pixels))
+    }
+
+    pub(crate) fn prepare_region_guarded(
+        &self,
+        region: Region,
+        active: &mut dyn FnMut() -> Result<()>,
+        owner: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<SurfaceRegion> {
+        active()?;
+        owner()?;
+        let budget = match &*self.storage {
+            SurfaceStorage::Zero => return Ok(self.region_view(region, RegionPixels::Zero)),
+            SurfaceStorage::Stored(plane, _) => plane.store().resident_budget(),
+            SurfaceStorage::Resolved(index) => index.budget.clone(),
+        };
+        let [xs, ys] = region.tile_ranges(self.width, self.height);
+        let mut tiles = RegionPins::new(&budget, xs.len() * ys.len())?;
+        const COLUMNS: usize = super::NATIVE_EDGE.div_ceil(super::TILE) as usize;
+        let mut row = [const { None }; COLUMNS];
+        for y in ys {
+            let row = &mut row[..xs.len()];
+            self.pin_row(xs.start, y, row, active, owner)?;
+            for (x, tile) in xs.clone().zip(row.iter_mut()) {
+                if let Some(tile) = tile.take() {
+                    tiles.push((x, y), tile)?;
+                }
+            }
+        }
+        owner()?;
+        let pinned = PinnedRegion::from_pins(self.width, self.height, self.depth, region, tiles)?;
+        Ok(self.region_view(region, RegionPixels::Pinned(pinned)))
+    }
+
+    fn region_view(&self, region: Region, pixels: RegionPixels) -> SurfaceRegion {
+        SurfaceRegion {
             key: self.key,
             width: self.width,
             height: self.height,
             depth: self.depth,
             region,
             pixels,
-        })
+        }
     }
 
     /// Complete physical tile, including padded edge samples. The caller changes

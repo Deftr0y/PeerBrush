@@ -56,15 +56,15 @@ fn every_discovered_effect_is_editable_undoable_and_native_depth_safe() {
                 .filter(|entry| entry.supports(mask))
             {
                 let mut engine = Engine::new();
-                engine.doc = Document::new_depth(8, 8, depth).unwrap();
+                engine.resident_state_mut().expect("resident fixture").document = Document::new_depth(8, 8, depth).unwrap();
                 if depth == 16 {
-                    engine.doc.layers[0]
+                    engine.resident_state_mut().expect("resident fixture").document.layers[0]
                         .pixels
                         .set16(2, 3, [12347, 33559, 51237, 45679]);
                 } else {
-                    engine.doc.layers[0].pixels.set(2, 3, [48, 131, 200, 177]);
+                    engine.resident_state_mut().expect("resident fixture").document.layers[0].pixels.set(2, 3, [48, 131, 200, 177]);
                 }
-                let layer = engine.doc.layers[0].id.clone();
+                let layer = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
                 if mask {
                     engine
                         .edit(
@@ -76,14 +76,14 @@ fn every_discovered_effect_is_editable_undoable_and_native_depth_safe() {
                         )
                         .unwrap();
                 }
-                let before = engine.doc.clone();
+                let before = engine.resident_state().expect("resident fixture").document.clone();
                 engine.edit("human", &[json!({"op":if mask {"mask.step.add"} else {"effect.add"},"layer":layer,"kind":entry.kind})], None, None, "Catalog effect").unwrap();
-                assert_eq!(engine.doc.bit_depth, depth);
+                assert_eq!(engine.resident_state().expect("resident fixture").document.bit_depth, depth);
                 assert_eq!(
-                    engine.doc.layers[0].pixels.rgba16(),
+                    engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(),
                     before.layers[0].pixels.rgba16()
                 );
-                let saved = psd::decode(&psd::encode(&engine.doc).unwrap()).unwrap();
+                let saved = psd::decode(&psd::encode(&engine.resident_state().expect("resident fixture").document).unwrap()).unwrap();
                 assert!(!saved.read_only, "{} mask={mask}", entry.kind);
                 assert_eq!(saved.bit_depth, depth);
                 if mask {
@@ -103,7 +103,7 @@ fn every_discovered_effect_is_editable_undoable_and_native_depth_safe() {
                 }
                 engine.undo("human").unwrap();
                 assert_eq!(
-                    serde_json::to_value(&engine.doc.layers).unwrap(),
+                    serde_json::to_value(&engine.resident_state().expect("resident fixture").document.layers).unwrap(),
                     serde_json::to_value(&before.layers).unwrap()
                 );
             }

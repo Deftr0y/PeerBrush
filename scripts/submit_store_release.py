@@ -62,7 +62,10 @@ def release_version(tag):
         raise SafeError('Only stable numeric release tags are supported.')
     major, minor, patch = (int(v or 0) for v in match.groups())
     app = f'{major}.{minor}.{patch}'
-    store = f'{major + 1}.{minor}.{patch}.0'
+    try:
+        store = msix.package_version(app)
+    except ValueError:
+        raise SafeError('Store version component out of range.') from None
     if version(store) <= BASELINE:
         raise SafeError('The initial 0.25 release and older versions cannot be submitted.')
     return app, store

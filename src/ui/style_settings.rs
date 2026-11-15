@@ -1,4 +1,81 @@
 use super::*;
+
+const SWATCH_SIZE: usize = 32;
+
+fn sample_swatch(ctx: &egui::Context, kind: &str, key: &str, choice: &str) -> Option<TextureHandle> {
+    if choice == "bitmap" {
+        return None;
+    }
+    let id = egui::Id::new(("layer style sample", kind, key, choice));
+    if let Some(texture) = ctx.data(|data| data.get_temp::<TextureHandle>(id)) {
+        return Some(texture);
+    }
+
+    let mut settings = json!({"opacity":1.});
+    settings[key] = match key {
+        "down" => json!(choice == "recessed"),
+        "invert" | "pixel_snap" | "source_knockout" => json!(choice == "on"),
+        _ => json!(choice),
+    };
+    let shadow_sample = matches!(key, "pixel_snap" | "source_knockout");
+    let fills_frame = key == "pattern"
+        || kind == "gradient_overlay"
+        || key == "invert" && matches!(kind, "pattern_overlay" | "texture");
+    match kind {
+        "gradient_overlay" => {
+            settings["angle"] = json!(0.);
+            settings["color"] = json!([0.08, 0.08, 0.08]);
+            settings["color2"] = json!([0.94, 0.94, 0.94]);
+        }
+        "texture" => settings["depth"] = json!(1.),
+        "stroke" => {
+            settings["color"] = json!([0.96, 0.58, 0.32]);
+            settings["size"] = json!(5.);
+        }
+        _ => {}
+    }
+    if shadow_sample {
+        settings["angle"] = json!(45.);
+        settings["distance"] = json!(6.5);
+        settings["size"] = json!(0.);
+        let color = if kind == "inner_shadow" { [1., 0.75, 0.40] } else { [0.12, 0.06, 0.04] };
+        settings["color"] = json!(color);
+        if kind == "inner_shadow" {
+            settings["blend"] = json!("normal");
+        }
+    }
+    let mut words = vec![0; SWATCH_SIZE * SWATCH_SIZE * 4];
+    for (index, pixel) in words.chunks_exact_mut(4).enumerate() {
+        let (x, y) = (index % SWATCH_SIZE, index / SWATCH_SIZE);
+        if fills_frame || ((7..25).contains(&x) && (7..25).contains(&y)) {
+            pixel[3] = if key == "source_knockout" { 32768 } else { u16::MAX };
+            if kind == "contour" && key == "invert" {
+                pixel[..3].fill((x as u16 - 7) * 3855);
+            } else if shadow_sample {
+                pixel[..3].copy_from_slice(&[65535, 29000, 13000]);
+            } else {
+                pixel[..3].fill(27000);
+            }
+        }
+    }
+    crate::effects::styles::apply(&mut words, SWATCH_SIZE as u32, SWATCH_SIZE as u32, kind, &settings).ok()?;
+    if shadow_sample {
+        for pixel in words.chunks_exact_mut(4) {
+            let source = [pixel[0], pixel[1], pixel[2], pixel[3]];
+            let background = [50000, 50000, 50000, u16::MAX];
+            pixel.copy_from_slice(&crate::raster::blend16(background, source, 1., "normal"));
+        }
+    }
+    let rgba: Vec<_> = words.into_iter().map(crate::raster::project16).collect();
+    let texture = ctx.load_texture(
+        format!("{kind} {choice} sample"),
+        egui::ColorImage::from_rgba_unmultiplied([SWATCH_SIZE; 2], &rgba),
+        egui::TextureOptions::LINEAR,
+    );
+    ctx.data_mut(|data| data.insert_temp(id, texture.clone()));
+    Some(texture)
+}
+
 pub(super) fn settings(ui: &mut egui::Ui, kind: &str, value: &mut Value) -> Option<egui::Response> {
     let bitmap = crate::effects::patterns::active(kind, value);
     let mut defaults = crate::effects::styles::defaults(kind);
@@ -16,6 +93,35 @@ pub(super) fn settings(ui: &mut egui::Ui, kind: &str, value: &mut Value) -> Opti
         }
     }
     let mut changed = None;
+    if kind == "bevel_emboss" {
+        ui.horizontal_wrapped(|ui| {
+            controls::label(ui, "Relief");
+            let current = value["down"].as_bool().unwrap_or(false);
+            for (down, label, help) in [
+                (false, "Raised", "Light the bevel as if it rises from the surface."),
+                (true, "Recessed", "Reverse the bevel lighting so it appears recessed."),
+            ] {
+                let selected = current == down;
+                let choice = if down { "recessed" } else { "raised" };
+                let button = match sample_swatch(ui.ctx(), kind, "down", choice) {
+                    Some(texture) => {
+                        egui::Button::image_and_text((texture.id(), Vec2::splat(26.)), label)
+                    }
+                    None => egui::Button::new(label),
+                };
+                let mut response = ui.add(button.selected(selected)).on_hover_text(help);
+                response.widget_info(|| {
+                    egui::WidgetInfo::selected(egui::WidgetType::RadioButton, response.enabled(), selected, label)
+                });
+                crate::icons::paint_focus(ui, &response);
+                if response.clicked() && !selected {
+                    value["down"] = json!(down);
+                    response.mark_changed();
+                    changed = Some(response);
+                }
+            }
+        });
+    }
     for (key, options) in [
         (
             "blend",
@@ -66,10 +172,6 @@ pub(super) fn settings(ui: &mut egui::Ui, kind: &str, value: &mut Value) -> Opti
             },
         ),
         (
-            "sampling",
-            vec![("bilinear", "Bilinear"), ("nearest", "Nearest")],
-        ),
-        (
             "position",
             vec![
                 ("inside", "Inside"),
@@ -117,39 +219,86 @@ pub(super) fn settings(ui: &mut egui::Ui, kind: &str, value: &mut Value) -> Opti
                     "pattern" => "Pattern",
                     "position" => "Position",
                     "source" => "Source",
-                    "sampling" => "Sampling",
                     _ => "Style",
                 },
             );
-            let label = options
-                .iter()
-                .find(|(id, _)| *id == selected)
-                .map_or(selected.as_str(), |(_, label)| *label);
-            egui::ComboBox::from_id_salt((ui.id(), key))
-                .selected_text(label)
-                .show_ui(ui, |ui| {
+            let mut response = None;
+            if matches!(key, "style" | "pattern" | "position" | "source" | "contour") {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 3.;
+                    for (id, label) in &options {
+                        let active = selected == *id;
+                        let mut r = if key == "contour" {
+                            let r = ui.add_sized([32., 24.], egui::Button::new("").selected(active));
+                            contour_points::swatch(ui, r.rect.shrink(5.), id, &value["contour_points"]);
+                            r
+                        } else {
+                            let button = match sample_swatch(ui.ctx(), kind, key, id) {
+                                Some(texture) => egui::Button::image((texture.id(), Vec2::splat(26.))),
+                                None => egui::Button::new(*label),
+                            };
+                            ui.add(button.selected(active))
+                        }.on_hover_text(*label);
+                        r.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::RadioButton, r.enabled(), active, *label));
+                        crate::icons::paint_focus(ui, &r);
+                        if !active && r.clicked() {
+                            selected = (*id).into();
+                            r.mark_changed();
+                            response = Some(r);
+                        }
+                    }
+                    if let Some((_, label)) = options.iter().find(|(id, _)| *id == selected && *id != "bitmap") {
+                        ui.label(*label);
+                    }
+                });
+            } else {
+                let label = options.iter().find(|(id, _)| *id == selected)
+                    .map_or(selected.as_str(), |(_, label)| *label);
+                let effect_blend = value["blend"].as_str().unwrap_or("normal");
+                egui::ComboBox::from_id_salt((ui.id(), key)).selected_text(label).show_ui(ui, |ui| {
                     for (id, label) in options {
-                        let r = ui.selectable_value(&mut selected, id.into(), label);
-                        if r.changed() {
-                            value[key] = json!(selected);
-                            if key == "contour" {
-                                if selected == "custom" {
-                                    value["contour_points"] = json!([{"position":0.,"value":0.},{"position":1.,"value":1.}]);
-                                } else { value.as_object_mut().unwrap().remove("contour_points"); }
+                        let mode = if id == "inherit" { effect_blend } else { id };
+                        let mut r = controls::blend_choice(ui, mode, label, selected == id, true);
+                        if r.clicked() {
+                            ui.close_menu();
+                            if selected != id {
+                                selected = id.into();
+                                r.mark_changed();
+                                response = Some(r);
                             }
-                            if key == "pattern" && selected != "bitmap" {
-                                for key in crate::effects::styles::bitmap_defaults()
-                                    .as_object()
-                                    .unwrap()
-                                    .keys()
-                                {
-                                    value.as_object_mut().unwrap().remove(key);
-                                }
-                            }
-                            changed = Some(r);
                         }
                     }
                 });
+            }
+            if let Some(response) = response {
+                value[key] = json!(selected);
+                if key == "contour" {
+                    if selected == "custom" {
+                        value["contour_points"] = json!([{"position":0.,"value":0.},{"position":1.,"value":1.}]);
+                    } else {
+                        value.as_object_mut().unwrap().remove("contour_points");
+                    }
+                }
+                if key == "pattern" && selected != "bitmap" {
+                    let fields = value.as_object_mut().unwrap();
+                    fields.remove("use_pattern_alpha");
+                    for key in crate::effects::styles::bitmap_defaults().as_object().unwrap().keys() {
+                        fields.remove(key);
+                    }
+                }
+                changed = Some(response);
+            }
+        });
+    }
+    if crate::effects::patterns::active(kind, value) {
+        use crate::production_export::Resampling;
+        ui.horizontal_wrapped(|ui| {
+            controls::label(ui, "Sampling");
+            let current = if value["sampling"] == "nearest" { Resampling::Nearest } else { Resampling::Bilinear };
+            if let Some((method, response)) = controls::sampling_choices(ui, current) {
+                value["sampling"] = json!(method);
+                changed = Some(response);
+            }
         });
     }
     egui::Grid::new((ui.id(), "style controls"))
@@ -157,7 +306,13 @@ pub(super) fn settings(ui: &mut egui::Ui, kind: &str, value: &mut Value) -> Opti
         .show(ui, |ui| {
             for (key, label, min, max, suffix) in [
                 ("opacity", "Opacity", 0., 1., "%"),
-                ("size", "Size", 0., 64., " px"),
+                (
+                    "size",
+                    "Size",
+                    0.,
+                    if kind == "stroke" { crate::effects::styles::MAX_STROKE_SIZE as f32 } else { 64. },
+                    " px",
+                ),
                 ("soften", "Soften", 0., 64., " px"),
                 ("distance", "Distance", 0., 128., " px"),
                 (
@@ -171,7 +326,7 @@ pub(super) fn settings(ui: &mut egui::Ui, kind: &str, value: &mut Value) -> Opti
                     180.,
                     "°",
                 ),
-                ("altitude", "Altitude", 0., 90., "°"),
+                ("altitude", "Light altitude", 0., 90., "°"),
                 (
                     "spread",
                     if kind == "inner_shadow" {
@@ -226,20 +381,23 @@ pub(super) fn settings(ui: &mut egui::Ui, kind: &str, value: &mut Value) -> Opti
                 if key == "smoothness" && value["color_stops"].as_array().is_none_or(|stops| stops.len() < 3) {
                     continue;
                 }
-                controls::label(ui, label);
-                if matches!(key, "angle" | "bitmap_angle") {
+                let linked_shadow = key == "angle" && value.get("global_light").is_some();
+                controls::label(ui, if linked_shadow { "Global light" } else { label });
+                if matches!(key, "angle" | "bitmap_angle" | "altitude") {
                     let mut degrees = value[key].as_f64().or_else(|| defaults[key].as_f64()).unwrap_or(0.);
-                    let (name, help) = if key == "bitmap_angle" {
-                        ("Tile angle", "Tile rotation: 0° points right; +90° rotates clockwise.")
-                    } else {
-                        match kind {
+                    let (name, help) = match key {
+                        "altitude" => ("Light altitude", "Set the light's elevation above the surface, from 0° along the surface to 90° overhead."),
+                        "bitmap_angle" => ("Tile angle", "Tile rotation: 0° points right; +90° rotates clockwise."),
+                        _ => match kind {
+                            "drop_shadow" | "inner_shadow" if linked_shadow => ("Shadow direction", "Uses the project’s Global Light. Changing the direction switches this shadow to local light."),
                             "drop_shadow" | "inner_shadow" => ("Shadow direction", "Shadow displacement: 0° points right; +90° points up. The light is opposite the shadow direction. Distance is independent."),
                             "bevel_emboss" | "texture" => ("Light angle", "Light direction: 0° points right; +90° points up. Altitude and distance remain independent."),
                             "satin" => ("Satin direction", "Satin samples along this axis: 0° is horizontal; +90° is vertical. Distance is independent."),
                             _ => ("Gradient angle", "Gradient direction: 0° points right; +90° points up. Scale and offset remain independent."),
-                        }
+                        },
                     };
-                    let response = controls::angle(ui, key, &mut degrees, key == "bitmap_angle", name, help);
+                    let limits = (key == "altitude").then_some(f64::from(min)..=f64::from(max));
+                    let response = controls::angle_with_limits(ui, key, &mut degrees, key == "bitmap_angle", name, help, limits);
                     if response.changed() || response.double_clicked() || controls::number_editing(&response.ctx, response.id) {
                         value[key] = json!(degrees);
                         changed = Some(response);
@@ -328,11 +486,12 @@ pub(super) fn settings(ui: &mut egui::Ui, kind: &str, value: &mut Value) -> Opti
                 label,
                 &mut rgb,
                 &mut alpha,
-                if kind == "bevel_emboss" {
+                Some(if kind == "bevel_emboss" {
                     "Channel opacity"
                 } else {
                     "Effect opacity"
-                },
+                }),
+                true,
             ) {
                 value[key] = json!(rgb);
                 value[alpha_key] = json!(alpha);
@@ -342,42 +501,90 @@ pub(super) fn settings(ui: &mut egui::Ui, kind: &str, value: &mut Value) -> Opti
     }
     if kind == "gradient_overlay" {
         changed = gradient_stops::controls(ui, value).or(changed);
-        let mut grid = value["pixel_grid"] == true;
-        let r = ui.checkbox(&mut grid, "Pixel aligned");
-        if r.changed() {
-            value["pixel_grid"] = json!(grid);
-            if !grid && value["align_layer"] == true {
-                value["align_layer"] = json!(false);
+        ui.horizontal_wrapped(|ui| {
+            controls::label(ui, "Placement");
+            let current = (value["pixel_grid"] == true, value["align_layer"] == true);
+            for (grid, layer, icon, label, help) in [
+                (false, false, Icon::Gradient, "Fractional canvas", "Use the full canvas with fractional gradient placement."),
+                (true, false, Icon::CanvasBounds, "Pixel-aligned canvas", "Align the gradient to the pixel grid using the canvas bounds."),
+                (true, true, Icon::TrimAlpha, "Pixel-aligned layer", "Align the gradient to the pixel grid using the bounds of the incoming visible pixels."),
+            ] {
+                let selected = current == (grid, layer);
+                let mut response = icons::labeled_choice(ui, icon, label, Some(selected), 0.)
+                    .on_hover_text(help);
+                if response.clicked() && !selected {
+                    value["pixel_grid"] = json!(grid);
+                    if layer || value.get("align_layer").is_some() {
+                        value["align_layer"] = json!(layer);
+                    }
+                    response.mark_changed();
+                    changed = Some(response);
+                }
             }
-            changed = Some(r);
-        }
-        if grid {
-            let mut aligned = value["align_layer"] == true;
-            let r = ui.checkbox(&mut aligned, "Align to layer");
-            if r.changed() {
-                value["align_layer"] = json!(aligned);
-                changed = Some(r);
+        });
+    }
+    let coverage_option = match kind {
+        "gradient_overlay" => Some(("use_gradient_alpha", "Use gradient opacity to vary the layer's transparency, independently of gradient color.")),
+        "pattern_overlay" if value["pattern"] == "bitmap" => Some(("use_pattern_alpha", "Use bitmap alpha to vary the layer's transparency, independently of tile color.")),
+        _ => None,
+    };
+    if let Some((key, help)) = coverage_option {
+        ui.horizontal_wrapped(|ui| {
+            controls::label(ui, "Coverage");
+            let current = value[key] == true;
+            for (coverage, icon, label, help) in [
+                (false, Icon::FillLayer, "Keep layer coverage", "Blend the overlay into the layer's colors while preserving its transparency."),
+                (true, Icon::Mask, "Apply overlay coverage", help),
+            ] {
+                let selected = current == coverage;
+                let mut response = icons::labeled_choice(ui, icon, label, Some(selected), 0.)
+                    .on_hover_text(help);
+                if response.clicked() && !selected {
+                    value[key] = json!(coverage);
+                    response.mark_changed();
+                    changed = Some(response);
+                }
             }
-        }
+        });
     }
     changed = contour_points::controls(ui, value).or(changed);
-    for (key, label) in [
-        ("reverse", "Reverse"),
-        ("invert", "Invert"),
-        ("down", "Down"),
-        ("pixel_snap", "Pixel aligned"),
-        ("source_knockout", "Knock out source"),
+    for (key, label, choices) in [
+        ("invert", "Effect output", [
+            ("Normal", "Use the effect’s original pattern, tone, or coverage."),
+            ("Inverted", "Reverse the effect’s pattern, tone, or coverage."),
+        ]),
+        ("pixel_snap", "Shadow offset", [
+            ("Fractional", "Allow the shadow to land between pixels for finer placement."),
+            ("Pixel aligned", "Round the shadow’s horizontal and vertical offsets to whole pixels."),
+        ]),
+        ("source_knockout", "Shadow under layer", [
+            ("Show through", "Let the shadow show through translucent parts of the layer."),
+            ("Knock out source", "Use the layer’s opacity to reduce the shadow underneath it."),
+        ]),
     ] {
         if defaults.get(key).is_some() && !bitmap {
-            let mut enabled = value[key]
-                .as_bool()
-                .or_else(|| defaults[key].as_bool())
-                .unwrap_or(false);
-            let r = ui.checkbox(&mut enabled, label);
-            if r.changed() {
-                value[key] = json!(enabled);
-                changed = Some(r);
-            }
+            let current = value[key].as_bool().or_else(|| defaults[key].as_bool()).unwrap_or(false);
+            ui.horizontal_wrapped(|ui| {
+                controls::label(ui, label);
+                for (enabled, (label, help)) in [false, true].into_iter().zip(choices) {
+                    let selected = current == enabled;
+                    let sample = sample_swatch(ui.ctx(), kind, key, if enabled { "on" } else { "off" });
+                    let button = match sample {
+                        Some(texture) => egui::Button::image_and_text((texture.id(), Vec2::splat(26.)), label),
+                        None => egui::Button::new(label),
+                    };
+                    let mut response = ui.add(button.selected(selected)).on_hover_text(help);
+                    response.widget_info(|| egui::WidgetInfo::selected(
+                        egui::WidgetType::RadioButton, response.enabled(), selected, label,
+                    ));
+                    icons::paint_focus(ui, &response);
+                    if response.clicked() && !selected {
+                        value[key] = json!(enabled);
+                        response.mark_changed();
+                        changed = Some(response);
+                    }
+                }
+            });
         }
     }
     changed
@@ -401,10 +608,10 @@ mod tests {
             ] {
                 let ctx = egui::Context::default();
                 let mut engine = crate::engine::Engine::new();
-                engine.doc = Document::new_depth(32, 32, depth).unwrap();
+                engine.resident_state_mut().expect("resident fixture").document = Document::new_depth(32, 32, depth).unwrap();
                 for y in 7..22 {
                     for x in 6..21 {
-                        engine.doc.layers[0].pixels.set16(
+                        engine.resident_state_mut().expect("resident fixture").document.layers[0].pixels.set16(
                             x,
                             y,
                             [
@@ -416,7 +623,7 @@ mod tests {
                         );
                     }
                 }
-                let layer = engine.doc.layers[0].id.clone();
+                let layer = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
                 let mut settings = crate::effects::styles::defaults(kind);
                 if settings.get("distance").is_some() {
                     settings["distance"] = json!(4.);
@@ -461,8 +668,8 @@ mod tests {
                         "Fixture",
                     )
                     .unwrap();
-                engine.undo.clear();
-                let before = engine.doc.clone();
+                engine.resident_state_mut().expect("resident fixture").undo.clear();
+                let before = engine.resident_state().expect("resident fixture").document.clone();
                 assert_eq!(before.bit_depth, depth);
                 let effect = before.layers[0].effects[0].id.clone();
                 let shared = Arc::new(std::sync::Mutex::new(engine));
@@ -541,31 +748,31 @@ mod tests {
                     before.export_png().unwrap(),
                     "{depth}/{kind}/{key}"
                 );
-                assert!(shared.lock().unwrap().undo.is_empty());
+                assert!(shared.lock().unwrap().resident_state().expect("resident fixture").undo.is_empty());
                 assert_eq!(
-                    serde_json::to_value(&shared.lock().unwrap().doc).unwrap(),
+                    serde_json::to_value(&shared.lock().unwrap().resident_state().expect("resident fixture").document).unwrap(),
                     serde_json::to_value(&before).unwrap()
                 );
                 draw(&mut app, vec![button(end, false)]);
                 {
                     let mut engine = shared.lock().unwrap();
-                    assert_eq!(engine.undo.len(), 1);
+                    assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), 1);
                     assert_eq!(
-                        engine.doc.export_png().unwrap(),
+                        engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
                         draft.export_png().unwrap()
                     );
                     assert_eq!(
-                        engine.doc.layers[0].pixels.rgba16(),
+                        engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(),
                         before.layers[0].pixels.rgba16()
                     );
                     engine.undo("human").unwrap();
                     assert_eq!(
-                        engine.doc.export_png().unwrap(),
+                        engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
                         before.export_png().unwrap()
                     );
                     engine.redo("human").unwrap();
                     assert_eq!(
-                        engine.doc.export_png().unwrap(),
+                        engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
                         draft.export_png().unwrap()
                     );
                 }
@@ -597,7 +804,7 @@ mod tests {
                         egui::Event::Text("13.1234567890123".into()),
                     ],
                 );
-                assert_eq!(shared.lock().unwrap().undo.len(), 1);
+                assert_eq!(shared.lock().unwrap().resident_state().expect("resident fixture").undo.len(), 1);
                 draw(
                     &mut app,
                     vec![egui::Event::Key {
@@ -610,17 +817,17 @@ mod tests {
                 );
                 let mut engine = shared.lock().unwrap();
                 assert_eq!(
-                    engine.doc.layers[0].effects[0].settings[key].as_f64(),
+                    engine.resident_state().expect("resident fixture").document.layers[0].effects[0].settings[key].as_f64(),
                     Some(13.1234567890123)
                 );
-                assert_eq!(engine.undo.len(), 2);
+                assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), 2);
                 assert_eq!(
-                    engine.doc.layers[0].pixels.rgba16(),
+                    engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(),
                     before.layers[0].pixels.rgba16()
                 );
                 engine.undo("human").unwrap();
                 assert_eq!(
-                    engine.doc.export_png().unwrap(),
+                    engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
                     draft.export_png().unwrap()
                 );
             }
@@ -632,11 +839,11 @@ mod tests {
             for interruption in ["revision", "identity", "escape", "focus", "focus_return"] {
                 let ctx = egui::Context::default();
                 let mut engine = crate::engine::Engine::new();
-                engine.doc = Document::new_depth(32, 32, depth).unwrap();
-                engine.doc.layers[0]
+                engine.resident_state_mut().expect("resident fixture").document = Document::new_depth(32, 32, depth).unwrap();
+                engine.resident_state_mut().expect("resident fixture").document.layers[0]
                     .pixels
                     .set16(12, 16, [12347, 23459, 34571, 65535]);
-                let layer = engine.doc.layers[0].id.clone();
+                let layer = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
                 engine
                     .edit(
                         "human",
@@ -646,8 +853,8 @@ mod tests {
                         "Fixture",
                     )
                     .unwrap();
-                engine.undo.clear();
-                let effect = engine.doc.layers[0].effects[0].id.clone();
+                engine.resident_state_mut().expect("resident fixture").undo.clear();
+                let effect = engine.resident_state().expect("resident fixture").document.layers[0].effects[0].id.clone();
                 let shared = Arc::new(std::sync::Mutex::new(engine));
                 let mut app = PeerBrush::init(
                     &ctx,
@@ -721,7 +928,7 @@ mod tests {
                             .unwrap();
                     }
                     "identity" => {
-                        shared.lock().unwrap().doc.id = crate::engine::id();
+                        shared.lock().unwrap().resident_state_mut().expect("resident fixture").document.id = crate::engine::id();
                     }
                     "escape" => events.push(egui::Event::Key {
                         key: egui::Key::Escape,
@@ -736,8 +943,8 @@ mod tests {
                         egui::Event::WindowFocused(true),
                     ]),
                 }
-                let later = shared.lock().unwrap().doc.clone();
-                let history = shared.lock().unwrap().undo.len();
+                let later = shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
+                let history = shared.lock().unwrap().resident_state().expect("resident fixture").undo.len();
                 draw(&mut app, events);
                 let late = moved - Vec2::new(22., 0.);
                 draw(
@@ -754,10 +961,10 @@ mod tests {
                 );
                 draw(&mut app, vec![button(late, false)]);
                 assert_eq!(
-                    serde_json::to_value(&shared.lock().unwrap().doc).unwrap(),
+                    serde_json::to_value(&shared.lock().unwrap().resident_state().expect("resident fixture").document).unwrap(),
                     serde_json::to_value(&later).unwrap()
                 );
-                assert_eq!(shared.lock().unwrap().undo.len(), history);
+                assert_eq!(shared.lock().unwrap().resident_state().expect("resident fixture").undo.len(), history);
                 // A new physical press may start another rendered preview.
                 draw(&mut app, vec![]);
                 draw(
@@ -774,21 +981,21 @@ mod tests {
                     .clone();
                 let draft = crate::engine::Engine::preview_edits(later.clone(), &commands).unwrap();
                 assert_ne!(draft.export_png().unwrap(), later.export_png().unwrap());
-                assert_eq!(shared.lock().unwrap().undo.len(), history);
+                assert_eq!(shared.lock().unwrap().resident_state().expect("resident fixture").undo.len(), history);
                 draw(&mut app, vec![button(moved, false)]);
                 let mut engine = shared.lock().unwrap();
-                assert_eq!(engine.undo.len(), history + 1);
+                assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), history + 1);
                 assert_eq!(
-                    engine.doc.export_png().unwrap(),
+                    engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
                     draft.export_png().unwrap()
                 );
                 engine.undo("human").unwrap();
                 assert_eq!(
-                    engine.doc.export_png().unwrap(),
+                    engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
                     later.export_png().unwrap()
                 );
                 assert_eq!(
-                    engine.doc.layers[0].pixels.rgba16(),
+                    engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(),
                     later.layers[0].pixels.rgba16()
                 );
             }
@@ -800,15 +1007,15 @@ mod tests {
             for kind in ["color_overlay", "drop_shadow", "pattern_overlay", "texture"] {
                 let ctx = egui::Context::default();
                 let mut e = crate::engine::Engine::new();
-                e.doc = Document::new_depth(32, 32, depth).unwrap();
+                e.resident_state_mut().expect("resident fixture").document = Document::new_depth(32, 32, depth).unwrap();
                 for y in 8..24 {
                     for x in 8..24 {
-                        e.doc.layers[0]
+                        e.resident_state_mut().expect("resident fixture").document.layers[0]
                             .pixels
                             .set16(x, y, [10001, 30003, 50007, 65535]);
                     }
                 }
-                let layer = e.doc.layers[0].id.clone();
+                let layer = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
                 let mut command = json!({"op":"effect.add","layer":layer,"kind":kind});
                 if matches!(kind, "pattern_overlay" | "texture") {
                     use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -838,9 +1045,9 @@ mod tests {
                         json!({"pattern":"bitmap","bitmap_png":STANDARD.encode(png)});
                 }
                 e.edit("human", &[command], None, None, "Style").unwrap();
-                e.undo.clear();
-                let before = e.doc.clone();
-                let effect = e.doc.layers[0].effects[0].id.clone();
+                e.resident_state_mut().expect("resident fixture").undo.clear();
+                let before = e.resident_state().expect("resident fixture").document.clone();
+                let effect = e.resident_state().expect("resident fixture").document.layers[0].effects[0].id.clone();
                 let shared = Arc::new(std::sync::Mutex::new(e));
                 let connection = crate::server::Connection {
                     port: 0,
@@ -917,23 +1124,23 @@ mod tests {
                 assert_ne!(native(&draft), native(&before));
                 {
                     let e = shared.lock().unwrap();
-                    assert!(e.undo.is_empty());
-                    assert_eq!(e.doc.revision, before.revision);
+                    assert!(e.resident_state().expect("resident fixture").undo.is_empty());
+                    assert_eq!(e.resident_state().expect("resident fixture").document.revision, before.revision);
                     assert_eq!(
-                        e.doc.layers[0].pixels.rgba16(),
+                        e.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(),
                         before.layers[0].pixels.rgba16()
                     );
                 }
                 draw(&mut app, vec![button(end, false)]);
                 let mut e = shared.lock().unwrap();
-                assert_eq!(e.undo.len(), 1);
-                assert_eq!(native(&e.doc), native(&draft));
+                assert_eq!(e.resident_state().expect("resident fixture").undo.len(), 1);
+                assert_eq!(native(&e.resident_state().expect("resident fixture").document), native(&draft));
                 assert_eq!(
-                    e.doc.layers[0].pixels.rgba16(),
+                    e.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(),
                     before.layers[0].pixels.rgba16()
                 );
                 e.undo("human").unwrap();
-                assert_eq!(native(&e.doc), native(&before));
+                assert_eq!(native(&e.resident_state().expect("resident fixture").document), native(&before));
             }
         }
     }
@@ -962,19 +1169,19 @@ mod bevel_tests {
                 for (delta, endpoint) in [(-300., lower), (300., 1.)] {
                     let ctx = egui::Context::default();
                     let mut engine = crate::engine::Engine::new();
-                    engine.doc = Document::new_depth(32, 24, depth).unwrap();
+                    engine.resident_state_mut().expect("resident fixture").document = Document::new_depth(32, 24, depth).unwrap();
                     for y in 0..24 {
                         for x in 0..32 {
-                            engine.doc.layers[0]
+                            engine.resident_state_mut().expect("resident fixture").document.layers[0]
                                 .pixels
                                 .set16(x, y, [12347, 23459, 34571, 65535]);
                         }
                     }
-                    let layer = engine.doc.layers[0].id.clone();
+                    let layer = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
                     engine.edit("human", &[json!({"op":"effect.add","layer":layer,"kind":kind,"settings":settings})], None, None, "Bevel").unwrap();
-                    engine.undo.clear();
-                    let before = engine.doc.clone();
-                    let effect = engine.doc.layers[0].effects[0].id.clone();
+                    engine.resident_state_mut().expect("resident fixture").undo.clear();
+                    let before = engine.resident_state().expect("resident fixture").document.clone();
+                    let effect = engine.resident_state().expect("resident fixture").document.layers[0].effects[0].id.clone();
                     let shared = Arc::new(std::sync::Mutex::new(engine));
                     let connection = crate::server::Connection {
                         port: 0,
@@ -1052,19 +1259,19 @@ mod bevel_tests {
                     assert_ne!(native(&draft), native(&before));
                     {
                         let engine = shared.lock().unwrap();
-                        assert!(engine.undo.is_empty());
-                        assert_eq!(engine.doc.revision, before.revision);
+                        assert!(engine.resident_state().expect("resident fixture").undo.is_empty());
+                        assert_eq!(engine.resident_state().expect("resident fixture").document.revision, before.revision);
                     }
                     draw(&mut app, vec![button(end, false)]);
                     let mut engine = shared.lock().unwrap();
-                    assert_eq!(engine.undo.len(), 1);
-                    assert_eq!(native(&engine.doc), native(&draft));
+                    assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), 1);
+                    assert_eq!(native(&engine.resident_state().expect("resident fixture").document), native(&draft));
                     assert_eq!(
-                        engine.doc.layers[0].pixels.rgba16(),
+                        engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(),
                         before.layers[0].pixels.rgba16()
                     );
                     engine.undo("human").unwrap();
-                    assert_eq!(native(&engine.doc), native(&before));
+                    assert_eq!(native(&engine.resident_state().expect("resident fixture").document), native(&before));
                 }
             }
         }

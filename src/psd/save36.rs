@@ -3,9 +3,11 @@
 use super::{
     bulk36::{self, BulkLimits, BulkVerifier, Digest, TileIndexEntry},
     canonical36::{Canonical, Limits as MetadataLimits, Stats},
-    container36::{self, Profile},
-    manifest36::{self, Manifest, StagedCore},
+    container36::{self, ImageResources},
+    manifest36::{self, CompletedStandard, Manifest, StagedCore},
     memory36::{Admitted, MetadataCharge, WorkingSet},
+    mib_progress,
+    read36::{self, VerificationPhase},
     row_stream::Source,
     scene_save36::{CapturedRows, ScenePlan},
     source_bulk36::SourceIndex,
@@ -19,19 +21,22 @@ use crate::{
         native::Metadata as DocumentMetadata,
         scene::{Document36, SceneSnapshot},
     },
-    large_document::{ByteRole, Error, ScratchBytes},
+    large_document::{
+        verified_transfer_buffer, BufferedWrite, ByteRole, Error, ScratchBytes, VERIFIED_BATCH_BYTES,
+    },
     workspace::source_runtime::SourceSession,
 };
 #[path = "save36_ownership.rs"]
 mod ownership;
-pub(crate) use ownership::SaveCursor;
+#[cfg(test)]
+use ownership::SaveCursor;
 use ownership::{StagedBytes, StagingFactory};
 use ring::digest::{Context, SHA256};
 #[cfg(test)]
 use std::path::Path;
 use std::{
     cell::Cell,
-    io::{Read, Write},
+    io::Write,
     sync::Arc,
 };
 
@@ -58,10 +63,21 @@ pub(crate) fn prepare<'a>(
     session: &'a SourceSession,
     provider: &mut impl CapturedRows,
     limits: SaveLimits,
+    progress: &dyn Fn(&str, usize, usize) -> Result<(), String>,
     check: &dyn Fn() -> Result<(), String>,
     cleanup: &dyn Fn() -> Result<(), String>,
 ) -> Result<CompletedSave36<'a>, String> {
-    prepare_owned(scene, format, &session, provider, limits, check, cleanup)
+    // The factory supplies the source-session and retirement checks.
+    prepare_owned(
+        scene,
+        format,
+        &session,
+        provider,
+        limits,
+        progress,
+        check,
+        cleanup,
+    )
 }
 #[cfg(test)]
 fn prepare_fixture<'a>(
@@ -73,7 +89,16 @@ fn prepare_fixture<'a>(
     check: &dyn Fn() -> Result<(), String>,
     cleanup: &dyn Fn() -> Result<(), String>,
 ) -> Result<CompletedSave36<'a>, String> {
-    prepare_owned(scene, format, &roots, provider, limits, check, cleanup)
+    prepare_owned(
+        scene,
+        format,
+        &roots,
+        provider,
+        limits,
+        &|_, _, _| Ok(()),
+        check,
+        cleanup,
+    )
 }
 fn prepare_owned<'a>(
     scene: &'a SceneSnapshot,
@@ -81,9 +106,14 @@ fn prepare_owned<'a>(
     factory: &impl StagingFactory<'a>,
     provider: &mut impl CapturedRows,
     limits: SaveLimits,
+    progress: &dyn Fn(&str, usize, usize) -> Result<(), String>,
     check: &dyn Fn() -> Result<(), String>,
     cleanup: &dyn Fn() -> Result<(), String>,
 ) -> Result<CompletedSave36<'a>, String> {
+    let pinned = || {
+        check()?;
+        factory.check_pinned_work()
+    };
     let active = || {
         check()?;
         factory.check()
@@ -127,22 +157,49 @@ fn prepare_owned<'a>(
         .try_reserve_exact(4)
         .map_err(|_| "Source36 staging receipt allocation refused")?;
     let result: Result<ComparedStandard, String> = (|| {
+        let layer_bytes = plan.standard().layer_bytes();
+        let composite_bytes = plan.standard().composite_bytes();
+        let source_bytes = sources.sizes().iter().map(|&bytes| u64::from(bytes)).sum();
+        let mut standard_hash = bulk36::standard_hasher(layer_bytes, composite_bytes);
         let (layers, layer_written) = stage_file(
             factory,
-            plan.standard().layer_bytes(),
+            layer_bytes,
             ByteRole::LayerData,
             scene,
             core_sha,
             check,
             cleanup,
             |output| {
-                plan.standard().write_layers(
+                let mut output = StandardWriter {
                     output,
+                    hash: &mut standard_hash,
+                };
+                let mut report_sources = mib_progress(
+                    progress,
+                    "Writing Photoshop editable sources",
+                    source_bytes,
+                );
+                let mut completed_source_bytes = 0;
+                let written = plan.standard().write_layers_with_checks(
+                    &mut output,
                     provider,
                     &mut scratch,
-                    check,
-                    |ordinal, output| sources.write(ordinal, core_sha, output, check),
-                )
+                    (check, &pinned),
+                    |completed, total| {
+                        progress("Encoding native Photoshop layers", completed, total)
+                    },
+                    |ordinal, output| {
+                        if ordinal == 0 {
+                            report_sources(0)?;
+                        }
+                        let descriptor = sources.write(ordinal, core_sha, output, &pinned, check)?;
+                        completed_source_bytes += u64::from(descriptor.bytes);
+                        report_sources(completed_source_bytes)?;
+                        Ok(descriptor)
+                    },
+                )?;
+                progress("Sealing native Photoshop layers", 0, 0)?;
+                Ok(written)
             },
         )?;
         staging.push(layers);
@@ -151,17 +208,31 @@ fn prepare_owned<'a>(
         {
             return Err("Source36 owned layer seal differs from emitted native data".into());
         }
+        progress("Preparing the native Photoshop merged composite", 0, 0)?;
         let (composite, composite_written) = stage_file(
             factory,
-            plan.standard().composite_bytes(),
+            composite_bytes,
             ByteRole::CompositeData,
             scene,
             core_sha,
             check,
             cleanup,
             |output| {
-                plan.standard()
-                    .write_composite(output, provider, &mut scratch, check)
+                let mut output = StandardWriter {
+                    output,
+                    hash: &mut standard_hash,
+                };
+                let written = plan.standard().write_composite(
+                    &mut output,
+                    provider,
+                    &mut scratch,
+                    check,
+                    |completed, total| {
+                        progress("Encoding the native Photoshop merged composite", completed, total)
+                    },
+                )?;
+                progress("Sealing the native Photoshop merged composite", 0, 0)?;
+                Ok(written)
             },
         )?;
         staging.push(composite);
@@ -172,29 +243,20 @@ fn prepare_owned<'a>(
                 "Source36 owned composite seal differs from emitted current composite".into(),
             );
         }
-        let standard_sha = {
-            let mut layer_check = || io_check(check);
-            let mut composite_check = || io_check(check);
-            let mut layer = staging[0]
-                .cursor(0, staging[0].payload_length(), &mut layer_check)
-                .map_err(|e| e.to_string())?;
-            let mut composite = staging[1]
-                .cursor(0, staging[1].payload_length(), &mut composite_check)
-                .map_err(|e| e.to_string())?;
-            bulk36::standard_digest(
-                &mut layer,
-                staging[0].payload_length(),
-                &mut composite,
-                staging[1].payload_length(),
-                check,
-            )?
-        };
+        // Both emitted ranges matched their sealed spools. Assembly checks the
+        // same aggregate digest independently while replaying those spools.
+        let standard = CompletedStandard::from_digest(
+            core_sha,
+            layer_bytes,
+            composite_bytes,
+            standard_hash.finish().as_ref().try_into().unwrap(),
+        );
         let manifest = core.map_unique(|core, _| {
             Manifest::bind_core(
                 core,
                 plan.standard().layer_bytes(),
                 plan.standard().composite_bytes(),
-                standard_sha,
+                standard.sha256(),
                 layer_written.descriptors,
                 limits.bulk,
                 check,
@@ -218,40 +280,37 @@ fn prepare_owned<'a>(
                 &mut counts,
                 check,
             )?;
+            let mut report_bulk = mib_progress(
+                progress,
+                "Checking staged Photoshop editable sources",
+                source_bytes,
+            );
+            if source_bytes != 0 {
+                report_bulk(0)?;
+            }
+            let mut verified = 0;
+            let charge = scene
+                .budget()
+                .reserve_bytes(VERIFIED_BATCH_BYTES, VERIFIED_BATCH_BYTES)
+                .ok();
             for ordinal in 0..sources.sizes().len() {
                 let span = plan.standard().chunk_span(ordinal)?;
                 let mut guarded = || io_check(check);
                 let mut input = staging[0]
                     .cursor(span.offset, span.bytes, &mut guarded)
                     .map_err(|e| e.to_string())?;
-                let mut prefix = [0; 24];
-                input.read_exact(&mut prefix).map_err(|e| e.to_string())?;
-                use std::io::{Seek, SeekFrom};
-                input.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
-                let header = bulk36::Header {
-                    ordinal: ordinal as u32,
-                    total: sources.sizes().len() as u32,
-                    records: u32::from_be_bytes(prefix[20..24].try_into().unwrap()),
-                    core: core_sha,
-                };
-                verifier.chunk(&mut input, header, &mut scratch, check, |_| Ok(()))?;
+                let header = sources.header(ordinal, core_sha)?;
+                if charge.is_some() {
+                    let mut input = std::io::BufReader::with_capacity(VERIFIED_BATCH_BYTES, input);
+                    verifier.chunk(&mut input, header, &mut scratch, &pinned, |_| Ok(()))?;
+                } else {
+                    verifier.chunk(&mut input, header, &mut scratch, &pinned, |_| Ok(()))?;
+                }
+                check()?;
+                verified += span.bytes;
+                report_bulk(verified)?;
             }
             verifier.finish(check)?
-        };
-        let standard = {
-            let mut layer_check = || io_check(check);
-            let mut composite_check = || io_check(check);
-            manifest.verify_standard(
-                &mut staging[0]
-                    .cursor(0, staging[0].payload_length(), &mut layer_check)
-                    .map_err(|e| e.to_string())?,
-                staging[0].payload_length(),
-                &mut staging[1]
-                    .cursor(0, staging[1].payload_length(), &mut composite_check)
-                    .map_err(|e| e.to_string())?,
-                staging[1].payload_length(),
-                check,
-            )?
         };
         // Deterministic two-pass compression admits an exact owned append sink.
         let compressed = container36::compress_manifest(
@@ -276,32 +335,45 @@ fn prepare_owned<'a>(
             |output| container36::compress_manifest(&manifest, limits.metadata, output, check),
         )?;
         staging.push(manifest_file);
-        let profile = scene.metadata().srgb_tagged().then(|| Profile {
-            bytes: crate::color_profile::srgb_profile(),
-        });
+        let image = ImageResources {
+            profile: scene.metadata().srgb_tagged().then(crate::color_profile::srgb_profile),
+            document: scene.metadata().psd_resources(),
+            file_info: scene.metadata().psd_file_info(),
+        };
+        let working_bytes = super::file_info::validation_working_bytes(image.file_info)?;
+        let _file_info_charge = super::memory36::MetadataCharge::reserve(scene.budget(), working_bytes, check)?;
         let layout = container36::LayoutPlan::new(
             plan.standard().header(),
             staging[0].payload_length(),
             staging[1].payload_length(),
             compressed.bytes(),
-            profile.as_ref(),
+            image,
         )?;
         if layout.output_bytes() > limits.file_bytes {
             return Err("Source36 final output exceeds declared file admission".into());
         }
+        let assembling = "Assembling the native Photoshop file";
+        let output_bytes = layout.output_bytes();
+        let mut assembly_progress = mib_progress(progress, assembling, output_bytes);
+        assembly_progress(0)?;
         let (candidate, written) = stage_file(
             factory,
-            layout.output_bytes(),
+            output_bytes,
             ByteRole::PhotoshopContainer,
             scene,
             core_sha,
             check,
             cleanup,
             |output| {
+                let mut transfer = match verified_transfer_buffer(scene.budget(), output_bytes) {
+                    Ok(transfer) => Some(transfer),
+                    Err(Error::Budget) => None,
+                    Err(error) => return Err(error.to_string()),
+                };
                 let mut layer_check = || io_check(check);
                 let mut composite_check = || io_check(check);
                 let mut manifest_check = || io_check(check);
-                container36::write(
+                let written = container36::write(
                     output,
                     plan.standard().header(),
                     &manifest,
@@ -318,10 +390,13 @@ fn prepare_owned<'a>(
                     &mut staging[1]
                         .cursor(0, staging[1].payload_length(), &mut composite_check)
                         .map_err(|e| e.to_string())?,
-                    profile.as_ref(),
-                    &mut scratch[..65536],
+                    image,
+                    transfer.as_deref_mut().unwrap_or(&mut scratch),
+                    assembly_progress,
                     check,
-                )
+                )?;
+                progress("Sealing the assembled Photoshop file", 0, 0)?;
+                Ok(written)
             },
         )?;
         staging.push(candidate);
@@ -330,6 +405,7 @@ fn prepare_owned<'a>(
         {
             return Err("Source36 assembled Photoshop container seal differs".into());
         }
+        progress("Checking the assembled Photoshop file structure", 0, 0)?;
         // Every large writer-side DOM/raw/canonical envelope is dead before a
         // separately admitted readback graph is built. Native scene owners stay.
         drop(manifest);
@@ -337,38 +413,33 @@ fn prepare_owned<'a>(
         drop(counts);
         let candidate = &staging[3];
         let mut guarded = || io_check(check);
-        let source = Source::with_buffer(
+        let source = Source::with_sealed_buffer(
             candidate
                 .cursor(0, candidate.payload_length(), &mut guarded)
                 .map_err(|e| e.to_string())?,
             candidate.payload_length(),
-            ScratchBytes::new(scene.budget(), 65536, 65536).map_err(|e| e.to_string())?,
+            verified_transfer_buffer(scene.budget(), candidate.payload_length())
+                .map_err(|e| e.to_string())?,
         )?;
         let whole = Span {
             offset: 0,
             bytes: candidate.payload_length(),
         };
-        let mut index_limits = structural::Limits::current();
-        index_limits.file_bytes = limits.file_bytes;
-        index_limits.max_edge = 16000;
-        index_limits.pixels = 16000 * 16000;
-        index_limits.layers = super::standard36::MAX_STANDARD_RECORDS;
-        index_limits.row_bytes = 32000;
-        index_limits.coordinate = 116000;
-        index_limits.mask_pixels8 = 16000 * 16000;
-        index_limits.mask_pixels16 = 16000 * 16000;
-        index_limits.tags = limits
-            .bulk
-            .chunks
-            .checked_add(4096)
-            .ok_or("Source36 index tag admission overflow")?;
-        index_limits.resources = 2;
+        let index_limits = structural::Limits::source36(limits.file_bytes, limits.bulk.chunks)?;
         let _parsed_index_owner = MetadataCharge::reserve(
             scene.budget(),
             4 * 1024 * 1024 + index_limits.tags * 128,
             check,
         )?;
         let index = structural::index(&mut source.range(whole, check)?, index_limits, || check())?;
+        if super::indexed_working_srgb(&source, &index, check)? != scene.metadata().srgb_tagged() {
+            return Err(super::SOURCE_WORKING_PROFILE_MISMATCH.into());
+        }
+        if super::indexed_resources(&source, &index, check)? != scene.metadata().psd_resources()
+            || !super::file_info::matches_indexed(&source, &index, scene.metadata().psd_file_info(), check)?
+        {
+            return Err("Saved Source36 document resources differ from the captured document".into());
+        }
         let resource = index
             .resources
             .iter()
@@ -441,26 +512,58 @@ fn prepare_owned<'a>(
             .try_reserve_exact(parsed.plan().rasters.len())
             .map_err(|_| "Source36 readback raster index allocation refused")?;
         counts.resize(parsed.plan().rasters.len(), 0u64);
-        let complete = super::read36::verify(
+        let mut initial_checksum = mib_progress(
+            progress,
+            "Verifying the assembled Photoshop file checksum",
+            candidate.payload_length(),
+        );
+        let mut streams_checksum = mib_progress(
+            progress,
+            "Rechecking the Photoshop checksum after stream verification",
+            candidate.payload_length(),
+        );
+        let complete = read36::verify(
             &source,
             &index,
             candidate.payload_sha256(),
             &parsed,
-            super::read36::VerificationLimits {
+            read36::VerificationLimits {
                 bulk: limits.bulk,
                 native_streams: super::standard36::MAX_STANDARD_RECORDS * 5 + 1,
             },
             &mut entries,
             &mut counts,
             &mut scratch,
-            check,
+            (check, &pinned),
+            |phase, bytes| match phase {
+                VerificationPhase::InitialChecksum => initial_checksum(bytes),
+                VerificationPhase::EditableSources { total_bytes } => progress(
+                    "Checking assembled Photoshop editable sources",
+                    (if bytes == total_bytes {
+                        bytes.div_ceil(1024 * 1024)
+                    } else {
+                        bytes / (1024 * 1024)
+                    }) as usize,
+                    total_bytes.div_ceil(1024 * 1024) as usize,
+                ),
+                VerificationPhase::Streams { total } => {
+                    progress("Checking the assembled Photoshop file streams", bytes as usize, total)
+                }
+                VerificationPhase::AfterStreamsChecksum => streams_checksum(bytes),
+            },
             |_| Ok(()),
         )?;
-        let mut actual =
-            ScratchBytes::new(scene.budget(), 32000, 32000).map_err(|e| e.to_string())?;
-        let fidelity =
-            plan.standard()
-                .compare(&source, &index, provider, &mut scratch, &mut actual, check)?;
+        // Each half fits the complete 128 KiPixel stripe at native16.
+        let (expected, actual) = scratch.split_at_mut(bulk36::MAX_TILE_BYTES / 2);
+        let fidelity = plan.standard().compare(
+            &source,
+            &index,
+            provider,
+            expected,
+            actual,
+            check,
+            |done, total| progress("Comparing saved Photoshop pixels", done, total),
+        )?;
         fidelity.check(plan.standard(), check)?;
         complete.recheck(
             &source,
@@ -469,6 +572,11 @@ fn prepare_owned<'a>(
             candidate.payload_sha256(),
             &mut scratch,
             check,
+            mib_progress(
+                progress,
+                "Rechecking the assembled Photoshop file checksum",
+                candidate.payload_length(),
+            ),
         )?;
         check()?;
         Ok(fidelity)
@@ -506,6 +614,24 @@ fn prepare_owned<'a>(
     }
 }
 
+
+struct StandardWriter<'a> {
+    output: &'a mut dyn Write,
+    hash: &'a mut Context,
+}
+
+impl Write for StandardWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let written = self.output.write(bytes)?;
+        self.hash.update(&bytes[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.output.flush()
+    }
+}
+
 fn stage_file<'a, T>(
     factory: &impl StagingFactory<'a>,
     length: u64,
@@ -520,7 +646,20 @@ fn stage_file<'a, T>(
     let mut temporary = factory.create(scene, length, role)?;
     let result = (|| {
         let mut guarded = || io_check(check);
-        write(&mut temporary.temporary()?.writer(&mut guarded))
+        let mut output = temporary.temporary()?.writer(&mut guarded);
+        if matches!(role, ByteRole::LayerData | ByteRole::CompositeData | ByteRole::PhotoshopContainer) {
+            match verified_transfer_buffer(scene.budget(), length) {
+                Ok(mut scratch) => {
+                    let mut buffered = BufferedWrite::new(&mut output, &mut scratch);
+                    let result = write(&mut buffered)?;
+                    buffered.flush().map_err(|e| e.to_string())?;
+                    return Ok(result);
+                }
+                Err(Error::Budget) => {}
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        write(&mut output)
     })();
     match result {
         Ok(value) => Ok((temporary.finish(binding, check)?, value)),
@@ -630,8 +769,7 @@ impl<'source> CompletedSave36<'source> {
     /// Namespace/owner proof only. Complete source/native fidelity and the final
     /// full candidate SHA recheck remain mandatory publication requirements.
     pub(crate) fn check_session(&self, session: &SourceSession) -> Result<(), String> {
-        self.check_cursor_guard()?;
-        session.check()?;
+        self.check_failed()?;
         if !self.scene.budget().same_pool(&session.resident())
             || !self.scene.disk_budget().same_pool(&session.disk())
         {
@@ -669,19 +807,25 @@ impl<'source> CompletedSave36<'source> {
         }
         Ok(())
     }
-    fn check_cursor_guard(&self) -> Result<(), String> {
+    fn check_failed(&self) -> Result<(), String> {
         if self.failed.get() {
             return Err("Source36 completed save is failed".into());
         }
+        Ok(())
+    }
+    #[cfg(test)]
+    fn check_cursor_guard(&self) -> Result<(), String> {
+        self.check_failed()?;
         self.candidate.check()
     }
-    pub(crate) fn cursor<'read>(
+    #[cfg(test)]
+    fn cursor<'read>(
         &'read self,
         start: u64,
         length: u64,
         check: &'read mut dyn FnMut() -> crate::large_document::Result<()>,
     ) -> Result<SaveCursor<'read, 'source>, String> {
-        self.check_cursor_guard()?;
+        self.check_failed()?;
         self.check_guards()?;
         let input = self
             .candidate
@@ -689,20 +833,67 @@ impl<'source> CompletedSave36<'source> {
             .map_err(|e| e.to_string())?;
         Ok(SaveCursor::new(self, input))
     }
+    pub(crate) fn publication_buffer(&self) -> Result<ScratchBytes, String> {
+        verified_transfer_buffer(self.scene.budget(), self.bytes).map_err(|e| e.to_string())
+    }
+
+    pub(crate) fn read_publication_batch(
+        &self,
+        session: &SourceSession,
+        start: u64,
+        count: usize,
+        output: &mut ScratchBytes,
+        check: &dyn Fn() -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.read_verified_batch(start, count, output, &|| {
+            self.check_session(session)?;
+            check()
+        })
+    }
+
+    fn read_verified_batch(
+        &self,
+        start: u64,
+        count: usize,
+        output: &mut ScratchBytes,
+        check: &dyn Fn() -> Result<(), String>,
+    ) -> Result<(), String> {
+        let mut failure = None;
+        self.candidate
+            .read_complete_chunks_into(start, count, output, &mut || {
+                check().map_err(|error| {
+                    failure = Some(error);
+                    Error::Cancelled
+                })
+            })
+            .map_err(|error| failure.unwrap_or_else(|| error.to_string()))
+    }
+
     /// Reobserve the entire owned candidate immediately before destination copy.
     /// Source file identity/lease and engine revision are the caller's guard;
     /// each supplied error is preserved through the owned I/O callback.
     pub(crate) fn recheck(&self, check: &dyn Fn() -> Result<(), String>) -> Result<(), String> {
+        self.recheck_with_progress(check, &mut |_| Ok(()))
+    }
+    pub(crate) fn recheck_with_progress(
+        &self,
+        check: &dyn Fn() -> Result<(), String>,
+        progress: &mut dyn FnMut(u64) -> Result<(), String>,
+    ) -> Result<(), String> {
         if self.failed.replace(true) {
             return Err("Source36 completed save is failed".into());
         }
-        let result = self.recheck_inner(check);
+        let result = self.recheck_inner(check, progress);
         if result.is_ok() {
             self.failed.set(false);
         }
         result
     }
-    fn recheck_inner(&self, check: &dyn Fn() -> Result<(), String>) -> Result<(), String> {
+    fn recheck_inner(
+        &self,
+        check: &dyn Fn() -> Result<(), String>,
+        progress: &mut dyn FnMut(u64) -> Result<(), String>,
+    ) -> Result<(), String> {
         check()?;
         self.check_guards()?;
         if super::scene_save36::provenance(self.scene) != self.provenance
@@ -718,35 +909,29 @@ impl<'source> CompletedSave36<'source> {
                 "Source36 save candidate differs from its captured source/owned completion".into(),
             );
         }
-        let mut transfer =
-            ScratchBytes::new(self.scene.budget(), 65536, 65536).map_err(|e| e.to_string())?;
+        let mut transfer = self.publication_buffer()?;
         let active = || {
             check()?;
             self.candidate.check()
         };
-        let mut guarded = || io_check(&active);
-        let mut input = self
-            .candidate
-            .cursor(0, self.bytes, &mut guarded)
-            .map_err(|e| e.to_string())?;
-        let mut left = self.bytes;
+        let mut offset = 0;
         let mut hash = Context::new(&SHA256);
-        while left != 0 {
-            active()?;
-            let n = left.min(65536) as usize;
-            input
-                .read_exact(&mut transfer[..n])
-                .map_err(|e| e.to_string())?;
+        progress(0)?;
+        while offset < self.bytes {
+            let n = (self.bytes - offset).min(transfer.len() as u64) as usize;
+            self.read_verified_batch(offset, n, &mut transfer, &active)?;
             hash.update(&transfer[..n]);
-            left -= n as u64;
+            offset += n as u64;
+            if offset < self.bytes {
+                progress(offset)?;
+            }
         }
-        if input.read(&mut [0; 1]).map_err(|e| e.to_string())? != 0
-            || hash.finish().as_ref() != &self.sha256[..]
-        {
+        if hash.finish().as_ref() != &self.sha256[..] {
             return Err("Source36 save candidate bytes changed after qualification".into());
         }
         check()?;
-        self.check_guards()
+        self.check_guards()?;
+        progress(offset)
     }
     /// Call only after destination publication/abort no longer needs staging.
     /// Verified retirement never removes a foreign replacement. Failed remains

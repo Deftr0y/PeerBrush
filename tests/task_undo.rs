@@ -7,14 +7,14 @@ use std::sync::{Arc, Mutex};
 
 fn fixture(depth: u16) -> (Engine, String, String) {
     let mut e = Engine::new();
-    e.doc = Document::new_depth(16, 12, depth).unwrap();
-    let layer = e.doc.layers[0].id.clone();
-    e.doc.layers[0].pixels.set16(14, 10, [123, 456, 789, 0]);
+    e.resident_state_mut().expect("resident fixture").document = Document::new_depth(16, 12, depth).unwrap();
+    let layer = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
+    e.resident_state_mut().expect("resident fixture").document.layers[0].pixels.set16(14, 10, [123, 456, 789, 0]);
     let task = e.reserve("agent", "Retouch", vec![]).unwrap().id;
     (e, layer, task)
 }
 fn edit(e: &mut Engine, actor: &str, task: Option<&str>, commands: Vec<Value>) {
-    e.edit(actor, &commands, Some(e.doc.revision), task, "Retouch")
+    e.edit(actor, &commands, Some(e.resident_state().expect("resident fixture").document.revision), task, "Retouch")
         .unwrap();
 }
 fn patch(
@@ -27,7 +27,13 @@ fn patch(
     words: [u16; 4],
 ) {
     let path = std::env::temp_dir().join(format!("pb-task-{}.png", peerbrush::engine::id()));
-    std::fs::write(&path, raster::png16(1, 1, &words).unwrap()).unwrap();
+    let png = if e.resident_state().expect("resident fixture").document.bit_depth == 16 {
+        raster::png16(1, 1, &words)
+    } else {
+        raster::png(1, 1, &words.map(raster::project16))
+    }
+    .unwrap();
+    std::fs::write(&path, png).unwrap();
     edit(
         e,
         actor,
@@ -39,7 +45,7 @@ fn patch(
     std::fs::remove_file(path).unwrap();
 }
 fn source(e: &Engine) -> Value {
-    let mut v = serde_json::to_value(&e.doc).unwrap();
+    let mut v = serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap();
     v.as_object_mut().unwrap().remove("revision");
     v
 }
@@ -48,7 +54,7 @@ fn source(e: &Engine) -> Value {
 fn interleaved_pixels_and_metadata_survive_native_task_undo_and_compensation_history() {
     for depth in [8, 16] {
         let (mut e, layer, task) = fixture(depth);
-        let baseline = e.doc.layers[0].pixels.clone();
+        let baseline = e.resident_state().expect("resident fixture").document.layers[0].pixels.clone();
         patch(
             &mut e,
             "agent",
@@ -67,7 +73,7 @@ fn interleaved_pixels_and_metadata_survive_native_task_undo_and_compensation_his
             2,
             [1911, 21387, 47813, 65535],
         );
-        let human = e.doc.layers[0].pixels.get16(3, 2);
+        let human = e.resident_state().expect("resident fixture").document.layers[0].pixels.get16(3, 2);
         edit(
             &mut e,
             "human",
@@ -84,7 +90,7 @@ fn interleaved_pixels_and_metadata_survive_native_task_undo_and_compensation_his
             [19871, 42137, 63341, 65535],
         );
         let edited = source(&e);
-        let history = e.undo.len();
+        let history = e.resident_state().expect("resident fixture").undo.len();
         let review = e.inspect_task_undo("human", "agent", &task).unwrap();
         assert_eq!(review["can_undo"], true);
         assert_eq!(review["batches"].as_array().unwrap().len(), 2);
@@ -94,16 +100,16 @@ fn interleaved_pixels_and_metadata_survive_native_task_undo_and_compensation_his
             .iter()
             .all(|s| s["rect"] != Value::Null));
         e.undo_task("human", "agent", &task).unwrap();
-        assert_eq!(e.undo.len(), history + 1);
-        assert_eq!(e.doc.layers[0].pixels.get16(2, 2), baseline.get16(2, 2));
-        assert_eq!(e.doc.layers[0].pixels.get16(5, 2), baseline.get16(5, 2));
-        assert_eq!(e.doc.layers[0].pixels.get16(3, 2), human);
-        assert_eq!(e.doc.layers[0].pixels.get16(14, 10), baseline.get16(14, 10));
-        assert_eq!(e.doc.layers[0].name, "Human name");
-        assert_eq!(e.doc.layers[0].opacity, 0.61);
+        assert_eq!(e.resident_state().expect("resident fixture").undo.len(), history + 1);
+        assert_eq!(e.resident_state().expect("resident fixture").document.layers[0].pixels.get16(2, 2), baseline.get16(2, 2));
+        assert_eq!(e.resident_state().expect("resident fixture").document.layers[0].pixels.get16(5, 2), baseline.get16(5, 2));
+        assert_eq!(e.resident_state().expect("resident fixture").document.layers[0].pixels.get16(3, 2), human);
+        assert_eq!(e.resident_state().expect("resident fixture").document.layers[0].pixels.get16(14, 10), baseline.get16(14, 10));
+        assert_eq!(e.resident_state().expect("resident fixture").document.layers[0].name, "Human name");
+        assert_eq!(e.resident_state().expect("resident fixture").document.layers[0].opacity, 0.61);
         let reverted = source(&e);
-        let png = e.doc.export_png().unwrap();
-        let saved = psd::decode(&psd::encode(&e.doc).unwrap()).unwrap();
+        let png = e.resident_state().expect("resident fixture").document.export_png().unwrap();
+        let saved = psd::decode(&psd::encode(&e.resident_state().expect("resident fixture").document).unwrap()).unwrap();
         assert!(!saved.read_only);
         assert_eq!(saved.export_png().unwrap(), png);
         assert_eq!(e.task_history()[0]["active_batches"], 0);
@@ -116,8 +122,8 @@ fn interleaved_pixels_and_metadata_survive_native_task_undo_and_compensation_his
         assert_eq!(e.task_history()[0]["active_batches"], 0);
         e.undo("human").unwrap();
         e.undo("human").unwrap();
-        assert_eq!(e.doc.layers[0].pixels.get16(3, 2), human);
-        assert_eq!(e.doc.layers[0].opacity, 0.61);
+        assert_eq!(e.resident_state().expect("resident fixture").document.layers[0].pixels.get16(3, 2), human);
+        assert_eq!(e.resident_state().expect("resident fixture").document.layers[0].opacity, 0.61);
     }
 }
 
@@ -152,8 +158,8 @@ fn overlapping_pixel_and_setting_conflicts_are_precise_atomic_and_owner_checked(
         [19871, 42137, 63341, 65535],
     );
     let before = source(&e);
-    let rev = e.doc.revision;
-    let h = e.undo.len();
+    let rev = e.resident_state().expect("resident fixture").document.revision;
+    let h = e.resident_state().expect("resident fixture").undo.len();
     let review = e.inspect_task_undo("human", "agent", &task).unwrap();
     assert_eq!(review["can_undo"], false);
     assert!(review["conflicts"]
@@ -165,8 +171,8 @@ fn overlapping_pixel_and_setting_conflicts_are_precise_atomic_and_owner_checked(
             && v["rect"] == json!([2, 2, 3, 3])));
     assert!(e.undo_task("human", "agent", &task).is_err());
     assert_eq!(source(&e), before);
-    assert_eq!(e.doc.revision, rev);
-    assert_eq!(e.undo.len(), h);
+    assert_eq!(e.resident_state().expect("resident fixture").document.revision, rev);
+    assert_eq!(e.resident_state().expect("resident fixture").undo.len(), h);
     assert!(e
         .undo_task("other-agent", "agent", &task)
         .unwrap_err()
@@ -182,7 +188,7 @@ fn separate_effect_settings_merge_but_later_edits_to_created_sources_conflict() 
         None,
         vec![json!({"op":"effect.add","layer":layer,"kind":"levels"})],
     );
-    let effect = e.doc.layers[0].effects[0].id.clone();
+    let effect = e.resident_state().expect("resident fixture").document.layers[0].effects[0].id.clone();
     edit(
         &mut e,
         "agent",
@@ -198,8 +204,8 @@ fn separate_effect_settings_merge_but_later_edits_to_created_sources_conflict() 
         ],
     );
     e.undo_task("human", "agent", &task).unwrap();
-    assert_eq!(e.doc.layers[0].effects[0].settings["gamma"], 1.0);
-    assert_eq!(e.doc.layers[0].effects[0].settings["white"], 0.8);
+    assert_eq!(e.resident_state().expect("resident fixture").document.layers[0].effects[0].settings["gamma"], 1.0);
+    assert_eq!(e.resident_state().expect("resident fixture").document.layers[0].effects[0].settings["white"], 0.8);
     let task2 = e.reserve("agent", "New blur", vec![]).unwrap().id;
     edit(
         &mut e,
@@ -207,7 +213,7 @@ fn separate_effect_settings_merge_but_later_edits_to_created_sources_conflict() 
         Some(&task2),
         vec![json!({"op":"effect.add","layer":layer,"kind":"blur"})],
     );
-    let effect = e.doc.layers[0].effects.last().unwrap().id.clone();
+    let effect = e.resident_state().expect("resident fixture").document.layers[0].effects.last().unwrap().id.clone();
     edit(
         &mut e,
         "human",
@@ -228,7 +234,7 @@ fn masks_selection_and_removed_layers_keep_coupled_sources_and_later_work() {
         None,
         vec![json!({"op":"mask.add","layer":layer})],
     );
-    let baseline = e.doc.layers[0].mask.clone();
+    let baseline = e.resident_state().expect("resident fixture").document.layers[0].mask.clone();
     edit(
         &mut e,
         "agent",
@@ -246,15 +252,15 @@ fn masks_selection_and_removed_layers_keep_coupled_sources_and_later_work() {
             json!({"op":"selection","rect":[8,7,12,11]}),
         ],
     );
-    let human = e.doc.layers[0].mask_value(9, 8);
+    let human = e.resident_state().expect("resident fixture").document.layers[0].mask_value(9, 8);
     assert_eq!(
         baseline.as_ref().unwrap().steps.len(),
-        e.doc.layers[0].mask.as_ref().unwrap().steps.len()
+        e.resident_state().expect("resident fixture").document.layers[0].mask.as_ref().unwrap().steps.len()
     );
     e.undo_task("human", "agent", &task).unwrap();
-    assert_eq!(e.doc.layers[0].mask_value(9, 8), human);
-    assert_eq!(e.doc.layers[0].mask_value(2, 2), 1.0);
-    assert_eq!(e.doc.selection, Some([8, 7, 12, 11]));
+    assert_eq!(e.resident_state().expect("resident fixture").document.layers[0].mask_value(9, 8), human);
+    assert_eq!(e.resident_state().expect("resident fixture").document.layers[0].mask_value(2, 2), 1.0);
+    assert_eq!(e.resident_state().expect("resident fixture").document.selection, Some([8, 7, 12, 11]));
     let task2 = e.reserve("agent", "Delete layer", vec![]).unwrap().id;
     edit(
         &mut e,
@@ -262,14 +268,14 @@ fn masks_selection_and_removed_layers_keep_coupled_sources_and_later_work() {
         None,
         vec![json!({"op":"layer.add","name":"Keep","kind":"paint"})],
     );
-    let old = e.doc.layers.iter().find(|l| l.id == layer).unwrap().clone();
+    let old = e.resident_state().expect("resident fixture").document.layers.iter().find(|l| l.id == layer).unwrap().clone();
     edit(
         &mut e,
         "agent",
         Some(&task2),
         vec![json!({"op":"layer.delete","layer":layer})],
     );
-    let keep = e.doc.layers[0].id.clone();
+    let keep = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
     edit(
         &mut e,
         "human",
@@ -277,11 +283,11 @@ fn masks_selection_and_removed_layers_keep_coupled_sources_and_later_work() {
         vec![json!({"op":"layer.update","layer":keep,"name":"Later work"})],
     );
     e.undo_task("human", "agent", &task2).unwrap();
-    assert!(e.doc.layers.iter().any(|l| l.name == "Later work"));
-    let restored = e.doc.layers.iter().find(|l| l.id == layer).unwrap();
+    assert!(e.resident_state().expect("resident fixture").document.layers.iter().any(|l| l.name == "Later work"));
+    let restored = e.resident_state().expect("resident fixture").document.layers.iter().find(|l| l.id == layer).unwrap();
     assert_eq!(restored.pixels, old.pixels);
     assert_eq!(restored.mask_value(9, 8), human);
-    psd::validate(&e.doc).unwrap();
+    psd::validate(&e.resident_state().expect("resident fixture").document).unwrap();
 }
 
 #[test]
@@ -346,7 +352,7 @@ fn structural_conflicts_reservations_and_truncated_history_refuse_partial_task_u
         vec![json!({"op":"layer.add","name":"AI folder","kind":"group"})],
     );
     let folder = e
-        .doc
+        .resident_state().expect("resident fixture").document
         .layers
         .iter()
         .find(|l| l.name == "AI folder")
@@ -417,7 +423,7 @@ fn protocol_inspection_revision_guards_feedback_and_actor_isolation() {
     )
     .unwrap();
     assert_eq!(
-        shared.lock().unwrap().doc.layers[0].pixels.get16(9, 8),
+        shared.lock().unwrap().resident_state().expect("resident fixture").document.layers[0].pixels.get16(9, 8),
         [1337, 45577, 21491, 65535]
     );
 }
@@ -454,8 +460,8 @@ fn later_moves_reserve_the_actual_inverse_region_and_visibility_stays_independen
     assert!(e.undo_task("agent", "agent", &task).is_err());
     e.leases.retain(|l| l.owner != "human");
     e.undo_task("agent", "agent", &task).unwrap();
-    assert_eq!((e.doc.layers[0].x, e.doc.layers[0].y), (20, 10));
-    assert_eq!(e.doc.layers[0].pixels.get16(2, 2), [0; 4]);
+    assert_eq!((e.resident_state().expect("resident fixture").document.layers[0].x, e.resident_state().expect("resident fixture").document.layers[0].y), (20, 10));
+    assert_eq!(e.resident_state().expect("resident fixture").document.layers[0].pixels.get16(2, 2), [0; 4]);
     let task2 = e.reserve("agent", "Visibility", vec![]).unwrap().id;
     edit(
         &mut e,
@@ -470,7 +476,7 @@ fn later_moves_reserve_the_actual_inverse_region_and_visibility_stays_independen
         true
     );
     e.undo_task("agent", "agent", &task2).unwrap();
-    assert!(e.doc.layers[0].visible);
+    assert!(e.resident_state().expect("resident fixture").document.layers[0].visible);
 }
 
 #[test]
@@ -514,11 +520,11 @@ fn completed_compensation_allows_new_batches_on_same_task_and_keeps_other_tasks(
     );
     e.undo_task("human", "agent", &task).unwrap();
     assert_eq!(
-        e.doc.layers[0].pixels.get16(9, 8),
+        e.resident_state().expect("resident fixture").document.layers[0].pixels.get16(9, 8),
         [1337, 45577, 21491, 65535]
     );
     e.undo_task("human", "other", &other).unwrap();
-    assert_eq!(e.doc.layers[0].pixels.get16(9, 8), [0; 4]);
+    assert_eq!(e.resident_state().expect("resident fixture").document.layers[0].pixels.get16(9, 8), [0; 4]);
     for i in 0..41 {
         edit(
             &mut e,
@@ -537,7 +543,7 @@ fn completed_compensation_allows_new_batches_on_same_task_and_keeps_other_tasks(
         [19871, 42137, 63341, 65535],
     );
     e.undo_task("human", "agent", &task).unwrap();
-    assert_eq!(e.doc.layers[0].pixels.get16(4, 4), [0; 4]);
+    assert_eq!(e.resident_state().expect("resident fixture").document.layers[0].pixels.get16(4, 4), [0; 4]);
 }
 
 #[test]
@@ -565,7 +571,7 @@ fn project_frame_inverse_cannot_crop_or_quantize_later_human_work() {
     assert!(e.undo_task("human", "agent", &task).is_err());
     assert_eq!(source(&e), before);
     assert_eq!(
-        e.doc.layers[0].pixels.get16(4, 4),
+        e.resident_state().expect("resident fixture").document.layers[0].pixels.get16(4, 4),
         [19871, 42137, 63341, 65535]
     );
 }

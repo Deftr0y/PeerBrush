@@ -119,7 +119,8 @@ pub(crate) fn stage<'d, 's>(
     check: &mut dyn FnMut() -> Result<(), String>,
 ) -> Result<crate::edit_bounds::output::BuiltTiles<'d, 's>, String> {
     stage_impl(
-        input, stroke, settings, color, erase, frame, None, session, check,
+        input, stroke, settings, input.color(color).map(|value| u16::from(value) * 257),
+        erase, frame, None, session, check,
     )
 }
 pub(crate) fn stage_guarded<'d, 's>(
@@ -134,7 +135,7 @@ pub(crate) fn stage_guarded<'d, 's>(
     stroke.validate_command(guard.token())?;
     let parameters = guard.parameters();
     let settings = Settings::from_command(parameters)?;
-    let color = crate::engine::color(parameters);
+    let color = crate::engine::raster_color(parameters, input.depth())?;
     let erase = parameters["erase"] == true;
     let mut checked = || {
         guard.check_active()?;
@@ -157,7 +158,7 @@ fn stage_impl<'d, 's>(
     input: &RasterInput<'d>,
     stroke: &LocalStroke,
     settings: Settings,
-    color: [u8; 4],
+    color: [u16; 4],
     erase: bool,
     frame: Option<&InputFrame>,
     guard: Option<&crate::edit_bounds::input::WriteGuard<'_>>,
@@ -188,32 +189,32 @@ fn stage_impl<'d, 's>(
     let plan = stroke.brush(input, settings, color, erase, check)?;
     let selection = input.selection()?;
     if let Some(frame) = frame {
-        let draft = stage_frame_with(input, frame, session, check, |key, before, check| {
-            if plan
-                .tiles()
-                .binary_search_by_key(&(key.1, key.0), |&(x, y)| (y, x))
-                .is_err()
-            {
-                return Ok(before.clone());
-            }
-            let after = plan.render_tile(key, before, check)?;
-            let after = if selection.has_coverage() {
-                let coverage = selection.prepare(frame.tile_document_rect(key)?, check)?;
-                restrict_frame_tile(input, frame, key, before, &after, &coverage, check)
-            } else {
+        let draft = stage_frame_with(
+            input,
+            frame,
+            session,
+            check,
+            Some(plan.tiles()),
+            |key, before, check| {
+                let after = plan.render_tile(key, before, check)?;
+                let after = if selection.has_coverage() {
+                    let coverage = selection.prepare(frame.tile_document_rect(key)?, check)?;
+                    restrict_frame_tile(input, frame, key, before, &after, &coverage, check)
+                } else {
+                    Ok(after)
+                }?;
+                crate::edit_bounds::input::check_proposal(
+                    guard,
+                    input,
+                    Some(frame),
+                    key,
+                    before,
+                    &after,
+                    check,
+                )?;
                 Ok(after)
-            }?;
-            crate::edit_bounds::input::check_proposal(
-                guard,
-                input,
-                Some(frame),
-                key,
-                before,
-                &after,
-                check,
-            )?;
-            Ok(after)
-        })?;
+            },
+        )?;
         return Ok(BuiltTiles::Draft(draft));
     }
     let mut output = TileOutput::new(input, session)?;
@@ -425,20 +426,20 @@ impl LocalStroke {
         &'a self,
         input: &RasterInput<'_>,
         mut settings: Settings,
-        color: [u8; 4],
+        color: [u16; 4],
         erase: bool,
         check: &mut dyn FnMut() -> Result<(), String>,
     ) -> Result<PreparedBrush<'a>, String> {
         input.validate(self.binding)?;
         settings.texture_origin = self.origin;
-        PreparedBrush::new(
+        PreparedBrush::with_native_color(
             self.shape[0],
             self.shape[1],
             input.depth(),
             &self.points,
             self.pressures.as_deref(),
             settings,
-            input.color(color),
+            color,
             erase,
             self.clip,
             self.polygon.as_deref(),
@@ -475,7 +476,7 @@ impl LocalStroke {
         &'a self,
         input: &RasterInput<'_>,
         mut settings: Settings,
-        color: [u8; 4],
+        color: [u16; 4],
         check: &mut dyn FnMut() -> Result<(), String>,
     ) -> Result<PreparedSmudge<'a>, String> {
         input.validate(self.binding)?;
@@ -487,7 +488,7 @@ impl LocalStroke {
             &self.points,
             self.pressures.as_deref(),
             settings,
-            input.color(color),
+            color,
             self.clip,
             self.polygon.as_deref(),
             input.pool(),

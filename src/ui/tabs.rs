@@ -197,6 +197,7 @@ impl PeerBrush {
     pub(super) fn draw_project_tabs(
         &mut self,
         ctx: &egui::Context,
+        release: Option<(Pos2, egui::Modifiers)>,
     ) -> (
         Option<String>,
         Option<(String, Shared)>,
@@ -204,6 +205,10 @@ impl PeerBrush {
     ) {
         let active = crate::workspace::active_id_in(&self.workspace);
         self.switch_project(&active);
+        let (transfer_pos, transfer_shift) = match release {
+            Some((pos, modifiers)) => (Some(pos), modifiers.shift),
+            None => ctx.input(|input| (input.pointer.hover_pos(), input.modifiers.shift)),
+        };
         let mut entries = crate::workspace::entries_in(&self.workspace);
         let source_order: Vec<_> = entries.iter().map(|(id, _, _)| id.clone()).collect();
         let escape = self.tab_drag.is_some()
@@ -305,12 +310,16 @@ impl PeerBrush {
                                     }
                                     if id != &self.project_id
                                         && ui.is_enabled()
-                                        && response.rect.intersect(ui.clip_rect()).contains(
-                                            ctx.input(|i| i.pointer.interact_pos())
-                                                .unwrap_or(Pos2::new(-1., -1.)),
-                                        )
+                                        && transfer_pos.is_some_and(|pos| {
+                                            response.rect.intersect(ui.clip_rect()).contains(pos)
+                                        })
                                     {
-                                        if let Some(drag) = &self.layer_drag {
+                                        let source = self.doc_snapshot.view();
+                                        if let Some(drag) = self.layer_drag.as_ref().filter(|drag| {
+                                            drag.document == source.id()
+                                                && drag.revision == source.revision()
+                                                && drag.native == source.native().map(|doc| doc.key())
+                                        }) {
                                             let target = shared.try_lock().ok().map(|engine| {
                                                 let view = crate::engine::view::current(&engine);
                                                 let selected = self
@@ -327,18 +336,13 @@ impl PeerBrush {
                                                 hovered = Some(TabTransfer {
                                                     source: self.project_id.clone(),
                                                     destination: id.clone(),
-                                                    source_document:
-                                                        crate::engine::view::DocumentView::from(
-                                                            &self.doc_snapshot,
-                                                        )
-                                                        .id()
-                                                        .to_owned(),
+                                                    source_document: drag.document.clone(),
                                                     destination_document: document,
                                                     source_revision: drag.revision,
                                                     destination_revision: revision,
                                                     layers: drag.ids.clone(),
                                                     target,
-                                                    move_layers: ctx.input(|i| i.modifiers.shift),
+                                                    move_layers: transfer_shift,
                                                 });
                                                 ui.painter().line_segment(
                                                     [
@@ -496,7 +500,7 @@ mod tests {
     fn fixture(depth: u16, count: usize) -> (PeerBrush, egui::Context, Vec<Shared>) {
         let ctx = egui::Context::default();
         let mut e = Engine::new();
-        e.doc = Document::new_depth(32, 24, depth).unwrap();
+        e.resident_state_mut().expect("resident fixture").document = Document::new_depth(32, 24, depth).unwrap();
         let root = Arc::new(Mutex::new(e));
         crate::workspace::attach(&root);
         let mut projects = vec![root.clone()];
@@ -504,7 +508,7 @@ mod tests {
             projects.push(crate::workspace::new_project(&root, 32, 24, depth, None).unwrap());
         }
         for (i, shared) in projects.iter().enumerate() {
-            shared.lock().unwrap().doc.name =
+            shared.lock().unwrap().resident_state_mut().expect("resident fixture").document.name =
                 format!("Project {} · an unusually long artwork name", i + 1);
         }
         let app = PeerBrush::init(
@@ -571,13 +575,13 @@ mod tests {
         for depth in [8, 16] {
             let (mut app, ctx, projects) = fixture(depth, names.len());
             for (shared, name) in projects.iter().zip(names) {
-                shared.lock().unwrap().doc.name = name.into();
+                shared.lock().unwrap().resident_state_mut().expect("resident fixture").document.name = name.into();
             }
             let before: Vec<_> = projects
                 .iter()
                 .map(|s| {
                     let e = s.lock().unwrap();
-                    (e.doc.clone(), e.undo.len(), e.path.clone())
+                    (e.resident_state().expect("resident fixture").document.clone(), e.resident_state().expect("resident fixture").undo.len(), e.path.clone())
                 })
                 .collect();
             frame(&mut app, &ctx, 1600., Vec::new());
@@ -594,10 +598,10 @@ mod tests {
             for (shared, (doc, history, path)) in projects.iter().zip(before) {
                 let e = shared.lock().unwrap();
                 assert_eq!(
-                    serde_json::to_value(&e.doc).unwrap(),
+                    serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap(),
                     serde_json::to_value(doc).unwrap()
                 );
-                assert_eq!(e.undo.len(), history);
+                assert_eq!(e.resident_state().expect("resident fixture").undo.len(), history);
                 assert_eq!(e.path, path);
             }
         }
@@ -642,8 +646,8 @@ mod tests {
             crate::workspace::select_in(&app.workspace, &original[0]).unwrap();
             for (i, project) in projects.iter().enumerate() {
                 let mut e = project.lock().unwrap();
-                let layer = e.doc.layers[0].id.clone();
-                e.doc.layers[0]
+                let layer = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
+                e.resident_state_mut().expect("resident fixture").document.layers[0]
                     .pixels
                     .set16(2, 3, [10001 + i as u16, 20003, 40007, 65535]);
                 e.edit(
@@ -670,9 +674,9 @@ mod tests {
                 .map(|p| {
                     let e = p.lock().unwrap();
                     (
-                        crate::psd::encode(&e.doc).unwrap(),
-                        e.undo.len(),
-                        e.redo.len(),
+                        crate::psd::encode(&e.resident_state().expect("resident fixture").document).unwrap(),
+                        e.resident_state().expect("resident fixture").undo.len(),
+                        e.resident_state().expect("resident fixture").redo.len(),
                         e.path.clone(),
                         e.saved_revision,
                     )
@@ -727,15 +731,15 @@ mod tests {
                 let e = project.lock().unwrap();
                 assert_eq!(
                     (
-                        crate::psd::encode(&e.doc).unwrap(),
-                        e.undo.len(),
-                        e.redo.len(),
+                        crate::psd::encode(&e.resident_state().expect("resident fixture").document).unwrap(),
+                        e.resident_state().expect("resident fixture").undo.len(),
+                        e.resident_state().expect("resident fixture").redo.len(),
                         e.path.clone(),
                         e.saved_revision
                     ),
                     before
                 );
-                assert_eq!(e.doc.bit_depth, depth);
+                assert_eq!(e.resident_state().expect("resident fixture").document.bit_depth, depth);
             }
         }
     }
@@ -795,14 +799,14 @@ mod tests {
         let end = app.project_rects[order.last().unwrap()].center();
         begin_drag(&mut app, &ctx, 980., &original[0], end);
         let e = projects[1].lock().unwrap();
-        let doc = e.doc.id.clone();
+        let doc = e.resident_state().expect("resident fixture").document.id.clone();
         drop(e);
         crate::workspace::close_in(&app.workspace, &original[1], &doc, 0, false, "human").unwrap();
         frame(&mut app, &ctx, 980., vec![]);
         press(&mut app, &ctx, 980., end, false);
         assert!(app.tab_drag.is_none());
         assert!(!ids(&app).contains(&original[1]));
-        assert!(projects[0].lock().unwrap().undo.is_empty());
+        assert!(projects[0].lock().unwrap().resident_state().expect("resident fixture").undo.is_empty());
     }
     #[test]
     fn tab_drag_edge_scroll_reaches_hidden_projects_without_changing_active_identity() {
@@ -837,7 +841,7 @@ mod tests {
             crate::workspace::select_in(&app.workspace, &first).unwrap();
             {
                 let mut e = projects[1].lock().unwrap();
-                let layer = e.doc.layers[0].id.clone();
+                let layer = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
                 e.edit("human",&[json!({"op":"paint.fill","layer":layer,"rect":[0,0,2,2],"color":[233,84,32,255]})],None,None,"Human work").unwrap();
             }
             for _ in 0..3 {
@@ -847,7 +851,7 @@ mod tests {
             let before = projects[1]
                 .lock()
                 .unwrap()
-                .doc
+                .resident_state().expect("resident fixture").document
                 .preview(None, 32, None, false)
                 .unwrap()
                 .2;
@@ -879,7 +883,7 @@ mod tests {
                 },
                 |ctx| app.lifecycle_dialog(ctx),
             );
-            let name = projects[1].lock().unwrap().doc.name.clone();
+            let name = projects[1].lock().unwrap().resident_state().expect("resident fixture").document.name.clone();
             assert!(
                 output.shapes.iter().any(
                     |s| matches!(&s.shape,egui::epaint::Shape::Text(t) if t.galley.job.text==name)
@@ -890,14 +894,14 @@ mod tests {
                 projects[1]
                     .lock()
                     .unwrap()
-                    .doc
+                    .resident_state().expect("resident fixture").document
                     .preview(None, 32, None, false)
                     .unwrap()
                     .2,
                 before
             );
-            assert_eq!(projects[1].lock().unwrap().undo.len(), 1);
-            assert!(projects[0].lock().unwrap().undo.is_empty());
+            assert_eq!(projects[1].lock().unwrap().resident_state().expect("resident fixture").undo.len(), 1);
+            assert!(projects[0].lock().unwrap().resident_state().expect("resident fixture").undo.is_empty());
         }
     }
     #[test]
@@ -957,7 +961,7 @@ mod tests {
                 "{width}: {rect:?}"
             );
             assert!(rect.width() >= 132. && rect.width() <= 216.);
-            assert!(projects.iter().all(|p| p.lock().unwrap().undo.is_empty()));
+            assert!(projects.iter().all(|p| p.lock().unwrap().resident_state().expect("resident fixture").undo.is_empty()));
         }
     }
     #[test]

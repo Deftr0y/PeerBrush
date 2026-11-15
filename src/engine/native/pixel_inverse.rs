@@ -270,8 +270,8 @@ mod tests {
             let after_surface = fixture.stage(&after.layers[0].pixels);
             let current_surface = fixture.stage(&current.layers[0].pixels);
             let mut legacy = Engine::new();
-            legacy.doc = current.clone();
-            legacy.undo = vec![History {
+            legacy.resident_state_mut().expect("resident fixture").document = current.clone();
+            legacy.resident_state_mut().expect("resident fixture").undo = vec![History {
                 before: before.clone(),
                 after: after.clone(),
                 actor: "agent".into(),
@@ -282,7 +282,7 @@ mod tests {
                 reverted: vec![],
             }];
             legacy.undo_task("human", "agent", "task").unwrap();
-            let expected = fixture.stage(&legacy.doc.layers[0].pixels);
+            let expected = fixture.stage(&legacy.resident_state().expect("resident fixture").document.layers[0].pixels);
             let inverse = PixelInverse::new(
                 &before_surface,
                 &after_surface,
@@ -307,7 +307,7 @@ mod tests {
             );
             assert_eq!(
                 current.layers[0].pixels.get16(1, 0),
-                legacy.doc.layers[0].pixels.get16(1, 0)
+                legacy.resident_state().expect("resident fixture").document.layers[0].pixels.get16(1, 0)
             );
             assert_eq!(
                 &pixels[..if depth == 16 { 8 } else { 4 }],

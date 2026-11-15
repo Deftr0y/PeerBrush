@@ -1,10 +1,16 @@
 //! Candidate-only selection preparation. All source row admission, native
 //! pinning and staging happen outside engine/UI locks; publication is separate.
-use super::{backed::CoverageSource, coverage_writer::Writer, flood, rows, SelectionSource};
+use super::{
+    backed::CoverageSource,
+    coverage_writer::{stage_rows, Writer},
+    flood, rows, source::PriorRows, SelectionSource,
+};
 use crate::{
     large_document::{Error, Result, ScratchBytes, Store},
-    raster::backed::Region,
+    raster::Surface,
 };
+#[cfg(test)]
+use crate::raster::backed::Region;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Combine {
@@ -14,7 +20,7 @@ pub enum Combine {
     Intersect,
 }
 impl Combine {
-    fn value(self, a: u8, b: u8) -> u8 {
+    pub(super) fn value(self, a: u8, b: u8) -> u8 {
         match self {
             Self::Replace => b,
             Self::Add => a.max(b),
@@ -136,10 +142,31 @@ pub fn prepare(
     store: Store,
     prior: Option<&SelectionSource>,
     check: &dyn Fn() -> Result<()>,
+    prepare_row: impl FnMut(u32) -> Result<()>,
+    matches: impl FnMut(usize, u32, u32) -> Result<bool>,
+) -> std::result::Result<CoverageSource, String> {
+    prepare_in_region(
+        request,
+        [0, 0, request.width, request.height],
+        store,
+        prior,
+        check,
+        prepare_row,
+        matches,
+    )
+}
+
+/// Seeds are local to the search rectangle. Sampling and coverage use document coordinates.
+pub(crate) fn prepare_in_region(
+    request: &Request<'_>,
+    [left, top, right, bottom]: [u32; 4],
+    store: Store,
+    prior: Option<&SelectionSource>,
+    check: &dyn Fn() -> Result<()>,
     mut prepare_row: impl FnMut(u32) -> Result<()>,
     mut matches: impl FnMut(usize, u32, u32) -> Result<bool>,
 ) -> std::result::Result<CoverageSource, String> {
-    if request.seeds.len() > 8192
+    if request.seeds.len() > super::MAX_BRUSH_SEEDS
         || request.feather > 64
         || request.maximum_work == 0
         || request.maximum_work > 1_024_000_000
@@ -147,9 +174,22 @@ pub fn prepare(
     {
         return Err("Invalid admitted selection worker request".into());
     }
-    let shape = flood::Layout::new(request.width, request.height).map_err(str::to_owned)?;
-    let layout =
-        rows::Layout::new(request.width, request.height, rows::MAX_SPANS).map_err(str::to_owned)?;
+    crate::raster::CanvasLimits::Native.check(request.width, request.height)?;
+    if left >= right || top >= bottom || right > request.width || bottom > request.height {
+        return Err("Selection search rectangle exceeds its canvas".into());
+    }
+    let (width, height) = (right - left, bottom - top);
+    let shape = flood::Layout::new(width, height).map_err(str::to_owned)?;
+    let max_spans = request.seeds.iter().filter(|[x, y]| *x < width && *y < height)
+        .fold(0usize, |total, &[x, y]| {
+            let (w, h) = request.quick_radius.map_or((width, height), |radius| {
+                (x.saturating_add(radius + 1).min(width) - x.saturating_sub(radius),
+                 y.saturating_add(radius + 1).min(height) - y.saturating_sub(radius))
+            });
+            // Runs from a single seed are separated by at least one pixel.
+            (total + w.div_ceil(2) as usize * h as usize).min(rows::MAX_SPANS)
+        }).max(1);
+    let layout = rows::Layout::new(width, height, max_spans).map_err(str::to_owned)?;
     check().map_err(|e| e.to_string())?;
     let pool = store.resident_budget();
     let allocate = |bytes| ScratchBytes::new(&pool, bytes, bytes).map_err(|e| e.to_string());
@@ -167,8 +207,6 @@ pub fn prepare(
         request.maximum_work,
     )
     .map_err(str::to_owned)?;
-    let mut writer =
-        Writer::new(request.width, request.height, store, &pool).map_err(|e| e.to_string())?;
     let completed = {
         let mut flood = flood::Flood::new(
             shape,
@@ -183,8 +221,8 @@ pub fn prepare(
                 request.seeds,
                 request.quick_radius,
                 check,
-                |y| prepare_row(y),
-                |s, x, y| matches(s, x, y),
+                |y| prepare_row(top + y),
+                |s, x, y| matches(s, left + x, top + y),
                 |y, l, r| spans.push(y, l, r).map_err(Error::Invalid),
             )
             .map_err(|e| e.to_string())?
@@ -193,14 +231,37 @@ pub fn prepare(
     drop(states);
     drop(generations);
     drop(frontier);
+    let ordered = spans.finish(&completed, || check().map_err(|e| e.to_string()))?;
+    if request.mode == Combine::Replace && request.feather == 0 {
+        let Some([x0, y0, x1, y1]) = ordered.bounds() else {
+            let empty =
+                Surface::zero(request.width, request.height, 8).map_err(|e| e.to_string())?;
+            return CoverageSource::new(empty, [0; 4], [0; 2], &[], &pool)
+                .map_err(|e| e.to_string());
+        };
+        // Pixels outside the completed spans are zero. Keep the exact contour
+        // and scalar output in its own frame and restore document coordinates.
+        let mut row = allocate(width as usize)?;
+        let coverage = stage_rows(x1 - x0, y1 - y0, store, &pool, check, |y, output| {
+            ordered.row(y + y0, &mut row, || check().map_err(|e| e.to_string()))?;
+            output.copy_from_slice(&row[x0 as usize..x1 as usize]);
+            Ok(())
+        })?;
+        check().map_err(|e| e.to_string())?;
+        return coverage
+            .translate_unique([(left + x0) as i32, (top + y0) as i32])
+            .map_err(|e| e.to_string());
+    }
+    let mut writer =
+        Writer::new(request.width, request.height, store, &pool).map_err(|e| e.to_string())?;
     let scalar_complete = {
-        let ordered = spans.finish(&completed, || check().map_err(|e| e.to_string()))?;
         let width = request.width as usize;
         let mut ring = allocate((2 * request.feather as usize + 1) * width)?;
         let mut sums = allocate(width * 4)?;
         let mut input = allocate(width)?;
         let mut output = allocate(width)?;
         let mut previous = allocate(width)?;
+        let mut prior_rows = PriorRows::new(prior, request.height);
         let mut combined = allocate(width)?;
         let mut feather = rows::Feather::new(
             request.width,
@@ -214,28 +275,25 @@ pub fn prepare(
         .map_err(str::to_owned)?;
         feather.run(
             || check().map_err(|e| e.to_string()),
-            |y, row| ordered.row(y, row, || check().map_err(|e| e.to_string())),
+            |y, row| {
+                if (top..bottom).contains(&y) {
+                    row[..left as usize].fill(0);
+                    row[right as usize..].fill(0);
+                    ordered.row(y - top, &mut row[left as usize..right as usize], || {
+                        check().map_err(|e| e.to_string())
+                    })?;
+                } else {
+                    row.fill(0);
+                }
+                Ok(())
+            },
             |y, row| {
                 if request.mode == Combine::Replace {
                     return writer
                         .row(y, row, &mut || check())
                         .map_err(|e| e.to_string());
                 }
-                // No restriction is not a previous selection: the historical
-                // combination baseline is zero until a selection actually exists.
-                previous.fill(0);
-                if let Some(prior) = prior.filter(|p| !matches!(p, SelectionSource::All)) {
-                    let view = prior
-                        .prepare_region(
-                            Region::new([0, y as i32, request.width as i32, y as i32 + 1])
-                                .map_err(|e| e.to_string())?,
-                            &pool,
-                            &mut || check(),
-                        )
-                        .map_err(|e| e.to_string())?;
-                    view.copy_row(y as i32, &mut previous)
-                        .map_err(|e| e.to_string())?;
-                }
+                prior_rows.copy_row(y, &mut previous, &pool, check).map_err(|e| e.to_string())?;
                 for ((value, &a), &b) in combined.iter_mut().zip(previous.iter()).zip(row) {
                     *value = request.mode.value(a, b);
                 }
@@ -437,6 +495,121 @@ mod tests {
         .unwrap();
         (store, path)
     }
+
+    #[test]
+    fn cropped_quick_flood_preserves_feather_and_prior_selection() {
+        let pool = ResidentBudget::new(32 * 1024 * 1024).unwrap();
+        let (store, path) = store(pool.clone());
+        let prior = SelectionSource::from_metadata(Some([3, 2, 5, 4]), None, None).unwrap();
+        let request = Request {
+            width: 32,
+            height: 24,
+            seeds: &[[14, 8], [20, 11]],
+            quick_radius: Some(3),
+            feather: 2,
+            mode: Combine::Add,
+            maximum_work: 100_000,
+        };
+        let matches = |seed, x, y| Ok(seed == 0 || (x + y) % 3 != 0);
+        let full = prepare(
+            &request,
+            store.clone(),
+            Some(&prior),
+            &|| Ok(()),
+            |_| Ok(()),
+            matches,
+        )
+        .unwrap();
+        let cropped = prepare_in_region(
+            &Request {
+                seeds: &[[3, 3], [9, 6]],
+                ..request
+            },
+            [11, 5, 24, 15],
+            store.clone(),
+            Some(&prior),
+            &|| Ok(()),
+            |y| {
+                assert!((5..15).contains(&y));
+                Ok(())
+            },
+            |seed, x, y| {
+                assert!((11..24).contains(&x));
+                matches(seed, x, y)
+            },
+        )
+        .unwrap();
+        assert_eq!(cropped.bounds(), full.bounds());
+        let frame = Region::new([0, 0, 32, 24]).unwrap();
+        let a = full.prepare_region(frame, &pool, &mut || Ok(())).unwrap();
+        let b = cropped.prepare_region(frame, &pool, &mut || Ok(())).unwrap();
+        assert_eq!(b.value(3, 2).unwrap(), 1.);
+        assert!(b.value(10, 8).unwrap() > 0.);
+        for y in 0..24 {
+            for x in 0..32 {
+                assert_eq!(b.value(x, y).unwrap(), a.value(x, y).unwrap());
+            }
+        }
+        drop((a, b, full, cropped, store));
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn unfeathered_replacement_keeps_disjoint_coverage_in_document_coordinates() {
+        let pool = ResidentBudget::new(64 * 1024 * 1024).unwrap();
+        let (store, path) = store(pool.clone());
+        let request = Request {
+            width: 96,
+            height: 80,
+            seeds: &[[3, 5], [15, 12]],
+            quick_radius: None,
+            feather: 0,
+            mode: Combine::Replace,
+            maximum_work: 100_000,
+        };
+        let inside = |x, y| {
+            ((43..46).contains(&x) && (55..57).contains(&y))
+                || ((55..57).contains(&x) && (62..65).contains(&y))
+        };
+        let prepare = |matches| {
+            prepare_in_region(
+                &request,
+                [40, 50, 80, 75],
+                store.clone(),
+                None,
+                &|| Ok(()),
+                |_| Ok(()),
+                |_, x, y| Ok(matches && inside(x, y)),
+            )
+            .unwrap()
+        };
+        let coverage = prepare(true);
+        assert_eq!(coverage.origin(), [43, 55]);
+        assert_eq!(coverage.bounds(), [43, 55, 57, 65]);
+        assert_eq!(
+            (coverage.mask().width(), coverage.mask().height()),
+            (14, 10)
+        );
+        assert_eq!(coverage.contours().len(), 2);
+        let frame = Region::new([0, 0, 96, 80]).unwrap();
+        let view = coverage
+            .prepare_region(frame, &pool, &mut || Ok(()))
+            .unwrap();
+        for y in 0..80 {
+            for x in 0..96 {
+                assert_eq!(
+                    view.value(x, y).unwrap(),
+                    u8::from(inside(x as u32, y as u32)) as f32
+                );
+            }
+        }
+        let empty = prepare(false);
+        assert_eq!(empty.bounds(), [0; 4]);
+        assert!(empty.contours().is_empty());
+        drop((view, coverage, empty, store));
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
     #[test]
     fn native16_source_rows_flood_into_exact_coverage_without_changing_original_samples() {
         let (w, h) = (257u32, 259u32);

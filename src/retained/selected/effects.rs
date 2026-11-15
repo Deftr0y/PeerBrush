@@ -8,7 +8,7 @@ use crate::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-pub(super) fn coverage(
+pub(crate) fn coverage(
     base: &NativeDocument,
     source: CoverageMetadata<'_>,
     delta: [i32; 2],
@@ -57,7 +57,7 @@ pub(super) fn coverage(
 
 /// Literal translation of local Liquify controls. Typed clip masks stay bound
 /// to their exact existing source slots; only placement/contours are translated.
-pub(super) fn patches(
+pub(crate) fn patches(
     base: &NativeDocument,
     layer: LayerMetadata<'_>,
     delta: [i32; 2],

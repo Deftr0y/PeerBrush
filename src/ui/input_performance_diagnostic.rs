@@ -61,11 +61,11 @@ fn fixture(depth: u16, filled: bool) -> (State, PeerBrush, egui::Context, f64) {
     let shared = Arc::new(std::sync::Mutex::new(Engine::new()));
     {
         let mut e = shared.lock().unwrap();
-        e.doc = Document::new_depth(512, 512, depth).unwrap();
+        e.resident_state_mut().expect("resident diagnostic fixture").document = Document::new_depth(512, 512, depth).unwrap();
         if filled {
             for y in 0..512 {
                 for x in 0..512 {
-                    e.doc.layers[0].pixels.set16(
+                    e.resident_state_mut().expect("resident diagnostic fixture").document.layers[0].pixels.set16(
                         x,
                         y,
                         if x < 256 {
@@ -100,7 +100,7 @@ fn fixture(depth: u16, filled: bool) -> (State, PeerBrush, egui::Context, f64) {
 fn begin_parameter(app: &mut PeerBrush, ctx: &egui::Context, wand: bool) -> Value {
     let mut rect = Rect::NOTHING;
     let mut control_frame = |app: &mut PeerBrush, events| {
-        let doc = app.shared.lock().unwrap().doc.clone();
+        let doc = app.shared.lock().unwrap().resident_state().expect("resident diagnostic fixture").document.clone();
         let started = Instant::now();
         let output = ctx.run(
             egui::RawInput {
@@ -179,7 +179,7 @@ fn actual_workspace_control_and_navigation_components() {
     for depth in [8, 16] {
         for filled in [false, true] {
             let (_state, mut app, ctx, init_ms) = fixture(depth, filled);
-            let before = app.shared.lock().unwrap().doc.clone();
+            let before = app.shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
             let before_json = serde_json::to_value(&before).unwrap();
             let before_native = before.layers[0].pixels.rgba16();
             let idle = timings(|| frame(&mut app, &ctx, vec![]));
@@ -218,14 +218,14 @@ fn actual_workspace_control_and_navigation_components() {
                 )],
             );
             assert_eq!(
-                serde_json::to_value(&app.shared.lock().unwrap().doc).unwrap(),
+                serde_json::to_value(&app.shared.lock().unwrap().resident_state().expect("resident fixture").document).unwrap(),
                 before_json
             );
             assert_eq!(
-                app.shared.lock().unwrap().doc.layers[0].pixels.rgba16(),
+                app.shared.lock().unwrap().resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(),
                 before_native
             );
-            assert!(app.shared.lock().unwrap().undo.is_empty());
+            assert!(app.shared.lock().unwrap().resident_state().expect("resident fixture").undo.is_empty());
             cases.push(
                 json!({"depth":depth,"filled":filled,"width":512,"height":512,
                 "layers":before.layers.len(),"tiles8":before.layers[0].pixels.tiles.len(),
@@ -249,11 +249,11 @@ fn actual_workspace_control_and_navigation_components() {
                     "Diagnostic seed",
                 )
                 .unwrap();
-                e.undo.clear();
+                e.resident_state_mut().expect("resident fixture").undo.clear();
                 drop(e);
                 canvas_ready(&mut app, &ctx);
             }
-            let before = app.shared.lock().unwrap().doc.clone();
+            let before = app.shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
             let before_json = serde_json::to_value(&before).unwrap();
             let before_native = before.layers[0].pixels.rgba16();
             let control = begin_parameter(&mut app, &ctx, wand);
@@ -286,15 +286,15 @@ fn actual_workspace_control_and_navigation_components() {
                 "Actual canvas worker must display shared-engine pixels"
             );
             assert_eq!(
-                serde_json::to_value(&app.shared.lock().unwrap().doc).unwrap(),
+                serde_json::to_value(&app.shared.lock().unwrap().resident_state().expect("resident fixture").document).unwrap(),
                 before_json
             );
             assert_eq!(
-                app.shared.lock().unwrap().doc.layers[0].pixels.rgba16(),
+                app.shared.lock().unwrap().resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(),
                 before_native
             );
-            assert!(app.shared.lock().unwrap().undo.is_empty());
-            assert!(app.shared.lock().unwrap().redo.is_empty());
+            assert!(app.shared.lock().unwrap().resident_state().expect("resident fixture").undo.is_empty());
+            assert!(app.shared.lock().unwrap().resident_state().expect("resident fixture").redo.is_empty());
             app.finish_parameter(true);
             cases.push(
                 json!({"depth":depth,"control":if wand {"wand_feather"} else {"opacity"},
@@ -373,13 +373,13 @@ fn actual_workspace_embedded_source_snapshot_and_inspector_components() {
                     "Diagnostic embedded source",
                 )
                 .unwrap();
-                embedded_id = e.doc.layers[0].id.clone();
+                embedded_id = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
                 e.edit("human", &[json!({"op":"effect.add","layer":embedded_id,
                     "kind":"pattern_overlay","settings":{"pattern":"bitmap","bitmap_png":png,"opacity":1.}
                 })], None, None, "Diagnostic embedded pattern").unwrap();
-                effect_id = e.doc.layers[0].effects[0].id.clone();
-                e.undo.clear();
-                e.redo.clear();
+                effect_id = e.resident_state().expect("resident fixture").document.layers[0].effects[0].id.clone();
+                e.resident_state_mut().expect("resident fixture").undo.clear();
+                e.resident_state_mut().expect("resident fixture").redo.clear();
                 drop(e);
                 app.selected = if expanded {
                     embedded_id.clone()
@@ -400,7 +400,7 @@ fn actual_workspace_embedded_source_snapshot_and_inspector_components() {
                     expanded
                 );
             }
-            let before = app.shared.lock().unwrap().doc.clone();
+            let before = app.shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
             let wire = serde_json::to_value(&before).unwrap();
             let (w, h, actual) = app.canvas_pixels.as_ref().unwrap();
             assert_eq!(
@@ -452,34 +452,34 @@ fn actual_workspace_embedded_source_snapshot_and_inspector_components() {
                 )],
             );
             let e = app.shared.lock().unwrap();
-            assert_eq!(serde_json::to_value(&e.doc).unwrap(), wire);
+            assert_eq!(serde_json::to_value(&e.resident_state().expect("resident fixture").document).unwrap(), wire);
             assert_eq!(
-                e.doc
+                e.resident_state().expect("resident fixture").document
                     .layers
                     .iter()
                     .map(|layer| layer.pixels.rgba16())
                     .collect::<Vec<_>>(),
                 native
             );
-            assert!(e.undo.is_empty() && e.redo.is_empty() && e.leases.is_empty());
+            assert!(e.resident_state().expect("resident fixture").undo.is_empty() && e.resident_state().expect("resident fixture").redo.is_empty() && e.leases.is_empty());
             if embedded {
                 let DocumentSnapshot::Resident(snapshot) = &app.doc_snapshot else {
                     panic!("This diagnostic explicitly measures resident compatibility")
                 };
                 assert!(Arc::ptr_eq(
-                    &e.doc.layers[0].effects[0].settings,
+                    &e.resident_state().expect("resident fixture").document.layers[0].effects[0].settings,
                     &before.layers[0].effects[0].settings
                 ));
                 assert!(Arc::ptr_eq(
                     &snapshot.layers[0].effects[0].settings,
-                    &e.doc.layers[0].effects[0].settings
+                    &e.resident_state().expect("resident fixture").document.layers[0].effects[0].settings
                 ));
                 assert!(Arc::ptr_eq(
                     snapshot.layers[0].source.as_ref().unwrap(),
-                    e.doc.layers[0].source.as_ref().unwrap()
+                    e.resident_state().expect("resident fixture").document.layers[0].source.as_ref().unwrap()
                 ));
                 assert!(Arc::ptr_eq(
-                    e.doc.layers[0].source.as_ref().unwrap(),
+                    e.resident_state().expect("resident fixture").document.layers[0].source.as_ref().unwrap(),
                     before.layers[0].source.as_ref().unwrap()
                 ));
             }

@@ -90,7 +90,7 @@ fn both_pixel_and_whole_layer_paste_clear_polygon_and_pixel_undo_restores_it() {
     let (doc, target) = selected_document();
     let image = Image::copy(&doc, &target, false, false).unwrap();
     let mut engine = Engine::new();
-    engine.doc = doc.clone();
+    engine.resident_state_mut().expect("resident fixture").document = doc.clone();
     engine
         .edit(
             "human",
@@ -100,11 +100,11 @@ fn both_pixel_and_whole_layer_paste_clear_polygon_and_pixel_undo_restores_it() {
             "Paste",
         )
         .unwrap();
-    assert!(engine.doc.selection.is_none());
-    assert!(engine.doc.selection_polygon.is_none());
+    assert!(engine.resident_state().expect("resident fixture").document.selection.is_none());
+    assert!(engine.resident_state().expect("resident fixture").document.selection_polygon.is_none());
     engine.undo("human").unwrap();
-    assert_eq!(engine.doc.selection, doc.selection);
-    assert_eq!(engine.doc.selection_polygon, doc.selection_polygon);
+    assert_eq!(engine.resident_state().expect("resident fixture").document.selection, doc.selection);
+    assert_eq!(engine.resident_state().expect("resident fixture").document.selection_polygon, doc.selection_polygon);
 
     let snapshot = layer_clipboard::copy(&doc, &[target.clone()]).unwrap();
     let mut pasted = doc;

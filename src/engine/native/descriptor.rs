@@ -74,7 +74,7 @@ impl Method {
             | "path.delete" | "path.to_selection" | "path.to_mask" | "path.node.add"
             | "path.node.split" | "path.node.delete" | "path.node.move" | "path.handle.move"
             | "path.node.convert" => Self::Source,
-            "new" | "document.settings" => Self::Document,
+            "new" | "document.settings" | "document.global_light" => Self::Document,
             _ => return Err("Unsupported normalized native command".into()),
         })
     }
@@ -84,13 +84,18 @@ pub(crate) struct CommandToken {
     descriptor: DocumentKey,
     index: u32,
 }
+struct CommandPlan {
+    method: Method,
+    preserve_selection: bool,
+    transforms_new_copy: bool,
+}
 pub(crate) struct CommandDescriptor {
     generation: DocumentKey,
     revision: u64,
     identity: DocumentKey,
     offset: u32,
     commands: Admitted<Vec<Value>>,
-    methods: Vec<Method>,
+    plans: Vec<CommandPlan>,
     scope_ranges: Vec<std::ops::Range<usize>>,
     scopes: Arc<Intent>,
     _charge: Reservation,
@@ -101,6 +106,8 @@ pub(crate) struct Command<'a> {
     generation: DocumentKey,
     index: u32,
     method: Method,
+    preserve_selection: bool,
+    transforms_new_copy: bool,
     parameters: &'a Value,
     scopes: &'a [Scope],
 }
@@ -113,6 +120,9 @@ impl<'a> Command<'a> {
     }
     pub fn method(&self) -> Method {
         self.method
+    }
+    pub(crate) fn preserves_selection(&self) -> bool {
+        self.preserve_selection
     }
     pub fn parameters(&self) -> &'a Value {
         self.parameters
@@ -213,7 +223,7 @@ impl CommandDescriptor {
         let bytes = commands
             .len()
             .checked_mul(
-                std::mem::size_of::<Method>() + std::mem::size_of::<std::ops::Range<usize>>(),
+                std::mem::size_of::<CommandPlan>() + std::mem::size_of::<std::ops::Range<usize>>(),
             )
             .and_then(|n| n.checked_add(std::mem::size_of::<CommandDescriptor>() + 128))
             .ok_or("Native descriptor footprint overflow")?;
@@ -236,8 +246,8 @@ impl CommandDescriptor {
             .and_then(|n| n.checked_add(commands.len() * 32 * 1024))
             .ok_or("Native scope footprint overflow")?;
         let temporary = MetadataCharge::reserve(base.budget(), scope_bytes, check)?;
-        let mut methods = Vec::new();
-        methods
+        let mut plans = Vec::new();
+        plans
             .try_reserve_exact(commands.len())
             .map_err(|_| "Native method allocation refused")?;
         let mut scope_ranges = Vec::new();
@@ -245,11 +255,41 @@ impl CommandDescriptor {
             .try_reserve_exact(commands.len())
             .map_err(|_| "Native scope range allocation refused")?;
         let mut scopes = Vec::new();
-        for command in commands.iter() {
+        let mut copied_roots = std::collections::HashSet::with_capacity(100);
+        let mut gesture_end = 0;
+        for (index, command) in commands.iter().enumerate() {
             check()?;
-            methods.push(Method::from_operation(
-                command["op"].as_str().ok_or("Missing native operation")?,
-            )?);
+            if index == gesture_end {
+                gesture_end = index + 1;
+                while let Some(next) = commands.get(gesture_end) {
+                    check()?;
+                    let target = next["layer"].as_str().unwrap_or("");
+                    if !crate::transform::shares_selection(command, next)
+                        || commands[index..gesture_end]
+                            .iter()
+                            .any(|prior| prior["layer"].as_str().unwrap_or("") == target)
+                    {
+                        break;
+                    }
+                    gesture_end += 1;
+                }
+            }
+            // Keep the original selection until every distinct target in the gesture has used it.
+            let operation = command["op"].as_str().ok_or("Missing native operation")?;
+            plans.push(CommandPlan {
+                method: Method::from_operation(operation)?,
+                preserve_selection: index + 1 < gesture_end,
+                transforms_new_copy: matches!(operation, "move" | "transform")
+                    && command["layer"].as_str().is_some_and(|id| copied_roots.contains(id)),
+            });
+            if operation == "layer.duplicate" && command.get("root_ids").is_some() {
+                if let Ok(Some(ids)) = super::duplicate::requested_root_ids(base, command) {
+                    if copied_roots.len() + ids.len() > 100 {
+                        return Err("Native batch exceeds the copied layer limit".into());
+                    }
+                    copied_roots.extend(ids.values().filter_map(Value::as_str));
+                }
+            }
             let planned = super::scopes::scopes(&base.core.metadata, command);
             let start = scopes.len();
             scopes
@@ -260,6 +300,7 @@ impl CommandDescriptor {
         }
         let intent = Intent::from_scopes(IntentKind::Capture, &scopes, base.budget())?;
         drop(scopes);
+        drop(copied_roots);
         drop(temporary);
         check()?;
         Ok(Arc::new(Self {
@@ -268,7 +309,7 @@ impl CommandDescriptor {
             identity: key(),
             offset: 0,
             commands,
-            methods,
+            plans,
             scope_ranges,
             scopes: Arc::new(intent),
             _charge: charge,
@@ -279,19 +320,28 @@ impl CommandDescriptor {
     ) -> impl ExactSizeIterator<Item = Command<'a>> + DoubleEndedIterator + 'a {
         self.commands
             .iter()
-            .zip(self.methods.iter())
+            .zip(self.plans.iter())
             .enumerate()
-            .map(move |(index, (parameters, method))| Command {
+            .map(move |(index, (parameters, plan))| Command {
                 descriptor: self.identity,
                 generation: self.generation,
                 index: self.offset + index as u32,
-                method: *method,
+                method: plan.method,
+                preserve_selection: plan.preserve_selection,
+                transforms_new_copy: plan.transforms_new_copy,
                 parameters,
                 scopes: &self.scopes.scopes()[self.scope_ranges[index].clone()],
             })
     }
     pub fn scopes(&self) -> &[Scope] {
         self.scopes.scopes()
+    }
+    pub(super) fn allows_copy_scope(&self, target: &str) -> bool {
+        let mut matching = self.commands().filter(|command| {
+            command.write_scopes().iter().any(|scope| scope.target.as_deref() == Some(target))
+        });
+        let valid = |command: Command<'_>| command.transforms_new_copy && command.parameters["layer"] == target;
+        matching.next().is_some_and(valid) && matching.all(valid)
     }
     pub fn generation(&self) -> DocumentKey {
         self.generation
@@ -320,6 +370,7 @@ impl CommandDescriptor {
             Arc::get_mut(&mut step).ok_or("Native step descriptor unexpectedly shared")?;
         step_mut.identity = self.identity;
         step_mut.offset = index as u32;
+        step_mut.plans[0].preserve_selection = self.plans[index].preserve_selection;
         Ok(step)
     }
     pub(super) fn shared_scopes(&self) -> Arc<Intent> {

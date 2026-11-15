@@ -51,7 +51,8 @@ impl<'c> WriteGuard<'c> {
             .as_str()
             .ok_or("Native paint command has no operation")?;
         let method = match operation {
-            "paint" => Method::Paint,
+            "paint" | "shape" | "gradient" | "fill" | "adjust" | "pixels.replace"
+            | "image.patch" => Method::Paint,
             "paint.fill" => Method::Fill,
             "paint.clear_selection" => Method::Clear,
             "smudge" => Method::Smudge,
@@ -154,6 +155,9 @@ impl<'c> WriteGuard<'c> {
     pub(crate) fn token(&self) -> CommandToken {
         self.command.token()
     }
+    pub(crate) fn capture(&self) -> &CapturedEdit {
+        self._capture
+    }
     pub(crate) fn validate(
         &self,
         input: &RasterInput<'_>,
@@ -192,6 +196,12 @@ impl<'c> WriteGuard<'c> {
             frame,
             &[
                 "paint",
+                "shape",
+                "gradient",
+                "fill",
+                "adjust",
+                "pixels.replace",
+                "image.patch",
                 "paint.fill",
                 "paint.clear_selection",
                 "smudge",
@@ -215,7 +225,7 @@ impl<'c> WriteGuard<'c> {
         after: &PinnedBytes,
         check: &mut dyn FnMut() -> Result<(), String>,
     ) -> Result<(), String> {
-        self.validate(input, None, &["paint.fill"])?;
+        self.validate(input, None, &["paint.fill", "fill"])?;
         if input.is_mask() || input.layer_metadata().kind() != "group" {
             return Err("Native child fill requires its captured folder target".into());
         }
@@ -254,7 +264,16 @@ impl<'c> WriteGuard<'c> {
             || self.parameters()["layer"].as_str() != Some(input.layer_metadata().id())
             || !matches!(
                 self.parameters()["op"].as_str(),
-                Some("paint" | "smudge" | "clone" | "heal" | "paint.fill")
+                Some(
+                    "paint"
+                        | "smudge"
+                        | "clone"
+                        | "heal"
+                        | "paint.fill"
+                        | "shape"
+                        | "gradient"
+                        | "fill"
+                )
             )
             || frame.command != Some(self.token())
             || frame.geometry().new_shape() != self.shape
@@ -305,6 +324,26 @@ pub(crate) enum RetouchInput<'a> {
         layer: LayerMetadata<'a>,
     },
 }
+
+fn read_with_guard<T>(
+    check: &mut dyn FnMut() -> Result<(), String>,
+    read: impl FnOnce(
+        &mut dyn FnMut() -> crate::large_document::Result<()>,
+    ) -> crate::large_document::Result<T>,
+) -> Result<T, String> {
+    let mut failure = None;
+    let result = read(&mut || {
+        check().map_err(|reason| {
+            failure = Some(reason);
+            Error::Cancelled
+        })
+    });
+    match failure {
+        Some(reason) => Err(reason),
+        None => result.map_err(|error| error.to_string()),
+    }
+}
+
 impl<'a> RasterInput<'a> {
     /// Resolve only immutable captured metadata. Disabled paint steps remain
     /// editable; a missing target step never falls back to a different plane.
@@ -327,7 +366,7 @@ impl<'a> RasterInput<'a> {
             .find(|l| l.id() == target)
             .ok_or("Unknown native paint layer")?;
         let mask = layer.mask().ok_or("Layer has no mask")?;
-        let step = if let Some(step) = parameters.get("step") {
+        let step = if let Some(step) = parameters.get("step").filter(|step| !step.is_null()) {
             step.as_str().ok_or("Mask step must be an ID")?
         } else {
             mask.steps()
@@ -390,19 +429,29 @@ impl<'a> RasterInput<'a> {
         Self::layer(self.document, target).map(RetouchInput::Raster)
     }
     pub(crate) fn layer(document: &'a NativeDocument, layer: &str) -> Result<Self, String> {
-        Self::resolve(document, layer, None)
+        Self::resolve(document, layer, None, false)
     }
     pub(crate) fn mask_step(
         document: &'a NativeDocument,
         layer: &str,
         step: &str,
     ) -> Result<Self, String> {
-        Self::resolve(document, layer, Some(step))
+        Self::resolve(document, layer, Some(step), true)
+    }
+    /// Read-only projection for remapping every raw mask plane with its layer.
+    /// WriteGuard still requires a paint step for the actual draw target.
+    pub(crate) fn mask_plane(
+        document: &'a NativeDocument,
+        layer: &str,
+        step: &str,
+    ) -> Result<Self, String> {
+        Self::resolve(document, layer, Some(step), false)
     }
     fn resolve(
         document: &'a NativeDocument,
         layer_id: &str,
         step: Option<&str>,
+        paint_only: bool,
     ) -> Result<Self, String> {
         let layer = document
             .metadata()
@@ -414,7 +463,7 @@ impl<'a> RasterInput<'a> {
                 .mask()
                 .ok_or("Native layer has no mask")?
                 .steps()
-                .find(|s| s.id() == step_id && s.kind() == "paint")
+                .find(|s| s.id() == step_id && (!paint_only || s.kind() == "paint"))
                 .ok_or("Unknown native mask step")?
                 .pixels()
         } else {
@@ -453,6 +502,9 @@ impl<'a> RasterInput<'a> {
     }
     pub(crate) fn document(&self) -> &'a NativeDocument {
         self.document
+    }
+    pub(crate) fn surface(&self) -> &'a Surface {
+        self.surface
     }
     pub(crate) fn metadata(&self) -> RasterMetadata<'a> {
         self.pixels
@@ -506,10 +558,7 @@ impl<'a> RasterInput<'a> {
         check: &mut dyn FnMut() -> Result<(), String>,
     ) -> Result<InputTile, String> {
         check()?;
-        let tile = self
-            .surface
-            .prepare_tile(key, &mut || check().map_err(|_| Error::Cancelled))
-            .map_err(|e| e.to_string())?;
+        let tile = read_with_guard(check, |guard| self.surface.prepare_tile(key, guard))?;
         let bytes = tile
             .copy_to_scratch(self.pool())
             .map_err(|e| e.to_string())?;
@@ -527,10 +576,7 @@ impl<'a> RasterInput<'a> {
     ) -> Result<PreparedInput<'a>, String> {
         check()?;
         let region = Region::new(area).map_err(|e| e.to_string())?;
-        let pixels = self
-            .surface
-            .prepare_region(region, &mut || check().map_err(|_| Error::Cancelled))
-            .map_err(|e| e.to_string())?;
+        let pixels = read_with_guard(check, |guard| self.surface.prepare_region(region, guard))?;
         check()?;
         Ok(PreparedInput {
             binding: self.binding,
@@ -561,6 +607,7 @@ impl<'a> RasterInput<'a> {
     pub(crate) fn prepare_samples(
         &self,
         queries: [f32; 4],
+        frame: Option<&InputFrame>,
         check: &mut dyn FnMut() -> Result<(), String>,
     ) -> Result<PreparedSamples<'a>, String> {
         check()?;
@@ -585,11 +632,23 @@ impl<'a> RasterInput<'a> {
         if support[2] - support[0] > 385 || support[3] - support[1] > 385 {
             return Err("Native bilinear footprint exceeds one complete healing halo".into());
         }
+        let mut bounds = [0, 0, self.shape()[0] as i32, self.shape()[1] as i32];
+        if let Some(frame) = frame {
+            self.validate(frame.binding())?;
+            let shift = frame.geometry().shift();
+            let shape = frame.geometry().new_shape();
+            bounds = [
+                bounds[0].max(-shift[0]),
+                bounds[1].max(-shift[1]),
+                bounds[2].min(shape[0] as i32 - shift[0]),
+                bounds[3].min(shape[1] as i32 - shift[1]),
+            ];
+        }
         let clipped = [
-            support[0].max(0),
-            support[1].max(0),
-            support[2].min(self.shape()[0] as i32),
-            support[3].min(self.shape()[1] as i32),
+            support[0].max(bounds[0]),
+            support[1].max(bounds[1]),
+            support[2].min(bounds[2]),
+            support[3].min(bounds[3]),
         ];
         let pixels = if clipped[0] < clipped[2] && clipped[1] < clipped[3] {
             Some(self.prepare_linear(clipped, 385, 385 * 385, check)?)
@@ -600,6 +659,7 @@ impl<'a> RasterInput<'a> {
         Ok(PreparedSamples {
             binding: self.binding,
             queries,
+            bounds,
             pixels,
         })
     }
@@ -689,8 +749,13 @@ impl<'a> RasterInput<'a> {
         })
     }
     pub(crate) fn fill_frame(&self, command: Command<'_>) -> Result<Option<InputFrame>, String> {
-        if command.parameters()["op"] != "paint.fill" {
-            return Err("Native fill frame requires its foreground-fill command".into());
+        if !matches!(
+            command.parameters()["op"].as_str(),
+            Some("paint.fill" | "shape" | "gradient" | "fill" | "pixels.replace")
+        ) {
+            return Err(
+                "Native area frame requires a fill, primitive or pixel replacement command".into(),
+            );
         }
         let metadata = self.document.metadata();
         let requested = command
@@ -721,10 +786,9 @@ impl<'a> RasterInput<'a> {
             return Err("Native stroke frame requires its same admitted command points".into());
         }
         let settings = crate::brush::Settings::from_command(parameters)?;
-        if settings.opacity == 0.
-            || settings.flow == 0.
-            || (parameters["op"] == "paint" && crate::engine::color(parameters)[3] == 0)
-        {
+        let transparent = parameters["op"] == "paint"
+            && crate::engine::raster_color(parameters, self.depth())?[3] == 0;
+        if settings.opacity == 0. || settings.flow == 0. || transparent {
             return Ok(None);
         }
         let radius = settings.radius + 1.;
@@ -946,6 +1010,7 @@ pub(crate) struct PreparedPixels<'a> {
 pub(crate) struct PreparedSamples<'a> {
     binding: InputBinding,
     queries: [f32; 4],
+    bounds: [i32; 4],
     pixels: Option<PreparedPixels<'a>>,
 }
 impl PreparedSamples<'_> {
@@ -961,12 +1026,16 @@ impl PreparedSamples<'_> {
         }
         let x = x - self.binding.origin[0] as f32;
         let y = y - self.binding.origin[1] as f32;
-        let shape = self.binding.shape;
-        if x <= -1. || y <= -1. || x >= shape[0] as f32 || y >= shape[1] as f32 {
+        let bounds = self.bounds;
+        if x <= bounds[0] as f32 - 1.
+            || y <= bounds[1] as f32 - 1.
+            || x >= bounds[2] as f32
+            || y >= bounds[3] as f32
+        {
             return Ok([0; 4]);
         }
         crate::retouch::native::bilinear(x, y, |x, y| {
-            if x < 0 || y < 0 || x >= shape[0] as i32 || y >= shape[1] as i32 {
+            if x < bounds[0] || y < bounds[1] || x >= bounds[2] || y >= bounds[3] {
                 return Ok([0; 4]);
             }
             self.pixels
@@ -1037,6 +1106,9 @@ impl PreparedInput<'_> {
     pub(crate) fn pixel16(&self, x: i32, y: i32) -> Result<[u16; 4], String> {
         self.pixels.pixel16(x, y).map_err(|e| e.to_string())
     }
+    pub(crate) fn copy_row(&self, y: i32, output: &mut [u8]) -> Result<(), String> {
+        self.pixels.copy_row(y, output).map_err(|e| e.to_string())
+    }
 }
 
 /// Geometry and contours stay borrowed from the admitted document. Bounds on
@@ -1072,8 +1144,33 @@ impl<'a> SelectionInput<'a> {
     pub(crate) fn bounds(&self) -> Option<[i32; 4]> {
         self.bounds
     }
+    /// A conservative pixel footprint. Older masks may contain samples outside
+    /// their recorded selection bounds, so use their physical tile locations.
+    pub(crate) fn support(&self) -> Option<[i32; 4]> {
+        use crate::{engine::reframe_scope::union, raster::TILE};
+        let Some((surface, [ox, oy])) = self.coverage else {
+            return self.bounds;
+        };
+        surface
+            .physical_tiles()
+            .map(|tile| {
+                let (x, y) = tile.coordinate();
+                [
+                    ox + (x * TILE) as i32,
+                    oy + (y * TILE) as i32,
+                    ox + ((x + 1) * TILE).min(surface.width()) as i32,
+                    oy + ((y + 1) * TILE).min(surface.height()) as i32,
+                ]
+            })
+            .reduce(union)
+    }
     pub(crate) fn has_coverage(&self) -> bool {
         self.coverage.is_some()
+    }
+    pub(crate) fn may_cover(&self, area_document: [i32; 4]) -> Result<bool, String> {
+        self.coverage.map_or(Ok(true), |(surface, origin)| {
+            Ok(surface.has_physical_tiles(translate(area_document, origin, true)?))
+        })
     }
     pub(crate) fn prepare(
         &self,
@@ -1102,14 +1199,8 @@ impl<'a> SelectionInput<'a> {
                     requested[3].min(surface.height() as i32),
                 ];
                 let pixels = if local[0] < local[2] && local[1] < local[3] {
-                    Some(
-                        surface
-                            .prepare_region(
-                                Region::new(local).map_err(|e| e.to_string())?,
-                                &mut || check().map_err(|_| Error::Cancelled),
-                            )
-                            .map_err(|e| e.to_string())?,
-                    )
+                    let region = Region::new(local).map_err(|e| e.to_string())?;
+                    Some(read_with_guard(check, |guard| surface.prepare_region(region, guard))?)
                 } else {
                     None
                 };

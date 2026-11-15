@@ -18,6 +18,7 @@ import time
 import zlib
 import zipfile
 
+from final_release import read
 from package import digest, git
 from package_macos_dmg import bounded_file, inspection_path
 from prepare_site_release import API, DOWNLOAD, public_get
@@ -302,6 +303,245 @@ def editable_snapshot(state):
                 layers=[{name: layer[name] for name in ['kind', 'bounds', 'source']} for layer in layers])
 
 
+def fixture_rpc(command, environment, method, parameters):
+    response = subprocess.run([*command, 'cli', method, json.dumps(dict(actor='human', **parameters))],
+        env=environment, stdin=subprocess.DEVNULL, capture_output=True, timeout=10)
+    if response.returncode != 0:
+        raise ValueError('Fixture RPC failed in the disposable compatibility phase.') from subprocess.CalledProcessError(
+            response.returncode, 'fixture-rpc')
+    if len(response.stdout) > 2 * 1024 * 1024:
+        raise ValueError('Fixture RPC response exceeds its budget.')
+    try:
+        reply = json.loads(response.stdout, object_pairs_hook=unique_fields)
+    except ValueError:
+        raise ValueError('Fixture RPC returned invalid JSON.') from None
+    if not isinstance(reply, dict) or reply.get('ok') is not True or not isinstance(reply.get('result'), dict):
+        raise ValueError('Fixture RPC failed in the disposable compatibility phase.')
+    return reply['result']
+
+
+def fixture_shape():
+    return dict(width=32, height=24, content=dict(kind='shape', shape='rectangle',
+        bounds=[2., 3., 22., 18.], points=[], closed=True,
+        fill=[10001, 20003, 30007, 65535], stroke=[0, 0, 0, 0], stroke_width=0.))
+
+
+class PackageRegistration:
+    """Exercise real Connect AI against private client files and reuse its saved route."""
+
+    def __init__(self, home, state):
+        self.home, self.state = home, state
+        self.config = home / '.cursor/mcp.json'
+        self.manifest = home / '.peerbrush/mcp.json'
+        self.config.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.saved = None
+
+    def environment(self, base):
+        return dict(base, HOME=str(self.home), USERPROFILE=str(self.home),
+                    LOCALAPPDATA=str(self.home / 'local'), APPDATA=str(self.home / 'roaming'),
+                    CODEX_HOME=str(self.home / '.codex'))
+
+    def check(self, launcher, legacy, environment, run, *, desktop_connect=None):
+        environment = self.environment(environment)
+        args = ['mcp', '--state-dir', str(self.state)]
+        if self.saved is None:
+            unrelated = dict(command='fixture-other-server', args=['stay'])
+            previous = dict(mcpServers=dict(peerbrush=dict(command=str(legacy), args=args), other=unrelated))
+            original = (json.dumps(previous, ensure_ascii=False) + '\n').encode('utf-8')
+            with self.config.open('xb') as file:
+                if os.name == 'posix':
+                    os.fchmod(file.fileno(), 0o600)
+                    if os.geteuid() == 0:
+                        owner = self.config.parent.stat()
+                        os.fchown(file.fileno(), owner.st_uid, owner.st_gid)
+                file.write(original)
+            if desktop_connect is None:
+                report = json.loads(run([launcher, 'discover', '--connect', '--state-dir', self.state], environment),
+                                    object_pairs_hook=unique_fields)
+                client = next((client for client in report['clients'] if client['client'] == 'Cursor'), None)
+                if (report['manifest_error'] is not None or not client or not client['registered']
+                        or not client['changed'] or client['requires_attention'] or client['error'] is not None
+                        or client['server_name'] != 'peerbrush' or not client['backup']):
+                    raise ValueError('Connect AI did not migrate the fixture client registration.')
+                backup = Path(client['backup'])
+            else:
+                desktop_connect()
+                backups = list(self.config.parent.glob(f'{self.config.name}.peerbrush-*.bak'))
+                if len(backups) != 1:
+                    raise ValueError('Desktop Connect AI must create exactly one fixture client backup.')
+                backup = backups[0]
+            if backup.parent.resolve() != self.config.parent.resolve() or read(backup, 128 * 1024) != original:
+                raise ValueError('Connect AI did not back up the exact original client configuration.')
+            config = read(self.config, 128 * 1024)
+            servers = json.loads(config, object_pairs_hook=unique_fields)['mcpServers']
+            if set(servers) != {'peerbrush', 'other'} or servers['other'] != unrelated:
+                raise ValueError('Connect AI changed an unrelated fixture server.')
+            self.saved = config, read(self.manifest, 128 * 1024)
+
+        self.preserve()
+        entry = json.loads(self.saved[0], object_pairs_hook=unique_fields)['mcpServers']['peerbrush']
+        status = json.loads(run([launcher, 'discover', '--status', '--state-dir', self.state], environment),
+                            object_pairs_hook=unique_fields)
+        candidate = Path(entry['command'])
+        expected = launcher
+        if os.name == 'nt':
+            # Ignore the extended-path spelling without resolving the current junction.
+            candidate = Path(candidate.as_posix().removeprefix('//?/'))
+            expected = Path(expected.as_posix().removeprefix('//?/'))
+        if (candidate != expected or entry['args'] != args
+                or status.get('manifest_status') != 'ready'
+                or (status.get('connection') or {}).get('category') != 'ready'
+                or status.get('stdio') != dict(command=entry['command'], args=args)
+                or not any(client.get('client') == 'Cursor' and client.get('category') == 'matching'
+                           for client in status.get('clients', []))):
+            raise ValueError('The saved fixture registration did not reach the installed workspace through its stable launcher.')
+        self.preserve()
+        return [Path(entry['command']), *entry['args']]
+
+    def preserve(self):
+        if self.saved != (read(self.config, 128 * 1024), read(self.manifest, 128 * 1024)):
+            raise ValueError('The package lifecycle changed the saved MCP registration.')
+
+
+class PackageWorkspace:
+    """Real editable files made by the first installed build in a disposable workspace."""
+
+    def __init__(self, state, artwork):
+        self.state, self.artwork = state, artwork
+        self.files = {}
+        self.projects = {}
+        self.profile = None
+
+    @staticmethod
+    def guarded(rpc, action, **parameters):
+        document = rpc('observe', dict(max_edge=32))['state']['document']
+        return rpc('document', dict(action=action, document_id=document['id'],
+                                   expected_revision=document['revision'], **parameters))
+
+    def export(self, rpc):
+        path = self.artwork / 'readback.png'
+        if path.exists() or path.is_symlink():
+            raise ValueError('The native workspace readback path is already occupied.')
+        try:
+            self.guarded(rpc, 'export', path=str(path))
+            return png_samples(path)
+        finally:
+            path.unlink(missing_ok=True)
+
+    def seed(self, rpc):
+        tool = rpc('tool_settings', dict(action='get', tool='brush'))
+        settings = dict(radius=31.5, opacity=0.375)
+        rpc('tool_settings', dict(action='set', tool='brush', expected_tool_revision=tool['revision'],
+                                 settings=settings))
+        self.profile = rpc('tool_settings', dict(action='get', tool='brush'))['profile']
+        if any(self.profile['settings'].get(key) != value for key, value in settings.items()):
+            raise ValueError('The installed build did not apply the selected tool preferences.')
+        for depth in (8, 16):
+            self.guarded(rpc, 'new', width=32, height=24, bit_depth=depth)
+            state = rpc('observe', dict(max_edge=32))['state']
+            document = state['document']
+            rpc('edit', dict(document_id=document['id'], expected_revision=document['revision'],
+                             commands=[dict(op='source.add', source=fixture_shape())], feedback='request'))
+            definition = editable_snapshot(rpc('observe', dict(max_edge=32))['state'])
+            self.guarded(rpc, 'save_report')
+            paths = [self.artwork / f'Artwork {depth} 作品.{extension}' for extension in ('psd', 'psb')]
+            for path in paths:
+                self.guarded(rpc, 'save', path=str(path), accept_editability_loss=True)
+            samples = self.export(rpc)
+            if (samples[2] != depth
+                    or (depth == 16 and b'\x27\x11\x4e\x23\x75\x37\xff\xff' not in samples[3])):
+                raise ValueError('The installed build did not retain the expected native samples.')
+            for path in paths:
+                self.projects[path] = definition, samples
+        self.files = {path: bounded_file(path, 1024 * 1024)[0] for path in self.projects}
+        prefs = self.state / 'tool-settings.json'
+        self.files[prefs] = bounded_file(prefs, 128 * 1024)[0]
+        self.guarded(rpc, 'new', width=32, height=24, bit_depth=8)
+
+    def preserve(self):
+        if not self.files or any(bounded_file(path, 1024 * 1024)[0] != checksum
+                                 for path, checksum in self.files.items()):
+            raise ValueError('Package lifecycle changed real user preferences or artwork.')
+
+    def retention_receipt(self):
+        self.preserve()
+        return dict(tool_preferences_sha256=self.files[self.state / 'tool-settings.json'],
+                    projects=[dict(format=path.suffix[1:], bit_depth=samples[2],
+                                   file_sha256=self.files[path],
+                                   rendered_sha256=hashlib.sha256(samples[3]).hexdigest())
+                              for path, (_, samples) in self.projects.items()])
+
+    def check(self, rpc):
+        if self.profile is None:
+            self.seed(rpc)
+        self.preserve()
+        if rpc('tool_settings', dict(action='get', tool='brush'))['profile'] != self.profile:
+            raise ValueError('The installed build did not restore the user tool preferences.')
+        for path, (definition, samples) in self.projects.items():
+            self.guarded(rpc, 'open', path=str(path))
+            if (editable_snapshot(rpc('observe', dict(max_edge=32))['state']) != definition
+                    or self.export(rpc) != samples):
+                raise ValueError('The installed build changed editable sources or native pixels on reopening.')
+        self.preserve()
+
+    def check_launcher(self, launcher, environment):
+        self.check(lambda method, params: fixture_rpc(
+            [launcher, '--state-dir', str(self.state)], environment, method, params))
+
+    def check_startup_projects(self, rpc):
+        def path_key(path):
+            # Rust canonical paths can carry the Windows extended-length prefix.
+            if os.name == 'nt':
+                if path.startswith('\\\\?\\UNC\\'):
+                    path = '\\\\' + path[8:]
+                else:
+                    path = path.removeprefix('\\\\?\\')
+            return Path(path)
+
+        self.preserve()
+        expected = {path_key(str(path)): saved for path, saved in self.projects.items()}
+        if not expected:
+            raise ValueError('Desktop startup requires seeded native project fixtures.')
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            inventory = rpc('projects', dict(action='list'))
+            rows = inventory.get('projects')
+            if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+                raise ValueError('Desktop startup returned an invalid project inventory.')
+            opened = {}
+            for row in rows:
+                path = row.get('path')
+                if path is not None:
+                    if not isinstance(path, str):
+                        raise ValueError('Desktop startup returned an invalid project path.')
+                    key = path_key(path)
+                    if key not in expected or key in opened:
+                        raise ValueError('Desktop startup opened an unexpected or duplicate project path.')
+                    opened[key] = row
+            if opened.keys() == expected.keys() and all(row.get('loading') is None for row in rows):
+                break
+            time.sleep(0.1)
+        else:
+            raise ValueError('Desktop startup did not finish opening the exact native project fixtures.')
+
+        identities = set()
+        for key, (definition, samples) in expected.items():
+            project = opened[key].get('project_id')
+            if not isinstance(project, str) or not project or project in identities or opened[key].get('dirty') is not False:
+                raise ValueError('Desktop startup did not create independent clean fixture tabs.')
+            identities.add(project)
+
+            def targeted(method, params):
+                return rpc(method, dict(params, project_id=project))
+
+            if (editable_snapshot(targeted('observe', dict(max_edge=32))['state']) != definition
+                    or self.export(targeted) != samples):
+                raise ValueError('Desktop startup changed editable sources or native pixels.')
+        if inventory.get('active_project_id') not in identities:
+            raise ValueError('Desktop startup did not activate an opened fixture.')
+        self.preserve()
+
+
 def installed_runuser():
     """Bind the container's tool before its child receives a restricted PATH."""
     try:
@@ -317,29 +557,18 @@ def installed_runuser():
 
 class Session:
     """Only synthetic container user state; never prints connection files or RPC contents."""
-    def __init__(self, binary, environment, work, state, runuser):
+    def __init__(self, binary, environment, work, state, runuser, *, account='peerbrush-upgrade-qa'):
         self.binary, self.environment, self.work, self.state = binary, environment, work, state
         self.runuser = runuser
+        self.account = account
         self.process = None
 
     def command(self, *arguments):
         state = ['--state-dir', str(self.state)] if self.state is not None else []
-        return [str(self.runuser), '-u', 'peerbrush-upgrade-qa', '--', str(self.binary), *state, *arguments]
+        return [str(self.runuser), '-u', self.account, '--', str(self.binary), *state, *arguments]
 
     def rpc(self, method, parameters):
-        response = subprocess.run(self.command('cli', method, json.dumps(dict(actor='human', **parameters))),
-            env=self.environment, stdin=subprocess.DEVNULL, capture_output=True, timeout=10)
-        if response.returncode != 0:
-            # Preserve only the numeric status as a diagnostic cause; do not
-            # retain RPC arguments, output or connection details in this cause.
-            raise ValueError('Fixture RPC failed in the disposable compatibility phase.') from subprocess.CalledProcessError(response.returncode, 'fixture-rpc')
-        data = response.stdout
-        if len(data) > 2 * 1024 * 1024:
-            raise ValueError('Fixture RPC response exceeds its budget.')
-        reply = json.loads(data, object_pairs_hook=unique_fields)
-        if not isinstance(reply, dict) or reply.get('ok') is not True or not isinstance(reply.get('result'), dict):
-            raise ValueError('Fixture RPC failed in the disposable compatibility phase.')
-        return reply['result']
+        return fixture_rpc(self.command(), self.environment, method, parameters)
 
     def __enter__(self):
         self.output = (self.work / ('server-' + str(time.monotonic_ns()) + '.log')).open('xb')
@@ -451,10 +680,7 @@ def check(old_source_root, package, expected, output):
             old_profile = old_session.rpc('tool_settings', dict(action='get', tool='brush'))['profile']
             for depth in [8, 16]:
                 old_session.guarded('new', width=32, height=24, bit_depth=depth)
-                source = dict(width=32, height=24, content=dict(kind='shape', shape='rectangle',
-                    bounds=[2., 3., 22., 18.], points=[], closed=True,
-                    fill=[10001, 20003, 30007, 65535], stroke=[0, 0, 0, 0], stroke_width=0.))
-                old_session.rpc('edit', dict(commands=[dict(op='source.add', source=source)], feedback='request'))
+                old_session.rpc('edit', dict(commands=[dict(op='source.add', source=fixture_shape())], feedback='request'))
                 definition = editable_snapshot(old_session.rpc('observe', dict(max_edge=32))['state'])
                 if definition['document']['bit_depth'] != depth:
                     raise ValueError('Historical fixture did not create the selected native document depth.')

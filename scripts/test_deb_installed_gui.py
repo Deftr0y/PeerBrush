@@ -17,13 +17,14 @@ import math
 import os
 from pathlib import Path
 import select
+import signal
 import stat
 import struct
 import subprocess
 import tempfile
 import time
 
-from package import digest
+from package import digest, release_version_order
 from package_deb import deb_version
 from package_macos_dmg import bounded_file
 from production_readiness import unique_fields
@@ -181,15 +182,17 @@ def gui_environment():
 
 class Window:
     """The installed desktop entry launches the app; only its exact adopted PID is closed."""
-    def __init__(self, facts, work):
+    def __init__(self, facts, work, *, desktop=None, connection=None, cli=None, executable=None,
+                 argv0=None, env=None):
         self.facts, self.work = facts, work
         self.pid = self.pidfd = self.identity = None
-        self.connection = QA_HOME / 'runtime/PeerBrush/connection.json'
+        self.connection = connection or QA_HOME / 'runtime/PeerBrush/connection.json'
+        self.desktop, self.cli, self.executable, self.argv0, self.env = desktop, cli, executable, argv0, env
 
     def rpc(self, method, parameters):
-        response = subprocess.run(['/usr/bin/peerbrush', 'cli', method,
+        response = subprocess.run([self.cli or '/usr/bin/peerbrush', 'cli', method,
             json.dumps(dict(actor='human', **parameters))], stdin=subprocess.DEVNULL,
-            capture_output=True, timeout=10)
+            capture_output=True, timeout=10, env=self.env)
         require(response.returncode == 0 and len(response.stdout) <= 2 * 1024 * 1024,
                 'Installed GUI RPC failed or exceeded its response bound.')
         reply = json.loads(response.stdout, object_pairs_hook=unique_fields)
@@ -202,11 +205,12 @@ class Window:
         status = (process / 'status').read_text()
         uid = next(row.split()[1:] for row in status.splitlines() if row.startswith('Uid:'))
         parent = next(row.split()[1] for row in status.splitlines() if row.startswith('PPid:'))
-        require(uid == [str(os.geteuid())] * 4 and (process / 'exe').resolve(strict=True) == Path('/usr/bin/peerbrush')
+        expected = self.executable or Path('/usr/bin/peerbrush')
+        require(uid == [str(os.geteuid())] * 4 and (process / 'exe').resolve(strict=True) == expected
                 and digest(process / 'exe') == self.facts['expected']['executable_sha256']
                 and parent == str(os.getpid()), 'Desktop process is not the exact adopted installed application.')
         command = (process / 'cmdline').read_bytes().split(b'\0')
-        require(command[0] == b'/usr/bin/peerbrush' and command[1] == b'--'
+        require(len(command) >= 3 and command[0] in (self.argv0 or (b'/usr/bin/peerbrush',)) and command[1] == b'--'
                 and b'--headless' not in command, 'Desktop entry did not start the real installed GUI route.')
         # starttime prevents a later reused PID from becoming close authority.
         fields = (process / 'stat').read_text().rsplit(')', 1)[1].split()
@@ -218,11 +222,12 @@ class Window:
                 and not select.select([self.pidfd], [], [], 0)[0], 'Owned installed window has exited or changed.')
 
     def launch(self, projects):
-        require(DESKTOP.read_bytes() == self.facts['desktop'].encode(), 'Installed desktop entry changed.')
+        desktop = self.desktop or DESKTOP
+        require(desktop.read_bytes() == self.facts['desktop'].encode(), 'Installed desktop entry changed.')
         # A launched app may retain GIO stdout/stderr; never wait for its pipe EOF.
         with (self.work / ('desktop-launch-' + str(time.monotonic_ns()) + '.log')).open('xb') as log:
-            subprocess.run(['gio', 'launch', str(DESKTOP), *map(str, projects)],
-                check=True, stdin=subprocess.DEVNULL, stdout=log, stderr=log, timeout=10)
+            subprocess.run(['gio', 'launch', str(desktop), *map(str, projects)],
+                check=True, stdin=subprocess.DEVNULL, stdout=log, stderr=log, timeout=10, env=self.env)
         if self.pid is not None:
             self.authenticate()
             return
@@ -341,20 +346,114 @@ class Window:
 
     def close(self):
         self.authenticate()
+        options = dict(env=self.env) if self.env is not None else {}
         windows = []
-        for row in run(['wmctrl', '-lp']).splitlines():
+        for row in run(['wmctrl', '-lp'], **options).splitlines():
             fields = row.split(None, 4)
             if len(fields) == 5 and fields[2] == str(self.pid):
                 windows.append(fields[0])
         require(len(windows) == 1, 'The owned installed GUI window is missing or ambiguous.')
         self.authenticate()
-        run(['wmctrl', '-ic', windows[0]])  # EWMH -> WM_DELETE_WINDOW -> real shared close/on_exit.
+        run(['wmctrl', '-ic', windows[0]], **options)  # EWMH -> WM_DELETE_WINDOW -> real shared close/on_exit.
         require(select.select([self.pidfd], [], [], 30)[0], 'Installed GUI did not close gracefully; acceptance failed.')
         pid, status = os.waitpid(self.pid, 0)
         require(pid == self.pid and os.waitstatus_to_exitcode(status) == 0,
                 'The exact adopted installed GUI did not exit successfully.')
         os.close(self.pidfd)
         self.pid = self.pidfd = self.identity = None
+
+
+def isolated_display_environment():
+    display = os.environ.get('DISPLAY', '')
+    bus = os.environ.get('DBUS_SESSION_BUS_ADDRESS', '')
+    authority = os.environ.get('XAUTHORITY', '')
+    if (not re.fullmatch(r':[0-9]+(?:\.[0-9]+)?', display) or not bus.startswith('unix:') or ';' in bus
+            or not Path(authority).is_absolute()):
+        raise ValueError('Desktop acceptance needs its own Xvfb display, Xauthority and session bus.')
+    authority_file = Path(authority)
+    _, size = bounded_file(authority_file, 16 * 1024)
+    metadata = authority_file.lstat()
+    if not size or metadata.st_uid != os.geteuid() or metadata.st_mode & 0o077:
+        raise ValueError('Desktop acceptance needs a nonempty private Xauthority file.')
+    return dict(DISPLAY=display, DBUS_SESSION_BUS_ADDRESS=bus, XAUTHORITY=authority)
+
+
+def desktop_session_environment(root, env):
+    config = root / 'config'
+    preferences = config / 'peerbrush/settings-v1'
+    preferences.mkdir(parents=True)
+    (preferences / 'associations.json').write_bytes(b'{"version":1,"answered":true}\n')
+    runtime = root / 'runtime'
+    runtime.mkdir(mode=0o700)
+    return dict(env, PATH='/usr/bin:/bin', TMPDIR=str(runtime), XDG_RUNTIME_DIR=str(runtime),
+               XDG_CONFIG_HOME=str(config), XDG_DATA_HOME=str(root / 'data'), XDG_CACHE_HOME=str(root / 'cache'),
+               XDG_STATE_HOME=str(root / 'state'),
+               LANG='C.UTF-8', LC_ALL='C.UTF-8', WINIT_X11_SCALE_FACTOR='1', LIBGL_ALWAYS_SOFTWARE='1')
+
+
+def check_startup_window(window, workspace):
+    root, env = window.work, window.env
+    require(env is not None and all(env.get(key) for key in ('DISPLAY', 'XAUTHORITY', 'DBUS_SESSION_BUS_ADDRESS')),
+            'Desktop startup requires its isolated display environment.')
+    probe = ['/usr/bin/wmctrl', '-m']
+
+    def manager_ready():
+        return subprocess.run(probe, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, timeout=5).returncode == 0
+
+    if manager_ready():
+        raise ValueError('The isolated display already has a window manager.')
+    library = ctypes.CDLL(None, use_errno=True)
+    previous = ctypes.c_int()
+    if library.prctl(37, ctypes.byref(previous), 0, 0, 0) != 0 or library.prctl(36, 1, 0, 0, 0) != 0:
+        raise ValueError('Could not establish owned desktop child reaping.')
+    manager = None
+    try:
+        manager = subprocess.Popen(['/usr/bin/openbox', '--sm-disable'], env=env,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        deadline = time.monotonic() + 10
+        while not manager_ready():
+            if manager.poll() is not None or time.monotonic() >= deadline:
+                raise ValueError('The isolated window manager did not start.')
+            time.sleep(0.1)
+        workspace.preserve()
+        window.launch(workspace.projects)
+        workspace.check_startup_projects(window.rpc)
+        capture = root / 'workspace.png'
+        window.authenticate()
+        window.rpc('capture_ui', dict(path=str(capture), panel='workspace'))
+        deadline = time.monotonic() + 40
+        while not capture.is_file() and time.monotonic() < deadline:
+            window.authenticate()
+            time.sleep(0.1)
+        png_samples(regular_file(root, capture.name), expected_size=WINDOW_SIZE)
+        window.close()
+        workspace.preserve()
+    finally:
+        try:
+            if window.pidfd is not None:
+                try:
+                    if not select.select([window.pidfd], [], [], 0)[0]:
+                        try:
+                            signal.pidfd_send_signal(window.pidfd, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                    if select.select([window.pidfd], [], [], 5)[0]:
+                        os.waitpid(window.pid, 0)
+                finally:
+                    os.close(window.pidfd)
+        finally:
+            try:
+                if manager is not None:
+                    if manager.poll() is None:
+                        manager.terminate()
+                    try:
+                        manager.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        manager.kill()
+                        manager.wait(timeout=5)
+            finally:
+                library.prctl(36, previous.value, 0, 0, 0)
 
 
 def display_check(fixture):
@@ -400,7 +499,7 @@ def display_check(fixture):
         window.launch(paths)
         gui_phase('projects-and-native-oracles')
         opened = window.projects(paths)
-        if tuple(map(int, facts['expected']['version'].split('.'))) >= (0, 30, 1):
+        if release_version_order(facts['expected']['version']) >= release_version_order('0.30.1'):
             choice = QA_HOME / 'config/peerbrush/settings-v1/associations.json'
             require(not choice.exists() and not choice.is_symlink(),
                     'First-launch consent must start unanswered in the disposable profile.')

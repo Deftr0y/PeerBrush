@@ -369,12 +369,12 @@ fn unsupported_psb_wide_tags_and_global_sources_keep_protected_native_composites
             assert!(psd::encode_psb(&doc).is_err());
             assert!(psd::encode(&doc).is_err());
             let shared = Arc::new(Mutex::new(Engine::new()));
-            shared.lock().unwrap().doc = doc;
+            shared.lock().unwrap().resident_state_mut().expect("resident fixture").document = doc;
             server::compatible_copy(&shared, "human", None).unwrap();
             let e = shared.lock().unwrap();
-            assert!(!e.doc.read_only);
-            assert_eq!(e.doc.bit_depth, depth);
-            assert_eq!(e.doc.layers[0].pixels.rgba16(), expected_pixels(depth));
+            assert!(!e.resident_state().expect("resident fixture").document.read_only);
+            assert_eq!(e.resident_state().expect("resident fixture").document.bit_depth, depth);
+            assert_eq!(e.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(), expected_pixels(depth));
             assert!(e.path.is_none());
         }
     }
@@ -410,23 +410,25 @@ fn protocol_psb_save_open_external_conflict_and_failed_open_preserve_original_wo
     std::fs::create_dir_all(&temp).unwrap();
     let path = temp.join("Artwork.PSB");
     let mut engine = Engine::new();
-    engine.doc = psd::decode(&fixture(16, 2, false, false)).unwrap();
+    let imported = psd::decode(&fixture(16, 2, false, false)).unwrap();
+    assert!(!imported.read_only, "{:?}", imported.warnings);
+    engine.resident_state_mut().expect("resident fixture").document = imported;
     let shared = Arc::new(Mutex::new(engine));
     peerbrush::workspace::attach(&shared);
-    let before = shared.lock().unwrap().doc.export_png().unwrap();
-    let document = shared.lock().unwrap().doc.id.clone();
-    let revision = shared.lock().unwrap().doc.revision;
+    let before = shared.lock().unwrap().resident_state().expect("resident fixture").document.export_png().unwrap();
+    let document = shared.lock().unwrap().resident_state().expect("resident fixture").document.id.clone();
+    let revision = shared.lock().unwrap().resident_state().expect("resident fixture").document.revision;
     let report = server::dispatch(
         &shared,
         "document",
         &json!({"action":"save_report","document_id":document,"expected_revision":revision}),
     )
     .unwrap();
-    assert!(report["has_editability_losses"].as_bool().unwrap());
+    assert_eq!(report["has_editability_losses"], false);
     server::dispatch(
         &shared,
         "document",
-        &json!({"action":"save","path":path,"actor":"human","document_id":document,"expected_revision":revision,"accept_editability_loss":true}),
+        &json!({"action":"save","path":path,"actor":"human","document_id":document,"expected_revision":revision}),
     )
     .unwrap();
     assert_eq!(&std::fs::read(&path).unwrap()[4..6], &2u16.to_be_bytes());
@@ -437,12 +439,11 @@ fn protocol_psb_save_open_external_conflict_and_failed_open_preserve_original_wo
     )
     .is_err());
     // Save As releases the original before the protocol opens it as an independent project.
-    server::save_accepted_source(
+    server::save_reviewed_source(
         &shared,
         &temp.join("Working.psb"),
         &document,
         revision,
-        false,
     )
     .unwrap();
     let opened = server::dispatch(
@@ -454,10 +455,10 @@ fn protocol_psb_save_open_external_conflict_and_failed_open_preserve_original_wo
     assert_eq!(opened["file_status"], "PSB opened");
     let id = opened["project_id"].as_str().unwrap();
     let project = peerbrush::workspace::get(&shared, id).unwrap();
-    assert_eq!(project.lock().unwrap().doc.export_png().unwrap(), before);
-    assert_eq!(project.lock().unwrap().doc.bit_depth, 16);
-    let doc = project.lock().unwrap().doc.id.clone();
-    let revision = project.lock().unwrap().doc.revision;
+    assert_eq!(project.lock().unwrap().resident_state().expect("resident fixture").document.export_png().unwrap(), before);
+    assert_eq!(project.lock().unwrap().resident_state().expect("resident fixture").document.bit_depth, 16);
+    let doc = project.lock().unwrap().resident_state().expect("resident fixture").document.id.clone();
+    let revision = project.lock().unwrap().resident_state().expect("resident fixture").document.revision;
     let mut changed = std::fs::read(&path).unwrap();
     changed.push(0);
     std::fs::write(&path, &changed).unwrap();
@@ -471,11 +472,11 @@ fn protocol_psb_save_open_external_conflict_and_failed_open_preserve_original_wo
     std::fs::write(&malformed, b"8BPS\0\x02bad").unwrap();
     assert!(server::open(&project, &malformed).is_err());
     let e = project.lock().unwrap();
-    assert_eq!(e.doc.id, doc);
-    assert_eq!(e.doc.revision, revision);
-    assert_eq!(e.doc.export_png().unwrap(), before);
-    assert!(e.undo.is_empty());
+    assert_eq!(e.resident_state().expect("resident fixture").document.id, doc);
+    assert_eq!(e.resident_state().expect("resident fixture").document.revision, revision);
+    assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), before);
+    assert!(e.resident_state().expect("resident fixture").undo.is_empty());
     drop(e);
-    assert_eq!(shared.lock().unwrap().doc.export_png().unwrap(), before);
+    assert_eq!(shared.lock().unwrap().resident_state().expect("resident fixture").document.export_png().unwrap(), before);
     std::fs::remove_dir_all(temp).unwrap();
 }

@@ -62,6 +62,50 @@ impl Drop for Fixture {
 }
 
 #[test]
+fn preset_libraries_preserve_same_size_restamped_external_edits() {
+    let fixture = Fixture::new();
+    fixture.preferences();
+    let brushes_path = fixture.source().join("brushes.json");
+    let filters_path = fixture.source().join("filters.json");
+    let mut brushes = crate::brush_library::Library::load(brushes_path.clone());
+    let mut filters = crate::filter_library::Library::load(filters_path.clone());
+    let brush = brushes.presets().into_iter().find(|preset| preset.custom).unwrap();
+    let filter = filters.presets().into_iter().find(|preset| preset.custom).unwrap();
+
+    let edit = |path: &Path, previous: &str, changed: &str| {
+        let modified = fs::metadata(path).unwrap().modified().unwrap();
+        let original = fs::read_to_string(path).unwrap();
+        let replacement = original.replace(previous, changed);
+        assert_ne!(original, replacement);
+        assert_eq!(original.len(), replacement.len());
+        fs::write(path, replacement.as_bytes()).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        assert_eq!(fs::metadata(path).unwrap().modified().unwrap(), modified);
+        replacement.into_bytes()
+    };
+    let edited_brushes = edit(&brushes_path, "My brush", "My Brush");
+    let edited_filters = edit(&filters_path, "My filter", "My Filter");
+
+    assert!(brushes
+        .delete(&brush.id)
+        .unwrap_err()
+        .contains("changed on disk"));
+    assert!(filters
+        .delete(&filter.id)
+        .unwrap_err()
+        .contains("changed on disk"));
+    assert_eq!(brushes.get(&brush.id).unwrap().name, "My brush");
+    assert_eq!(filters.get(&filter.id).unwrap().name, "My filter");
+    assert_eq!(fs::read(brushes_path).unwrap(), edited_brushes);
+    assert_eq!(fs::read(filters_path).unwrap(), edited_filters);
+}
+
+#[test]
 fn standard_locations_respect_platform_and_absolute_xdg_overrides() {
     let home = std::env::temp_dir().join("profile-test");
     let roaming = home.join("roaming");

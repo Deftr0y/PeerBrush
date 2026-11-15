@@ -1,6 +1,8 @@
 //! Native-depth layer-style effects. Styles receive a derived document-coordinate frame.
 use serde_json::{json, Value};
 
+pub(crate) const MAX_STROKE_SIZE: f64 = 128.;
+
 pub const KINDS: &[&str] = &[
     "bevel_emboss",
     "contour",
@@ -23,6 +25,97 @@ pub fn pixel_aligned_shadow(kind: &str, value: &Value) -> bool {
 }
 pub fn knockout_shadow(kind: &str, value: &Value) -> bool {
     kind == "drop_shadow" && value.get("source_knockout").is_some()
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct GlobalLight {
+    pub angle: u32,
+    pub local_angle: f64,
+}
+
+impl GlobalLight {
+    pub fn from_value(value: &Value) -> Option<Self> {
+        let [angle, local_angle] = value.as_array()?.as_slice() else { return None };
+        let angle = angle.as_u64().filter(|&angle| angle < 360)? as u32;
+        let local_angle = local_angle.as_f64().filter(|angle| (-180. ..=180.).contains(angle))?;
+        Some(Self { angle, local_angle })
+    }
+
+    pub fn cast_angle(light: f64) -> f64 {
+        (light + 360.).rem_euclid(360.) - 180.
+    }
+
+    pub fn is_linked(self, settings: &Value) -> bool {
+        settings["angle"].as_f64() == Some(Self::cast_angle(f64::from(self.angle)))
+    }
+
+    pub(crate) fn for_document(settings: &Value, angle: Option<[u8; 4]>) -> Option<Self> {
+        Self::from_value(&settings["global_light"])
+            .filter(|light| angle.map(u32::from_be_bytes) == Some(light.angle) && light.is_linked(settings))
+    }
+
+    pub(crate) fn set_angle(self, settings: &mut Value, angle: u32) {
+        settings["global_light"] = json!([angle, self.local_angle]);
+        settings["angle"] = json!(Self::cast_angle(f64::from(angle)));
+        if settings["size"] == 0. {
+            if angle % 90 == 0 {
+                settings.as_object_mut().unwrap().remove("pixel_snap");
+            } else {
+                settings["pixel_snap"] = json!(true);
+            }
+        }
+    }
+}
+
+pub(crate) fn shadow_kind(kind: &str) -> bool {
+    matches!(kind, "inner_shadow" | "drop_shadow")
+}
+
+pub(crate) fn global_light_request(kind: &str, command: &Value) -> Result<Option<bool>, String> {
+    command.get("use_global_light").map(|value| {
+        if !shadow_kind(kind) {
+            return Err("Global Light links are available for Inner and Drop Shadows".into());
+        }
+        value.as_bool().ok_or_else(|| "Use Global Light must be true or false".into())
+    }).transpose()
+}
+
+pub(crate) fn apply_global_light_request(
+    settings: &mut Value, resource: &mut Option<[u8; 4]>, request: Option<bool>,
+) {
+    match request {
+        Some(true) if GlobalLight::for_document(settings, *resource).is_none() => {
+            let local_angle = GlobalLight::cast_angle(settings["angle"].as_f64().unwrap_or(120.));
+            let angle = resource.map_or_else(
+                || (local_angle.round() as i32).rem_euclid(360) as u32,
+                u32::from_be_bytes,
+            );
+            GlobalLight { angle, local_angle }.set_angle(settings, angle);
+            *resource = Some(angle.to_be_bytes());
+        }
+        Some(false) => detach_global_light(settings),
+        None if !global_light_matches(settings, *resource) => detach_global_light(settings),
+        _ => {}
+    }
+}
+
+pub(crate) fn global_light_matches(settings: &Value, angle: Option<[u8; 4]>) -> bool {
+    settings.get("global_light").is_none() || GlobalLight::for_document(settings, angle).is_some()
+}
+
+pub(crate) fn detach_global_light(settings: &mut Value) {
+    if let Some(object) = settings.as_object_mut() {
+        object.remove("global_light");
+    }
+}
+
+pub(crate) fn localize_shadow_light(settings: &mut Value) {
+    if GlobalLight::from_value(&settings["global_light"]).is_some_and(|light| !light.is_linked(settings)) {
+        detach_global_light(settings);
+    }
+}
+pub(crate) fn pattern_coverage(kind: &str, value: &Value) -> bool {
+    kind == "pattern_overlay" && value.get("use_pattern_alpha").is_some()
 }
 pub fn separate_bevel_channels(kind: &str, value: &Value) -> bool {
     kind == "bevel_emboss"
@@ -153,6 +246,7 @@ fn validate_with_bitmap(
     {
         if defaults.get(key).is_none()
             && !(bitmap && bitmap_defaults.get(key).is_some())
+            && !(bitmap && kind == "pattern_overlay" && key == "use_pattern_alpha")
             && !(kind == "gradient_overlay"
                 && matches!(
                     key.as_str(),
@@ -163,12 +257,19 @@ fn validate_with_bitmap(
                         | "pixel_grid"
                         | "align_layer"
                         | "smoothness"
+                        | "use_gradient_alpha"
                 ))
             && !(crate::effects::contours::contains(kind) && key == "contour_points")
+            && !(matches!(kind, "inner_shadow" | "drop_shadow") && key == "global_light")
         {
             return Err(format!("Unsupported {kind} setting: {key}"));
         }
         match key.as_str() {
+            "global_light" => {
+                if GlobalLight::from_value(v).is_none() {
+                    return Err("Invalid Photoshop global and local shadow angles".into());
+                }
+            }
             "contour_points" => {
                 crate::effects::contours::Curve::decode(v)?;
             }
@@ -197,7 +298,7 @@ fn validate_with_bitmap(
                 }
             }
             "reverse" | "invert" | "down" | "pixel_snap" | "source_knockout" | "pixel_grid"
-            | "align_layer" => {
+            | "align_layer" | "use_gradient_alpha" | "use_pattern_alpha" => {
                 if !v.is_boolean() {
                     return Err(format!("{key} must be true or false"));
                 }
@@ -225,6 +326,7 @@ fn validate_with_bitmap(
                 let (min, max) = match key.as_str() {
                     "opacity" | "spread" | "highlight_opacity" | "shadow_opacity" => (0., 1.),
                     "smoothness" => (0., 1.),
+                    "size" if kind == "stroke" => (0., MAX_STROKE_SIZE),
                     "size" | "soften" => (0., 64.),
                     "distance" => (0., 128.),
                     "angle" => (-180., 180.),
@@ -296,6 +398,7 @@ pub(crate) fn normalized_prepared(
     for (key, value) in value.as_object().unwrap() {
         result[key] = value.clone();
     }
+    localize_shadow_light(&mut result);
     Ok(result)
 }
 fn choice(value: &Value, allowed: &[&str], key: &str) -> Result<(), String> {
@@ -314,7 +417,7 @@ fn word(x: f64) -> u16 {
 fn rgb(v: &Value, key: &str) -> [u16; 3] {
     std::array::from_fn(|i| word(v[key][i].as_f64().unwrap_or(0.)))
 }
-fn profile(x: f64, key: &str) -> f64 {
+pub(crate) fn profile(x: f64, key: &str) -> f64 {
     let x = x.clamp(0., 1.);
     match key {
         "cone" => 1. - (2. * x - 1.).abs(),
@@ -375,12 +478,14 @@ pub(super) fn smooth(values: &mut Vec<f64>, w: usize, h: usize, r: usize) -> Res
     }
     Ok(())
 }
-fn sample(v: &[f64], w: usize, h: usize, x: f64, y: f64) -> f64 {
+fn sample(v: &[f64], w: usize, h: usize, origin: [u32; 2], x: f64, y: f64) -> f64 {
     let ix = x.floor() as i32;
     let iy = y.floor() as i32;
     let fx = x - f64::from(ix);
     let fy = y - f64::from(iy);
     let get = |x: i32, y: i32| {
+        let x = x - origin[0] as i32;
+        let y = y - origin[1] as i32;
         if x < 0 || y < 0 || x >= w as i32 || y >= h as i32 {
             0.
         } else {
@@ -490,23 +595,25 @@ pub(crate) fn apply_window(
 }
 
 pub(crate) fn smoothing_radii(kind: &str, settings: &Value) -> Vec<u32> {
-    let mut radii = if matches!(
-        kind,
-        "inner_glow" | "outer_glow" | "inner_shadow" | "drop_shadow" | "satin" | "bevel_emboss"
-    ) {
-        vec![(number(settings, "size") / 3.).ceil() as u32; 3]
-    } else {
-        Vec::new()
+    let default_size = match kind {
+        "inner_glow" | "outer_glow" | "satin" => 8.,
+        "inner_shadow" | "drop_shadow" | "bevel_emboss" => 5.,
+        _ => return Vec::new(),
     };
+    let size = settings["size"].as_f64().unwrap_or(default_size);
+    let mut radii = vec![(size / 3.).ceil() as u32; 3];
     if kind == "bevel_emboss" {
-        radii.push(number(settings, "soften").ceil() as u32);
+        radii.push(settings["soften"].as_f64().unwrap_or(1.).ceil() as u32);
     }
     radii
 }
 
 pub(crate) fn field_padding(kind: &str, settings: &Value) -> i32 {
     match kind {
-        "inner_shadow" | "drop_shadow" | "satin" => number(settings, "distance").ceil() as i32 + 1,
+        "inner_shadow" | "drop_shadow" | "satin" => {
+            let default = if kind == "satin" { 12. } else { 8. };
+            settings["distance"].as_f64().unwrap_or(default).ceil() as i32 + 1
+        }
         // Bilinear sampling reads the neighbouring cell even at an integer
         // probe, so +/-1 gradient probes require two declared edge samples.
         "bevel_emboss" => 2,
@@ -581,7 +688,9 @@ fn apply_window_resolved(
     if w.checked_mul(h).and_then(|n| n.checked_mul(4)) != Some(words.len()) {
         return Err("Style dimensions do not match native samples".into());
     }
-    if words.is_empty() || number(v, "opacity") == 0. {
+    let fill_coverage = kind == "gradient_overlay" && v["use_gradient_alpha"] == true
+        || kind == "pattern_overlay" && v["use_pattern_alpha"] == true;
+    if words.is_empty() || (number(v, "opacity") == 0. && !fill_coverage) {
         return Ok(());
     }
     window.validate(width, height)?;
@@ -615,6 +724,9 @@ fn apply_window_resolved(
     let mut alpha = filled(w * h, 0.)?;
     for (a, p) in alpha.iter_mut().zip(source.chunks_exact(4)) {
         *a = f64::from(p[3]) / 65535.;
+    }
+    if kind == "stroke" {
+        return stroke(words, &source, &alpha, w, h, v, window);
     }
     let mut field = if prepared_field.is_none() {
         copied(&alpha)?
@@ -696,14 +808,11 @@ fn apply_window_resolved(
         )
     };
     let field_sample = |x: usize, y: usize, dx: f64, dy: f64| -> Result<f64, String> {
+        let x = (x + window.origin[0] as usize) as f64 + dx;
+        let y = (y + window.origin[1] as usize) as f64 + dy;
         prepared_field.map_or_else(
-            || Ok(sample(&field, w, h, x as f64 + dx, y as f64 + dy)),
-            |f| {
-                f.sample(
-                    (x + window.origin[0] as usize) as f64 + dx,
-                    (y + window.origin[1] as usize) as f64 + dy,
-                )
-            },
+            || Ok(sample(&field, w, h, window.origin, x, y)),
+            |f| f.sample(x, y),
         )
     };
     let color = rgb(v, "color");
@@ -900,23 +1009,18 @@ fn apply_window_resolved(
                         coverage *= if v["style"] == "outer" { 1. - a } else { 1. };
                     }
                 }
-                "stroke" => {
-                    // A circular native-alpha outline is applied after the generic loop.
-                    coverage = 0.;
-                }
                 "color_overlay" => {}
                 _ => return Err("Unsupported layer-style effect".into()),
-            }
-            if kind == "stroke" {
-                continue;
             }
             if !outside && original[3] == 0 {
                 continue;
             }
-            if coverage * opacity == 0. {
+            if coverage * opacity == 0. && !fill_coverage {
                 continue;
             }
-            let effect = [tint[0], tint[1], tint[2], word(coverage * opacity)];
+            // Fill coverage changes alpha independently of the sampled RGB.
+            // Ordinary overlays retain their historical opacity interpolation.
+            let effect = [tint[0], tint[1], tint[2], if fill_coverage { 65535 } else { word(coverage * opacity) }];
             let mut result = if behind {
                 crate::raster::blend16(effect, original, 1., "normal")
             } else if !outside {
@@ -926,13 +1030,10 @@ fn apply_window_resolved(
                 crate::raster::blend16(original, effect, 1., blend)
             };
             if !outside {
-                result[3] = original[3];
+                result[3] = if fill_coverage { word(a * coverage * opacity) } else { original[3] };
             }
             words[at..at + 4].copy_from_slice(&result);
         }
-    }
-    if kind == "stroke" {
-        stroke(words, &source, &alpha, w, h, v, window)?;
     }
     Ok(())
 }
@@ -1022,20 +1123,29 @@ fn stroke(
     if size == 0. {
         return Ok(());
     }
-    let radius = if v["position"] == "center" {
+    let position = v["position"].as_str().unwrap_or("outside");
+    let radius = if position == "center" {
         size * 0.5
     } else {
         size
     };
-    let outer = distances(alpha, w, h, false, window)?;
-    let inner = distances(alpha, w, h, true, window)?;
+    let outer = if position != "inside" {
+        distances(alpha, w, h, false, window)?
+    } else {
+        Vec::new()
+    };
+    let inner = if matches!(position, "inside" | "center") {
+        distances(alpha, w, h, true, window)?
+    } else {
+        Vec::new()
+    };
     let color = rgb(v, "color");
     let opacity = number(v, "opacity");
     let blend = v["blend"].as_str().unwrap_or("normal");
     for (index, pixel) in words.chunks_exact_mut(4).enumerate() {
         let original: [u16; 4] = source[index * 4..index * 4 + 4].try_into().unwrap();
         let a = alpha[index];
-        let coverage = match v["position"].as_str().unwrap_or("outside") {
+        let coverage = match position {
             "inside" => (radius + 0.5 - inner[index]).clamp(0., 1.) * a,
             "center" => {
                 (radius + 0.5 - outer[index]).clamp(0., 1.) * (1. - a)
@@ -1048,7 +1158,7 @@ fn stroke(
         }
         let effect = [color[0], color[1], color[2], word(coverage * opacity)];
         let mut result = crate::raster::blend16(original, effect, 1., blend);
-        if v["position"] == "inside" {
+        if position == "inside" {
             result[3] = original[3];
         }
         pixel.copy_from_slice(&result);
@@ -1060,6 +1170,78 @@ fn stroke(
 mod window_tests {
     use super::*;
     use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+    #[test]
+    fn stroke_positions_keep_their_native_outline_coverage() {
+        for (position, center_red, next_alpha, fringe_alpha) in [
+            ("inside", 65535, 0, 0),
+            ("outside", 0, 65535, 32768),
+            ("center", 32768, 32768, 0),
+        ] {
+            let mut words = vec![0; 5 * 5 * 4];
+            let center = (2 * 5 + 2) * 4;
+            words[center..center + 4].copy_from_slice(&[0, 0, 65535, 65535]);
+            let settings = json!({
+                "size": 2., "position": position, "color": [1., 0., 0.], "opacity": 1.,
+            });
+            apply(&mut words, 5, 5, "stroke", &settings).unwrap();
+            assert_eq!(words[center], center_red, "{position} color");
+            assert_eq!(words[center + 3], 65535, "{position} source alpha");
+            assert_eq!(words[center + 7], next_alpha, "{position} adjacent alpha");
+            assert_eq!(words[center + 11], fringe_alpha, "{position} fringe alpha");
+        }
+    }
+
+    #[test]
+    fn bitmap_fill_coverage_keeps_native_colors_and_multiplies_alpha() {
+        let tile = crate::raster::png16(2, 1, &[0, 0, 0, 0, 12347, 23459, 34571, 29123]).unwrap();
+        let mut settings = json!({"pattern":"bitmap", "bitmap_png":STANDARD.encode(tile),
+            "sampling":"nearest", "use_pattern_alpha":true, "opacity":0.5});
+        let original = [65535, 65535, 65535, 65535, 65535, 65535, 65535, 40001];
+        let mut fill = original;
+        apply(&mut fill, 2, 1, "pattern_overlay", &settings).unwrap();
+        assert_eq!(fill, [0, 0, 0, 0, 12347, 23459, 34571, 8888]);
+        settings["use_pattern_alpha"] = json!(false);
+        let mut overlay = original;
+        apply(&mut overlay, 2, 1, "pattern_overlay", &settings).unwrap();
+        assert_eq!(&overlay[..4], &original[..4]);
+        assert_eq!(overlay[7], 40001);
+        settings["use_pattern_alpha"] = json!(1);
+        assert!(validate("pattern_overlay", &settings).is_err());
+    }
+
+    #[test]
+    fn gradient_coverage_retains_color_and_multiplies_native_alpha_including_zero() {
+        let mut settings = defaults("gradient_overlay");
+        settings["opacity"] = json!(0.5);
+        settings["use_gradient_alpha"] = json!(true);
+        settings["pixel_grid"] = json!(true);
+        settings["angle"] = json!(0.);
+        settings["color_stops"] = json!([
+            {"position":0.,"color":[1.,0.,0.]},
+            {"position":1.,"color":[1.,0.,0.]}
+        ]);
+        settings["alpha_stops"] = json!([
+            {"position":0.,"opacity":0.}, {"position":1.,"opacity":1.}
+        ]);
+        validate("gradient_overlay", &settings).unwrap();
+        let source = vec![12347, 23459, 34571, 65535, 23459, 34571, 45683, 40001];
+        let mut fill = source.clone();
+        apply(&mut fill, 2, 1, "gradient_overlay", &settings).unwrap();
+        assert_eq!(fill, [65535, 0, 0, 0, 65535, 0, 0, 10000]);
+        settings["opacity"] = json!(0.);
+        let mut hidden = source.clone();
+        apply(&mut hidden, 2, 1, "gradient_overlay", &settings).unwrap();
+        assert_eq!(hidden, [65535, 0, 0, 0, 65535, 0, 0, 0]);
+        settings["opacity"] = json!(0.5);
+        settings["use_gradient_alpha"] = json!(false);
+        let mut overlay = source.clone();
+        apply(&mut overlay, 2, 1, "gradient_overlay", &settings).unwrap();
+        assert_eq!(&overlay[..4], &source[..4]);
+        assert_eq!(overlay[7], 40001);
+        settings["use_gradient_alpha"] = json!(1);
+        assert!(validate("gradient_overlay", &settings).is_err());
+    }
 
     fn source(w: u32, h: u32, depth: u16) -> Vec<u16> {
         (0..h)
@@ -1173,6 +1355,10 @@ mod window_tests {
                     settings["align_layer"] = json!(true);
                     settings["angle"] = json!(37.);
                     settings["offset_x"] = json!(0.13);
+                    settings["use_gradient_alpha"] = json!(true);
+                    settings["alpha_stops"] = json!([
+                        {"position":0.,"opacity":0.}, {"position":1.,"opacity":0.73}
+                    ]);
                 }
                 let mut full = source.clone();
                 apply(&mut full, w, h, kind, &settings).unwrap();

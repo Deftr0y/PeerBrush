@@ -35,8 +35,8 @@ fn toolbar_opacity_edits_shared_brush_settings_and_real_native_strokes_without_e
         app.recovery.open = false;
         {
             let mut e = app.shared.lock().unwrap();
-            e.doc = Document::new_depth(64, 64, depth).unwrap();
-            app.selected = e.doc.layers[0].id.clone();
+            e.resident_state_mut().expect("resident fixture").document = Document::new_depth(64, 64, depth).unwrap();
+            app.selected = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
         }
         app.brush = crate::brush::Settings {
             opacity: 0.73,
@@ -54,8 +54,8 @@ fn toolbar_opacity_edits_shared_brush_settings_and_real_native_strokes_without_e
         let start = label(&out, "73%");
         assert!(start.y < 140. && !app.show_brush);
         assert!(out.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Rect(r) if r.fill == AI_BLUE && r.rect.top() < 140. && r.rect.width() > 50. && r.rect.height() >= 20.)), "AI brush feedback must be blue");
-        let before = app.shared.lock().unwrap().doc.export_png().unwrap();
-        let revision = app.shared.lock().unwrap().doc.revision;
+        let before = app.shared.lock().unwrap().resident_state().expect("resident fixture").document.export_png().unwrap();
+        let revision = app.shared.lock().unwrap().resident_state().expect("resident fixture").document.revision;
         // The compact value is painted inside the filled portion of the bar.
         let end = start - Vec2::new(22., 0.);
         frame(
@@ -67,9 +67,9 @@ fn toolbar_opacity_edits_shared_brush_settings_and_real_native_strokes_without_e
         frame(&mut app, &ctx, vec![button(end, false)]);
         assert!(app.brush.opacity > 0. && app.brush.opacity < 0.73);
         assert!(app.animation.tool(ctx.input(|i| i.time)).is_none());
-        assert_eq!(app.shared.lock().unwrap().doc.revision, revision);
-        assert_eq!(app.shared.lock().unwrap().undo.len(), 1);
-        assert_eq!(app.shared.lock().unwrap().doc.export_png().unwrap(), before);
+        assert_eq!(app.shared.lock().unwrap().resident_state().expect("resident fixture").document.revision, revision);
+        assert_eq!(app.shared.lock().unwrap().resident_state().expect("resident fixture").undo.len(), 1);
+        assert_eq!(app.shared.lock().unwrap().resident_state().expect("resident fixture").document.export_png().unwrap(), before);
         let percent = format!("{:.0}%", app.brush.opacity * 100.);
         app.show_brush = true;
         let mut out = frame(&mut app, &ctx, vec![]);
@@ -98,7 +98,7 @@ fn toolbar_opacity_edits_shared_brush_settings_and_real_native_strokes_without_e
             let out = frame(&mut app, &ctx, vec![]);
             let active_percent = format!("{:.0}%", app.brush.opacity * 100.);
             assert!(label(&out, &active_percent).y < 140.);
-            let command = app.stroke_command(vec![[32., 32.]], [233, 84, 32, 255]);
+            let command = app.stroke_command(&[[32., 32.]], [233, 84, 32, 255]);
             assert!(
                 (command["opacity"].as_f64().unwrap() as f32 - app.brush.opacity).abs() < 0.00001
             );
@@ -116,25 +116,25 @@ fn toolbar_opacity_edits_shared_brush_settings_and_real_native_strokes_without_e
         frame(&mut app, &ctx, vec![button(moved, false)]);
         let mut e = app.shared.lock().unwrap();
         assert_eq!(
-            e.undo.len(),
+            e.resident_state().expect("resident fixture").undo.len(),
             2,
             "A completed stroke commits exactly one undo step"
         );
-        assert_eq!(e.doc.bit_depth, depth);
-        let alpha = e.doc.layers[0].pixels.get16(32, 32)[3];
+        assert_eq!(e.resident_state().expect("resident fixture").document.bit_depth, depth);
+        let alpha = e.resident_state().expect("resident fixture").document.layers[0].pixels.get16(32, 32)[3];
         let expected = (app.brush.opacity * 65535.).round() as u16;
         assert!(
             alpha.abs_diff(expected) <= if depth == 8 { 257 } else { 2 },
             "Native alpha {alpha} differs from toolbar opacity {expected}"
         );
-        let saved = crate::psd::decode(&crate::psd::encode(&e.doc).unwrap()).unwrap();
+        let saved = crate::psd::decode(&crate::psd::encode(&e.resident_state().expect("resident fixture").document).unwrap()).unwrap();
         assert_eq!(saved.bit_depth, depth);
         assert_eq!(
             saved.layers[0].pixels.get16(32, 32),
-            e.doc.layers[0].pixels.get16(32, 32)
+            e.resident_state().expect("resident fixture").document.layers[0].pixels.get16(32, 32)
         );
-        assert_eq!(saved.export_png().unwrap(), e.doc.export_png().unwrap());
+        assert_eq!(saved.export_png().unwrap(), e.resident_state().expect("resident fixture").document.export_png().unwrap());
         e.undo("human").unwrap();
-        assert_eq!(e.doc.export_png().unwrap(), before);
+        assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), before);
     }
 }

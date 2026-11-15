@@ -1,28 +1,132 @@
 use super::*;
 
 pub(super) struct Pending {
-    pub shared: Shared,
-    pub prepared: crate::image_open::Prepared,
+    pub source: Source,
     pub control: crate::loading::Control,
     pub initiating: String,
     pub index: usize,
+}
+
+pub(super) enum Source {
+    Resident {
+        shared: Shared,
+        prepared: crate::image_open::Prepared,
+        icon_sizes: Vec<[u16; 2]>,
+    },
+    Native(server::ImageChoice),
+}
+impl Source {
+    pub(super) fn choice(&self) -> (Option<&'static str>, usize) {
+        match self {
+            Self::Resident { prepared, .. } => {
+                (prepared.encoded.info.choice, prepared.encoded.info.count)
+            }
+            Self::Native(choice) => (Some(choice.key), choice.count),
+        }
+    }
+    fn path(&self) -> &Path {
+        match self {
+            Self::Resident { prepared, .. } => &prepared.path,
+            Self::Native(choice) => choice.path(),
+        }
+    }
+    fn icon_sizes(&self) -> &[[u16; 2]] {
+        match self {
+            Self::Resident { icon_sizes, .. } => icon_sizes,
+            Self::Native(choice) => &choice.sizes,
+        }
+    }
+}
+
+pub(super) fn content_choice(
+    ui: &mut egui::Ui,
+    choice: &str,
+    count: usize,
+    sizes: &[[u16; 2]],
+    index: &mut usize,
+) {
+    let label = match choice {
+        "frame" => "Frame",
+        "page" => "Page",
+        "variant" => "Icon variant",
+        _ => "Image content",
+    };
+    let subject = label.to_lowercase();
+    let mut number = index.saturating_add(1).min(count);
+    ui.horizontal_wrapped(|ui| {
+        ui.label(label);
+        if count == 0 {
+            ui.weak("No choices available");
+            return;
+        }
+        if ui.add_enabled_ui(number > 1, |ui| {
+            icons::small_button(ui, Icon::Left, &format!("Previous {subject}"))
+        }).inner.clicked() {
+            number -= 1;
+        }
+        let response = controls::numeric(ui, &mut number, 1..=count)
+            .on_hover_text(format!("Enter a {subject} number from 1 to {count}"));
+        response.widget_info(|| egui::WidgetInfo {
+            label: Some(label.into()),
+            ..egui::WidgetInfo::drag_value(response.enabled(), number as f64)
+        });
+        ui.label(format!("of {count}"));
+        if ui.add_enabled_ui(number < count, |ui| {
+            icons::small_button(ui, Icon::Right, &format!("Next {subject}"))
+        }).inner.clicked() {
+            number += 1;
+        }
+        if let Some(&[width, height]) = sizes.get(number - 1).filter(|_| sizes.len() == count) {
+            let menu = egui::ComboBox::from_id_salt("icon size")
+                .selected_text(format!("{width} × {height}"))
+                .height(180.)
+                .show_ui(ui, |ui| {
+                    for (i, &[width, height]) in sizes.iter().enumerate() {
+                        ui.selectable_value(&mut number, i + 1, format!("{} · {} × {}", i + 1, width, height));
+                    }
+                });
+            menu.response.widget_info(|| {
+                let mut info = egui::WidgetInfo::labeled(
+                    egui::WidgetType::ComboBox, menu.response.enabled(), "Icon size",
+                );
+                let [width, height] = sizes[number - 1];
+                info.current_text_value = Some(format!("{width} × {height}"));
+                info
+            });
+        } else if count > 2 {
+            let response = ui.add(egui::Slider::new(&mut number, 1..=count).show_value(false))
+                .on_hover_text(format!("Scrub {subject}s"));
+            response.widget_info(|| egui::WidgetInfo::slider(
+                response.enabled(), number as f64, format!("{label} scrubber"),
+            ));
+            icons::paint_focus(ui, &response);
+        }
+    });
+    *index = number.saturating_sub(1);
 }
 
 pub(super) fn finish(
     pending: Pending,
     workspace: &crate::workspace::Registry,
 ) -> Result<String, String> {
-    let mut options = json!({});
-    if let Some(choice) = pending.prepared.encoded.info.choice {
-        options[choice] = json!(pending.index);
+    match pending.source {
+        Source::Resident { shared, prepared, .. } => {
+            let mut options = json!({});
+            if let Some(choice) = prepared.encoded.info.choice {
+                options[choice] = json!(pending.index);
+            }
+            server::open_prepared_image(&shared, prepared, &pending.control, &options)?;
+            crate::workspace::register_opened(workspace, shared, Some(&pending.initiating))?;
+        }
+        Source::Native(choice) => {
+            choice.finish(
+                workspace,
+                &pending.control,
+                &pending.initiating,
+                pending.index,
+            )?;
+        }
     }
-    server::open_prepared_image(
-        &pending.shared,
-        pending.prepared,
-        &pending.control,
-        &options,
-    )?;
-    crate::workspace::register_opened(workspace, pending.shared, Some(&pending.initiating))?;
     Ok("Image opened — save as PSD or PSB".into())
 }
 
@@ -41,8 +145,8 @@ impl PeerBrush {
         let Some(pending) = &mut self.pending_image_open else {
             return;
         };
-        let info = &pending.prepared.encoded.info;
-        let choice = info.choice.unwrap_or("content");
+        let (choice, count) = pending.source.choice();
+        let choice = choice.unwrap_or("content");
         let mut open = true;
         let mut apply = false;
         let mut cancel = false;
@@ -54,24 +158,14 @@ impl PeerBrush {
                 dialogs::body(ui, 420.);
                 ui.label(
                     pending
-                        .prepared
-                        .path
+                        .source
+                        .path()
                         .file_name()
                         .unwrap_or_default()
                         .to_string_lossy(),
                 );
-                ui.label("Choose the content to open in a new project.");
-                egui::ComboBox::from_id_salt("open image content")
-                    .selected_text(format!("{choice} {} of {}", pending.index + 1, info.count))
-                    .show_ui(ui, |ui| {
-                        for index in 0..info.count {
-                            ui.selectable_value(
-                                &mut pending.index,
-                                index,
-                                format!("{choice} {}", index + 1),
-                            );
-                        }
-                    });
+                let sizes = pending.source.icon_sizes();
+                content_choice(ui, choice, count, sizes, &mut pending.index);
                 ui.horizontal(|ui| {
                     apply = ui
                         .add_enabled(!self.busy, dialogs::primary("Open"))
@@ -112,12 +206,21 @@ mod tests {
         let shared = Arc::new(std::sync::Mutex::new(crate::engine::Engine::new()));
         let control = crate::loading::Control::default();
         let e = shared.lock().unwrap();
-        control.bind(e.doc.id.clone(), e.doc.revision);
+        control.bind(
+            e.resident_state()
+                .expect("resident fixture")
+                .document
+                .id
+                .clone(),
+            e.resident_state()
+                .expect("resident fixture")
+                .document
+                .revision,
+        );
         let prepared = crate::image_open::Prepared::read(path, &e.project_id, &control).unwrap();
         drop(e);
         Pending {
-            shared,
-            prepared,
+            source: Source::Resident { shared, prepared, icon_sizes: Vec::new() },
             control,
             initiating: app.project_id.clone(),
             index: 1,
@@ -140,7 +243,7 @@ mod tests {
         drop(encoder);
         std::fs::write(&path, &bytes).unwrap();
         let root = app.shared.clone();
-        let before = root.lock().unwrap().state();
+        let before = crate::server::state(&root).unwrap();
         app.pending_image_open = Some(pending(&app, &path));
         crate::activation::quit_signal(&app.workspace)
             .store(true, std::sync::atomic::Ordering::Release);
@@ -148,7 +251,7 @@ mod tests {
         assert!(app.pending_image_open.is_some());
         assert!(app.lifecycle.is_none() && !app.exit_approved);
         assert!(!root.lock().unwrap().closed);
-        assert_eq!(root.lock().unwrap().state(), before);
+        assert_eq!(crate::server::state(&root).unwrap(), before);
         frame(
             &mut app,
             &ctx,
@@ -162,7 +265,7 @@ mod tests {
         );
         assert!(app.pending_image_open.is_none());
         assert_eq!(crate::workspace::handles(&root).len(), 1);
-        assert_eq!(root.lock().unwrap().state(), before);
+        assert_eq!(crate::server::state(&root).unwrap(), before);
         let changed = pending(&app, &path);
         std::fs::write(&path, b"changed source").unwrap();
         assert!(finish(changed, &app.workspace).is_err());
@@ -209,9 +312,26 @@ mod tests {
             .find(|s| !Arc::ptr_eq(s, &root))
             .unwrap();
         let e = opened.lock().unwrap();
-        assert_eq!((e.doc.width, e.doc.height), (12, 9));
-        assert_eq!(e.doc.layers[0].pixels.get(4, 4), [0, 255, 0, 255]);
-        assert_eq!(root.lock().unwrap().state(), before);
+        assert_eq!(
+            (
+                e.resident_state().expect("resident fixture").document.width,
+                e.resident_state()
+                    .expect("resident fixture")
+                    .document
+                    .height
+            ),
+            (12, 9)
+        );
+        assert_eq!(
+            e.resident_state()
+                .expect("resident fixture")
+                .document
+                .layers[0]
+                .pixels
+                .get(4, 4),
+            [0, 255, 0, 255]
+        );
+        assert_eq!(crate::server::state(&root).unwrap(), before);
         drop(e);
         drop(opened);
         drop(app);

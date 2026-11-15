@@ -6,9 +6,11 @@ use std::{
     fs,
     io::Read,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 pub const LIMIT: usize = 256;
 pub const FILE_LIMIT: u64 = 4 * 1024 * 1024;
+const OVERSIZED: &str = "Filter library exceeds 4 MiB";
 pub fn read(path: &Path) -> Result<Value, String> {
     let mut bytes = Vec::new();
     fs::File::open(path)
@@ -51,24 +53,13 @@ struct Portable {
 }
 #[derive(Default)]
 pub struct Library {
-    custom: Vec<Preset>,
+    custom: Arc<Vec<Preset>>,
     path: Option<PathBuf>,
-    version: Option<(u64, u128)>,
+    original: Option<Vec<u8>>,
     pub error: Option<String>,
 }
-fn version(path: &Path) -> Result<Option<(u64, u128)>, String> {
-    match fs::metadata(path) {
-        Ok(m) => Ok(Some((
-            m.len(),
-            m.modified()
-                .map_err(|e| e.to_string())?
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos(),
-        ))),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e.to_string()),
-    }
+fn read_library(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    crate::tool_settings::read_owned_bounded(path, FILE_LIMIT, OVERSIZED)
 }
 fn text(value: &str, max: usize, label: &str) -> Result<(), String> {
     if value.trim().is_empty() || value.chars().count() > max || value.chars().any(char::is_control)
@@ -89,9 +80,9 @@ fn validate(p: &mut Preset) -> Result<(), String> {
     if serde_json::to_vec(&p.settings)
         .map_err(|e| e.to_string())?
         .len()
-        > 64 * 1024
+        > filters::settings_limit(&p.kind)
     {
-        return Err("Filter settings exceed 64 KiB".into());
+        return Err(format!("Filter settings exceed {} KiB", filters::settings_limit(&p.kind) / 1024));
     }
     let defaults = effects::defaults(&p.kind);
     if p.settings
@@ -112,14 +103,12 @@ impl Library {
             ..Default::default()
         };
         let result = (|| -> Result<(), String> {
-            library.version = version(&path)?;
-            let Some((size, _)) = library.version else {
+            let Some(bytes) = read_library(&path)? else {
                 return Ok(());
             };
-            if size > FILE_LIMIT {
-                return Err("Filter library exceeds 4 MiB".into());
-            }
-            let mut stored: Stored = serde_json::from_value(read(&path)?)
+            let value = serde_json::from_slice(&bytes)
+                .map_err(|e| format!("Unreadable filter JSON: {e}"))?;
+            let mut stored: Stored = serde_json::from_value(value)
                 .map_err(|e| format!("Unreadable filter library: {e}"))?;
             if stored.version != 1 || stored.presets.len() > LIMIT {
                 return Err("Unsupported or oversized filter library".into());
@@ -139,23 +128,29 @@ impl Library {
                     return Err("Invalid or duplicate custom filter ID".into());
                 }
             }
-            if version(&path)? != library.version {
+            if read_library(&path)?.as_deref() != Some(bytes.as_slice()) {
                 return Err("Filter library changed during loading".into());
             }
-            library.custom = stored.presets;
+            library.custom = Arc::new(stored.presets);
+            library.original = Some(bytes);
             Ok(())
         })();
         library.error = result.err();
         library
     }
     pub fn presets(&self) -> Vec<Preset> {
-        let mut p = curated();
-        p.extend(self.custom.clone());
-        p
+        curated_values().iter().chain(self.custom.iter()).cloned().collect()
+    }
+    pub(crate) fn custom_snapshot(&self) -> Arc<Vec<Preset>> {
+        Arc::clone(&self.custom)
     }
     pub fn get(&self, id: &str) -> Result<Preset, String> {
-        self.presets()
-            .into_iter()
+        self.get_ref(id).cloned()
+    }
+    pub(crate) fn get_ref(&self, id: &str) -> Result<&Preset, String> {
+        curated_values()
+            .iter()
+            .chain(self.custom.iter())
             .find(|p| p.id == id)
             .ok_or("Unknown filter preset".into())
     }
@@ -171,16 +166,19 @@ impl Library {
         })
         .map_err(|e| e.to_string())?;
         if bytes.len() as u64 > FILE_LIMIT {
-            return Err("Filter library exceeds 4 MiB".into());
+            return Err(OVERSIZED.into());
         }
         if let Some(path) = &self.path {
-            if version(path)? != self.version {
-                return Err("Filter library changed on disk; reload before saving".into());
-            }
-            crate::server::atomic_write(path, &bytes)?;
-            self.version = version(path)?;
+            crate::tool_settings::write_owned_with_reader(
+                path,
+                &bytes,
+                self.original.as_deref(),
+                "Filter library changed on disk; reload before saving",
+                read_library,
+            )?;
+            self.original = Some(bytes);
         }
-        self.custom = presets;
+        self.custom = Arc::new(presets);
         Ok(())
     }
     pub fn save(
@@ -204,7 +202,7 @@ impl Library {
             custom: true,
         };
         validate(&mut preset)?;
-        let mut custom = self.custom.clone();
+        let mut custom = self.custom.as_ref().clone();
         if let Some(id) = id {
             let index = custom
                 .iter()
@@ -225,7 +223,7 @@ impl Library {
         self.save(Some(id), name, &p.category, &p.kind, p.settings, p.weight)
     }
     pub fn delete(&mut self, id: &str) -> Result<(), String> {
-        let mut custom = self.custom.clone();
+        let mut custom = self.custom.as_ref().clone();
         let index = custom
             .iter()
             .position(|p| p.id == id)
@@ -296,12 +294,20 @@ impl Library {
     }
 }
 pub fn curated() -> Vec<Preset> {
+    curated_values().to_vec()
+}
+pub(crate) fn curated_values() -> &'static [Preset] {
+    static PRESETS: std::sync::OnceLock<Vec<Preset>> = std::sync::OnceLock::new();
+    PRESETS.get_or_init(build_curated)
+}
+fn build_curated() -> Vec<Preset> {
     [
         ("soft-contrast","Soft contrast","Tone","adjust",json!({"brightness":0.02,"contrast":1.15,"saturation":1.0})),
         ("matte-tones","Matte tones","Tone","levels",json!({"black":0.0,"white":0.95,"gamma":1.12})),
         ("s-curve","S curve","Tone","curves",json!({"points":[[0.0,0.0],[0.25,0.15],[0.75,0.85],[1.0,1.0]],"interpolation":"smooth"})),
         ("brighten","Brighten","Tone","adjust",json!({"brightness":0.08,"contrast":1.0,"saturation":1.0})),
         ("posterize","Posterize","Tone","posterize",json!({"levels":4})),
+        ("threshold","Threshold","Tone","threshold",effects::defaults("threshold")),
         ("monochrome","Monochrome","Color","grayscale",json!({})),
         ("invert","Invert","Color","invert",json!({})),
         ("warm-light","Warm light","Color","color_balance",json!({"shadows":[-0.03,-0.03,0.04],"midtones":[0.0,0.0,0.0],"highlights":[0.18,0.07,-0.08],"preserve_luminosity":true})),
@@ -314,29 +320,47 @@ pub fn curated() -> Vec<Preset> {
         ("gaussian-blur","Gaussian blur","Blur & light","blur",json!({"radius":4.0})),
     ].into_iter().map(|(id,name,category,kind,settings)|Preset {id:id.into(),name:name.into(),category:category.into(),kind:kind.into(),settings:effects::normalized(kind,&settings).expect("Curated filter settings"),weight:1.0,custom:false}).collect()
 }
+pub(crate) const THUMBNAIL_SIZE: [u32; 2] = [96, 64];
+
+fn reference_image(depth: u16) -> Result<&'static crate::raster::Raster, String> {
+    use std::sync::OnceLock;
+    static RGB8: OnceLock<Result<crate::raster::Raster, String>> = OnceLock::new();
+    static RGB16: OnceLock<Result<crate::raster::Raster, String>> = OnceLock::new();
+    let [width, height] = THUMBNAIL_SIZE;
+    if depth == 16 {
+        return RGB16.get_or_init(|| {
+            let words: Vec<_> = reference_image(8)?.rgba().into_iter()
+                .map(|value| u16::from(value) * 257).collect();
+            crate::raster::Raster::from_rgba16(width, height, &words)
+        }).as_ref().map_err(String::clone);
+    }
+    RGB8.get_or_init(|| {
+        let image = image::load_from_memory_with_format(
+            include_bytes!("../assets/filter-reference.png"),
+            image::ImageFormat::Png,
+        )
+        .map_err(|error| error.to_string())?
+        .into_rgba8();
+        if image.dimensions() != (width, height) {
+            return Err("Filter reference image must be 96 × 64 pixels".into());
+        }
+        crate::raster::Raster::from_rgba(width, height, image.as_raw())
+    }).as_ref().map_err(String::clone)
+}
+
+pub(crate) fn reference_thumbnail() -> Result<Vec<u8>, String> {
+    Ok(reference_image(8)?.rgba())
+}
+
 /// Thumbnails share one native reference image; selection previews use the actual project.
 pub fn thumbnail(preset: &Preset) -> Result<Vec<u8>, String> {
-    let mut doc = crate::engine::Document::new_depth(96, 64, 16)?;
-    for y in 0..64 {
-        for x in 0..96 {
-            let warm = x < 48;
-            let v = (x % 48) as u16 * 1100 + 4001;
-            doc.layers[0].pixels.set16(
-                x,
-                y,
-                if warm {
-                    [v, 12001 + y as u16 * 600, 9003, 65535]
-                } else {
-                    [7001, 17003 + y as u16 * 600, v, 65535]
-                },
-            );
-        }
-    }
-    let doc = crate::engine::Engine::preview_edits(
-        doc,
-        &[
-            json!({"op":"filter.add","kind":preset.kind,"settings":preset.settings,"weight":preset.weight}),
-        ],
-    )?;
-    Ok(doc.preview(None, 96, None, false)?.2)
+    thumbnail_for(&preset.kind, &preset.settings, preset.weight, 16)
+}
+
+pub(crate) fn thumbnail_for(kind: &str, settings: &Value, weight: f32, depth: u16) -> Result<Vec<u8>, String> {
+    let [width, height] = THUMBNAIL_SIZE;
+    let mut doc = crate::engine::Document::new_depth(width, height, depth)?;
+    doc.layers[0].pixels = reference_image(depth)?.clone();
+    filters::apply(&mut doc, &json!({"op":"filter.add","kind":kind,"settings":settings,"weight":weight}))?;
+    Ok(doc.preview(None, width, None, false)?.2)
 }

@@ -211,6 +211,21 @@ pub fn resolve_commands(mut commands: Vec<Value>) -> Result<Vec<Value>, String> 
     }
     Ok(commands)
 }
+
+pub(crate) fn shares_selection(a: &Value, b: &Value) -> bool {
+    if !matches!(a["op"].as_str(), Some("move" | "transform")) || a["selection_only"] == false {
+        return false;
+    }
+    let (Some(a), Some(b)) = (a.as_object(), b.as_object()) else {
+        return false;
+    };
+    let fields = |object: &serde_json::Map<String, Value>| {
+        object.len() - usize::from(object.contains_key("layer"))
+    };
+    fields(a) == fields(b)
+        && a.iter().all(|(key, value)| key == "layer" || b.get(key) == Some(value))
+}
+
 pub(crate) fn copy_shift(source: &Raster, w: u32, h: u32, dx: i32, dy: i32) -> Raster {
     if (source.width, source.height, dx, dy) == (w, h, 0, 0) {
         return source.clone();
@@ -755,9 +770,9 @@ pub(crate) fn plain_mask(layer: &Layer) -> Result<(), String> {
     if layer.mask.as_ref().is_some_and(|mask| {
         mask.steps
             .iter()
-            .any(|step| !matches!(step.kind.as_str(), "fill" | "paint"))
+            .any(|step| !matches!(step.kind.as_str(), "fill" | "paint" | "density"))
     }) {
-        return Err("Independent or selected linked transforms require a fill/paint mask; mask effects are preserved unchanged. Unlink and choose a paint step for a mask-only transform.".into());
+        return Err("Independent or selected linked transforms support fill, paint and density steps. Unlink and choose a paint step for a mask-only transform.".into());
     }
     Ok(())
 }

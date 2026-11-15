@@ -17,9 +17,9 @@ fn dir() -> PathBuf {
     fs::create_dir_all(&dir).unwrap();
     dir
 }
-fn fixture(depth: u16) -> server::Shared {
+fn fixture_engine(depth: u16) -> Engine {
     let mut e = Engine::new();
-    e.doc = Document::new_depth(16, 12, depth).unwrap();
+    e.resident_state_mut().expect("resident fixture").document = Document::new_depth(16, 12, depth).unwrap();
     let mut folder = Layer::new("Artwork", "group", 16, 12);
     folder.pixels = Raster::new_depth(16, 12, depth);
     let mut hidden = Layer::new("Hidden source", "paint", 16, 12);
@@ -27,7 +27,7 @@ fn fixture(depth: u16) -> server::Shared {
     hidden.pixels.set16(8, 9, [11113, 22227, 33339, 0]);
     hidden.parent = Some(folder.id.clone());
     hidden.visible = false;
-    let paint = &mut e.doc.layers[0];
+    let paint = &mut e.resident_state_mut().expect("resident fixture").document.layers[0];
     paint.parent = Some(folder.id.clone());
     for y in 0..12 {
         for x in 0..16 {
@@ -68,8 +68,8 @@ fn fixture(depth: u16) -> server::Shared {
             },
         ],
     });
-    e.doc.layers.push(hidden);
-    e.doc.layers.push(folder);
+    e.resident_state_mut().expect("resident fixture").document.layers.push(hidden);
+    e.resident_state_mut().expect("resident fixture").document.layers.push(folder);
     // Keep the standard merged comparison opaque; alpha/mask/source words are
     // checked independently below without Photoshop's white rematting ambiguity.
     let mut background = Layer::new("Background", "paint", 16, 12);
@@ -79,9 +79,9 @@ fn fixture(depth: u16) -> server::Shared {
             background.pixels.set16(x, y, [37011, 28007, 19001, 65535]);
         }
     }
-    e.doc.layers.push(background);
+    e.resident_state_mut().expect("resident fixture").document.layers.push(background);
     let target = e
-        .doc
+        .resident_state().expect("resident fixture").document
         .layers
         .iter()
         .find(|l| l.name == "Paint 1")
@@ -119,12 +119,15 @@ fn fixture(depth: u16) -> server::Shared {
     )
     .unwrap();
     e.saved_revision = u64::MAX;
-    e.doc.srgb_tagged = true;
-    Arc::new(Mutex::new(e))
+    e.resident_state_mut().expect("resident fixture").document.srgb_tagged = true;
+    e
+}
+fn fixture(depth: u16) -> server::Shared {
+    Arc::new(Mutex::new(fixture_engine(depth)))
 }
 fn rename(shared: &server::Shared, name: &str) {
     let mut e = shared.lock().unwrap();
-    let layer = e.doc.layers[0].id.clone();
+    let layer = e.resident_state().expect("resident fixture").document.layers[0].id.clone();
     e.edit(
         "human",
         &[json!({"op":"layer.update","layer":layer,"name":name})],
@@ -139,8 +142,8 @@ fn accepted_save(shared: &server::Shared, path: &std::path::Path) -> Result<(), 
         let engine = shared.lock().unwrap();
         (
             engine.project_id.clone(),
-            engine.doc.id.clone(),
-            engine.doc.revision,
+            engine.resident_state().expect("resident fixture").document.id.clone(),
+            engine.resident_state().expect("resident fixture").document.revision,
         )
     };
     let report = server::dispatch(
@@ -184,16 +187,14 @@ fn named_and_untitled_native_versions_restore_independently_with_standard_compos
         let dir = dir();
         let root = fixture(depth);
         let workspace = workspace::attach(&root);
-        let named =
-            workspace::register_in(&workspace, fixture(depth).lock().unwrap().clone(), None)
-                .unwrap();
+        let named = workspace::register_in(&workspace, fixture_engine(depth), None).unwrap();
         let original = dir.join("original.psd");
         accepted_save(&named, &original).unwrap();
         let original_bytes = fs::read(&original).unwrap();
         rename(&named, "Dirty named work");
         let baselines: Vec<_> = [&root, &named]
             .iter()
-            .map(|s| s.lock().unwrap().doc.clone())
+            .map(|s| s.lock().unwrap().resident_state().expect("resident fixture").document.clone())
             .collect();
         server::checkpoint_projects(&workspace, &dir, &mut Default::default());
         assert_eq!(recovery::catalog(&dir).len(), 2);
@@ -229,13 +230,13 @@ fn named_and_untitled_native_versions_restore_independently_with_standard_compos
                     .unwrap();
             let e = restored.lock().unwrap();
             assert!(e.path.is_none() && e.file_version.is_none());
-            assert_ne!(e.doc.revision, e.saved_revision);
-            assert_ne!(e.doc.id, before.id);
-            assert_eq!(e.doc.bit_depth, depth);
-            assert_eq!(e.doc.srgb_tagged, before.srgb_tagged);
-            assert_eq!(e.doc.export_png().unwrap(), before.export_png().unwrap());
+            assert_ne!(e.resident_state().expect("resident fixture").document.revision, e.saved_revision);
+            assert_ne!(e.resident_state().expect("resident fixture").document.id, before.id);
+            assert_eq!(e.resident_state().expect("resident fixture").document.bit_depth, depth);
+            assert_eq!(e.resident_state().expect("resident fixture").document.srgb_tagged, before.srgb_tagged);
+            assert_eq!(e.resident_state().expect("resident fixture").document.export_png().unwrap(), before.export_png().unwrap());
             for old in &before.layers {
-                let new = e.doc.layers.iter().find(|l| l.id == old.id).unwrap();
+                let new = e.resident_state().expect("resident fixture").document.layers.iter().find(|l| l.id == old.id).unwrap();
                 assert_eq!(new.pixels.rgba16(), old.pixels.rgba16());
                 assert_eq!(new.parent, old.parent);
                 assert_eq!(json!(new.effects), json!(old.effects));
@@ -279,7 +280,7 @@ fn named_and_untitled_native_versions_restore_independently_with_standard_compos
             let reopened = psd::decode(&fs::read(output).unwrap()).unwrap();
             assert_eq!(
                 reopened.export_png().unwrap(),
-                restored.lock().unwrap().doc.export_png().unwrap()
+                restored.lock().unwrap().resident_state().expect("resident fixture").document.export_png().unwrap()
             );
         }
         assert_eq!(fs::read(original).unwrap(), original_bytes);
@@ -304,7 +305,7 @@ fn interrupted_checkpoint_or_index_and_damaged_latest_leave_an_earlier_complete_
     let versions = recovery::catalog(&dir);
     assert_eq!(versions.len(), 3);
     let revisions: Vec<_> = versions.iter().map(|e| e.revision).collect();
-    let latest = root.lock().unwrap().doc.revision;
+    let latest = root.lock().unwrap().resident_state().expect("resident fixture").document.revision;
     assert_eq!(revisions, vec![latest, latest - 1, latest - 2]);
     let project = &versions[0].project_id;
     let orphan = dir.join(format!("recovery-{project}-{}.psd", engine::id()));
@@ -319,7 +320,7 @@ fn interrupted_checkpoint_or_index_and_damaged_latest_leave_an_earlier_complete_
     fs::write(&unrelated, b"human file").unwrap();
     fs::write(dir.join("recoveries.json"), b"partial index").unwrap();
     fs::write(dir.join(&versions[0].file), b"truncated version").unwrap();
-    let before = root.lock().unwrap().doc.export_png().unwrap();
+    let before = root.lock().unwrap().resident_state().expect("resident fixture").document.export_png().unwrap();
     assert!(recovery::restore(
         &workspace,
         &dir,
@@ -331,7 +332,7 @@ fn interrupted_checkpoint_or_index_and_damaged_latest_leave_an_earlier_complete_
     .unwrap()
     .contains("damaged"));
     assert_eq!(workspace::entries_in(&workspace).len(), 1);
-    assert_eq!(root.lock().unwrap().doc.export_png().unwrap(), before);
+    assert_eq!(root.lock().unwrap().resident_state().expect("resident fixture").document.export_png().unwrap(), before);
     let restored = recovery::restore(
         &workspace,
         &dir,
@@ -340,11 +341,66 @@ fn interrupted_checkpoint_or_index_and_damaged_latest_leave_an_earlier_complete_
         None,
     )
     .unwrap();
-    assert_eq!(restored.lock().unwrap().doc.layers[0].name, "Four");
+    assert_eq!(restored.lock().unwrap().resident_state().expect("resident fixture").document.layers[0].name, "Four");
     server::checkpoint_projects(&workspace, &dir, &mut previous);
     assert!(!orphan.exists() && !tmp.exists());
     assert_eq!(fs::read(unrelated).unwrap(), b"human file");
 }
+#[test]
+fn damaged_retention_candidate_cannot_displace_a_complete_resident_checkpoint() {
+    let dir = dir();
+    let root = fixture(16);
+    let workspace = workspace::attach(&root);
+    let mut previous = Default::default();
+    for name in ["One", "Two", "Three"] {
+        rename(&root, name);
+        server::checkpoint_projects(&workspace, &dir, &mut previous);
+    }
+    let versions = recovery::catalog(&dir);
+    assert_eq!(versions.len(), 3);
+    let damaged = &versions[0];
+    let oldest = &versions[2];
+    let oldest_bytes = fs::read(dir.join(&oldest.file)).unwrap();
+    let mut damaged_bytes = fs::read(dir.join(&damaged.file)).unwrap();
+    *damaged_bytes.last_mut().unwrap() ^= 1;
+    fs::write(dir.join(&damaged.file), &damaged_bytes).unwrap();
+
+    rename(&root, "Four");
+    server::checkpoint_projects(&workspace, &dir, &mut previous);
+    let retained = recovery::catalog(&dir);
+    assert_eq!(retained.len(), 4);
+    let newest = &retained[0];
+    let newest_bytes = fs::read(dir.join(&newest.file)).unwrap();
+    assert_eq!(psd::decode(&newest_bytes).unwrap().layers[0].name, "Four");
+    assert_eq!(fs::read(dir.join(&oldest.file)).unwrap(), oldest_bytes);
+    assert_eq!(fs::read(dir.join(&damaged.file)).unwrap(), damaged_bytes);
+    assert!(workspace
+        .lock()
+        .unwrap()
+        .recovery_error
+        .as_deref()
+        .unwrap()
+        .contains("earlier versions retained"));
+
+    rename(&root, "Five");
+    server::checkpoint_projects(&workspace, &dir, &mut previous);
+    assert_eq!(recovery::catalog(&dir).len(), 4);
+    assert_eq!(fs::read(dir.join(&oldest.file)).unwrap(), oldest_bytes);
+
+    recovery::discard(&dir, &damaged.snapshot).unwrap();
+    server::checkpoint_projects(&workspace, &dir, &mut previous);
+    assert!(workspace.lock().unwrap().recovery_error.is_none());
+    let retained = recovery::catalog(&dir);
+    assert_eq!(retained.len(), 3);
+    assert_eq!(
+        psd::decode(&fs::read(dir.join(&retained[0].file)).unwrap())
+            .unwrap()
+            .layers[0]
+            .name,
+        "Five"
+    );
+}
+
 #[test]
 fn autosave_failure_is_visible_retried_and_never_marks_work_saved() {
     let dir = dir();
@@ -356,7 +412,7 @@ fn autosave_failure_is_visible_retried_and_never_marks_work_saved() {
     let complete = recovery::catalog(&dir)[0].clone();
     let bytes = fs::read(dir.join(&complete.file)).unwrap();
     rename(&root, "Newer unsaved work");
-    let before = root.lock().unwrap().doc.clone();
+    let before = root.lock().unwrap().resident_state().expect("resident fixture").document.clone();
     let blocked = dir.join("blocked");
     fs::write(&blocked, b"not a directory").unwrap();
     server::checkpoint_projects(&workspace, &blocked, &mut previous);
@@ -373,7 +429,7 @@ fn autosave_failure_is_visible_retried_and_never_marks_work_saved() {
     assert!(workspace.lock().unwrap().recovery_error.is_none());
     assert_eq!(recovery::catalog(&dir).len(), 2);
     assert_eq!(
-        root.lock().unwrap().doc.export_png().unwrap(),
+        root.lock().unwrap().resident_state().expect("resident fixture").document.export_png().unwrap(),
         before.export_png().unwrap()
     );
 }
@@ -388,7 +444,7 @@ fn explicit_close_cleans_only_its_recoveries_and_keeps_other_session_work() {
     server::checkpoint_projects(&registry, &dir, &mut Default::default());
     let (project, document, revision) = {
         let e = root.lock().unwrap();
-        (e.project_id.clone(), e.doc.id.clone(), e.doc.revision)
+        (e.project_id.clone(), e.resident_state().expect("resident fixture").document.id.clone(), e.resident_state().expect("resident fixture").document.revision)
     };
     workspace::close_in(&registry, &project, &document, revision, true, "human").unwrap();
     server::checkpoint_projects(&registry, &dir, &mut Default::default());
@@ -402,7 +458,7 @@ fn recovery_protocol_preserves_reserved_work_and_guards_explicit_discard() {
     let root = fixture(16);
     let registry = workspace::attach(&root);
     server::checkpoint_projects(&registry, &dir, &mut Default::default());
-    let before = root.lock().unwrap().doc.export_png().unwrap();
+    let before = root.lock().unwrap().resident_state().expect("resident fixture").document.export_png().unwrap();
     root.lock()
         .unwrap()
         .reserve(
@@ -440,7 +496,7 @@ fn recovery_protocol_preserves_reserved_work_and_guards_explicit_discard() {
     .unwrap();
     assert_eq!(result["state"]["document"]["bit_depth"], 16);
     assert_eq!(result["images"][0]["document_rect"], json!([0, 0, 16, 12]));
-    assert_eq!(root.lock().unwrap().doc.export_png().unwrap(), before);
+    assert_eq!(root.lock().unwrap().resident_state().expect("resident fixture").document.export_png().unwrap(), before);
     assert_eq!(
         workspace::active_id_in(&registry),
         root.lock().unwrap().project_id
@@ -526,7 +582,7 @@ fn interrupted_or_blocked_ordinary_save_preserves_original_and_dirty_revision() 
     assert!(accepted_save(&root, &file).is_err());
     {
         let e = root.lock().unwrap();
-        assert_ne!(e.doc.revision, e.saved_revision);
+        assert_ne!(e.resident_state().expect("resident fixture").document.revision, e.saved_revision);
     }
     drop(guard);
     assert_eq!(fs::read(&file).unwrap(), original);

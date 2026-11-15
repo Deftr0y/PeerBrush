@@ -419,13 +419,13 @@ impl CapturedEdit {
                             "Changed source definition requires its rendered raster output".into(),
                         );
                     }
-                    let admitted: Admitted<crate::source::Source> =
-                        copy_admitted(&**source, pool, false, check)?;
-                    // Preserve the current validated source contract, including
-                    // font/SVG/path checks; this does not lift its existing caps.
-                    let validation = MetadataCharge::reserve(pool, 32 * 1024 * 1024, check)?;
-                    admitted.validate()?;
-                    drop(validation);
+                    // The native renderer validates geometry, font identity,
+                    // glyphs and SVG under the same bounded admission as edits.
+                    drop(crate::source::prepared::PreparedSource::load(
+                        source,
+                        pool,
+                        &mut || check(),
+                    )?);
                 }
                 _ => {}
             }

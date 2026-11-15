@@ -4,6 +4,72 @@ use super::*;
 use crate::{file_safety::NativeLease, psd::save36::with_session_candidate};
 
 #[test]
+fn refused_native_finalization_returns_the_real_owner_for_verified_abort_settlement() {
+    for depth in [8, 16] {
+        with_session_candidate(depth, |session, candidate, runtime, root, _| {
+            let path = root.join("refused-source.psb");
+            let lease = NativeLease::acquire_admitted(
+                session.admit_destination(&path, &|| Ok(())).unwrap(),
+                || Ok(()),
+            )
+            .unwrap();
+            let inventory = lease
+                .freeze_inventory(&runtime.resident(), &|| Ok(()))
+                .unwrap();
+            let observed = inventory.observe_external(&|| Ok(())).unwrap();
+            let mut checked = Vec::new();
+            let intent = session
+                .prepare_publication(candidate, &observed, &|| Ok(()), &mut |bytes| {
+                    checked.push(bytes);
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(checked.first(), Some(&0));
+            assert_eq!(checked.last(), Some(&candidate.bytes()));
+            assert!(checked.windows(2).all(|pair| pair[0] < pair[1]));
+            drop(observed);
+            let mut writer =
+                NativeNewDestination::create(session, candidate, &inventory, &intent, &|| Ok(()))
+                    .unwrap();
+            let mut copied = Vec::new();
+            writer
+                .replay(candidate, &|| Ok(()), &mut |bytes| {
+                    copied.push(bytes);
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(copied.first(), Some(&0));
+            assert_eq!(copied.last(), Some(&candidate.bytes()));
+            assert!(copied.windows(2).all(|pair| pair[0] < pair[1]));
+            writer.ready_to_arm(&|| Ok(())).unwrap();
+            let control = crate::saving::Control::default();
+            let identity = candidate.scene().identity();
+            control
+                .begin(identity.document_id.clone(), identity.revision)
+                .unwrap();
+            let armed = intent.prearm(candidate, &control, &|| Ok(())).unwrap();
+            let status = control.status();
+            assert_eq!(status.stage, "Rechecking Photoshop file before publication");
+            assert_eq!(status.completed, status.total);
+            assert!(status.total > 0);
+            assert!(control.cancel());
+            let refused = match armed.commit(&control) {
+                Err(refused) => refused,
+                Ok(_) => panic!("Canceled publication obtained a committed permit"),
+            };
+            assert!(refused.reason().contains("cancellation"));
+            let receipt = writer.abort(&|| session.cleanup_check()).unwrap();
+            refused
+                .abort(&receipt, &|| session.cleanup_check())
+                .unwrap();
+            assert!(!path.exists());
+            assert!(session.check().is_ok());
+            assert!(runtime.disk().used().unwrap() >= candidate.bytes());
+        });
+    }
+}
+
+#[test]
 fn actual_native_new_destination_requires_durable_creation_and_keeps_all_debt_on_abort() {
     for depth in [8, 16] {
         with_session_candidate(depth, |session, candidate, runtime, root, _| {
@@ -18,7 +84,7 @@ fn actual_native_new_destination_requires_durable_creation_and_keeps_all_debt_on
                 .unwrap();
             let observed = inventory.observe_external(&|| Ok(())).unwrap();
             let intent = session
-                .prepare_publication(candidate, &observed, &|| Ok(()))
+                .prepare_publication(candidate, &observed, &|| Ok(()), &mut |_| Ok(()))
                 .unwrap();
             drop(observed);
             let mut writer =
@@ -31,7 +97,7 @@ fn actual_native_new_destination_requires_durable_creation_and_keeps_all_debt_on
                 .unwrap()
                 .identity();
             assert_eq!(fs::metadata(&temporary).unwrap().len(), 0);
-            writer.replay(candidate, &|| Ok(())).unwrap();
+            writer.replay(candidate, &|| Ok(()), &mut |_| Ok(())).unwrap();
             writer.ready_to_arm(&|| Ok(())).unwrap();
             let receipt = writer.abort(&|| Ok(())).unwrap();
             receipt
@@ -52,7 +118,7 @@ fn actual_native_new_destination_requires_durable_creation_and_keeps_all_debt_on
             intent.abort(&receipt, &|| Ok(())).unwrap();
             let next_observation = inventory.observe_external(&|| Ok(())).unwrap();
             assert!(session
-                .prepare_publication(candidate, &next_observation, &|| Ok(()))
+                .prepare_publication(candidate, &next_observation, &|| Ok(()), &mut |_| Ok(()))
                 .is_err());
             drop(next_observation);
             drop(receipt);
@@ -77,7 +143,7 @@ fn actual_native_new_destination_no_clobber_publication_returns_exact_live_ident
                 .unwrap();
             let observed = inventory.observe_external(&|| Ok(())).unwrap();
             let intent = session
-                .prepare_publication(candidate, &observed, &|| Ok(()))
+                .prepare_publication(candidate, &observed, &|| Ok(()), &mut |_| Ok(()))
                 .unwrap();
             drop(observed);
             let mut writer =
@@ -85,7 +151,7 @@ fn actual_native_new_destination_no_clobber_publication_returns_exact_live_ident
                     .unwrap();
             let temporary = root.join(intent.temporary_name());
             let id = super::super::identity(&writer.temporary).unwrap();
-            writer.replay(candidate, &|| Ok(())).unwrap();
+            writer.replay(candidate, &|| Ok(()), &mut |_| Ok(())).unwrap();
             writer.ready_to_arm(&|| Ok(())).unwrap();
             let identity = candidate.scene().identity();
             let control = crate::saving::Control::default();
@@ -118,6 +184,12 @@ fn actual_native_new_destination_no_clobber_publication_returns_exact_live_ident
             // the receipt deliberately does not borrow the permit or Session.
             committed.finish(&receipt, &|| Ok(())).unwrap();
             drop(receipt);
+            assert_eq!(
+                lease
+                    .verified_version(&path, candidate.bytes(), candidate.sha256(), || Ok(()))
+                    .unwrap(),
+                version
+            );
             drop(inventory);
             drop(lease);
         });
@@ -139,7 +211,7 @@ fn actual_native_foreign_target_and_temporary_replacements_are_never_overwritten
                 .unwrap();
             let observed = inventory.observe_external(&|| Ok(())).unwrap();
             let intent = session
-                .prepare_publication(candidate, &observed, &|| Ok(()))
+                .prepare_publication(candidate, &observed, &|| Ok(()), &mut |_| Ok(()))
                 .unwrap();
             drop(observed);
             let mut writer =
@@ -154,7 +226,7 @@ fn actual_native_foreign_target_and_temporary_replacements_are_never_overwritten
                 path.clone()
             };
             fs::write(&foreign, b"foreign replacement must survive").unwrap();
-            assert!(writer.replay(candidate, &|| Ok(())).is_err());
+            assert!(writer.replay(candidate, &|| Ok(()), &mut |_| Ok(())).is_err());
             assert_eq!(
                 fs::read(&foreign).unwrap(),
                 b"foreign replacement must survive"
@@ -184,7 +256,7 @@ fn actual_native_replay_cancellation_is_latched_and_keeps_prefix_as_charged_debt
             .unwrap();
         let observed = inventory.observe_external(&|| Ok(())).unwrap();
         let intent = session
-            .prepare_publication(candidate, &observed, &|| Ok(()))
+            .prepare_publication(candidate, &observed, &|| Ok(()), &mut |_| Ok(()))
             .unwrap();
         drop(observed);
         let mut writer =
@@ -198,10 +270,10 @@ fn actual_native_replay_cancellation_is_latched_and_keeps_prefix_as_charged_debt
                 } else {
                     Ok(())
                 }
-            })
+            }, &mut |_| Ok(()))
             .unwrap_err();
         assert_eq!(error, "exact native replay cancellation");
-        assert!(writer.replay(candidate, &|| Ok(())).is_err());
+        assert!(writer.replay(candidate, &|| Ok(()), &mut |_| Ok(())).is_err());
         assert!(writer.ready_to_arm(&|| Ok(())).is_err());
         let receipt = writer.abort(&|| Ok(())).unwrap();
         assert!(receipt.retired().is_empty());
@@ -232,13 +304,13 @@ fn actual_native_committed_new_target_finishes_after_closing_without_new_source_
                 .unwrap();
             let observed = inventory.observe_external(&|| Ok(())).unwrap();
             let intent = session
-                .prepare_publication(candidate, &observed, &|| Ok(()))
+                .prepare_publication(candidate, &observed, &|| Ok(()), &mut |_| Ok(()))
                 .unwrap();
             drop(observed);
             let mut writer =
                 NativeNewDestination::create(session, candidate, &inventory, &intent, &|| Ok(()))
                     .unwrap();
-            writer.replay(candidate, &|| Ok(())).unwrap();
+            writer.replay(candidate, &|| Ok(()), &mut |_| Ok(())).unwrap();
             writer.ready_to_arm(&|| Ok(())).unwrap();
             let identity = candidate.scene().identity();
             let control = crate::saving::Control::default();
@@ -297,13 +369,13 @@ fn actual_native_late_foreign_replacement_prevents_receipt_settlement_without_cl
             .unwrap();
         let observed = inventory.observe_external(&|| Ok(())).unwrap();
         let intent = session
-            .prepare_publication(candidate, &observed, &|| Ok(()))
+            .prepare_publication(candidate, &observed, &|| Ok(()), &mut |_| Ok(()))
             .unwrap();
         drop(observed);
         let mut writer =
             NativeNewDestination::create(session, candidate, &inventory, &intent, &|| Ok(()))
                 .unwrap();
-        writer.replay(candidate, &|| Ok(())).unwrap();
+        writer.replay(candidate, &|| Ok(()), &mut |_| Ok(())).unwrap();
         writer.ready_to_arm(&|| Ok(())).unwrap();
         let identity = candidate.scene().identity();
         let control = crate::saving::Control::default();
@@ -352,7 +424,7 @@ fn actual_native_existing_target_refuses_new_target_driver_before_external_stagi
             .unwrap();
         let observed = inventory.observe_external(&|| Ok(())).unwrap();
         let intent = session
-            .prepare_publication(candidate, &observed, &|| Ok(()))
+            .prepare_publication(candidate, &observed, &|| Ok(()), &mut |_| Ok(()))
             .unwrap();
         drop(observed);
         let temporary = root.join(intent.temporary_name());

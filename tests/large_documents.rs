@@ -320,7 +320,7 @@ fn disk_lru_respects_budget_and_rejects_corrupt_or_wrong_precision_entries() {
 #[test]
 fn canceled_stale_failed_and_invalid_opens_preserve_document_and_history() {
     let shared = Arc::new(Mutex::new(Engine::new()));
-    let original = shared.lock().unwrap().doc.id.clone();
+    let original = shared.lock().unwrap().resident_state().expect("resident fixture").document.id.clone();
     let control = Control::default();
     control.bind(original.clone(), 999);
     assert!(server::open_progress(&shared, std::path::Path::new("missing.psd"), &control).is_err());
@@ -336,8 +336,8 @@ fn canceled_stale_failed_and_invalid_opens_preserve_document_and_history() {
     let control = Control::default();
     control.cancel();
     assert!(server::open_progress(&shared, &path, &control).is_err());
-    assert_eq!(shared.lock().unwrap().doc.id, original);
-    assert!(shared.lock().unwrap().undo.is_empty());
+    assert_eq!(shared.lock().unwrap().resident_state().expect("resident fixture").document.id, original);
+    assert!(shared.lock().unwrap().resident_state().expect("resident fixture").undo.is_empty());
     server::open(&shared, &path).unwrap();
     let reused = Control::default();
     assert!(server::open_progress(&shared, &path, &reused)
@@ -347,9 +347,9 @@ fn canceled_stale_failed_and_invalid_opens_preserve_document_and_history() {
         .unwrap_err()
         .contains("already started"));
     let e = shared.lock().unwrap();
-    assert_eq!(e.doc.bit_depth, 16);
+    assert_eq!(e.resident_state().expect("resident fixture").document.bit_depth, 16);
     assert_eq!(
-        e.doc.layers[0].pixels.get16(2, 3),
+        e.resident_state().expect("resident fixture").document.layers[0].pixels.get16(2, 3),
         [60001, 12347, 34569, 65535]
     );
     assert!(e.loading.is_none());

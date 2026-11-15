@@ -46,4 +46,12 @@ impl StageSession for SourceSession {
     ) -> Result<Snapshot, String> {
         SourceSession::seal_store(self, store, blocks, metadata)
     }
+    fn try_seal_store(
+        &self,
+        store: &Store,
+        blocks: &[BlockRef],
+        metadata: &[u8],
+    ) -> Result<Option<Snapshot>, String> {
+        SourceSession::try_seal_store(self, store, blocks, metadata)
+    }
 }

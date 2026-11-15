@@ -83,6 +83,14 @@ Release measurements on the Windows NVIDIA RTX 3070 Ti Laptop system, with nine 
 
 Run `cargo run --release --example preview_performance` or add `-- --effects16` for native effects. Finer dirty-tile tracking remains queued. Progressive loading is described below.
 
+## Startup artwork (PB-108, unreleased)
+
+The build prepares the toolbar and selection icon atlases and workspace wordmark. The GUI loads those pixels directly, avoiding startup PNG decoding for all three images. Each icon cell uses a 128 × 128 coverage grid and keeps its square shape and runtime state tint. The wordmark uses a 576-pixel-wide texture for a 136-point header image. Launch and first-frame timings for this change remain unmeasured.
+
+Background font discovery checks preferred faces for each filename script before sorting the fallback catalog. It reads each candidate through the shared bounded font reader and keeps the same owned bytes when the face covers the script. Startup timing for this change remains unmeasured.
+
+The Layers panel builds names, thumbnails and mask controls for rows in view and keeps an active inline rename editable while scrolling. Row navigation and folder guides use the full expanded hierarchy. Visibility sweeps follow the pointer through visible eye controls and include its release position. Focus loss cancels a sweep or layer drag before it commits. AI transitions identify arriving layers once per change and reuse that result during animation.
+
 ## Changed-dab regional previews (PB-108, unreleased)
 
 Growing brush previews now redraw conservative bounds of newly generated dabs. Smoothing, pressure, taper and shortened paths include old coverage when the tail changes. Settings/baseline changes and unsupported commands use a full render. Paint, erasure and mask pixels still come from the same native-depth brush session; cached replay/render stay together across worker project switches. Derived coverage and pixels remain outside history and PSD sources.

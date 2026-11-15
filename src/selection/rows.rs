@@ -272,6 +272,7 @@ pub(super) struct Spans<'a> {
     ends: &'a mut [u8],
     count: usize,
     selected: u64,
+    bounds: Option<[u32; 4]>,
     maximum_work: u64,
     failed: bool,
 }
@@ -306,6 +307,7 @@ impl<'a> Spans<'a> {
             ends,
             count: 0,
             selected: 0,
+            bounds: None,
             maximum_work,
             failed: false,
         })
@@ -334,6 +336,14 @@ impl<'a> Spans<'a> {
         }
         self.count += 1;
         self.selected += u64::from(right - left);
+        self.bounds = Some(self.bounds.map_or([left, y, right, y + 1], |bounds| {
+            [
+                bounds[0].min(left),
+                bounds[1].min(y),
+                bounds[2].max(right),
+                bounds[3].max(y + 1),
+            ]
+        }));
         put_word(self.ends, y as usize, word(self.ends, y as usize) + 1);
         Ok(())
     }
@@ -372,6 +382,7 @@ impl<'a> Spans<'a> {
             records: self.records,
             indices: self.indices,
             ends: self.ends,
+            bounds: self.bounds,
         })
     }
 }
@@ -381,9 +392,14 @@ pub(super) struct Rows<'a> {
     records: &'a [u8],
     indices: &'a [u8],
     ends: &'a [u8],
+    bounds: Option<[u32; 4]>,
 }
 
 impl Rows<'_> {
+    pub fn bounds(&self) -> Option<[u32; 4]> {
+        self.bounds
+    }
+
     pub fn row(
         &self,
         y: u32,
@@ -440,6 +456,28 @@ impl CompleteRows {
     pub fn shape(&self) -> (u32, u32) {
         (self.width, self.rows)
     }
+}
+
+/// Read each complete input row and emit it without filtering.
+pub(super) fn unfiltered(
+    width: u32,
+    height: u32,
+    row: &mut [u8],
+    mut check: impl FnMut() -> Result<(), String>,
+    mut read: impl FnMut(u32, &mut [u8]) -> Result<(), String>,
+    mut emit: impl FnMut(u32, &mut [u8]) -> Result<(), String>,
+) -> Result<CompleteRows, String> {
+    if width == 0 || height == 0 || width > 16000 || height > 16000 || row.len() != width as usize {
+        return Err("Selection rows differ from the admitted layout".into());
+    }
+    for y in 0..height {
+        check()?;
+        read(y, row)?;
+        check()?;
+        emit(y, row)?;
+    }
+    check()?;
+    Ok(CompleteRows { rows: height, width })
 }
 
 impl<'a> Feather<'a> {
@@ -513,6 +551,16 @@ impl<'a> Feather<'a> {
             return Err("Selection feather cannot resume after completion or failure".into());
         }
         self.finished = true;
+        if self.radius == 0 {
+            return unfiltered(
+                self.width as u32,
+                self.height as u32,
+                self.input,
+                check,
+                read,
+                |y, row| emit(y, row),
+            );
+        }
         let count = 2 * self.radius + 1;
         for y in 0..(self.radius + 1).min(self.height) {
             check()?;

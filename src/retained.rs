@@ -9,7 +9,7 @@ pub(crate) mod stage;
 pub(crate) mod transaction;
 use crate::{
     engine::{Document, Layer},
-    raster::{check_size, Raster},
+    raster::{check_size, CanvasLimits, Raster},
 };
 use geometry::exact;
 use serde::{Deserialize, Serialize};
@@ -52,10 +52,13 @@ impl Original {
         })
     }
     pub fn validate(&self, depth: u16) -> Result<(), String> {
+        self.validate_with_limits(depth, CanvasLimits::Resident)
+    }
+    pub(crate) fn validate_with_limits(&self, depth: u16, limits: CanvasLimits) -> Result<(), String> {
         if self.pixels.retained.is_some() {
             return Err("Nested transform originals are unsupported".into());
         }
-        check_size(self.pixels.width, self.pixels.height)?;
+        limits.check(self.pixels.width, self.pixels.height)?;
         self.pixels.validate_layout()?;
         geometry::validate(
             self.pixels.width,

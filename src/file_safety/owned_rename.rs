@@ -1,5 +1,7 @@
 //! No-clobber publication of a verified held staging file, not path authority.
-use crate::large_document::{Reservation, ResidentBudget, ScratchBytes};
+use crate::large_document::{
+    verified_transfer_buffer, Reservation, ResidentBudget, ScratchBytes, VERIFIED_BATCH_BYTES,
+};
 use ring::digest::{Context, SHA256};
 use std::{
     fs::{self, File, OpenOptions},
@@ -29,7 +31,27 @@ impl Sealed {
         if bytes > MAXIMUM {
             return Err("Owned publication bounds exceeded".into());
         }
-        let mut scratch = ScratchBytes::new(budget, CHUNK, CHUNK).map_err(|e| e.to_string())?;
+        let mut scratch = verified_transfer_buffer(budget, bytes).map_err(|e| e.to_string())?;
+        Self::verify_with_buffer(file, bytes, expected, budget, &mut scratch, check)
+    }
+
+    pub(in crate::file_safety) fn verify_with_buffer(
+        file: &File,
+        bytes: u64,
+        expected: [u8; 32],
+        budget: &ResidentBudget,
+        scratch: &mut ScratchBytes,
+        check: Check<'_>,
+    ) -> Result<Self, String> {
+        if bytes > MAXIMUM {
+            return Err("Owned publication bounds exceeded".into());
+        }
+        if scratch.is_empty()
+            || scratch.len() > VERIFIED_BATCH_BYTES
+            || !scratch.uses_budget(budget)
+        {
+            return Err("Owned publication verification buffer differs from its admission".into());
+        }
         check()?;
         file.sync_all()
             .map_err(|_| "Owned staging sync failed; files retained")?;
@@ -51,7 +73,7 @@ impl Sealed {
         let mut at = 0;
         while at < bytes {
             check()?;
-            let count = (bytes - at).min(CHUNK as u64) as usize;
+            let count = (bytes - at).min(scratch.len() as u64) as usize;
             read_at(file, at, &mut scratch[..count])?;
             context.update(&scratch[..count]);
             at += count as u64;
@@ -77,6 +99,10 @@ impl Sealed {
         }
         Ok(())
     }
+    pub(crate) fn check_path(&self, file: &File, path: &Path) -> Result<(), String> {
+        self.check(file)?;
+        named(file, path, self.identity)
+    }
 }
 
 pub(crate) fn staging_options() -> OpenOptions {
@@ -96,6 +122,51 @@ pub(crate) fn staging_options() -> OpenOptions {
         options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
     options
+}
+
+/// Only for newly created owned outputs, never the original source. Windows
+/// otherwise defers automatic write stamps until the writing handle closes.
+pub(in crate::file_safety) fn hold_write_stamp(file: &File) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        use std::{os::windows::io::AsRawHandle, ptr};
+        #[repr(C)]
+        struct FileTime {
+            low: u32,
+            high: u32,
+        }
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn SetFileTime(
+                file: *mut std::ffi::c_void,
+                created: *const FileTime,
+                accessed: *const FileTime,
+                modified: *const FileTime,
+            ) -> i32;
+        }
+        let unchanged = FileTime {
+            low: u32::MAX,
+            high: u32::MAX,
+        };
+        // The documented sentinel suppresses subsequent automatic updates on
+        // this handle without changing the stored time. It requires WRITE_ATTRIBUTES.
+        // https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-setfiletime
+        if unsafe { SetFileTime(file.as_raw_handle(), ptr::null(), ptr::null(), &unchanged) } == 0 {
+            return Err("Cannot stabilize owned output timestamp; file and debt retained".into());
+        }
+    }
+    let _ = file;
+    Ok(())
+}
+pub(crate) fn finish_write_stamp(file: &File) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        file.set_times(fs::FileTimes::new().set_modified(SystemTime::now()))
+            .map_err(|_| "Cannot finalize owned output timestamp; file and debt retained")?;
+        hold_write_stamp(file)?;
+    }
+    let _ = file;
+    Ok(())
 }
 
 fn component(path: &Path) -> Result<&std::ffi::OsStr, String> {
@@ -153,45 +224,92 @@ pub(crate) fn publish_new(
     sealed: &Sealed,
     check: Check<'_>,
 ) -> Result<(), String> {
+    relocate_new(
+        directory,
+        held_directory,
+        directory,
+        held_directory,
+        from,
+        to,
+        file,
+        sealed,
+        check,
+    )
+}
+
+/// Move the physical owner between admitted directories without replacing any
+/// destination. No copy, unlink, cross-volume fallback or quota refund occurs.
+/// POSIX source-name races still require the named postcheck; an uncertain move
+/// retains all files and cannot grant a publication or recovery receipt.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::file_safety) fn relocate_new(
+    from_directory: &Path,
+    held_from: &File,
+    to_directory: &Path,
+    held_to: &File,
+    from: &Path,
+    to: &Path,
+    file: &File,
+    sealed: &Sealed,
+    check: Check<'_>,
+) -> Result<(), String> {
     let from_name = component(from)?;
     let to_name = component(to)?;
-    if from_name == to_name || !directory.is_absolute() {
+    let from_id = super::identity(held_from)?;
+    let to_id = super::identity(held_to)?;
+    if (from_id == to_id && from_name == to_name)
+        || !from_directory.is_absolute()
+        || !to_directory.is_absolute()
+    {
         return Err("Owned publication requires distinct internal names".into());
     }
-    let dir_id = super::identity(held_directory)?;
+    if from_id.0 != to_id.0 || from_id.0 != sealed.identity.0 {
+        return Err("Owned relocation requires one admitted volume; files retained".into());
+    }
     let observe = || -> Result<(), String> {
-        let metadata =
-            fs::symlink_metadata(directory).map_err(|_| "Owned directory unavailable")?;
-        if !metadata.is_dir() || metadata.file_type().is_symlink() {
-            return Err("Owned directory changed".into());
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::MetadataExt;
-            if metadata.file_attributes() & 0x400 != 0 {
-                return Err("Owned directory alias refused".into());
+        for (path, held, expected) in [
+            (from_directory, held_from, from_id),
+            (to_directory, held_to, to_id),
+        ] {
+            let metadata = fs::symlink_metadata(path).map_err(|_| "Owned directory unavailable")?;
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return Err("Owned directory changed".into());
             }
-        }
-        let opened = open_directory(directory)?;
-        if super::identity(&opened)? != dir_id || super::identity(held_directory)? != dir_id {
-            return Err("Owned directory identity changed".into());
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                if metadata.file_attributes() & 0x400 != 0 {
+                    return Err("Owned directory alias refused".into());
+                }
+            }
+            let opened = open_directory(path)?;
+            if super::identity(&opened)? != expected || super::identity(held)? != expected {
+                return Err("Owned directory identity changed".into());
+            }
         }
         Ok(())
     };
     check()?;
     observe()?;
     sealed.check(file)?;
-    named(file, &directory.join(from_name), sealed.identity)?;
+    named(file, &from_directory.join(from_name), sealed.identity)?;
     #[cfg(windows)]
-    let _pins = pin_directories(directory, dir_id)?;
+    let _from_pins = pin_directories(from_directory, from_id)?;
+    #[cfg(windows)]
+    let _to_pins = if from_id == to_id {
+        None
+    } else {
+        Some(pin_directories(to_directory, to_id)?)
+    };
     // Last application source/revision/lease check is after all payload sync/readback.
     check()?;
     observe()?;
     sealed.check(file)?;
-    named(file, &directory.join(from_name), sealed.identity)?;
+    named(file, &from_directory.join(from_name), sealed.identity)?;
     rename_new(
-        held_directory,
-        directory,
+        held_from,
+        held_to,
+        to_directory,
         from_name,
         to_name,
         file,
@@ -199,11 +317,14 @@ pub(crate) fn publish_new(
     )?;
     file.sync_all()
         .map_err(|_| "Owned publication sync uncertain; files retained")?;
-    crate::server::sync_parent(&directory.join(to_name))?;
+    crate::server::sync_parent(&to_directory.join(to_name))?;
+    if from_id != to_id {
+        crate::server::sync_parent(&from_directory.join(from_name))?;
+    }
     observe()?;
     sealed.check(file)?;
-    named(file, &directory.join(to_name), sealed.identity)?;
-    if !matches!(fs::symlink_metadata(directory.join(from_name)), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+    named(file, &to_directory.join(to_name), sealed.identity)?;
+    if !matches!(fs::symlink_metadata(from_directory.join(from_name)), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
     {
         return Err("Owned publication source outcome uncertain; names retained".into());
     }
@@ -267,13 +388,19 @@ pub(in crate::file_safety) fn pin_directories(
 }
 
 #[cfg(windows)]
-struct NativeBuffer {
+pub(in crate::file_safety) struct NativeBuffer {
     words: Box<[u64]>,
     _charge: Reservation,
 }
 #[cfg(windows)]
 impl NativeBuffer {
-    fn new(budget: &ResidentBudget, bytes: usize) -> Result<Self, String> {
+    pub(in crate::file_safety) fn new(
+        budget: &ResidentBudget,
+        bytes: usize,
+    ) -> Result<Self, String> {
+        if bytes == 0 {
+            return Err("Native buffer must not be empty".into());
+        }
         let count = bytes
             .checked_add(7)
             .ok_or("Native rename buffer overflow")?
@@ -302,10 +429,18 @@ impl NativeBuffer {
             _charge: charge,
         })
     }
+    pub(in crate::file_safety) fn as_mut_ptr(&mut self) -> *mut std::ffi::c_void {
+        self.words.as_mut_ptr().cast()
+    }
+    pub(in crate::file_safety) fn bytes(&self) -> &[u8] {
+        // The initialized aligned allocation outlives the returned shared view.
+        unsafe { std::slice::from_raw_parts(self.words.as_ptr().cast(), self.words.len() * 8) }
+    }
 }
 
 #[cfg(windows)]
 fn rename_new(
+    _source_directory: &File,
     directory: &File,
     path: &Path,
     _from: &std::ffi::OsStr,
@@ -313,12 +448,13 @@ fn rename_new(
     file: &File,
     budget: &ResidentBudget,
 ) -> Result<(), String> {
+    use ::windows::Win32::Storage::FileSystem::{FileRenameInfo, FILE_INFO_BY_HANDLE_CLASS};
     use std::os::windows::{ffi::OsStrExt, io::AsRawHandle};
     #[link(name = "kernel32")]
     extern "system" {
         fn SetFileInformationByHandle(
             file: *mut std::ffi::c_void,
-            kind: u32,
+            kind: FILE_INFO_BY_HANDLE_CLASS,
             data: *const std::ffi::c_void,
             bytes: u32,
         ) -> i32;
@@ -384,7 +520,7 @@ fn rename_new(
     if unsafe {
         SetFileInformationByHandle(
             file.as_raw_handle(),
-            3,
+            FileRenameInfo,
             storage.words.as_ptr().cast(),
             packet_bytes as u32,
         )
@@ -398,13 +534,36 @@ fn rename_new(
     Ok(())
 }
 #[cfg(unix)]
+pub(crate) fn publish_legacy_new(from: &Path, to: &Path) -> Result<(), String> {
+    let parent = from
+        .parent()
+        .filter(|parent| to.parent() == Some(*parent))
+        .ok_or("New file publication requires staging beside the destination")?;
+    let directory = open_directory(parent)?;
+    let from = from.file_name().ok_or("Save temporary name missing")?;
+    let to = to.file_name().ok_or("Destination name missing")?;
+    rename_new_at(&directory, &directory, from, to)
+}
+
+#[cfg(unix)]
 fn rename_new(
-    directory: &File,
+    source_directory: &File,
+    target_directory: &File,
     _path: &Path,
     from: &std::ffi::OsStr,
     to: &std::ffi::OsStr,
     _file: &File,
     _budget: &ResidentBudget,
+) -> Result<(), String> {
+    rename_new_at(source_directory, target_directory, from, to)
+}
+
+#[cfg(unix)]
+fn rename_new_at(
+    source_directory: &File,
+    target_directory: &File,
+    from: &std::ffi::OsStr,
+    to: &std::ffi::OsStr,
 ) -> Result<(), String> {
     use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
     let from = std::ffi::CString::new(from.as_bytes()).map_err(|_| "Invalid owned source name")?;
@@ -412,9 +571,9 @@ fn rename_new(
     #[cfg(target_os = "linux")]
     let result = unsafe {
         libc::renameat2(
-            directory.as_raw_fd(),
+            source_directory.as_raw_fd(),
             from.as_ptr(),
-            directory.as_raw_fd(),
+            target_directory.as_raw_fd(),
             to.as_ptr(),
             libc::RENAME_NOREPLACE,
         )
@@ -422,9 +581,9 @@ fn rename_new(
     #[cfg(target_os = "macos")]
     let result = unsafe {
         libc::renameatx_np(
-            directory.as_raw_fd(),
+            source_directory.as_raw_fd(),
             from.as_ptr(),
-            directory.as_raw_fd(),
+            target_directory.as_raw_fd(),
             to.as_ptr(),
             libc::RENAME_EXCL,
         )
@@ -435,7 +594,7 @@ fn rename_new(
     Ok(())
 }
 #[cfg(windows)]
-fn read_at(file: &File, mut at: u64, mut output: &mut [u8]) -> Result<(), String> {
+pub(crate) fn read_at(file: &File, mut at: u64, mut output: &mut [u8]) -> Result<(), String> {
     use std::os::windows::fs::FileExt;
     while !output.is_empty() {
         let n = file
@@ -515,6 +674,206 @@ mod tests {
                 let _ = fs::remove_dir_all(&self.path);
             }
         }
+    }
+    #[test]
+    fn relocation_between_held_directories_retains_the_physical_file_and_metadata() {
+        let f = Fixture::new();
+        let versions = f.path.join(".peerbrush-versions");
+        fs::create_dir(&versions).unwrap();
+        let held_versions = open_directory(&versions).unwrap();
+        let source = f.path.join("original.psb");
+        let bytes = b"original main data";
+        fs::write(&source, bytes).unwrap();
+        #[cfg(windows)]
+        fs::write(
+            source.with_file_name("original.psb:peerbrush-metadata"),
+            b"retained named stream",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&source, fs::Permissions::from_mode(0o640)).unwrap();
+        }
+        let file = staging_options().create_new(false).open(&source).unwrap();
+        let pool = ResidentBudget::new(CHUNK).unwrap();
+        let hash = ring::digest::digest(&SHA256, bytes)
+            .as_ref()
+            .try_into()
+            .unwrap();
+        let sealed =
+            Sealed::verify(&file, bytes.len() as u64, hash, &pool, &mut || Ok(())).unwrap();
+        let before = file.metadata().unwrap();
+        let identity = super::super::identity(&file).unwrap();
+        relocate_new(
+            &f.path,
+            f.held.as_ref().unwrap(),
+            &versions,
+            &held_versions,
+            Path::new("original.psb"),
+            Path::new("original.psb"),
+            &file,
+            &sealed,
+            &mut || Ok(()),
+        )
+        .unwrap();
+        let retained = versions.join("original.psb");
+        let named = super::super::open_native_identity(&retained).unwrap();
+        assert_eq!(super::super::identity(&named).unwrap(), identity);
+        assert!(!source.exists());
+        assert_eq!(fs::read(&retained).unwrap(), bytes);
+        let after = file.metadata().unwrap();
+        assert_eq!(before.modified().unwrap(), after.modified().unwrap());
+        assert_eq!(before.created().ok(), after.created().ok());
+        #[cfg(windows)]
+        assert_eq!(
+            fs::read(retained.with_file_name("original.psb:peerbrush-metadata")).unwrap(),
+            b"retained named stream",
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                (before.uid(), before.gid(), before.mode()),
+                (after.uid(), after.gid(), after.mode())
+            );
+        }
+        assert_eq!(pool.used(), 0);
+    }
+    #[test]
+    fn relocation_never_clobbers_an_initial_or_last_callback_destination() {
+        for late in [false, true] {
+            let f = Fixture::new();
+            let (file, sealed, pool) = f.staged();
+            let versions = f.path.join(".peerbrush-versions");
+            fs::create_dir(&versions).unwrap();
+            let held_versions = open_directory(&versions).unwrap();
+            let target = versions.join("retained.psb");
+            if !late {
+                fs::write(&target, b"foreign original survives").unwrap();
+            }
+            let mut calls = 0;
+            assert!(relocate_new(
+                &f.path,
+                f.held.as_ref().unwrap(),
+                &versions,
+                &held_versions,
+                Path::new("candidate.tmp"),
+                Path::new("retained.psb"),
+                &file,
+                &sealed,
+                &mut || {
+                    calls += 1;
+                    if late && calls == 2 {
+                        fs::write(&target, b"foreign original survives").unwrap();
+                    }
+                    Ok(())
+                },
+            )
+            .is_err());
+            file.unlock().unwrap();
+            assert_eq!(
+                fs::read(f.path.join("candidate.tmp")).unwrap(),
+                b"exact owned candidate bytes"
+            );
+            assert_eq!(fs::read(&target).unwrap(), b"foreign original survives");
+            assert_eq!(pool.used(), 0);
+        }
+    }
+    #[test]
+    fn relocation_refuses_cancellation_and_a_mismatched_held_directory_before_mutation() {
+        let f = Fixture::new();
+        let (file, sealed, pool) = f.staged();
+        let versions = f.path.join(".peerbrush-versions");
+        fs::create_dir(&versions).unwrap();
+        let held_versions = open_directory(&versions).unwrap();
+        for cancel_at in [1, 2] {
+            let mut calls = 0;
+            assert!(relocate_new(
+                &f.path,
+                f.held.as_ref().unwrap(),
+                &versions,
+                &held_versions,
+                Path::new("candidate.tmp"),
+                Path::new("retained.psb"),
+                &file,
+                &sealed,
+                &mut || {
+                    calls += 1;
+                    if calls == cancel_at {
+                        Err("cancel relocation".into())
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .is_err());
+        }
+        assert!(relocate_new(
+            &f.path,
+            f.held.as_ref().unwrap(),
+            &versions,
+            f.held.as_ref().unwrap(),
+            Path::new("candidate.tmp"),
+            Path::new("retained.psb"),
+            &file,
+            &sealed,
+            &mut || Ok(()),
+        )
+        .is_err());
+        file.unlock().unwrap();
+        assert_eq!(
+            fs::read(f.path.join("candidate.tmp")).unwrap(),
+            b"exact owned candidate bytes"
+        );
+        assert!(!versions.join("retained.psb").exists());
+        assert_eq!(pool.used(), 0);
+    }
+    #[cfg(windows)]
+    #[test]
+    fn relocation_pins_both_directory_names_through_the_last_callback() {
+        let f = Fixture::new();
+        let (file, sealed, pool) = f.staged();
+        let versions = f.path.join(".peerbrush-versions");
+        fs::create_dir(&versions).unwrap();
+        let held_versions = open_directory(&versions).unwrap();
+        let moved = f.path.with_file_name(format!(
+            "peerbrush-owned-rename-moved-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut calls = 0;
+        relocate_new(
+            &f.path,
+            f.held.as_ref().unwrap(),
+            &versions,
+            &held_versions,
+            Path::new("candidate.tmp"),
+            Path::new("retained.psb"),
+            &file,
+            &sealed,
+            &mut || {
+                calls += 1;
+                if calls == 2 {
+                    for (from, to) in [
+                        (&f.path, &moved),
+                        (&versions, &f.path.join("moved-versions")),
+                    ] {
+                        let error = fs::rename(from, to).unwrap_err();
+                        assert!(matches!(error.raw_os_error(), Some(5 | 32)));
+                    }
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, 2);
+        file.unlock().unwrap();
+        assert_eq!(
+            fs::read(versions.join("retained.psb")).unwrap(),
+            b"exact owned candidate bytes"
+        );
+        assert!(!moved.exists());
+        assert_eq!(pool.used(), 0);
     }
     #[test]
     fn absolute_native_rename_covers_every_utf16_packet_alignment() {
@@ -743,7 +1102,7 @@ mod tests {
     }
 }
 #[cfg(unix)]
-fn read_at(file: &File, mut at: u64, mut output: &mut [u8]) -> Result<(), String> {
+pub(crate) fn read_at(file: &File, mut at: u64, mut output: &mut [u8]) -> Result<(), String> {
     use std::os::unix::fs::FileExt;
     while !output.is_empty() {
         let n = file

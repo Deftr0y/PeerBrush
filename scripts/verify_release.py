@@ -8,8 +8,9 @@ import plistlib
 import re
 import shutil
 import stat
+import tomllib
 import zipfile
-from package import source_files, portable_files, architecture_from_stream, git, relative_path, validate_binary, equivalent_build_inputs, policy_from_sources, MACOS_RESOURCES, macos_info, binary_build_info, macos_sparkle_required, macos_installed_release_required, macos_installed_release, MACOS_INSTALLED_RELEASE
+from package import source_files, portable_files, architecture_from_stream, git, relative_path, validate_binary, equivalent_build_inputs, policy_from_sources, MACOS_RESOURCES, macos_info, binary_build_info, macos_sparkle_required, macos_installed_release_required, macos_installed_release, MACOS_INSTALLED_RELEASE, upstream_notice_paths
 
 
 MACOS_SIGNING_FILES = frozenset({
@@ -126,6 +127,10 @@ def inspect_archive(path, commit, version, source_root=None, selected_sources=No
                 raise ValueError('License notice checksum mismatch')
             if name in required_rust and archive.getinfo(prefix + name).file_size == 0:
                 raise ValueError('Required Rust runtime notice is empty')
+        packages = tomllib.loads(expected_source['Cargo.lock'].decode('utf-8'))['package']
+        for name, destination in upstream_notice_paths(packages).items():
+            if name not in expected_source or notices.get(destination) != sha(expected_source[name]):
+                raise ValueError('Missing exact upstream crate notice')
         expected_entries = set(expected_portable) | set(notices) | {'release.json', 'THIRD_PARTY_NOTICES.md', manifest['executable'], manifest['source']}
         if platform == 'Windows':
             expected_entries.add('Start PeerBrush.cmd')

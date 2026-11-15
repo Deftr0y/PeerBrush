@@ -1,6 +1,7 @@
 //! Native scalar refinement through explicit bounded source regions.
 use crate::{
     large_document::{Error, Result, ScratchBytes, Store},
+    preview::regions::{intersect, window},
     raster::{backed::Region, project16, surface::Surface, TILE},
 };
 use serde_json::Value;
@@ -51,6 +52,106 @@ impl Settings {
     }
 }
 
+fn tile_bounds(bounds: [i32; 4], reach: usize, [width, height]: [u32; 2]) -> [i32; 4] {
+    let [l, t, r, b] = window(bounds, reach as i32, width, height).map(|v| v as u32);
+    [
+        l / TILE * TILE,
+        t / TILE * TILE,
+        (r.div_ceil(TILE) * TILE).min(width),
+        (b.div_ceil(TILE) * TILE).min(height),
+    ]
+    .map(|v| v as i32)
+}
+
+pub(crate) struct SelectionPlan<'a> {
+    input: &'a super::SelectionSource,
+    size: [u32; 2],
+    settings: Settings,
+    source: Option<[i32; 4]>,
+    base: [i32; 4],
+    output: [i32; 4],
+}
+
+impl<'a> SelectionPlan<'a> {
+    pub(crate) fn capture(
+        input: &'a super::SelectionSource,
+        size @ [width, height]: [u32; 2],
+        c: &Value,
+        check: &dyn Fn() -> std::result::Result<(), String>,
+    ) -> std::result::Result<Self, String> {
+        crate::raster::CanvasLimits::Native.check(width, height)?;
+        let settings = Settings::parse(c)?;
+        check()?;
+        let source = match input {
+            super::SelectionSource::All => {
+                return Err("Select an area before refining its edge".into())
+            }
+            super::SelectionSource::Geometry { bounds, .. } => Some(*bounds),
+            super::SelectionSource::Coverage(coverage) => {
+                let mask = coverage.mask();
+                let [ox, oy] = coverage.origin();
+                let mut bounds = None;
+                // Coverage bounds are a hint. Include every physical tile even
+                // when an older mask has samples beyond that hint.
+                for tile in mask.physical_tiles() {
+                    check()?;
+                    let (x, y) = tile.coordinate();
+                    let rect = [
+                        ox + (x * TILE) as i32,
+                        oy + (y * TILE) as i32,
+                        ox + ((x + 1) * TILE).min(mask.width()) as i32,
+                        oy + ((y + 1) * TILE).min(mask.height()) as i32,
+                    ];
+                    let rect = intersect(rect, width, height);
+                    if rect[0] < rect[2] && rect[1] < rect[3] {
+                        bounds =
+                            Some(bounds.map_or(rect, |old| {
+                                crate::engine::reframe_scope::union(old, rect)
+                            }));
+                    }
+                }
+                bounds
+            }
+        }
+        .map(|rect| intersect(rect, width, height))
+        .filter(|rect| rect[0] < rect[2] && rect[1] < rect[3]);
+        let base = source.map_or([0; 4], |bounds| {
+            tile_bounds(
+                bounds,
+                settings.shift.unsigned_abs() as usize + settings.smooth + settings.feather,
+                size,
+            )
+        });
+        // Whole tiles preserve the floating-point filter's original summation origin.
+        let output = if settings.edge > 0. && source.is_some() {
+            tile_bounds(base, 2 * settings.radius, size)
+        } else {
+            base
+        };
+        Ok(Self {
+            input,
+            size,
+            settings,
+            source,
+            base,
+            output,
+        })
+    }
+
+    pub(crate) fn guide_rect(&self, profiled: bool) -> Option<[i32; 4]> {
+        if self.settings.edge == 0. || self.source.is_none() {
+            return None;
+        }
+        let [width, height] = self.size;
+        let mut rect = window(self.output, 2 * self.settings.radius as i32, width, height);
+        if profiled {
+            rect[0] = 0;
+            rect[2] = width as i32;
+        }
+        Some(rect)
+    }
+}
+
 fn zeroes<T: Default + Clone>(length: usize) -> Result<Vec<T>> {
     if length > 512 * 512 {
         return Err(Error::Budget);
@@ -77,6 +178,25 @@ pub fn prepare(
     check: &mut dyn FnMut() -> Result<()>,
 ) -> std::result::Result<Surface, String> {
     let s = Settings::parse(c)?;
+    let frame = [0, 0, input.width() as i32, input.height() as i32];
+    refine(
+        input,
+        guide.map(|guide| (guide, frame)),
+        s,
+        [frame; 2],
+        store,
+        check,
+    )
+}
+
+fn refine(
+    input: &Surface,
+    guide: Option<(&Surface, [i32; 4])>,
+    s: Settings,
+    [base_bounds, output_bounds]: [[i32; 4]; 2],
+    store: Store,
+    check: &mut dyn FnMut() -> Result<()>,
+) -> std::result::Result<Surface, String> {
     let pool = store.resident_budget();
     let disk = store
         .disk_budget()
@@ -84,10 +204,22 @@ pub fn prepare(
     if !input.uses_budget(&pool)
         || !input.uses_disk_budget(&disk)
         || (s.edge > 0.
-            && guide.is_some_and(|g| {
+            && guide.is_some_and(|(g, rect)| {
+                let needed = window(
+                    output_bounds,
+                    2 * s.radius as i32,
+                    input.width(),
+                    input.height(),
+                );
                 !g.uses_budget(&pool)
                     || !g.uses_disk_budget(&disk)
-                    || (g.width(), g.height()) != (input.width(), input.height())
+                    || rect != intersect(rect, input.width(), input.height())
+                    || rect[0] > needed[0]
+                    || rect[1] > needed[1]
+                    || rect[2] < needed[2]
+                    || rect[3] < needed[3]
+                    || rect[2] - rect[0] != g.width() as i32
+                    || rect[3] - rect[1] != g.height() as i32
             }))
     {
         return Err("Refinement sources differ from shared scene admission".into());
@@ -105,9 +237,9 @@ pub fn prepare(
     let _scratch = pool
         .reserve_bytes(16 * 1024 * 1024, 16 * 1024 * 1024)
         .map_err(|e| e.to_string())?;
-    let base = base(input, s, store.clone(), check).map_err(|e| e.to_string())?;
+    let base = base(input, base_bounds, s, store.clone(), check).map_err(|e| e.to_string())?;
     let output = if s.edge > 0. {
-        guided(&base, guide.unwrap(), s, store, check).map_err(|e| e.to_string())?
+        guided(&base, output_bounds, guide.unwrap(), s, store, check).map_err(|e| e.to_string())?
     } else {
         base
     };
@@ -126,89 +258,139 @@ pub fn prepare_selection(
     store: Store,
     check: &dyn Fn() -> Result<()>,
 ) -> std::result::Result<Option<super::backed::CoverageSource>, String> {
-    if matches!(input, super::SelectionSource::All) {
-        return Err("Select an area before refining its edge".into());
-    }
-    let settings = Settings::parse(c)?;
-    check().map_err(|e| e.to_string())?;
-    if settings.unchanged() {
-        return Ok(None);
-    }
-    let pool = store.resident_budget();
-    let mut writer = super::native_tiles::Writer::new(width, height, 8, store.clone())
-        .map_err(|e| e.to_string())?;
-    let tile_bytes = (TILE * TILE * 4) as usize;
-    let mut bytes = ScratchBytes::new(&pool, tile_bytes, tile_bytes).map_err(|e| e.to_string())?;
-    for top in (0..height).step_by(TILE as usize) {
-        for left in (0..width).step_by(TILE as usize) {
-            check().map_err(|e| e.to_string())?;
-            bytes.fill(0);
-            let right = (left + TILE).min(width);
-            let bottom = (top + TILE).min(height);
-            let view = input
-                .prepare_region(
-                    Region::new([left as i32, top as i32, right as i32, bottom as i32])
-                        .map_err(|e| e.to_string())?,
+    let plan = SelectionPlan::capture(input, [width, height], c, &|| {
+        check().map_err(|e| e.to_string())
+    })?;
+    plan.prepare(
+        guide.map(|guide| (guide, [0, 0, width as i32, height as i32])),
+        store,
+        check,
+    )
+}
+
+impl SelectionPlan<'_> {
+    pub(crate) fn prepare(
+        &self,
+        guide: Option<(&Surface, [i32; 4])>,
+        store: Store,
+        check: &dyn Fn() -> Result<()>,
+    ) -> std::result::Result<Option<super::backed::CoverageSource>, String> {
+        check().map_err(|e| e.to_string())?;
+        if self.settings.unchanged() {
+            return Ok(None);
+        }
+        let pool = store.resident_budget();
+        if matches!(self.input, super::SelectionSource::Coverage(coverage) if !coverage.uses_budget(&pool))
+        {
+            return Err("Selection source uses a different payload ledger".into());
+        }
+        let Some(source_bounds) = self.source else {
+            return Ok(None);
+        };
+        let source = stage_tiles(
+            self.size,
+            8,
+            tile_bounds(source_bounds, 0, self.size),
+            store.clone(),
+            &mut || check(),
+            |[left, top, right, bottom], bytes, check| {
+                let view = self.input.prepare_region(
+                    Region::new([left, top, right, bottom])?,
                     &pool,
-                    &mut || check(),
-                )
-                .map_err(|e| e.to_string())?;
-            for y in top..bottom {
-                check().map_err(|e| e.to_string())?;
-                for x in left..right {
-                    let at = (((y - top) * TILE + x - left) * 4) as usize;
-                    let value = (view.value(x as i32, y as i32).map_err(|e| e.to_string())? * 255.)
-                        .round() as u8;
-                    bytes[at..at + 4].fill(value);
+                    check,
+                )?;
+                for y in top..bottom {
+                    check()?;
+                    for x in left..right {
+                        let at = (((y - top) as u32 * TILE + (x - left) as u32) * 4) as usize;
+                        let value = (view.value(x, y)? * 255.).round() as u8;
+                        bytes[at..at + 4].fill(value);
+                    }
+                }
+                Ok(())
+            },
+        )
+        .map_err(|e| e.to_string())?;
+        let output = refine(
+            &source,
+            guide,
+            self.settings,
+            [self.base, self.output],
+            store.clone(),
+            &mut || check(),
+        )?;
+        if same_pixels(&output, &source, self.output, &mut || check()).map_err(|e| e.to_string())? {
+            return Ok(None);
+        }
+        let [width, height] = self.size;
+        let [left, top, right, bottom] = self.output;
+        (|| -> Result<_> {
+            let mut contours = super::contours::Contours::new(width, height, &pool)?;
+            let mut row = ScratchBytes::new(&pool, width as usize, width as usize)?;
+            for y in 0..top {
+                contours.row(y as u32, &row, &mut || check())?;
+            }
+            // The scalar output already owns complete, read-back native tiles.
+            // Retain one band of source pins while deriving its display contours.
+            let band_rows = (crate::raster::backed::MAX_REGION_PIXELS / (right - left) as usize) as i32;
+            let mut start = top;
+            while start < bottom {
+                let tile_end = (start / TILE as i32 + 1) * TILE as i32;
+                let end = (start + band_rows).min(tile_end).min(bottom);
+                let view = output.prepare_region(Region::new([left, start, right, end])?, &mut || check())?;
+                for y in start..end {
+                    for (x, value) in (left..right).zip(&mut row[left as usize..right as usize]) {
+                        *value = view.pixel(x, y)?[0];
+                    }
+                    contours.row(y as u32, &row, &mut || check())?;
+                }
+                start = end;
+            }
+            row.fill(0);
+            for y in bottom..height as i32 {
+                contours.row(y as u32, &row, &mut || check())?;
+            }
+            let (bounds, contours) = contours.finish(&mut || check())?;
+            let coverage = super::backed::CoverageSource::from_frozen(output, bounds, [0, 0], contours)?;
+            check()?;
+            Ok(coverage)
+        })()
+        .map_err(|e| e.to_string())
+        .map(Some)
+    }
+}
+
+fn same_pixels(
+    a: &Surface,
+    b: &Surface,
+    [left, top, right, bottom]: [i32; 4],
+    check: &mut dyn FnMut() -> Result<()>,
+) -> Result<bool> {
+    check()?;
+    if (a.width(), a.height(), a.depth()) != (b.width(), b.height(), b.depth()) {
+        return Ok(false);
+    }
+    if a.key() == b.key() {
+        return Ok(true);
+    }
+    let rows =
+        (crate::raster::backed::MAX_REGION_PIXELS / (right - left) as usize).min(TILE as usize);
+    for y0 in (top..bottom).step_by(rows) {
+        let y1 = (y0 + rows as i32).min(bottom);
+        let region = Region::new([left, y0, right, y1])?;
+        let a = a.prepare_region(region, check)?;
+        let b = b.prepare_region(region, check)?;
+        for y in y0..y1 {
+            check()?;
+            for x in left..right {
+                if a.pixel16(x, y)? != b.pixel16(x, y)? {
+                    return Ok(false);
                 }
             }
-            writer
-                .tile(left / TILE, top / TILE, &bytes, &mut || check())
-                .map_err(|e| e.to_string())?;
         }
     }
-    drop(bytes);
-    let source = writer.finish(&mut || check()).map_err(|e| e.to_string())?;
-    let output = prepare(&source, guide, c, store.clone(), &mut || check())?;
-    if output.key() == source.key() {
-        return Ok(None);
-    }
-    let mut writer = super::coverage_writer::Writer::new(width, height, store, &pool)
-        .map_err(|e| e.to_string())?;
-    let allocate = |bytes| ScratchBytes::new(&pool, bytes, bytes).map_err(|e| e.to_string());
-    let mut ring = allocate(width as usize)?;
-    let mut sums = allocate(width as usize * 4)?;
-    let mut input = allocate(width as usize)?;
-    let mut row = allocate(width as usize)?;
-    let complete =
-        super::rows::Feather::new(width, height, 0, &mut ring, &mut sums, &mut input, &mut row)
-            .map_err(str::to_owned)?
-            .run(
-                || check().map_err(|e| e.to_string()),
-                |y, row| {
-                    let view = output
-                        .prepare_region(
-                            Region::new([0, y as i32, width as i32, y as i32 + 1])
-                                .map_err(|e| e.to_string())?,
-                            &mut || check(),
-                        )
-                        .map_err(|e| e.to_string())?;
-                    for (x, value) in row.iter_mut().enumerate() {
-                        *value = view.pixel(x as i32, y as i32).map_err(|e| e.to_string())?[0];
-                    }
-                    Ok(())
-                },
-                |y, row| {
-                    writer
-                        .row(y, row, &mut || check())
-                        .map_err(|e| e.to_string())
-                },
-            )?;
-    let candidate = writer
-        .finish(&complete, &mut || check())
-        .map_err(|e| e.to_string())?;
-    check().map_err(|e| e.to_string())?;
-    Ok(Some(candidate))
+    check()?;
+    Ok(true)
 }
 
 fn red(
@@ -254,33 +436,7 @@ fn red(
     Ok(values)
 }
 
-fn morph(input: &[u16], r: usize, expand: bool, output: &mut [u16], queue: &mut [usize]) {
-    let (mut head, mut tail, mut end) = (0, 0, 0);
-    for (i, v) in output.iter_mut().enumerate() {
-        while end < (i + r + 1).min(input.len()) {
-            while tail > head
-                && if expand {
-                    input[queue[tail - 1]] <= input[end]
-                } else {
-                    input[queue[tail - 1]] >= input[end]
-                }
-            {
-                tail -= 1;
-            }
-            queue[tail] = end;
-            tail += 1;
-            end += 1;
-        }
-        while tail > head && queue[head] < i.saturating_sub(r) {
-            head += 1;
-        }
-        *v = if !expand && (i < r || i + r >= input.len()) {
-            0
-        } else {
-            input[queue[head]]
-        };
-    }
-}
+use super::morphology::line as morph;
 
 fn shifted(
     input: &Surface,
@@ -389,36 +545,72 @@ fn write(bytes: &mut [u8], depth: u16, x: usize, y: usize, value: u16) {
     }
 }
 
+fn stage_tiles(
+    [width, height]: [u32; 2],
+    depth: u16,
+    bounds: [i32; 4],
+    store: Store,
+    check: &mut dyn FnMut() -> Result<()>,
+    mut render: impl FnMut([i32; 4], &mut [u8], &mut dyn FnMut() -> Result<()>) -> Result<()>,
+) -> Result<Surface> {
+    let mut writer = super::native_tiles::Writer::new(width, height, depth, store.clone())?;
+    let columns = width.div_ceil(TILE);
+    let total = columns * height.div_ceil(TILE);
+    let n = (TILE * TILE * 4) as usize * usize::from(depth / 8);
+    let mut bytes = ScratchBytes::new(&store.resident_budget(), n, n)?;
+    let [left, top, right, bottom] = bounds.map(|v| v as u32);
+    let mut next = 0;
+    for y in top / TILE..bottom.div_ceil(TILE) {
+        for x in left / TILE..right.div_ceil(TILE) {
+            let index = y * columns + x;
+            if index > next {
+                writer.zero_tiles(index - next, check)?;
+            }
+            check()?;
+            bytes.fill(0);
+            let area = [
+                x * TILE,
+                y * TILE,
+                ((x + 1) * TILE).min(width),
+                ((y + 1) * TILE).min(height),
+            ];
+            render(area.map(|v| v as i32), &mut bytes, check)?;
+            writer.tile(x, y, &bytes, check)?;
+            next = index + 1;
+        }
+    }
+    if next < total {
+        writer.zero_tiles(total - next, check)?;
+    }
+    writer.finish(check)
+}
+
 fn base(
     input: &Surface,
+    bounds: [i32; 4],
     s: Settings,
     store: Store,
     check: &mut dyn FnMut() -> Result<()>,
 ) -> Result<Surface> {
-    let mut writer = super::native_tiles::Writer::new(
-        input.width(),
-        input.height(),
+    stage_tiles(
+        [input.width(), input.height()],
         input.depth(),
-        store.clone(),
-    )?;
-    let n = (TILE * TILE * 4) as usize * usize::from(input.depth() / 8);
-    let mut bytes = ScratchBytes::new(&store.resident_budget(), n, n)?;
-    for top in (0..input.height()).step_by(TILE as usize) {
-        for left in (0..input.width()).step_by(TILE as usize) {
-            check()?;
-            bytes.fill(0);
-            let tw = (input.width() - left).min(TILE) as usize;
-            let th = (input.height() - top).min(TILE) as usize;
+        bounds,
+        store,
+        check,
+        |[left, top, right, bottom], bytes, check| {
+            let tw = (right - left) as usize;
+            let th = (bottom - top) as usize;
             let halo = s.smooth + s.feather;
             let w = tw + 2 * halo;
             let h = th + 2 * halo;
             let source = shifted(
                 input,
                 [
-                    left as i32 - halo as i32,
-                    top as i32 - halo as i32,
-                    left as i32 + tw as i32 + halo as i32,
-                    top as i32 + th as i32 + halo as i32,
+                    left - halo as i32,
+                    top - halo as i32,
+                    right + halo as i32,
+                    bottom + halo as i32,
                 ],
                 s.shift,
                 check,
@@ -443,44 +635,39 @@ fn base(
                     let v = ((block[(y + halo) * w + x + halo] - 0.5) / (1. - s.contrast * 0.99)
                         + 0.5)
                         .clamp(0., 1.);
-                    write(&mut bytes, input.depth(), x, y, (v * 65535.).round() as u16);
+                    write(bytes, input.depth(), x, y, (v * 65535.).round() as u16);
                 }
             }
-            writer.tile(left / TILE, top / TILE, &bytes, check)?;
-        }
-    }
-    writer.finish(check)
+            Ok(())
+        },
+    )
 }
 
 fn guided(
     input: &Surface,
-    guide: &Surface,
+    bounds: [i32; 4],
+    (guide, [gx, gy, _, _]): (&Surface, [i32; 4]),
     s: Settings,
     store: Store,
     check: &mut dyn FnMut() -> Result<()>,
 ) -> Result<Surface> {
-    let mut writer = super::native_tiles::Writer::new(
-        input.width(),
-        input.height(),
+    stage_tiles(
+        [input.width(), input.height()],
         input.depth(),
-        store.clone(),
-    )?;
-    let n = (TILE * TILE * 4) as usize * usize::from(input.depth() / 8);
-    let mut bytes = ScratchBytes::new(&store.resident_budget(), n, n)?;
-    for top in (0..input.height()).step_by(TILE as usize) {
-        for left in (0..input.width()).step_by(TILE as usize) {
-            check()?;
-            bytes.fill(0);
-            let tw = (input.width() - left).min(TILE) as usize;
-            let th = (input.height() - top).min(TILE) as usize;
+        bounds,
+        store,
+        check,
+        |[left, top, right, bottom], bytes, check| {
+            let tw = (right - left) as usize;
+            let th = (bottom - top) as usize;
             let halo = 2 * s.radius;
             let w = tw + 2 * halo;
             let h = th + 2 * halo;
             let area = [
-                left as i32 - halo as i32,
-                top as i32 - halo as i32,
-                left as i32 + tw as i32 + halo as i32,
-                top as i32 + th as i32 + halo as i32,
+                left - halo as i32,
+                top - halo as i32,
+                right + halo as i32,
+                bottom + halo as i32,
             ];
             let native = red(input, area, true, check)?;
             let mut source = zeroes(w * h)?;
@@ -494,18 +681,18 @@ fn guided(
                 check()?;
                 let y1 = (y0 + stripe).min(h);
                 let bounds = [
-                    area[0].clamp(0, input.width() as i32 - 1),
-                    (area[1] + y0 as i32).clamp(0, input.height() as i32 - 1),
-                    (area[2] - 1).clamp(0, input.width() as i32 - 1) + 1,
-                    (area[1] + y1 as i32 - 1).clamp(0, input.height() as i32 - 1) + 1,
+                    area[0].clamp(0, input.width() as i32 - 1) - gx,
+                    (area[1] + y0 as i32).clamp(0, input.height() as i32 - 1) - gy,
+                    (area[2] - 1).clamp(0, input.width() as i32 - 1) + 1 - gx,
+                    (area[1] + y1 as i32 - 1).clamp(0, input.height() as i32 - 1) + 1 - gy,
                 ];
                 let view = guide.prepare_region(Region::new(bounds)?, check)?;
                 for y in y0..y1 {
                     check()?;
                     for x in 0..w {
                         let p = view.pixel(
-                            (area[0] + x as i32).clamp(0, input.width() as i32 - 1),
-                            (area[1] + y as i32).clamp(0, input.height() as i32 - 1),
+                            (area[0] + x as i32).clamp(0, input.width() as i32 - 1) - gx,
+                            (area[1] + y as i32).clamp(0, input.height() as i32 - 1) - gy,
                         )?;
                         image[y * w + x] =
                             (p[0] as f32 * 0.2126 + p[1] as f32 * 0.7152 + p[2] as f32 * 0.0722)
@@ -543,13 +730,12 @@ fn guided(
                     let v = ((source[i] * (1. - s.edge) + q * s.edge) * 65535.)
                         .round()
                         .clamp(0., 65535.) as u16;
-                    write(&mut bytes, input.depth(), x, y, v);
+                    write(bytes, input.depth(), x, y, v);
                 }
             }
-            writer.tile(left / TILE, top / TILE, &bytes, check)?;
-        }
-    }
-    writer.finish(check)
+            Ok(())
+        },
+    )
 }
 
 #[cfg(test)]
@@ -578,6 +764,82 @@ mod tests {
         )
         .unwrap();
         (store, path)
+    }
+
+    #[test]
+    fn bounded_refinement_matches_full_guide_with_offset_coverage_beyond_hint() {
+        let size @ [width, height] = [1089, 1051];
+        let origin = [773, 780];
+        let pool = ResidentBudget::new(128 * 1024 * 1024).unwrap();
+        let (store, path) = fixture(&pool);
+        let mut full = Raster::new(width, height);
+        let mut local = Raster::new(17, 15);
+        for y in 0..15 {
+            for x in 0..17 {
+                let value = (35 + (x * 19 + y * 23) % 221) as u8;
+                local.set(x, y, [value, 0, 0, 0]);
+                full.set(x + origin[0], y + origin[1], [value; 4]);
+            }
+        }
+        let mask = Surface::stage_raster(&local, store.clone(), &mut || Ok(())).unwrap();
+        let input = super::super::SelectionSource::Coverage(
+            super::super::backed::CoverageSource::new(
+                mask,
+                [780, 786, 782, 788],
+                origin,
+                &[],
+                &pool,
+            )
+            .unwrap(),
+        );
+        let settings =
+            json!({"shift":4,"smooth":3,"feather":8,"contrast":17,"edge":70,"edge_radius":5});
+        let plan = SelectionPlan::capture(&input, size, &settings, &|| Ok(())).unwrap();
+        let crop = plan.guide_rect(false).unwrap();
+        let [left, top, right, bottom] = crop;
+        assert_eq!(crop, [246, 246, width as i32, height as i32]);
+        assert_eq!(plan.guide_rect(true).unwrap(), [0, top, right, bottom]);
+        let mut full_guide = Raster::new(width, height);
+        let mut crop_guide = Raster::new((right - left) as u32, (bottom - top) as u32);
+        for y in 0..height as i32 {
+            for x in 0..width as i32 {
+                let color = [(x * 11) as u8, (y * 17) as u8, ((x + y) * 9) as u8, 255];
+                full_guide.set(x, y, color);
+                if x >= left && y >= top {
+                    crop_guide.set(x - left, y - top, color);
+                }
+            }
+        }
+        let staged = |raster| Surface::stage_raster(raster, store.clone(), &mut || Ok(())).unwrap();
+        let guide = staged(&crop_guide);
+        let actual = plan
+            .prepare(Some((&guide, crop)), store.clone(), &|| Ok(()))
+            .unwrap()
+            .unwrap();
+        let expected = prepare(
+            &staged(&full),
+            Some(&staged(&full_guide)),
+            &settings,
+            store.clone(),
+            &mut || Ok(()),
+        )
+        .unwrap();
+        assert!(
+            same_pixels(actual.mask(), &expected, [0, 0, right, bottom], &mut || Ok(
+                ()
+            ))
+            .unwrap()
+        );
+        assert!(plan
+            .prepare(
+                Some((&guide, [left + 1, top, right, bottom])),
+                store.clone(),
+                &|| Ok(())
+            )
+            .is_err());
+        drop((actual, expected, guide, input, store));
+        assert_eq!(pool.used(), 0);
+        std::fs::remove_dir_all(path).unwrap();
     }
 
     #[test]
@@ -785,6 +1047,17 @@ mod tests {
                 prepare_selection(&input, 33, 31, None, &settings, store.clone(), &|| Ok(()))
                     .unwrap()
                     .unwrap();
+            let reference = super::super::stage_rows(33, 31, store.clone(), &pool, &|| Ok(()), |y, row| {
+                for (x, value) in row.iter_mut().enumerate() {
+                    *value = expected.as_ref().map_or(0, |coverage| {
+                        (coverage.value(x as i32, y as i32) * 255.).round() as u8
+                    });
+                }
+                Ok(())
+            }).unwrap();
+            assert_eq!(candidate.origin(), reference.origin());
+            assert_eq!(candidate.bounds(), reference.bounds());
+            assert_eq!(candidate.contours(), reference.contours());
             let view = candidate
                 .prepare_region(Region::new([0, 0, 33, 31]).unwrap(), &pool, &mut || Ok(()))
                 .unwrap();
@@ -798,6 +1071,7 @@ mod tests {
                 }
             }
             drop(view);
+            drop(reference);
             drop(candidate);
             drop(input);
             drop(store);

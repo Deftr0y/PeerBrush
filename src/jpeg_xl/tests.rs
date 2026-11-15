@@ -100,6 +100,9 @@ fn completed_native_workers_apply_child_limits_and_preserve_parent_policy() {
 fn fault() -> String {
     std::env::var("PEERBRUSH_JXL_TEST_FAULT").unwrap_or_default()
 }
+pub(super) fn has_body_fault() -> bool {
+    matches!(fault().as_str(), "exit" | "abort" | "sleep" | "noise" | "truncated" | "oversized" | "partial")
+}
 pub(super) fn ready_response(mut ready: Response) -> Response {
     match fault().as_str() {
         "wrong_nonce" => ready.nonce.replace_range(
@@ -381,6 +384,7 @@ fn known_reaped_child_never_reaches_primary_or_fallback_kill() {
     let mut child = command.spawn().unwrap();
     assert!(!child.wait().unwrap().success());
     let stop = Arc::new(AtomicBool::new(false));
+    let may_retire = Arc::new(AtomicBool::new(false));
     let mut guard = ChildGuard {
         child: Some(child),
         done: false,
@@ -388,6 +392,7 @@ fn known_reaped_child_never_reaches_primary_or_fallback_kill() {
         _limits: None,
         _source: None,
         _resources: None,
+        may_retire: Some(may_retire.clone()),
         primary_kill_failed: true,
         kill_calls: 0,
     };
@@ -395,6 +400,8 @@ fn known_reaped_child_never_reaches_primary_or_fallback_kill() {
     assert!(guard.done);
     assert!(stop.load(Ordering::SeqCst));
     assert_eq!(guard.kill_calls, 0);
+    drop(guard);
+    assert!(may_retire.load(Ordering::SeqCst));
     assert!(!FAILED_STOP.load(Ordering::SeqCst));
     assert!(RETAINED.lock().unwrap().is_none());
 }
@@ -456,6 +463,53 @@ fn strict_metadata_lengths_nonce_source_and_trailing_bytes_fail_before_output() 
     result.profile_bytes = crate::color_profile::MAX_PROFILE_BYTES as u32 + 1;
     assert!(result.validate(&request).is_err());
     assert!(eof(&mut Cursor::new([1])).is_err());
+}
+
+#[test]
+fn inspected_decode_shape_is_checked_in_the_child_before_output_registration() {
+    let _serial = PROCESS_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    let encoded = encode(
+        3,
+        2,
+        PixelsRef::Sixteen(&[12347; 24]),
+        None,
+        Options::default(),
+        &|| Ok(()),
+    )
+    .unwrap();
+    let expected = Info {
+        width: 3,
+        height: 2,
+        bit_depth: 16,
+    };
+    for info in [
+        expected,
+        Info {
+            width: 4,
+            ..expected
+        },
+        Info {
+            bit_depth: 8,
+            ..expected
+        },
+    ] {
+        let request =
+            super::request(Operation::Decode, Some(info), None, 0, encoded.len()).unwrap();
+        request.validate().unwrap();
+        let output = invoke(
+            request,
+            Input::Encoded(&encoded),
+            &|| Ok(()),
+            runtime("", 16, DEADLINE, None),
+        );
+        assert_eq!(output.is_ok(), info == expected);
+    }
+    assert!(
+        super::request(Operation::Inspect, Some(expected), None, 0, encoded.len())
+            .unwrap()
+            .validate()
+            .is_err()
+    );
 }
 #[test]
 fn abnormal_exit_abort_protocol_damage_and_timeout_preserve_parent_native_work() {

@@ -245,8 +245,8 @@ mod tests {
 
     fn document(depth: u16) -> Document {
         let mut engine = Engine::new();
-        engine.doc = Document::new_depth(259, 73, depth).unwrap();
-        let id = engine.doc.layers[0].id.clone();
+        engine.resident_state_mut().expect("resident fixture").document = Document::new_depth(259, 73, depth).unwrap();
+        let id = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
         engine
             .edit(
                 "human",
@@ -259,7 +259,7 @@ mod tests {
                 "Fixture",
             )
             .unwrap();
-        let layer = &mut engine.doc.layers[0];
+        let layer = &mut engine.resident_state_mut().expect("resident fixture").document.layers[0];
         for y in 2..70 {
             for x in 3..257 {
                 layer.pixels.set16(
@@ -281,9 +281,9 @@ mod tests {
         overlay.pixels = Raster::new_depth(259, 73, depth);
         overlay.opacity = 0.37;
         overlay.pixels.set16(256, 32, [53001, 43003, 33007, 22009]);
-        engine.doc.layers.insert(0, overlay);
-        engine.doc.srgb_tagged = true;
-        engine.doc
+        engine.resident_state_mut().expect("resident fixture").document.layers.insert(0, overlay);
+        engine.resident_state_mut().expect("resident fixture").document.srgb_tagged = true;
+        engine.into_resident_document().unwrap()
     }
 
     #[test]
@@ -293,7 +293,7 @@ mod tests {
                 let mut doc = document(depth);
                 if filtered {
                     let mut engine = Engine::new();
-                    engine.doc = doc;
+                    engine.resident_state_mut().expect("resident fixture").document = doc;
                     engine
                         .edit(
                             "human",
@@ -303,7 +303,7 @@ mod tests {
                             "Filter",
                         )
                         .unwrap();
-                    doc = engine.doc;
+                    doc = engine.into_resident_document().unwrap();
                 }
                 let before = serde_json::to_value(&doc).unwrap();
                 for target in [None, Some(doc.layers[1].id.clone())] {

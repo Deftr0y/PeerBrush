@@ -1,7 +1,10 @@
-//! Bounded RGB matrix/TRC and classic LUT ICC conversion. Source samples stay in their profile;
-//! only display previews and an explicitly requested sRGB copy are converted.
+//! Bounded RGB matrix/TRC and classic LUT ICC conversion, plus monochrome tone
+//! curves for protected grayscale previews.
 #[path = "color_profile/prepared.rs"]
 pub(crate) mod prepared;
+pub(crate) mod device_link;
+pub(crate) mod device_link_mpe;
+pub(crate) mod clut;
 use moxcms::{
     ColorProfile, DataColorSpace, Layout, ProfileClass, RenderingIntent, Transform16BitExecutor,
     Transform8BitExecutor, TransformOptions,
@@ -93,6 +96,15 @@ fn parse_observing(
     bytes: &[u8],
     native_error: &mut dyn FnMut(&moxcms::CmsError),
 ) -> Result<ColorProfile, String> {
+    parse_color_space(bytes, DataColorSpace::Rgb, native_error)
+}
+
+fn parse_color_space(
+    bytes: &[u8],
+    space: DataColorSpace,
+    native_error: &mut dyn FnMut(&moxcms::CmsError),
+) -> Result<ColorProfile, String> {
+    let grayscale = space == DataColorSpace::Gray;
     if bytes.len() > MAX_PROFILE_BYTES || bytes.len() < 132 {
         return Err("ICC profile exceeds the supported size or is truncated".into());
     }
@@ -100,12 +112,12 @@ fn parse_observing(
         return Err("Invalid ICC profile header or size".into());
     }
     if !matches!(bytes[8], 2 | 4)
-        || &bytes[16..20] != b"RGB "
+        || &bytes[16..20] != if grayscale { b"GRAY" } else { b"RGB " }
         || !matches!(&bytes[20..24], b"XYZ " | b"Lab ")
+        || grayscale && &bytes[20..24] != b"XYZ "
     {
-        return Err(
-            "Only ICC v2/v4 RGB profiles with XYZ or Lab connection space are supported".into(),
-        );
+        return Err(if grayscale { "Grayscale preview requires an ICC v2/v4 monochrome profile with XYZ connection space" }
+            else { "Only ICC v2/v4 RGB profiles with XYZ or Lab connection space are supported" }.into());
     }
     let count = number(bytes, 128)?;
     if count > 128 || 132 + count * 12 > bytes.len() {
@@ -138,6 +150,9 @@ fn parse_observing(
             &signature,
             b"A2B0" | b"A2B1" | b"A2B2" | b"B2A0" | b"B2A1" | b"B2A2"
         ) {
+            if grayscale {
+                return Err("Grayscale preview requires a monochrome ICC tone-curve profile".into());
+            }
             let words = classic_lut(&bytes[offset..offset + length])?;
             if !words && &bytes[20..24] == b"XYZ " {
                 return Err("lut8 PCS XYZ has no standardized encoding".into());
@@ -160,9 +175,12 @@ fn parse_observing(
     }
     let lut = !forward.is_empty();
     if !tags.contains(b"wtpt") {
-        return Err("RGB ICC profiles require a white point".into());
+        return Err("ICC profiles require a white point".into());
     }
-    if !lut
+    if grayscale && !tags.contains(b"kTRC") {
+        return Err("Grayscale ICC profiles require a monochrome tone curve".into());
+    }
+    if !grayscale && !lut
         && [
             *b"rXYZ", *b"gXYZ", *b"bXYZ", *b"rTRC", *b"gTRC", *b"bTRC", *b"wtpt",
         ]
@@ -205,7 +223,7 @@ fn parse_observing(
         native_error(&e);
         format!("Invalid ICC profile: {e}")
     })?;
-    if profile.color_space != DataColorSpace::Rgb
+    if profile.color_space != space
         || !matches!(profile.pcs, DataColorSpace::Xyz | DataColorSpace::Lab)
         || !matches!(
             profile.profile_class,
@@ -215,9 +233,18 @@ fn parse_observing(
                 | ProfileClass::ColorSpace
         )
     {
-        return Err(
-            "Only RGB input, display, output or color-space profiles can be converted".into(),
-        );
+        return Err("Only ICC input, display, output or color-space profiles can be converted".into());
+    }
+    if grayscale {
+        if profile.gray_trc.is_none() {
+            return Err("Invalid grayscale ICC tone curve".into());
+        }
+        if profile.media_white_point.as_ref().is_none_or(|white| {
+            [white.x, white.y, white.z].into_iter().any(|value| !value.is_finite() || value <= 0.)
+        }) {
+            return Err("Invalid grayscale ICC media white point".into());
+        }
+        return Ok(profile);
     }
     if lut {
         return Ok(profile);
@@ -305,13 +332,21 @@ impl Transforms {
             return Err("Invalid RGBA sample length".into());
         }
         let mut output = vec![0; pixels.len()];
+        self.convert16_into(pixels, &mut output)?;
+        pixels.copy_from_slice(&output);
+        Ok(())
+    }
+
+    pub(crate) fn convert16_into(&self, input: &[u16], output: &mut [u16]) -> Result<(), String> {
+        if input.len() % 4 != 0 || input.len() != output.len() {
+            return Err("Invalid RGBA sample length".into());
+        }
         self.words
-            .transform(pixels, &mut output)
+            .transform(input, output)
             .map_err(|e| e.to_string())?;
-        for (source, target) in pixels.chunks_exact(4).zip(output.chunks_exact_mut(4)) {
+        for (source, target) in input.chunks_exact(4).zip(output.chunks_exact_mut(4)) {
             target[3] = source[3];
         }
-        pixels.copy_from_slice(&output);
         Ok(())
     }
 }
@@ -341,4 +376,12 @@ pub fn summary(profile: Option<&[u8]>) -> serde_json::Value {
             }
         },
     }
+}
+pub(crate) fn srgb_to_linear(encoded: f64) -> f64 {
+    if encoded <= 0.04045 { encoded / 12.92 } else { ((encoded + 0.055) / 1.055).powf(2.4) }
+}
+
+pub(crate) fn linear_to_srgb(linear: f64) -> f64 {
+    let linear = linear.clamp(0., 1.);
+    if linear <= 0.0031308 { 12.92 * linear } else { 1.055 * linear.powf(1. / 2.4) - 0.055 }
 }

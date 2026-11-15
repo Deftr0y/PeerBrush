@@ -226,6 +226,85 @@ fn capture(history: &NativeHistory, current: &NativeDocument) -> TaskCapture {
         )
         .unwrap()
 }
+
+#[test]
+fn task_frame_undo_preserves_a_saved_filename_and_still_refuses_later_human_pixels() {
+    for depth in [8, 16] {
+        for later_pixels in [false, true] {
+            let session = Session::new();
+            let mut before = Document::new_depth(4, 2, depth).unwrap();
+            before.layers[0]
+                .pixels
+                .set16(0, 0, [12347, 23459, 34571, 65535]);
+            let mut current = session.capture(&before);
+            let mut history = NativeHistory::new(&session.pool, 8).unwrap();
+            let descriptor = CommandDescriptor::from_normalized(&current, 0,
+                &[serde_json::json!({"op":"canvas.resize","width":5,"height":2,"anchor":"top_left"})], &|| Ok(())).unwrap();
+            let edit = current
+                .capture_descriptor(descriptor, "agent", &[], 1, false, true)
+                .unwrap();
+            let delta = crate::engine::native::canvas::prepare(edit, &|| Ok(())).unwrap();
+            let prepared = history
+                .snapshot()
+                .prepare_commit(
+                    &current,
+                    delta,
+                    HistoryRequest {
+                        actor: "agent",
+                        label: "Canvas",
+                        task: Some("task"),
+                        gesture: None,
+                    },
+                    &|| Ok(()),
+                )
+                .unwrap();
+            history
+                .commit(&mut current, gate("agent"), prepared)
+                .unwrap()
+                .retire(&session, &|| Ok(()))
+                .unwrap();
+            let name = history
+                .snapshot()
+                .prepare_save_name(&current, "Human save.psb", &|| Ok(()))
+                .unwrap();
+            drop(history.commit_save_name(&mut current, name).unwrap());
+            let mut human = before.layers[0].pixels.clone();
+            if later_pixels {
+                human.set16(2, 1, [45001, 35003, 25007, 65535]);
+                replace(&session, &mut current, &mut history, &human, "human", None);
+            }
+            let key = current.key();
+            let prepared = capture(&history, &current).prepare(&session, &|| Ok(()));
+            if later_pixels {
+                assert!(prepared.is_err());
+                assert_eq!(current.key(), key);
+                assert_eq!(current.metadata().width(), 5);
+                let region = current
+                    .source(current.metadata().layer(0).unwrap().pixels().slot())
+                    .unwrap()
+                    .prepare_region(Region::new([0, 0, 4, 2]).unwrap(), &mut || Ok(()))
+                    .unwrap();
+                assert_eq!(region.pixel16(2, 1).unwrap(), human.get16(2, 1));
+            } else {
+                let candidate = prepared.unwrap_or_else(|error| panic!("{}", error.reason));
+                assert_eq!(candidate.preview().metadata().name(), "Human save.psb");
+                let prepared = history
+                    .snapshot()
+                    .prepare_task(candidate, &|| Ok(()))
+                    .unwrap();
+                history
+                    .commit(&mut current, gate("human"), prepared)
+                    .unwrap()
+                    .retire(&session, &|| Ok(()))
+                    .unwrap();
+                assert_eq!(current.metadata().width(), 4);
+                assert_eq!(pixel(&current, 0), before.layers[0].pixels.get16(0, 0));
+            }
+            assert_eq!(current.metadata().name(), "Human save.psb");
+            assert_eq!(current.metadata().depth(), depth);
+        }
+    }
+}
 fn pixel(current: &NativeDocument, x: i32) -> [u16; 4] {
     current
         .source(current.metadata().layer(0).unwrap().pixels().slot())
@@ -283,8 +362,11 @@ fn task_pixels_preserve_later_human_bytes_and_compensate_once_with_undo_redo() {
             Some("task"),
         );
         let mut oracle = Engine::new();
-        oracle.doc = final_agent.clone();
-        oracle.undo = vec![
+        oracle
+            .resident_state_mut()
+            .expect("resident fixture")
+            .document = final_agent.clone();
+        oracle.resident_state_mut().expect("resident fixture").undo = vec![
             History {
                 before: before.clone(),
                 after: after.clone(),
@@ -336,7 +418,13 @@ fn task_pixels_preserve_later_human_bytes_and_compensate_once_with_undo_redo() {
                     .unwrap();
                 assert_eq!(
                     region.pixel16(x, y).unwrap(),
-                    oracle.doc.layers[0].pixels.get16(x, y)
+                    oracle
+                        .resident_state()
+                        .expect("resident fixture")
+                        .document
+                        .layers[0]
+                        .pixels
+                        .get16(x, y)
                 );
             }
         }

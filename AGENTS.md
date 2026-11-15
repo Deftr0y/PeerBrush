@@ -1,11 +1,12 @@
 # PeerBrush development
 
-- Develop directly on the appropriate `version/<version>` branch; the active milestone is `version/0.3` (application hotfix version 0.30.1). Do not create routine feature/fix PRs or run development CI. Production is `main`; a version-to-`main` release candidate receives the essential gate once before promotion. `dev` and existing feature branches retain historical/WIP work. Never force-push or delete that history. Historical maintenance and website content have separate roles in the [development guide](docs/development-guide.md).
+- Develop directly on the appropriate `version/<version>` branch. The active branch is `version/0.4`, with 0.4.0 as the working version after the published 0.30.1 release. Do not create routine feature/fix PRs or run development CI. Production is `main`. A version-to-`main` release candidate receives the essential gate once before promotion. `dev` and existing feature branches retain historical/WIP work. Never force-push or delete that history. Historical maintenance and website content have separate roles in the [development guide](docs/development-guide.md).
 
 - Git attribution belongs to the human contributor. Never register an LLM or AI tool as a commit author, committer, co-author or contributor, or add automated contributor badges. Use an approved human identity from `.github/human-contributors.json`; adding another identity requires the maintainer to verify that it belongs to a human. GitHub's signing service is allowed only as a committer. Keep the README's AI-development disclosure.
 
 - Preserve the GPL v3 license and Ember palette from MayaMCP.
 - Use compact, unboxed range values. Avoid decorative containers and borders that add clutter or waste space.
+- Use controls suited to the setting throughout PeerBrush. Use an interactive color picker for colors and recognizable icons for visual choices such as text alignment. Give icon controls accessible labels and tooltips. Keep precise entry available where the setting needs it.
 - Show the actual rendered result while the user works: strokes, transforms, blend choices, effect changes and layer reordering. Preview through the shared engine, without committing history until the gesture finishes. Outline-only feedback is insufficient.
 - Show AI work in blue. Animate meaningful AI changes in presentation only: numeric controls, canvas results and hierarchy movement. Commit the actual shared state immediately, keep animations out of history/PSD sources, isolate derived caches, and let human input interrupt them.
 - Editing logic belongs in the document engine. UI, MCP, and CLI must share commands and enforce the same reservations.

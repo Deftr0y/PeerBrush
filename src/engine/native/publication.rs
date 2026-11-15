@@ -211,9 +211,8 @@ impl SourcePublication {
     ) -> Result<Self> {
         check()?;
         let physical = candidate
-            .roster()
-            .iter()
-            .try_fold(0usize, |count, (_, source)| {
+            .owned_sources()
+            .try_fold(0usize, |count, source| {
                 count
                     .checked_add(source.physical_tiles().count())
                     .ok_or("Native publication source count overflow")
@@ -251,7 +250,7 @@ impl SourcePublication {
         if owners.capacity() > physical {
             return Err("Native publication owner allocation exceeds admission".into());
         }
-        for (_, surface) in candidate.roster().iter() {
+        for surface in candidate.owned_sources() {
             for tile in surface.physical_tiles() {
                 check()?;
                 owners.push(tile.owner().identity());

@@ -151,6 +151,7 @@ struct Inverse<'a, R> {
     report: Report,
     text: usize,
     check: &'a dyn Fn() -> Result<()>,
+    name_from_save: bool,
 }
 
 /// `current` is a fresh admitted metadata copy, not live authority. All source
@@ -163,6 +164,17 @@ pub(crate) fn inverse<'a>(
     rasters: &'a mut impl Resolver,
     pool: &'a ResidentBudget,
     check: &'a dyn Fn() -> Result<()>,
+) -> Result<MetadataResult> {
+    inverse_with_saved_name(before, after, current, rasters, pool, check, false)
+}
+pub(super) fn inverse_with_saved_name<'a>(
+    before: &'a Document36,
+    after: &'a Document36,
+    current: Admitted<Document36>,
+    rasters: &'a mut impl Resolver,
+    pool: &'a ResidentBudget,
+    check: &'a dyn Fn() -> Result<()>,
+    name_from_save: bool,
 ) -> Result<MetadataResult> {
     check()?;
     if !current.owner().uses_budget(pool) {
@@ -230,6 +242,7 @@ pub(crate) fn inverse<'a>(
         report: Report::default(),
         text: 0,
         check,
+        name_from_save,
     };
     let b = bp.header.map_unique(|value, _| {
         let mut node = work.project(value, &before, Side::Before)?;
@@ -260,6 +273,13 @@ pub(crate) fn inverse<'a>(
         }
         asset.shared()
     })?;
+    let linked = |doc: &Document36| {
+        doc.layers.iter().flat_map(|layer| &layer.effects).chain(&doc.filters)
+            .all(|effect| crate::effects::styles::global_light_matches(&effect.settings, doc.psd_global_angle))
+    };
+    if linked(&current) && !linked(&candidate) {
+        work.conflict(None, "document.global_light", None, "Global Light links changed after this task")?;
+    }
     candidate.revision = current.revision;
     work.import_document(&mut candidate)?;
     candidate.visit_rasters(|_| Ok(()))?;
@@ -926,8 +946,14 @@ impl<'a, R: Resolver> Inverse<'a, R> {
         }
         if changed {
             let co = c.object()?;
+            // Only a captured save-name change may coexist with frame undo.
+            // A task that itself renamed the document retains the strict check.
+            let saved_name = self.name_from_save && self.equal(&bo["name"], &ao["name"])?;
             for (key, value) in ao {
-                if key != "revision" && !self.equal(value, &co[key])? {
+                if key != "revision"
+                    && !(key == "name" && saved_name)
+                    && !self.equal(value, &co[key])?
+                {
                     self.scope(None, None)?;
                     return self.conflict(
                         None,

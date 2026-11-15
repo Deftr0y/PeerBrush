@@ -5,9 +5,29 @@ use super::*;
 impl NativeDocument {
     /// This prepares an unregistered owner outside Engine/registry locks. It is
     /// not a source proof, registry permission, history edit or file publication.
-    pub(crate) fn for_runtime_registration(&self, check: &dyn Fn() -> Result<()>) -> Result<Self> {
+    pub(crate) fn for_runtime_registration(
+        &self,
+        filename: Option<&str>,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<Self> {
         check()?;
-        let identity_charge = MetadataCharge::reserve(self.budget(), 128, check)?;
+        let bytes = filename
+            .map_or(0, str::len)
+            .checked_add(128)
+            .ok_or("Native open identity admission overflow")?;
+        let identity_charge = MetadataCharge::reserve(self.budget(), bytes, check)?;
+        let name = filename
+            .map(|filename| -> Result<_> {
+                let mut name = String::new();
+                name.try_reserve_exact(filename.len())
+                    .map_err(|_| "Native open filename allocation refused")?;
+                if name.capacity() > filename.len() {
+                    return Err("Native open filename exceeds admission".into());
+                }
+                name.push_str(filename);
+                Ok(name)
+            })
+            .transpose()?;
         let copied = copy_metadata(&self.core.metadata, self.budget(), check)?;
         let mut identity = String::new();
         identity
@@ -24,6 +44,9 @@ impl NativeDocument {
         let disk = self.core.disk.clone();
         let core = copied.rehome_unique(|mut metadata, _| {
             metadata.id = identity;
+            if let Some(name) = name {
+                metadata.name = name;
+            }
             Core::prepare(metadata, roster, resident, disk, check)
         })?;
         // The new header now owns the identity allocation independently of this
@@ -44,7 +67,7 @@ mod tests {
         let key = original.key();
         let slot = original.metadata().layer(0).unwrap().pixels().slot();
         let source_key = original.source(slot).unwrap().key();
-        let registered = original.for_runtime_registration(&|| Ok(())).unwrap();
+        let registered = original.for_runtime_registration(None, &|| Ok(())).unwrap();
         assert_ne!(registered.key(), key);
         assert_ne!(registered.metadata().id(), original.metadata().id());
         assert!(uuid::Uuid::parse_str(registered.metadata().id()).is_ok());
@@ -81,13 +104,13 @@ mod tests {
         let key = original.key();
         let baseline = pool.used();
         assert!(original
-            .for_runtime_registration(&|| Err("cancelled registration".into()))
+            .for_runtime_registration(None, &|| Err("cancelled registration".into()))
             .is_err());
         assert_eq!(pool.used(), baseline);
         let remainder = pool.limit() - baseline - 1;
         let ballast = pool.reserve_bytes(remainder, remainder).unwrap();
         let occupied = pool.used();
-        assert!(original.for_runtime_registration(&|| Ok(())).is_err());
+        assert!(original.for_runtime_registration(None, &|| Ok(())).is_err());
         assert_eq!(pool.used(), occupied);
         assert_eq!(original.key(), key);
         drop(ballast);

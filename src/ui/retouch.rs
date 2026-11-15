@@ -38,18 +38,34 @@ impl PeerBrush {
         if ![Tool::Clone, Tool::Heal].contains(&self.tool) {
             return;
         }
-        ui.checkbox(&mut self.retouch_aligned, "Aligned");
-        ui.add_enabled(
-            !self.mask,
-            egui::Checkbox::new(&mut self.retouch_merged, "Merged"),
-        );
-        if ui
-            .selectable_label(self.retouch_pick, "Set source")
-            .on_hover_text("Click an image source, or Alt-click the canvas")
-            .clicked()
-        {
-            self.retouch_pick = !self.retouch_pick;
+        ui.horizontal(|ui| {
+            controls::label(ui, "Source tracking");
+            ui.spacing_mut().item_spacing.x = 2.;
+            for (aligned, icon, label, help) in [
+                (true, Icon::RetouchAligned, "Keep source offset", "Keep the same distance and direction between source and brush across strokes."),
+                (false, Icon::RetouchRestart, "Restart at source", "Start each stroke from the chosen source point."),
+            ] {
+                if icons::selectable(ui, icon, self.retouch_aligned == aligned, label)
+                    .on_hover_text(help).clicked()
+                {
+                    self.retouch_aligned = aligned;
+                }
+            }
+        });
+        if self.mask {
+            ui.label("Sample mask")
+                .on_hover_text("Clone and Heal sample the evaluated layer mask while mask editing is active.");
+        } else {
+            controls::layer_sampling(
+                ui,
+                &mut self.retouch_merged,
+                "Sample source layer",
+                "Sample the chosen source layer’s original pixels.",
+                "Sample the visible composite, including effects and masks.",
+            );
         }
+        icons::toggle(ui, Icon::Picker, &mut self.retouch_pick, "Set source")
+            .on_hover_text("Click the canvas to pick the source, or Alt-click to pick directly.");
         ui.label(
             RichText::new(
                 self.retouch_source
@@ -66,7 +82,7 @@ impl PeerBrush {
             .color(MUTED),
         );
     }
-    pub(super) fn retouch_command(&self, command: &mut Value, points: &[[f32; 2]]) {
+    pub(super) fn retouch_command(&self, command: &mut Value, first: Option<[f32; 2]>) {
         if ![Tool::Clone, Tool::Heal].contains(&self.tool) {
             return;
         }
@@ -78,7 +94,7 @@ impl PeerBrush {
         if let Some(source) = &self.retouch_source {
             let mut point = source.point;
             if self.retouch_aligned {
-                if let (Some(destination), Some(first)) = (source.destination, points.first()) {
+                if let (Some(destination), Some(first)) = (source.destination, first) {
                     point = [
                         point[0] + first[0] - destination[0],
                         point[1] + first[1] - destination[1],

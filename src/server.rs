@@ -1,9 +1,19 @@
 mod fonts;
 mod instance;
 mod native_edit;
-pub(crate) use native_edit::{edit_shared, edit_shared_controlled, EditControl, EditReply};
+mod native_open;
+mod export_file;
+pub(crate) use native_open::{ImageChoice, ImageOpen};
+pub(crate) mod code_feedback;
+mod proposals;
+mod native_save;
+pub(crate) use native_edit::{
+    edit_code_shared, edit_shared, edit_shared_controlled, edit_shared_observed, history_shared,
+    history_shared_controlled, paste_image_shared, paste_layers_shared, paste_resident_images_shared,
+    EditControl, EditReply,
+};
 pub(crate) mod observation;
-mod reply;
+pub(crate) mod reply;
 mod stream;
 #[cfg(test)]
 mod stream_http_tests;
@@ -27,6 +37,11 @@ use std::{
 };
 
 pub type Shared = Arc<Mutex<Engine>>;
+/// Capture Engine metadata before profile preparation and report allocation.
+pub fn state(shared: &Shared) -> Result<crate::engine::RuntimeValue<Value>, String> {
+    let capture = shared.lock().unwrap().capture_state()?;
+    capture.project()
+}
 
 pub(crate) struct FileOperation(pub(crate) Arc<std::sync::atomic::AtomicUsize>);
 impl FileOperation {
@@ -117,6 +132,7 @@ impl Connection {
             return Err("Native source service is closing or already configured".into());
         }
         workspace.source_runtime = Some(runtime);
+        workspace.native_proposals_closing = false;
         Ok(())
     }
 }
@@ -129,33 +145,68 @@ impl Drop for ServerAvailability {
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     atomic_write_checked(path, bytes, |_| Ok(()))
 }
+pub(crate) fn atomic_create<T>(
+    path: &Path,
+    bytes: &[u8],
+    validate: impl FnOnce(&Path) -> Result<T, String>,
+) -> Result<(), String> {
+    atomic_publish(path, bytes, false, validate)
+}
 pub(crate) fn atomic_write_checked(
     path: &Path,
     bytes: &[u8],
     validate: impl FnOnce(&Path) -> Result<(), String>,
 ) -> Result<(), String> {
-    let tmp = path.with_extension(format!("{}.tmp", engine::id()));
-    let result = (|| {
-        let mut file = fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&tmp)
-            .map_err(|e| e.to_string())?;
-        if path.exists() {
-            crate::file_safety::preserve_permissions(path, &tmp)?;
-        }
-        file.write_all(bytes).map_err(|e| e.to_string())?;
-        file.sync_all().map_err(|e| e.to_string())?;
-        drop(file);
-        validate(&tmp)?;
-        replace_file(&tmp, path)?;
-        sync_parent(path)?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&tmp);
+    atomic_publish(path, bytes, true, validate)
+}
+fn atomic_publish<T>(
+    path: &Path,
+    bytes: &[u8],
+    replace: bool,
+    validate: impl FnOnce(&Path) -> Result<T, String>,
+) -> Result<(), String> {
+    let name = path.with_extension(format!("{}.tmp", engine::id()));
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&name)
+        .map_err(|e| e.to_string())?;
+    let temporary = Temporary {
+        name,
+        identity: crate::file_safety::identity(&file)?,
+    };
+    if replace && path.exists() {
+        crate::file_safety::preserve_permissions(path, &temporary.name)?;
     }
-    result
+    file.write_all(bytes).map_err(|e| e.to_string())?;
+    file.sync_all().map_err(|e| e.to_string())?;
+    drop(file);
+    let publication_guard = validate(&temporary.name)?;
+    temporary.check()?;
+    publish_legacy_file(&temporary.name, path, replace)?;
+    drop(publication_guard);
+    sync_parent(path)
+}
+
+struct Temporary {
+    name: PathBuf,
+    identity: (u64, u64),
+}
+impl Temporary {
+    fn check(&self) -> Result<(), String> {
+        let named = crate::file_safety::open_native_identity(&self.name).map_err(|e| e.to_string())?;
+        if crate::file_safety::identity(&named)? != self.identity {
+            return Err("Temporary file identity changed; existing files retained".into());
+        }
+        Ok(())
+    }
+}
+impl Drop for Temporary {
+    fn drop(&mut self) {
+        if self.check().is_ok() {
+            let _ = fs::remove_file(&self.name);
+        }
+    }
 }
 #[cfg(not(windows))]
 fn replace_file(from: &Path, to: &Path) -> Result<(), String> {
@@ -163,17 +214,39 @@ fn replace_file(from: &Path, to: &Path) -> Result<(), String> {
 }
 #[cfg(windows)]
 fn replace_file(from: &Path, to: &Path) -> Result<(), String> {
+    move_file(from, to, true)
+}
+#[cfg(windows)]
+fn move_file(from: &Path, to: &Path, replace: bool) -> Result<(), String> {
     #[link(name = "kernel32")]
     extern "system" {
         fn MoveFileExW(from: *const u16, to: *const u16, flags: u32) -> i32;
     }
     let from = crate::file_safety::wide_absolute_file_path(from)?;
     let to = crate::file_safety::wide_absolute_file_path(to)?;
-    // Same-directory replacement, with Windows write-through durability.
-    if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), 1 | 8) } == 0 {
+    // Same-directory publication, with Windows write-through durability.
+    if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), u32::from(replace) | 8) } == 0 {
         return Err(std::io::Error::last_os_error().to_string());
     }
     Ok(())
+}
+
+fn publish_legacy_file(from: &Path, to: &Path, replacing: bool) -> Result<(), String> {
+    if replacing {
+        return replace_file(from, to);
+    }
+    if from.parent() != to.parent() {
+        return Err("New file publication requires staging beside the destination".into());
+    }
+    #[cfg(test)]
+    save_safety_tests::observe("before-new-publication", to, from)?;
+    #[cfg(windows)]
+    let result = move_file(from, to, false);
+    #[cfg(unix)]
+    let result = crate::file_safety::owned_rename::publish_legacy_new(from, to);
+    result.map_err(|error| {
+        format!("New destination could not be published without replacement. {error}")
+    })
 }
 #[cfg(all(test, windows))]
 mod atomic_file_tests;
@@ -212,7 +285,7 @@ pub fn open_progress(
     path: &Path,
     control: &crate::loading::Control,
 ) -> Result<(), String> {
-    open_request(shared, path, control, &json!({}), None)
+    open_request(shared, path, control, &json!({"actor":"human"}), None, None).map(|_| ())
 }
 pub fn open_options(
     shared: &Shared,
@@ -220,7 +293,7 @@ pub fn open_options(
     control: &crate::loading::Control,
     options: &Value,
 ) -> Result<(), String> {
-    open_request(shared, path, control, options, None)
+    open_request(shared, path, control, options, None, None).map(|_| ())
 }
 pub(crate) fn open_prepared_image(
     shared: &Shared,
@@ -229,41 +302,98 @@ pub(crate) fn open_prepared_image(
     options: &Value,
 ) -> Result<(), String> {
     let path = prepared.path.clone();
-    open_request(shared, &path, control, options, Some(prepared))
+    open_request(shared, &path, control, options, Some(prepared), None).map(|_| ())
 }
+
+pub(crate) fn open_project_in(
+    workspace: &crate::workspace::Registry,
+    path: &Path,
+    control: &crate::loading::Control,
+    activate_if: Option<&str>,
+) -> Result<Shared, String> {
+    open_project_request(workspace, path, control, &Value::Null, activate_if, None)
+        .map(|(shared, _)| shared)
+}
+
+pub(crate) fn begin_image_project_in(
+    workspace: &crate::workspace::Registry,
+    path: &Path,
+    control: &crate::loading::Control,
+    initiating: &str,
+) -> Result<ImageOpen, String> {
+    let result = native_open::begin_image_open(workspace, path, control, initiating);
+    if let Err(error) = &result {
+        crate::workspace::duplicate_warning(workspace, path, error, true);
+    }
+    result
+}
+
+fn open_project_request(
+    workspace: &crate::workspace::Registry,
+    path: &Path,
+    control: &crate::loading::Control,
+    options: &Value,
+    activate_if: Option<&str>,
+    mut admission: Option<&mut reply::ReplyAdmission>,
+) -> Result<(Shared, Option<Value>), String> {
+    let result: Result<(Shared, Option<Value>), String> = (|| {
+        if path.is_dir() {
+            return Err("Choose a supported image, PSD or PSB file inside this folder".into());
+        }
+        if let Some(opened) = native_open::project(
+            workspace, path, control, options, activate_if, admission.as_deref_mut(),
+        )? {
+            return Ok(opened);
+        }
+        let shared = Arc::new(Mutex::new(Engine::new()));
+        open_options(&shared, path, control, options)?;
+        let shared = crate::workspace::register_opened(workspace, shared, activate_if)?;
+        let reply = if let Some(admission) = admission {
+            let mut reply = observation(&shared, &json!({"image":false}), admission)?;
+            Some(reply["state"].take())
+        } else {
+            None
+        };
+        Ok((shared, reply))
+    })();
+    if let Err(error) = &result {
+        crate::workspace::duplicate_warning(workspace, path, error, activate_if.is_some());
+    }
+    result
+}
+
 fn open_request(
     shared: &Shared,
     path: &Path,
     control: &crate::loading::Control,
     options: &Value,
     prepared: Option<crate::image_open::Prepared>,
-) -> Result<(), String> {
+    admission: Option<&mut reply::ReplyAdmission>,
+) -> Result<Option<Value>, String> {
     control.begin()?;
     let _loading = LoadGuard {
         shared: shared.clone(),
         control: control.clone(),
     };
-    let result = open_progress_inner(shared, path, control, options, prepared);
+    let native = shared.lock().unwrap().native_document().is_some();
+    let result = open_progress_inner(shared, path, control, options, prepared, admission);
+    let status = match &result {
+        Err(reason) => Some(reason.clone()),
+        Ok(_) if native => None,
+        Ok(_) if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("psb")) => {
+            Some("PSB opened".into())
+        }
+        Ok(_) if crate::image_open::photoshop(path) => Some("PSD opened".into()),
+        Ok(_) => Some("Image opened — save as PSD or PSB".into()),
+    };
     {
         let mut e = shared.lock().unwrap();
-        if e.loading.as_ref().is_none_or(|c| c.same(control)) {
-            e.status = result
-                .as_ref()
-                .map(|_| {
-                    if path
-                        .extension()
-                        .and_then(|e| e.to_str())
-                        .is_some_and(|e| e.eq_ignore_ascii_case("psb"))
-                    {
-                        "PSB opened".into()
-                    } else if crate::image_open::photoshop(path) {
-                        "PSD opened".into()
-                    } else {
-                        "Image opened — save as PSD or PSB".into()
-                    }
-                })
-                .unwrap_or_else(|e| e.clone())
-                .into();
+        if e.loading.as_ref().is_some_and(|c| c.same(control))
+            || (!native && e.loading.is_none())
+        {
+            if let Some(status) = status {
+                e.status = status.into();
+            }
             e.loading = None;
         }
     }
@@ -286,11 +416,12 @@ fn open_progress_inner(
     control: &crate::loading::Control,
     options: &Value,
     prepared: Option<crate::image_open::Prepared>,
-) -> Result<(), String> {
+    mut admission: Option<&mut reply::ReplyAdmission>,
+) -> Result<Option<Value>, String> {
     if path.is_dir() {
         return Err("Choose a supported image, PSD or PSB file inside this folder".into());
     }
-    let (before, project) = {
+    let (before, project, native) = {
         let mut e = shared.lock().unwrap();
         e.ensure_open()?;
         if e.loading.as_ref().is_some_and(|c| !c.same(control)) {
@@ -310,9 +441,16 @@ fn open_progress_inner(
         {
             return Err("Canvas changed before opening; current work preserved".into());
         }
+        let native = e.native_seed()?;
+        if let (Some(seed), Some(admission)) = (&native, admission.as_deref_mut()) {
+            admission.admit(seed.document().budget(), 0)?;
+        }
         e.loading = Some(control.clone());
-        (before, e.project_id.clone())
+        (before, e.project_id.clone(), native)
     };
+    if let Some(seed) = native {
+        return native_open::replace(shared, seed, path, control, options, admission);
+    }
     if !crate::image_open::photoshop(path) {
         let prepared = match prepared {
             Some(p) => p,
@@ -334,7 +472,7 @@ fn open_progress_inner(
         e.file_ownership = Some(prepared.ownership);
         e.file_version = None;
         e.saved_revision = u64::MAX;
-        return Ok(());
+        return Ok(None);
     }
     if ["frame", "page", "variant"]
         .iter()
@@ -385,7 +523,7 @@ fn open_progress_inner(
     e.file_version = Some(version);
     #[cfg(test)]
     psd::observe_open_phase("replaced", 0);
-    Ok(())
+    Ok(None)
 }
 /// Explicitly flatten unsupported Photoshop structure without reducing channel precision or replacing its file.
 pub fn compatible_copy(shared: &Shared, actor: &str, expected: Option<u64>) -> Result<(), String> {
@@ -399,7 +537,7 @@ pub fn compatible_copy_with_color(
 ) -> Result<(), String> {
     compatible_copy_guarded(shared, actor, expected, convert_to_srgb, None)
 }
-fn compatible_copy_guarded(
+pub(crate) fn compatible_copy_guarded(
     shared: &Shared,
     actor: &str,
     expected: Option<u64>,
@@ -425,7 +563,11 @@ fn compatible_copy_guarded(
         if expected.is_some_and(|rev| rev != view::current(&e).revision()) {
             return Err("Document changed; observe again before converting".into());
         }
-        e.doc.clone()
+        if let Some(seed) = e.native_seed()? {
+            drop(e);
+            return native_open::compatible_copy(shared, seed, actor, convert_to_srgb);
+        }
+        e.authority.resident_state()?.document.clone()
     };
     if let Some(profile) = source.icc_profile.as_deref() {
         if !convert_to_srgb {
@@ -435,6 +577,26 @@ fn compatible_copy_guarded(
     }
     let mut doc = engine::Document::new_depth(source.width, source.height, source.bit_depth)?;
     doc.srgb_tagged = source.icc_profile.is_some() || source.srgb_tagged;
+    doc.psd_intentionally_untagged = source.psd_intentionally_untagged && !doc.srgb_tagged;
+    if let Some(resolution) = &source.psd_resolution {
+        doc.psd_resolution = Some(psd::parse_resolution(resolution)?);
+    }
+    if let Some(scale) = &source.psd_print_scale {
+        doc.psd_print_scale = Some(psd::parse_print_scale(scale)?);
+    }
+    if let Some(aspect) = &source.psd_pixel_aspect {
+        doc.psd_pixel_aspect = Some(psd::parse_pixel_aspect(aspect)?);
+    }
+    if let Some(grid) = &source.psd_grid {
+        doc.psd_grid = Some(psd::parse_grid(grid)?);
+    }
+    doc.psd_layer_id_seed = source.psd_layer_id_seed;
+    doc.psd_print_flags = source.psd_print_flags;
+    doc.psd_print_flags_info = source.psd_print_flags_info;
+    doc.psd_copyright = source.psd_copyright;
+    doc.psd_file_info = source.psd_file_info.clone();
+    doc.psd_global_angle = source.psd_global_angle;
+    doc.psd_global_altitude = source.psd_global_altitude;
     if source.bit_depth == 16 {
         let mut image = crate::depth16::render(&source)?;
         if let Some(profile) = source.icc_profile.as_deref() {
@@ -450,18 +612,8 @@ fn compatible_copy_guarded(
         }
         doc.layers[0].pixels = raster::Raster::from_rgba(w, h, &pixels)?;
     }
-    doc.name = format!(
-        "{} - {}-bit{} copy.psd",
-        std::path::Path::new(&source.name)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or(&source.name),
-        source.bit_depth,
-        if source.icc_profile.is_some() {
-            " sRGB"
-        } else {
-            ""
-        }
+    doc.name = compatible_copy_name(
+        &source.name, source.bit_depth, source.icc_profile.is_some(), "psd",
     );
     doc.layers[0].name = format!("Flattened {}-bit artwork", source.bit_depth);
     doc.revision = 1;
@@ -482,6 +634,11 @@ fn compatible_copy_guarded(
     e.saved_revision = 0;
     e.file_version = None;
     Ok(())
+}
+fn compatible_copy_name(name: &str, depth: u16, profiled: bool, extension: &str) -> String {
+    let stem = Path::new(name).file_stem().and_then(|s| s.to_str()).unwrap_or(name);
+    let color = if profiled { " sRGB" } else { "" };
+    format!("{stem} - {depth}-bit{color} copy.{extension}")
 }
 pub fn save(shared: &Shared, path: &Path) -> Result<(), String> {
     save_guarded(shared, path, &json!({}))
@@ -605,13 +762,21 @@ fn save_controlled(
     operation.complete(&result);
     result
 }
-fn save_async(shared: &Shared, path: PathBuf, request: &Value) -> Result<(), String> {
+fn save_async<T>(
+    shared: &Shared,
+    path: PathBuf,
+    request: &Value,
+    prepare_reply: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
     if request["document_id"].as_str().is_none() || request["expected_revision"].as_u64().is_none()
     {
         return Err("Async Save requires observed document_id and expected_revision".into());
     }
     let control = crate::saving::Control::default();
     let mut operation = SaveOperation::begin(shared, request, &control)?;
+    // Admit the response while the registered run is still idle. Native
+    // observation and the writer can otherwise contend for the source inventory.
+    let reply = prepare_reply()?;
     let shared = shared.clone();
     let request = request.clone();
     let worker = move || {
@@ -628,8 +793,8 @@ fn save_async(shared: &Shared, path: PathBuf, request: &Value) -> Result<(), Str
     thread::Builder::new()
         .name("peerbrush-save".into())
         .spawn(worker)
-        .map(|_| ())
-        .map_err(|error| format!("Could not start saving: {error}"))
+        .map_err(|error| format!("Could not start saving: {error}"))?;
+    Ok(reply)
 }
 // Working Save owns all staging files; none becomes a source before publication.
 struct SaveTemporary {
@@ -796,6 +961,9 @@ fn save_prepared_inner(
     control: &crate::saving::Control,
     before_commit: impl FnOnce(),
 ) -> Result<(), String> {
+    if shared.lock().unwrap().native_document().is_some() {
+        return native_save::save(shared, path, request, control, before_commit);
+    }
     control.progress("Checking destination", 0, 0)?;
     if path
         .extension()
@@ -830,7 +998,7 @@ fn save_prepared_inner(
             return Err("Project revision changed before saving".into());
         }
         (
-            e.doc.clone(),
+            e.authority.resident_state()?.document.clone(),
             e.path.clone(),
             e.file_version,
             e.saved_revision,
@@ -944,7 +1112,7 @@ fn save_prepared_inner(
     // Serialize the last cancellation decision with the first irreversible step.
     // No cancellable callback may run after this transition or after rename.
     control.commit()?;
-    replace_file(&output.path, path)?;
+    publish_legacy_file(&output.path, path, lease.expected.is_some())?;
     sync_parent(path)?;
     #[cfg(test)]
     save_safety_tests::observe("published", path, &spool_path)?;
@@ -962,7 +1130,7 @@ fn save_prepared_inner(
     if view::current(&e).id() == doc.id {
         e.path = Some(path.into());
         e.file_version = Some(version);
-        e.doc.name = path
+        e.authority.resident_state_mut()?.document.name = path
             .file_name()
             .unwrap_or_default()
             .to_string_lossy()
@@ -1021,18 +1189,25 @@ fn export_guarded(shared: &Shared, path: &Path, request: &Value) -> Result<(), S
         .unwrap_or_default();
     jxl.validate()?;
     let control = crate::production_export::Control::default();
-    export_derived_to_guarded(shared, path, request, &control, |doc, writer| {
-        if format == crate::production_export::Format::Jxl
-            && request
-                .get("bit_depth")
-                .is_some_and(|depth| depth.as_u64() != Some(u64::from(doc.bit_depth)))
-        {
-            return Err(
-                "JPEG XL export preserves the working document's native channel depth".into(),
-            );
-        }
-        crate::production_export::render_document_to(doc, format, jxl, &control, writer)
-    })
+    export_file::write(
+        shared,
+        path,
+        request,
+        &control,
+        Some(export_file::NativeOutput::Canvas(jxl)),
+        |doc, writer| {
+            if format == crate::production_export::Format::Jxl
+                && request
+                    .get("bit_depth")
+                    .is_some_and(|depth| depth.as_u64() != Some(u64::from(doc.bit_depth)))
+            {
+                return Err(
+                    "JPEG XL export preserves the working document's native channel depth".into(),
+                );
+            }
+            crate::production_export::render_document_to(doc, format, jxl, &control, writer)
+        },
+    )
     .map(|_| ())
 }
 #[cfg(test)]
@@ -1049,6 +1224,7 @@ pub(crate) fn export_derived_guarded(
     .map(|bytes| bytes.is_some())
 }
 
+#[cfg(test)]
 pub(crate) fn export_derived_to_guarded(
     shared: &Shared,
     path: &Path,
@@ -1056,157 +1232,26 @@ pub(crate) fn export_derived_to_guarded(
     control: &crate::production_export::Control,
     encode: impl FnOnce(&crate::engine::Document, &mut dyn Write) -> Result<(), String>,
 ) -> Result<Option<usize>, String> {
-    let _operation = FileOperation::begin(shared)?;
-    control.check()?;
-    let format = crate::production_export::Format::from_path(path)?;
-    let lease = crate::file_safety::Lease::acquire(path)?;
-    let path = lease.path.as_path();
-    if crate::production_export::Format::from_path(path)? != format {
-        return Err("Export alias must resolve to the same PNG, WebP or JPEG XL format".into());
-    }
-    if lease.expected.is_some() && request["overwrite"] != true && request["skip_existing"] != true
-    {
-        return Err(
-            "Export destination exists. Confirm overwrite=true or choose a new path.".into(),
-        );
-    }
-    let doc = {
-        let e = shared.lock().unwrap();
-        crate::workspace::validate_target(&e, request)?;
-        if e.path
-            .as_deref()
-            .or_else(|| e.file_ownership.as_ref().map(|owner| owner.path.as_path()))
-            .map(|source| crate::file_safety::same_destination(source, path))
-            .transpose()?
-            .unwrap_or(false)
-        {
-            return Err("Image export cannot replace this project's working source. Choose a different destination.".into());
-        }
-        if request["expected_revision"]
-            .as_u64()
-            .is_some_and(|r| r != view::current(&e).revision())
-        {
-            return Err("Project changed before exporting".into());
-        }
-        e.doc.clone()
-    };
-    // Protect sources owned by another project or application instance too.
-    if lease.expected.is_some() && request["skip_existing"] == true {
-        return Ok(None);
-    }
-    let project = shared.lock().unwrap().project_id.clone();
-    let _ownership = crate::file_ownership::Ownership::save(path, &project)?;
-    // Keep the existing 256 MiB file-safety envelope while encoding directly to
-    // a private same-directory file outside the document lock.
-    struct Output<'a> {
-        file: &'a mut fs::File,
-        bytes: usize,
-        fingerprint: ring::digest::Context,
-        control: &'a crate::production_export::Control,
-    }
-    impl Write for Output<'_> {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.control.check().map_err(std::io::Error::other)?;
-            if self
-                .bytes
-                .checked_add(bytes.len())
-                .is_none_or(|n| n > 256 * 1024 * 1024)
-            {
-                return Err(std::io::Error::other(
-                    "Export exceeds the 256 MiB file safety limit",
-                ));
-            }
-            let n = self.file.write(bytes)?;
-            self.fingerprint.update(&bytes[..n]);
-            self.bytes += n;
-            Ok(n)
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            self.control.check().map_err(std::io::Error::other)?;
-            self.file.flush()
-        }
-    }
-    struct Temporary(PathBuf);
-    impl Drop for Temporary {
-        fn drop(&mut self) {
-            let _ = fs::remove_file(&self.0);
-        }
-    }
-    let temporary = Temporary(path.with_extension(format!("{}.tmp", engine::id())));
-    let mut file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(&temporary.0)
-        .map_err(|e| e.to_string())?;
-    let identity = crate::file_safety::identity(&file)?;
-    if path.exists() {
-        crate::file_safety::preserve_permissions(path, &temporary.0)?;
-    }
-    let mut output = Output {
-        file: &mut file,
-        bytes: 0,
-        fingerprint: ring::digest::Context::new(&ring::digest::SHA256),
+    export_file::write(shared, path, request, control, None, encode)
+}
+
+pub(crate) fn export_planned_to_guarded(
+    shared: &Shared,
+    path: &Path,
+    request: &Value,
+    control: &crate::production_export::Control,
+    output: &crate::production_export::Output,
+    settings: &crate::production_export::Settings,
+    seed: Option<&engine::authority::NativeSeed>,
+) -> Result<Option<usize>, String> {
+    export_file::write(
+        shared,
+        path,
+        request,
         control,
-    };
-    encode(&doc, &mut output)?;
-    output.flush().map_err(|e| e.to_string())?;
-    let bytes = output.bytes;
-    let fingerprint = crate::file_safety::finish_fingerprint(output.fingerprint.clone());
-    drop(output);
-    file.sync_all().map_err(|e| e.to_string())?;
-    let metadata = file.metadata().map_err(|e| e.to_string())?;
-    let stamp = (
-        metadata.len(),
-        metadata.modified().map_err(|e| e.to_string())?,
-    );
-    let named_metadata = fs::symlink_metadata(&temporary.0).map_err(|e| e.to_string())?;
-    if !named_metadata.is_file() || named_metadata.file_type().is_symlink() {
-        return Err("Export temporary path changed; destination retained".into());
-    }
-    let staged =
-        crate::file_safety::verified_version(&temporary.0, bytes as u64, fingerprint, || {
-            control.check()
-        })?;
-    if staged.identity != identity || staged.bytes != bytes as u64 {
-        return Err("Export temporary file changed; destination retained".into());
-    }
-    control.check()?;
-    let backup = lease.preserve()?;
-    let e = shared.lock().unwrap();
-    e.ensure_open()?;
-    if view::current(&e).id() != doc.id || view::current(&e).revision() != doc.revision {
-        return Err("Project source changed before exporting".into());
-    }
-    lease.validate()?;
-    control.check()?;
-    let metadata = file.metadata().map_err(|e| e.to_string())?;
-    let named_metadata = fs::symlink_metadata(&temporary.0).map_err(|e| e.to_string())?;
-    let named = fs::File::open(&temporary.0).map_err(|e| e.to_string())?;
-    if !named_metadata.is_file()
-        || named_metadata.file_type().is_symlink()
-        || (
-            metadata.len(),
-            metadata.modified().map_err(|e| e.to_string())?,
-        ) != stamp
-        || crate::file_safety::identity(&file)? != identity
-        || crate::file_safety::identity(&named)? != identity
-    {
-        return Err("Export temporary file changed; destination retained".into());
-    }
-    drop(named);
-    replace_file(&temporary.0, path)?;
-    sync_parent(path)?;
-    drop(e);
-    drop(file);
-    let published = crate::file_safety::version_with_check(path, || Ok(()))?;
-    if published != staged {
-        return Err("Published file changed before verification. Current work remains open; inspect the destination and use a new export path.".into());
-    }
-    if let Some(backup) = backup {
-        lease.prune(&backup);
-    }
-    Ok(Some(bytes))
+        seed.map(|seed| export_file::NativeOutput::Planned(seed, output, settings)),
+        |doc, writer| crate::production_export::render_to(doc, output, settings, control, writer),
+    )
 }
 
 pub fn tools() -> Value {
@@ -1215,14 +1260,14 @@ pub fn tools() -> Value {
         {"name":"peerbrush_edit","description":"Atomically apply typed editing commands to the shared document. First observe for IDs and revision. Include expected_revision and task when reserved. Inspect capabilities for command examples. All changes are undoable; no screen-coordinate clicking or code evaluation.","inputSchema":{"type":"object","properties":{"actor":{"type":"string"},"commands":{"type":"array","items":{"type":"object"},"minItems":1,"maxItems":100},"expected_revision":{"type":"integer"},"task":{"type":"string"},"label":{"type":"string"},"feedback":{"type":"string","enum":["batch","request","always"]},"max_edge":{"type":"integer"}},"required":["commands"]}},
         {"name":"peerbrush_proposal","description":"Create and render frozen proposed edits for explicit human review. create needs observed document_id/expected_revision and ordinary engine commands; the shared project and history stay unchanged. preview returns actual PNG pixels with document coordinates. Only actor human can accept; agents can list, preview or reject their proposals. A changed project or ended/expired/taken-over task invalidates its draft. Never silently reacquire a task. Direct edits remain available when already authorized.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["create","list","preview","accept","reject"]},"actor":{"type":"string"},"proposal":{"type":"string"},"document_id":{"type":"string"},"expected_revision":{"type":"integer"},"commands":{"type":"array","items":{"type":"object"},"minItems":1,"maxItems":100},"task":{"type":"string"},"label":{"type":"string"},"rect":{"type":"array","items":{"type":"integer"},"minItems":4,"maxItems":4},"max_edge":{"type":"integer","minimum":32,"maximum":4096},"feedback":{"type":"string","enum":["batch","request"]}},"required":["action"],"additionalProperties":false}},
         {"name":"peerbrush_task","description":"Begin/update/end a selective reservation for layers or rectangular document regions. Scopes have optional target (layer ID) and rect [left,top,right,bottom]. Descriptions appear live in the top bar: write concise natural-language activity, update as you work. Empty scopes permit cooperative edits without locking. Reservations expire after five idle minutes; user takeover revokes them. Never silently reacquire after takeover.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["begin","update","end","status","recovery"]},"actor":{"type":"string"},"task":{"type":"string"},"description":{"type":"string"},"scopes":{"type":"array","items":{"type":"object","properties":{"target":{"type":["string","null"]},"rect":{"type":["array","null"],"items":{"type":"integer"},"minItems":4,"maxItems":4}}}},"feedback":{"type":"string","enum":["batch","request","always"]}},"required":["action"]}},
-        {"name":"peerbrush_document","description":"Open supported images or PSD v1/PSB v2, save PSD/PSB, or export flattened PNG/WebP/JPEG XL selected by destination extension. PNG and JPEG XL keep native 8/16-bit channels; lossless WebP is explicitly 8-bit output only, including from native16 sources. All retain alpha and supported color handling; JPEG XL assigns untagged RGB to sRGB and defaults to lossless, with optional jxl lossless/distance/effort settings; exporting never changes the editable document's precision. Image sources open unsaved at native dimensions and 8/16-bit depth; select explicit frame/page/variant for multi-content images. Working saves remain PSD/PSB under the same 8192-edge, 32 MP and 256 MiB limits. open_async returns immediately; observe loading progress and file_status, cancel_open preserves the current project. save remains synchronous; save_async requires observed document_id/expected_revision and returns immediately. Observe state.saving and file_status; cancel_save requires its exact run. Cancellation is cooperative before final publication; late cancellation is refused while the verified save finishes. Existing effect/composite preparation, backup and OS calls may finish before cancellation is observed. compatible_copy explicitly flattens protected Photoshop structure into a new project at the same 8/16-bit depth; source file is retained. Supported embedded RGB matrix/TRC and classic LUT ICC profiles require convert_to_srgb=true; unsupported profiles cannot become editable copies. save_report requires observed document_id/expected_revision and describes actual standard-layer baking and supplementary-source editability without saving. Saves with reported losses require explicit accept_editability_loss=true for that exact document_id/expected_revision; no continuing consent or bypass of protected originals/file conflicts. pattern_sources inspects protected raw RGB pattern assets; it requires observed document_id/expected_revision. Optional pattern_index returns native PNG content in pattern_asset coordinates, without interpreting Photoshop color handling or style placement. Use explicit local paths. Opening replaces the current document and refuses to discard unsaved work unless discard=true.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["new","open","open_async","cancel_open","save","save_async","cancel_save","save_report","export","compatible_copy","pattern_sources"]},"path":{"type":"string"},"frame":{"type":"integer","minimum":0},"page":{"type":"integer","minimum":0},"variant":{"type":"integer","minimum":0},"width":{"type":"integer"},"height":{"type":"integer"},"run":{"type":"string","description":"Exact observed state.saving.run required by cancel_save."},"pattern_index":{"type":"integer","minimum":0,"maximum":15},"jxl":{"type":"object","properties":{"lossless":{"type":"boolean","default":true},"distance":{"type":"number","minimum":0.1,"maximum":15,"default":1},"effort":{"type":"integer","minimum":1,"maximum":9,"default":3}},"additionalProperties":false},"bit_depth":{"type":"integer","enum":[8,16]},"discard":{"type":"boolean"},"convert_to_srgb":{"type":"boolean"},"document_id":{"type":"string"},"project_id":{"type":"string"},"expected_revision":{"type":"integer"}},"required":["action"]}},
+        {"name":"peerbrush_document","description":"Open supported images or PSD v1/PSB v2, save PSD/PSB, or export flattened PNG/WebP/JPEG XL selected by destination extension. PNG and JPEG XL keep native 8/16-bit channels; lossless WebP is explicitly 8-bit output only, including from native16 sources. All retain alpha and supported color handling; JPEG XL assigns untagged RGB to sRGB and defaults to lossless, with optional jxl lossless/distance/effort settings; exporting never changes the editable document's precision. Image sources open unsaved at native dimensions and 8/16-bit depth; select explicit frame/page/variant for multi-content images. Native canvases support up to 16000 pixels per edge with a configured source service. Working saves use PSD or PSB. Use PSB when the standard layers and composite exceed PSD capacity. Resident projects retain the 8192-edge, 32 MP and 256 MiB limits. open_async returns immediately; observe loading progress and file_status, cancel_open preserves the current project. save remains synchronous; save_async requires observed document_id/expected_revision and returns immediately. Observe state.saving and file_status; cancel_save requires its exact run. Cancellation is cooperative before final publication; late cancellation is refused while the verified save finishes. Existing effect/composite preparation, backup and OS calls may finish before cancellation is observed. compatible_copy explicitly flattens protected Photoshop structure into a new project at the same 8/16-bit depth; source file is retained. Supported embedded RGB matrix/TRC and classic LUT ICC profiles require convert_to_srgb=true; unsupported profiles cannot become editable copies. save_report requires observed document_id/expected_revision and describes actual standard-layer baking and supplementary-source editability without saving. Saves with reported losses require explicit accept_editability_loss=true for that exact document_id/expected_revision; no continuing consent or bypass of protected originals/file conflicts. pattern_sources inspects protected raw RGB pattern assets; it requires observed document_id/expected_revision. Optional pattern_index returns native PNG content in pattern_asset coordinates, without interpreting Photoshop color handling or style placement. Use explicit local paths. Opening replaces the current document and refuses to discard unsaved work unless discard=true.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["new","open","open_async","cancel_open","save","save_async","cancel_save","save_report","export","compatible_copy","pattern_sources"]},"path":{"type":"string"},"frame":{"type":"integer","minimum":0},"page":{"type":"integer","minimum":0},"variant":{"type":"integer","minimum":0},"width":{"type":"integer"},"height":{"type":"integer"},"run":{"type":"string","description":"Exact observed state.saving.run required by cancel_save."},"pattern_index":{"type":"integer","minimum":0,"maximum":15},"jxl":{"type":"object","properties":{"lossless":{"type":"boolean","default":true},"distance":{"type":"number","minimum":0.1,"maximum":15,"default":1},"effort":{"type":"integer","minimum":1,"maximum":9,"default":3}},"additionalProperties":false},"bit_depth":{"type":"integer","enum":[8,16]},"discard":{"type":"boolean"},"convert_to_srgb":{"type":"boolean"},"document_id":{"type":"string"},"project_id":{"type":"string"},"expected_revision":{"type":"integer"}},"required":["action"]}},
         {"name":"peerbrush_history","description":"Inspect results, undo/redo chronological batches, or inspect_task/undo_task to compensate an agent task while preserving later work. task identifies the agent reservation; task_actor defaults to actor, human may select any agent. Conflicting pixels/settings/structure reject the whole task undo. Mutations require the current expected_revision for agents and return visual feedback.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","undo","redo","inspect_task","undo_task"]},"actor":{"type":"string"},"task":{"type":"string"},"task_actor":{"type":"string"},"expected_revision":{"type":"integer"},"feedback":{"type":"string","enum":["batch","request"]},"max_edge":{"type":"integer"}}}},
         {"name":"peerbrush_place_image","description":"Place generated or edited image pixels in one undoable operation. Supply a supported absolute local image path or base64 PNG. SVG/SVGZ placement creates rendered pixels; image.import retains editable vector markup. Use image_info and explicit frame/page/variant for animations, multipage TIFF and icons. Supply an exact destination rect [left,top,right,bottom] in document pixels. new_layer defaults true; layer chooses sibling/folder context and parent can override it. Set new_layer:false to modify that layer; mode replace replaces transparent pixels too, over composites. Surrounding pixels, masks and editable effects are retained. Returns placed layer ID, rectangle and cropped PNG feedback.","inputSchema":{"type":"object","properties":{"frame":{"type":"integer","minimum":0},"page":{"type":"integer","minimum":0},"variant":{"type":"integer","minimum":0},"path":{"type":"string"},"png":{"type":"string"},"rect":{"type":"array","items":{"type":"integer"},"minItems":4,"maxItems":4},"layer":{"type":"string"},"parent":{"type":["string","null"]},"new_layer":{"type":"boolean"},"name":{"type":"string"},"mode":{"type":"string","enum":["over","replace"]},"actor":{"type":"string"},"expected_revision":{"type":"integer"},"task":{"type":"string"},"label":{"type":"string"},"feedback":{"type":"string","enum":["batch","request","always"]},"max_edge":{"type":"integer","minimum":32,"maximum":4096}},"required":["rect"],"oneOf":[{"required":["path"]},{"required":["png"]}],"additionalProperties":false}},
         {"name":"peerbrush_segment","description":"Create a learned subject/object confidence selection using the externally configured local provider. Model choice stays outside PeerBrush. Supply current expected_revision and optional document-pixel rect, point, layer and selection mode. Human edits cancel inference; original 8/16-bit image channels remain untouched. Returns actual selection PNG feedback with coordinates.","inputSchema":{"type":"object","properties":{"actor":{"type":"string"},"expected_revision":{"type":"integer"},"document_id":{"type":"string"},"task":{"type":"string"},"rect":{"type":"array","items":{"type":"integer"},"minItems":4,"maxItems":4},"point":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":2},"layer":{"type":"string"},"mode":{"type":"string","enum":["replace","add","subtract","intersect"]},"feedback":{"type":"string","enum":["batch","request"]},"max_edge":{"type":"integer"}},"required":["expected_revision"],"additionalProperties":false}},
         {"name":"peerbrush_capabilities","description":"Get concise supported operations and runnable JSON examples before editing.","inputSchema":{"type":"object","properties":{}}}
         ,{"name":"peerbrush_brushes","description":"Browse original brush presets, render actual stroke previews, and save/update/delete instance-local custom brushes. Presets work in paint/smudge/clone/heal commands via preset ID with explicit setting overrides. This library is outside document history; curated presets are immutable. Preview coordinates refer to brush_preview, not the document.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","preview","save","delete"]},"id":{"type":"string"},"name":{"type":"string"},"category":{"type":"string"},"settings":{"type":"object"},"width":{"type":"integer","minimum":64,"maximum":512},"height":{"type":"integer","minimum":24,"maximum":128}},"required":["action"],"additionalProperties":false}}
     ]);
-    tools.as_array_mut().unwrap().push(json!({"name":"peerbrush_recovery","description":"List complete instance-local autosave versions and failures. Restore an explicit snapshot into a new independent unsaved project, retaining original files and recovery versions. Returns actual image content with coordinates. Only human input may discard an explicit version; never discard to hide an autosave failure.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","restore","discard"]},"snapshot":{"type":"string"},"actor":{"type":"string"}},"required":["action"],"additionalProperties":false}}));
+    tools.as_array_mut().unwrap().push(json!({"name":"peerbrush_recovery","description":"List instance-local autosave versions, unpaired PSD candidates and failures. Restore an explicit snapshot into a new independent unsaved project, retaining original files and recovery versions. Returns actual image content with coordinates. Only human input may discard a complete version; unpaired PSDs are retained for manual review.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","restore","discard"]},"snapshot":{"type":"string"},"actor":{"type":"string"}},"required":["action"],"additionalProperties":false}}));
     tools.as_array_mut().unwrap().push(json!({"name":"peerbrush_filters","description":"Browse whole-image filter presets; thumbnail renders a standard reference image, preview renders the explicitly targeted current project without history and returns frozen commands. Apply with peerbrush_edit filter.add/update; edit settings, strength, bypass, delete and reorder non-destructively. Top filters run last after the composite. Save/rename/delete/import/export validated instance-local custom presets outside history. Curated presets are immutable. Preview requires current project_id/document_id/expected_revision; original 8/16-bit sources stay editable.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","thumbnail","preview","save","rename","delete","import","export"]},"id":{"type":"string"},"name":{"type":"string"},"category":{"type":"string"},"kind":{"type":"string"},"settings":{"type":"object"},"weight":{"type":"number","minimum":0,"maximum":1},"data":{"type":"object"},"max_edge":{"type":"integer","minimum":32,"maximum":4096}},"required":["action"],"additionalProperties":false}}));
     tools.as_array_mut().unwrap().push(json!({"name":"peerbrush_code","description":"Run bounded Rhai code against a frozen native 8/16-bit project, then commit shared commands atomically. start requires explicit project/document/revision, a named AI actor, active owned task, description and declared scopes. Code cannot bypass locks/reservations or read files/network. Returns run ID immediately; status returns completion and actual PNG with document coordinates. cancel or human takeover discards unfinished work. read_pixel, begin_pixels, write_pixel, commit_pixels and edit are documented in capabilities. One undo step; source changes reject the whole run.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["start","status","cancel"]},"actor":{"type":"string"},"task":{"type":"string"},"run":{"type":"string"},"description":{"type":"string","maxLength":240},"scopes":{"type":"array","minItems":1,"maxItems":16,"items":{"type":"object","properties":{"target":{"type":["string","null"]},"rect":{"type":["array","null"],"items":{"type":"integer"},"minItems":4,"maxItems":4}},"additionalProperties":false}},"script":{"type":"string","maxLength":65536},"max_edge":{"type":"integer","minimum":32,"maximum":1024}},"required":["action","project_id","document_id"],"additionalProperties":false}}));
     tools.as_array_mut().unwrap().push(json!({"name":"peerbrush_exports","description":"Flattened PNG/WebP/JPEG XL production presets and selected layer/folder batches. list returns instance-local preset revision; save_preset/delete_preset require expected_library_revision and never enter document history. plan/preview/start require observed project_id/document_id/expected_revision. Targets are isolated selected roots with their masks/effects and internal clipping; ancestor folders and document filters are excluded. An empty target list exports the current composite with document filters. Standalone adjustments/clipped layers and protected-source layers require their containing folder/composite. Presets define format (png by default), portable filenames, explicit numbered duplicates, canvas/alpha bounds, transparent padding and named scale variants. PNG and JPEG XL preserve native 8/16-bit channels. JPEG XL defaults to lossless; jxl options select lossless/distance/effort, retaining alpha losslessly. JPEG XL previews and reopening use the validated actual decoded RGB profile; lossless retains the exact ICC, while a differing decoder profile selects explicit SDR sRGB. Lossless WebP has explicit 8-bit output; native16 working sources remain unchanged. All retain alpha and supported color handling without changing the working document. Plan/receipts report output format/bit_depth and native_source_depth. preview returns actual output pixels as PNG with document coordinates. start requires an existing output directory and explicit existing-file policy (error by default, skip, or replace); status reports each written/skipped/failed/not-written output. cancel preserves completed exports and editable sources. Loaded sources, file ownership, concurrent edits and destination conflicts remain guarded.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","save_preset","delete_preset","plan","preview","start","status","cancel"]},"preset":{"type":"string"},"name":{"type":"string"},"actor":{"type":"string"},"expected_library_revision":{"type":"integer","minimum":0},"targets":{"type":"array","maxItems":1024,"items":{"type":"string"}},"directory":{"type":"string"},"existing":{"type":"string","enum":["error","skip","replace"]},"run":{"type":"string"},"output_index":{"type":"integer","minimum":0,"maximum":63},"max_edge":{"type":"integer","minimum":32,"maximum":1024},"settings":{"type":"object","properties":{"jxl":{"type":"object","properties":{"lossless":{"type":"boolean","default":true},"distance":{"type":"number","minimum":0.1,"maximum":15,"default":1},"effort":{"type":"integer","minimum":1,"maximum":9,"default":3}},"additionalProperties":false},"format":{"type":"string","enum":["png","webp","jxl"],"default":"png"},"template":{"type":"string","maxLength":160},"crop":{"type":"string","enum":["canvas","alpha"]},"padding":{"type":"integer","minimum":0,"maximum":4096},"resampling":{"type":"string","enum":["nearest","bilinear"]},"duplicate_names":{"type":"string","enum":["error","number"]},"variants":{"type":"array","minItems":1,"maxItems":12,"items":{"type":"object","properties":{"name":{"type":"string","maxLength":48},"scale":{"type":"number","minimum":0.01,"maximum":8}},"required":["name","scale"],"additionalProperties":false}}},"required":["template","crop","padding","resampling","duplicate_names","variants"],"additionalProperties":false}},"required":["action"],"additionalProperties":false}}));
@@ -1243,7 +1288,7 @@ pub fn tools() -> Value {
             }
         }
     }
-    tools.as_array_mut().unwrap().push(json!({"name":"peerbrush_image_info","description":"Inspect a supported local image without editing. Reports channel depth and explicit zero-based frame/page/variant choices for image.import and place_image. Float, CMYK and PNG16 animation require explicit supported conversion.","inputSchema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}}));
+    tools.as_array_mut().unwrap().push(json!({"name":"peerbrush_image_info","description":"Inspect a supported local image without editing. Reports channel depth and explicit zero-based frame/page/variant choices for image.import and place_image. Float and CMYK require explicit supported conversion.","inputSchema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}}));
     tools.as_array_mut().unwrap().push(json!({"name":"peerbrush_tool_settings","description":"Inspect/update independent instance-local Brush, Eraser, Smudge, Clone and Heal preferences, plus Liquify radius/strength/mode. Settings and preset choice stay outside document history and PSD sources; set never selects the visible tool or paints. Supply expected_tool_revision from get when changing preferences as an agent. Settings partially override the current snapshot; choosing a preset first copies its settings. Use returned profile.settings as explicit parameters in shared edit commands. preview returns actual brush-preview PNG pixels with explicit coordinates.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["get","set","preview"]},"tool":{"type":"string","enum":["brush","eraser","smudge","clone","heal","liquify"]},"actor":{"type":"string"},"expected_tool_revision":{"type":"integer","minimum":0},"preset":{"type":["string","null"]},"settings":{"type":"object"}},"required":["action"],"additionalProperties":false}}));
     tools.as_array_mut().unwrap().push(json!({"name":"peerbrush_projects","description":"List stable project IDs, create/open independent projects, select/reorder tabs or request native Save/Don't Save/Cancel close review (human only), close with exact source guards, or copy/move editable layer trees between projects. Background AI writes must supply project_id, document_id and expected_revision; never depend on the visible tab. Transfers need both source identities/revisions and preserve native precision, masks and effects. preview_transfer returns actual destination pixels without history. move creates one undo step in each document; failures change neither.","inputSchema":{"type":"object","properties":{"action":{"type":"string","enum":["list","new","open","select","reorder","request_close","close","copy","move","preview_transfer"]},"actor":{"type":"string"},"project_id":{"type":"string"},"document_id":{"type":"string"},"expected_revision":{"type":"integer"},"path":{"type":"string"},"frame":{"type":"integer","minimum":0},"page":{"type":"integer","minimum":0},"variant":{"type":"integer","minimum":0},"width":{"type":"integer"},"height":{"type":"integer"},"bit_depth":{"type":"integer","enum":[8,16]},"expected_order":{"type":"array","items":{"type":"string"}},"order":{"type":"array","items":{"type":"string"}},"activate":{"type":"boolean"},"discard":{"type":"boolean"},"source_project_id":{"type":"string"},"source_document_id":{"type":"string"},"source_revision":{"type":"integer"},"source_task":{"type":"string"},"task":{"type":"string"},"layers":{"type":"array","items":{"type":"string"}},"target":{"type":"string"},"move":{"type":"boolean"},"max_edge":{"type":"integer"}},"required":["action"],"additionalProperties":false}}));
     tools
@@ -1271,9 +1316,24 @@ pub fn capabilities() -> Value {
         "liquify": "CPU displacement grid"
     });
     result["segmentation"]["configured"] = json!(crate::segmentation::configured());
-    result["photoshop_files"] = json!({"formats":["PSD v1","PSB v2"],"native_depths":[8,16],"mode":"RGB","file_limit_bytes":256*1024*1024,"max_edge":8192,"max_pixels":32*1024*1024,"protection":"Unsupported structures remain read-only; explicit compatible copies retain original precision. Both formats write current standard raster/masks and merged composites."});
+    let native_edge = crate::raster::NATIVE_EDGE;
+    result["photoshop_files"] = json!({
+        "formats": ["PSD v1", "PSB v2"],
+        "native_depths": [8, 16],
+        "mode": "RGB",
+        "file_limit_bytes": crate::file_safety::RESIDENT_FILE_BYTES,
+        "max_edge": crate::raster::MAX_EDGE,
+        "max_pixels": crate::raster::MAX_PIXELS,
+        "native_limits": {
+            "file_limit_bytes": crate::file_safety::NATIVE_FILE_BYTES,
+            "max_edge": native_edge,
+            "max_pixels": u64::from(native_edge) * u64::from(native_edge),
+            "requirements": "Native project with a configured source service. Format and resource limits also apply."
+        },
+        "protection": "Unsupported structures remain read-only. Explicit compatible copies retain original precision. Both formats write current standard raster and mask data and a current merged composite."
+    });
     result["projects"] = json!({"tool":"peerbrush_projects","max_open":crate::workspace::MAX_PROJECTS,"targeting":"Use project_id, document_id and expected_revision for every background AI mutation. Switching or reordering tabs never changes a project's engine. Human-only reorder requires the complete expected_order and new order.","transfer":"Editable trees, masks, effects and native16 sources; copy changes destination, move is atomic with one undo step per project."});
-    result["image_import"] = json!({"extensions":crate::image_import::EXTENSIONS,"inspect_tool":"peerbrush_image_info","choices":"Explicit zero-based frame/page/variant when image_info reports choice; never silently flatten animations or multipage files.","precision":"Raster imports retain native 8/16-bit RGB and gray. Supported embedded RGB ICC is converted to sRGB at original depth. Float, CMYK and PNG16 animation are rejected. JPEG XL accepts static SDR RGB with optional straight alpha at native8/16; animation, gray, associated alpha and extra channels reject. Static supported SVG/SVGZ retains editable markup; its colors and coverage project through RGBA8 and promote in native16 projects without quantizing existing raster channels. image.place and external image-file paste rasterize SVG."});
+    result["image_import"] = json!({"extensions":crate::image_import::EXTENSIONS,"inspect_tool":"peerbrush_image_info","choices":"Explicit zero-based frame/page/variant when image_info reports choice; never silently flatten animations or multipage files.","precision":"Raster imports retain native 8/16-bit RGB and gray, including selected APNG frames. Supported embedded RGB ICC is converted to sRGB at original depth. Float and CMYK are rejected. JPEG XL accepts static SDR RGB with optional straight alpha at native8/16; animation, gray, associated alpha and extra channels reject. Static supported SVG/SVGZ retains editable markup; its colors and coverage project through RGBA8 and promote in native16 projects without quantizing existing raster channels. image.place and external image-file paste rasterize SVG."});
     result["production_exports"] = json!({"tool":"peerbrush_exports","formats":["png","webp","jxl"],"default_format":"png","precision":"PNG and JPEG XL retain native8/16. Lossless WebP produces8-bit RGBA from the rendered output only; native16 working channels are never replaced.","color":"Alpha is retained at the output depth. PNG/WebP retain supported ICC; lossless JPEG XL retains exact ICC. JPEG XL previews/reopening use the actual decoded RGB profile, selecting explicit SDR sRGB when the default differs. Untagged RGB is assigned sRGB for JPEG XL.","preview":"Actual encoded output returned as display PNG with document coordinates; output format/bit_depth and native_source_depth are distinct.","publication":"Existing guarded atomic writes, source revision/ownership checks, cancellation and exact previous-file preservation apply to every format."});
     result["effect_catalog"] = crate::effects::catalog::discovery();
     result["custom_contours"] = json!({"effects":["contour","bevel_emboss","inner_shadow","inner_glow","satin","outer_glow","drop_shadow"],"settings":{"contour":"custom","contour_points":"2–16 objects: position and value, each finite 0–1; positions strictly increase with fixed 0/1 endpoints"},"rendering":"Piecewise linear native contour mapping; original sources remain intact. Shared previews, history, reservations and document coordinates apply.","limits":"Unknown fields, missing points, duplicate positions and points on preset contours reject. Native contours do not establish Photoshop contour/style equivalence.","source_format":21});
@@ -1288,11 +1348,17 @@ pub fn capabilities() -> Value {
         json!({"op":"path.handle.move","layer":"PATH_ID","index":1,"handle":"out","point":[210,150]}),
         json!({"op":"path.to_selection","path":"PATH_ID","feather":1}),
     ]);
-    result["mask_link"] = json!({"command":{"op":"mask.link","layer":"LAYER_ID","linked":true},"default":true,"transforms":"Linked masks and Color move/rotate/scale together, including selected areas. Unlinked targets transform independently. Whole mask transforms include all paint steps; an explicit step selects one unlinked paint step. Independent Color and selected linked transforms require fill/paint mask steps; unsupported mask effects are refused without rasterization.","precision":"Native 8/16-bit rasters and retained originals; shared previews, reservations and undo.","psd":"Source format 29 retains link state. Standard mask pixels and composite remain current; external Photoshop link editing is not written or verified and appears in the save report."});
+    result["mask_link"] = json!({"command":{"op":"mask.link","layer":"LAYER_ID","linked":true},"default":true,"transforms":"Linked masks and Color move/rotate/scale together, including selected areas. Unlinked targets transform independently. Whole mask transforms include all paint steps, and an explicit step selects one unlinked paint step. Independent Color and selected linked transforms support fill, paint and density steps.","precision":"Native 8/16-bit rasters and retained originals with shared previews, reservations and undo.","psd":"Separate standard PSD/PSB raster masks carry their link state and can store a terminal full-strength Density step. PeerBrush sources retain full mask stacks and link choices. Photoshop receiving-editor verification is pending."});
     result["commands"]
         .as_array_mut()
         .unwrap()
         .push(json!({"op":"mask.link","layer":"LAYER_ID","linked":false}));
+    result["global_light"] = json!({
+        "command":{"op":"document.global_light","angle":135},
+        "link_command":{"op":"effect.update","layer":"layer-id","effect":"shadow-id","use_global_light":true},
+        "angle_range":[0,359], "state":"document.global_light_angle",
+        "scope":"Document-wide. Updates the Global Angle and linked shadows in one undoable edit."
+    });
     result["effect_bake"] = json!({"commands":["effect.bake","mask.step.bake"],"scope":"Selected effect plus preceding stack; following effects remain editable. Folder Color flattens all children; editable Color sources rasterize. Mask keeps Color/hierarchy. Whole-target reservations, native 8/16-bit fidelity check and one undo. Inexact prefixes, backdrop-dependent adjustments and expanding styles that shift an attached mask frame are refused."});
     result["commands"].as_array_mut().unwrap().extend([
         json!({"op":"effect.bake","layer":"LAYER_ID","effect":"EFFECT_ID"}),
@@ -1321,8 +1387,9 @@ fn observation(
         let image = p.get("image").and_then(Value::as_bool).unwrap_or(true)
             && p.get("since_revision").and_then(Value::as_u64) != Some(revision);
         let pixels = if image { Some(e.resident()?.clone()) } else { None };
-        (e.state(), revision, pixels)
+        (e.capture_state()?, revision, pixels)
     };
+    let state = state.project()?;
     let mut result = json!({"state":state,"revision":revision,"images":[]});
     if let Some(doc) = pixels {
         let (w, h, rgba, rect) = doc.preview(
@@ -1397,9 +1464,13 @@ fn dispatch_reply(
             )
         };
         return match p["action"].as_str().unwrap_or("list") {
-            "list" => Ok(
-                json!({"versions":crate::recovery::catalog(&dir),"autosave_error":error,"versions_per_project":crate::recovery::VERSIONS_PER_PROJECT,"max_bytes":crate::recovery::MAX_BYTES}),
-            ),
+            "list" => {
+                let catalog = crate::recovery::catalog_in(&workspace, &dir, &|| Ok(()))?;
+                if let Some(pool) = catalog.native.pool() {
+                    admission.admit_projection(pool, &(&catalog.versions, &catalog.unpaired, catalog.resident_error, catalog.native.entries(), catalog.native.error(), &error))?;
+                }
+                Ok(json!({"versions":catalog.versions,"unpaired_versions":catalog.unpaired,"resident_catalog_error":catalog.resident_error,"native_versions":catalog.native.entries(),"native_catalog_error":catalog.native.error(),"native_discard_available":crate::recovery::NATIVE_DISCARD_AVAILABLE,"autosave_error":error,"versions_per_project":crate::recovery::VERSIONS_PER_PROJECT,"max_bytes":crate::recovery::MAX_BYTES}))
+            }
             "restore" => {
                 let snapshot = p["snapshot"]
                     .as_str()
@@ -1431,7 +1502,7 @@ fn dispatch_reply(
         };
     }
     if method == "projects" {
-        return projects(shared, p);
+        return projects(shared, p, admission);
     }
     if method == "filters" && p["action"] != "preview" {
         return filter_library(shared, p);
@@ -1456,7 +1527,7 @@ fn dispatch_reply(
     }
     Ok(result)
 }
-fn new_document(p: &Value) -> Result<engine::Document, String> {
+fn new_dimensions(p: &Value) -> Result<(u32, u32, u16), String> {
     let size = |key: &str, default| {
         p.get(key).map_or(Ok(default), |v| {
             v.as_u64()
@@ -1470,9 +1541,93 @@ fn new_document(p: &Value) -> Result<engine::Document, String> {
             .map(|n| n as u16)
             .ok_or("Color depth must be 8 or 16 bits")
     })?;
-    engine::Document::new_depth(size("width", 1024)?, size("height", 768)?, depth)
+    Ok((size("width", 1024)?, size("height", 768)?, depth))
 }
-fn projects(root: &Shared, p: &Value) -> Result<Value, String> {
+fn new_document(p: &Value) -> Result<engine::Document, String> {
+    let (width, height, depth) = new_dimensions(p)?;
+    engine::Document::new_depth(width, height, depth)
+}
+fn replace_native_blank(
+    shared: &Shared,
+    runtime: &Arc<crate::workspace::source_runtime::SourceRuntime>,
+    source: (&str, u64),
+    seed: Option<engine::authority::NativeSeed>,
+    actor: &str,
+    p: &Value,
+    admission: &mut reply::ReplyAdmission,
+) -> Result<Value, String> {
+    let (width, height, depth) = new_dimensions(p)?;
+    let validate_source = |engine: &Engine| {
+        crate::workspace::guard(engine, source.0, source.1)?;
+        match &seed {
+            Some(seed) => seed.validate(engine),
+            None if engine.native_document().is_none() => Ok(()),
+            None => Err("Canvas authority changed before opening; current work preserved".into()),
+        }
+    };
+    let (_operation, project) = {
+        let engine = shared.lock().unwrap();
+        engine.ensure_write_available()?;
+        validate_source(&engine)?;
+        if engine.file_operations.load(Ordering::Acquire) != 0 {
+            return Err("Finish the active file operation before replacing the canvas".into());
+        }
+        (
+            FileOperation::track(engine.file_operations.clone()),
+            engine.project_id.clone(),
+        )
+    };
+    admission.admit(&runtime.resident(), 0)?;
+    let document = engine::native::NativeDocument::new_blank(
+        width, height, depth, &runtime.resident(), &runtime.disk(), &|| Ok(()),
+    )?;
+    document.validate_editable(&|| Ok(()))?;
+    let mut prepared = Engine::from_native(document, 40)?;
+    prepared.project_id = project;
+    let capture = observation::capture_engine(&mut prepared, admission)?
+        .ok_or("New canvas is missing native observation authority")?;
+    let session = runtime.begin_read(capture.scene())?;
+    let mut reply = capture.observe_admitted(
+        session.clone(), &json!({"image":false}), admission,
+    )?;
+    session.check()?;
+    {
+        let mut engine = shared.lock().unwrap();
+        let workspace = engine
+            .workspace
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or("Project lost its source workspace; current canvas preserved")?;
+        session.with_live_fence(|| {
+            let workspace = workspace
+                .try_lock()
+                .map_err(|_| "Workspace is busy; current canvas preserved")?;
+            if workspace.exiting
+                || !workspace
+                    .source_runtime
+                    .as_ref()
+                    .is_some_and(|current| session.uses_runtime(current))
+                || engine.file_operations.load(Ordering::Acquire) != 1
+            {
+                return Err("Source workspace or file operation changed; current canvas preserved".into());
+            }
+            validate_source(&engine)?;
+            if engine.project_id != prepared.project_id {
+                return Err("Project changed before opening; current work preserved".into());
+            }
+            engine.replace_prepared(&mut prepared, actor, p["discard"] == true, None)
+        })??;
+    }
+    prepared.release_file_ownership();
+    drop(seed);
+    drop(prepared);
+    Ok(reply["state"].take())
+}
+fn projects(
+    root: &Shared,
+    p: &Value,
+    admission: &mut reply::ReplyAdmission,
+) -> Result<Value, String> {
     use crate::workspace as w;
     let actor = p["actor"].as_str().unwrap_or("agent");
     let text = |key: &str| p[key].as_str().ok_or_else(|| format!("Missing {key}"));
@@ -1483,21 +1638,28 @@ fn projects(root: &Shared, p: &Value) -> Result<Value, String> {
             let active = w::active_id(root);
             let activate = actor == "human" && p["activate"] != false;
             let activate_if = activate.then_some(active.as_str());
-            let shared = if p["action"] == "open" {
-                let shared = Arc::new(Mutex::new(Engine::new()));
-                let path = Path::new(text("path")?);
-                if let Err(error) =
-                    open_options(&shared, path, &crate::loading::Control::default(), p)
-                {
-                    w::duplicate_warning(&w::attach(root), path, &error, activate);
-                    return Err(error);
-                }
-                w::register_opened(&w::attach(root), shared, activate_if)?
-            } else {
-                w::register(root, Engine::from_document(new_document(p)?), activate_if)?
-            };
-            let result = shared.lock().unwrap().state();
-            Ok(result)
+            if p["action"] == "new" {
+                let initiating = w::get(root, &active)?;
+                let (width, height, depth) = new_dimensions(p)?;
+                let (_, state) = w::new_project_with(&initiating, width, height, depth, activate_if, |shared, session| {
+                    let options = json!({"image":false});
+                    let mut result = if let Some(session) = session {
+                        observation::capture(shared, &options, admission)?
+                            .ok_or("New tab lost native authority")?
+                            .observe_admitted(session.clone(), &options, admission)?
+                    } else {
+                        observation(shared, &options, admission)?
+                    };
+                    Ok(result["state"].take())
+                })?;
+                return Ok(state);
+            }
+            let path = Path::new(text("path")?);
+            let (_, state) = open_project_request(
+                &w::attach(root), path, &crate::loading::Control::default(), p, activate_if,
+                Some(admission),
+            )?;
+            state.ok_or_else(|| "Opened project has no observation".into())
         }
         "select" => {
             if actor != "human" {
@@ -1571,15 +1733,14 @@ fn projects(root: &Shared, p: &Value) -> Result<Value, String> {
             if action != "preview_transfer" {
                 return w::transfer(root, &request);
             }
-            let doc = w::transfer_preview(root, &request)?;
-            let (width, height, rgba, rect) = doc.preview(
-                None,
+            let preview = w::render_transfer_in(
+                &w::attach(root), &request,
                 p["max_edge"].as_u64().unwrap_or(1024).clamp(32, 4096) as u32,
-                None,
-                false,
+                None, &|| Ok(()), |_| {},
             )?;
+            let (width, height, rect) = (preview.width, preview.height, preview.rect);
             Ok(
-                json!({"project_id":request.destination,"document_id":request.destination_document,"revision":request.destination_revision,"preview_only":true,"images":[{"mime_type":"image/png","data":STANDARD.encode(raster::png(width,height,&rgba)?),"width":width,"height":height,"document_rect":rect}]}),
+                json!({"project_id":request.destination,"document_id":request.destination_document,"revision":request.destination_revision,"preview_only":true,"images":[{"mime_type":"image/png","data":STANDARD.encode(raster::png(width,height,preview.bytes())?),"width":width,"height":height,"document_rect":rect}]}),
             )
         }
         _ => Err("Unknown project action".into()),
@@ -1646,7 +1807,7 @@ fn filter_library(shared: &Shared, p: &Value) -> Result<Value, String> {
                         rect: None,
                     }],
                 )?;
-                e.doc.clone()
+                e.authority.resident_state()?.document.clone()
             };
             let mut command = json!({"op":"filter.add","preset":id()?,"settings":p.get("settings").cloned().unwrap_or(json!({}))});
             if let Some(weight) = p.get("weight") {
@@ -1713,7 +1874,7 @@ fn dispatch_project(
             Ok(json!({"queued":queued}))
         }
         "observe" => observation(shared, p, admission),
-        "code" => crate::code::dispatch(shared, actor, p),
+        "code" => crate::code::dispatch_owned(shared, actor, p, admission),
         "filters" => filter_library(shared, p),
         "tool_settings" => {
             let (store, library) = {
@@ -1851,6 +2012,7 @@ fn dispatch_project(
             }
         }
         "proposal" => {
+            if let Some(result) = proposals::native(shared, actor, p, admission)? { return Ok(result); }
             let action = p["action"].as_str().ok_or("Missing proposal action")?;
             if action == "list" {
                 let mut e = shared.lock().unwrap();
@@ -1894,7 +2056,7 @@ fn dispatch_project(
             }
             let (doc, proposal) = {
                 let mut e = shared.lock().unwrap();
-                let doc = e.proposal_document(&id)?;
+                let doc = e.proposal_snapshot(&id)?;
                 let proposal = e
                     .proposals_state()
                     .as_array()
@@ -1917,7 +2079,7 @@ fn dispatch_project(
             }
             // Rendering runs without the shared lock. Report interruption rather than a
             // ready proposal if human input changed its source while pixels were sampled.
-            shared.lock().unwrap().proposal_document(&id)?;
+            shared.lock().unwrap().proposal_snapshot(&id)?;
             Ok(result)
         }
         "client_state" => {
@@ -2172,8 +2334,17 @@ fn dispatch_project(
                 }
             }
             match action {
-                "undo" => e.undo(actor)?,
-                "redo" => e.redo(actor)?,
+                "undo" | "redo" => {
+                    let document = view::current(&e).id().to_owned();
+                    let revision = view::current(&e).revision();
+                    drop(e);
+                    history_shared(
+                        shared, actor,
+                        if action == "undo" { engine::native::Direction::Undo } else { engine::native::Direction::Redo },
+                        Some(revision), Some(&document),
+                    )?;
+                    e = shared.lock().unwrap();
+                }
                 "undo_task" => {
                     e.undo_task(actor, owner, task)?;
                 }
@@ -2198,6 +2369,7 @@ fn dispatch_project(
                 .and_then(Value::as_str)
                 .ok_or("Missing action")?;
             let path = p.get("path").and_then(Value::as_str).map(PathBuf::from);
+            let mut native_new = None;
             let opening_source = if ["new", "open", "open_async"].contains(&action) {
                 let e = shared.lock().unwrap();
                 crate::workspace::validate_target(&e, p)?;
@@ -2211,6 +2383,11 @@ fn dispatch_project(
                     && p.get("discard") != Some(&Value::Bool(true))
                 {
                     return Err("Unsaved work: save first or explicitly pass discard=true".into());
+                }
+                if action == "new" {
+                    native_new = e.native_seed()?;
+                } else if let Some(native) = e.native_document() {
+                    admission.admit(native.budget(), 0)?;
                 }
                 Some((
                     view::current(&e).id().to_owned(),
@@ -2276,6 +2453,12 @@ fn dispatch_project(
                     return Ok(result);
                 }
                 "new" => {
+                    if let Some(runtime) = crate::workspace::native_dispatch::configured_runtime_for(shared)? {
+                        let (document, revision) = opening_source.as_ref().unwrap();
+                        return replace_native_blank(
+                            shared, &runtime, (document, *revision), native_new, actor, p, admission,
+                        );
+                    }
                     let doc = new_document(p)?;
                     let mut e = shared.lock().unwrap();
                     if opening_source.as_ref()
@@ -2294,11 +2477,27 @@ fn dispatch_project(
                     let control = crate::loading::Control::default();
                     let (document, revision) = opening_source.unwrap();
                     control.bind(document, revision);
-                    open_options(shared, path.as_deref().ok_or("Missing path")?, &control, p)?;
+                    let reply = open_request(
+                        shared, path.as_deref().ok_or("Missing path")?, &control, p, None,
+                        Some(admission),
+                    )?;
+                    if let Some(reply) = reply {
+                        return Ok(reply);
+                    }
                 }
                 "open_async" => {
                     let path = path.ok_or("Missing path")?;
                     let control = crate::loading::Control::default();
+                    control.progress("Opening document", 0, 0)?;
+                    let accepted = observation::capture(shared, p, admission)?
+                        .map(|capture| {
+                            let key = capture.scene().key();
+                            let mut reply = capture.with_loading(control.clone()).observe(
+                                shared, &json!({"image":false}), admission,
+                            )?;
+                            Ok::<_, String>((key, reply["state"].take()))
+                        })
+                        .transpose()?;
                     {
                         let mut e = shared.lock().unwrap();
                         if e.loading.is_some() {
@@ -2310,6 +2509,9 @@ fn dispatch_project(
                                 view::current(&e).id().to_owned(),
                                 view::current(&e).revision(),
                             )
+                            || accepted.as_ref().is_some_and(|(key, _)| {
+                                e.native_document().is_none_or(|native| native.key() != *key)
+                            })
                         {
                             return Err(
                                 "Canvas changed before opening; current work preserved".into()
@@ -2335,6 +2537,9 @@ fn dispatch_project(
                         });
                         return Err(format!("Could not start opening: {error}"));
                     }
+                    if let Some((_, reply)) = accepted {
+                        return Ok(reply);
+                    }
                 }
                 "cancel_open" => {
                     let e = shared.lock().unwrap();
@@ -2355,7 +2560,10 @@ fn dispatch_project(
                         .or_else(|| shared.lock().unwrap().path.clone())
                         .ok_or("Choose a PSD or PSB path")?;
                     if action == "save_async" {
-                        save_async(shared, path, p)?;
+                        return save_async(shared, path, p, || {
+                            let mut reply = observation(shared, &json!({"image":false}), admission)?;
+                            Ok(reply["state"].take())
+                        });
                     } else {
                         save_guarded(shared, &path, p)?;
                     }
@@ -2380,7 +2588,8 @@ fn dispatch_project(
                 "export" => export_guarded(shared, path.as_deref().ok_or("Missing path")?, p)?,
                 _ => return Err("Unknown document action".into()),
             }
-            Ok(shared.lock().unwrap().state())
+            let mut result = observation(shared, &json!({"image":false}), admission)?;
+            Ok(result["state"].take())
         }
         _ => Err(format!("Unknown API method: {method}")),
     }
@@ -3312,7 +3521,7 @@ pub fn start_with_preferences(
         .open(state_dir.join("instance.lock"))
         .map_err(|e| e.to_string())?;
     instance_lock.try_lock().map_err(|_|"PeerBrush is already running for this workspace. Use that window or a different --state-dir.".to_string())?;
-    crate::disk_cache::configure(cache);
+    let current_cache = crate::disk_cache::configure(cache);
     let library = crate::brush_library::Library::load(preferences.join("brushes.json"));
     if let Some(error) = &library.error {
         shared.lock().unwrap().status = error.clone().into();
@@ -3337,15 +3546,7 @@ pub fn start_with_preferences(
     let workspace = crate::workspace::attach(&shared);
     workspace.lock().unwrap().recovery_dir = Some(state_dir.clone());
     // Preserve the preceding session's index before the running session updates its own.
-    if let Ok(bytes) = fs::read(state_dir.join("recoveries.json")) {
-        if bytes.len() < 65536
-            && serde_json::from_slice::<Value>(&bytes)
-                .ok()
-                .is_some_and(|index| index["projects"].as_array().is_some_and(|p| !p.is_empty()))
-        {
-            atomic_write(&state_dir.join("previous-recoveries.json"), &bytes)?;
-        }
-    }
+    crate::recovery::preserve_previous_index(&state_dir)?;
     let http = tiny_http::Server::http("127.0.0.1:0").map_err(|e| e.to_string())?;
     let port = http
         .server_addr()
@@ -3362,6 +3563,7 @@ pub fn start_with_preferences(
         shared,
         workspace,
         state_dir.clone(),
+        current_cache,
         auth,
         port,
         availability.clone(),
@@ -3817,11 +4019,11 @@ mod save_loss_tests {
                     std::fs::create_dir(&root).unwrap();
                     let path = root.join(format!("Original.{}", format.extension()));
                     let mut engine = Engine::new();
-                    engine.doc = Document::new_depth(8, 6, depth).unwrap();
+                    engine.resident_state_mut().expect("resident fixture").document = Document::new_depth(8, 6, depth).unwrap();
                     let shared = Arc::new(Mutex::new(engine));
                     export(&shared, &path).unwrap();
                     let original = std::fs::read(&path).unwrap();
-                    let source = shared.lock().unwrap().doc.clone();
+                    let source = shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
                     let before = serde_json::to_value(&source).unwrap();
                     let control = Control::default();
                     let error = export_derived_guarded(&shared, &path,
@@ -3850,17 +4052,17 @@ mod save_loss_tests {
                     );
                     assert_eq!(std::fs::read(&path).unwrap(), original);
                     let engine = shared.lock().unwrap();
-                    assert_eq!(engine.doc.bit_depth, depth);
+                    assert_eq!(engine.resident_state().expect("resident fixture").document.bit_depth, depth);
                     assert_eq!(engine.saved_revision, 0);
                     if failure == "source" {
                         assert_eq!(
-                            engine.doc.layers[0].pixels.get16(1, 2),
+                            engine.resident_state().expect("resident fixture").document.layers[0].pixels.get16(1, 2),
                             [53 * 257, 97 * 257, 173 * 257, 65535]
                         );
-                        assert_eq!(engine.undo.len(), 1);
+                        assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), 1);
                     } else {
-                        assert_eq!(serde_json::to_value(&engine.doc).unwrap(), before);
-                        assert!(engine.undo.is_empty());
+                        assert_eq!(serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap(), before);
+                        assert!(engine.resident_state().expect("resident fixture").undo.is_empty());
                     }
                     assert_eq!(
                         std::fs::read_dir(&root)
@@ -3892,15 +4094,18 @@ mod save_loss_tests {
             let alias = root.join(format!("Alias.{}", format.extension()));
             std::os::unix::fs::symlink(&original, &alias).unwrap();
             let shared = Arc::new(Mutex::new(Engine::new()));
-            let doc = shared.lock().unwrap().doc.clone();
-            let error =
-                export_confirmed_source(&shared, &alias, &doc.id, doc.revision).unwrap_err();
+            let (document, revision) = {
+                let engine = shared.lock().unwrap();
+                let doc = &engine.resident_state().unwrap().document;
+                (doc.id.clone(), doc.revision)
+            };
+            let error = export_confirmed_source(&shared, &alias, &document, revision).unwrap_err();
             assert!(
                 error.contains("same PNG, WebP or JPEG XL format"),
                 "{error}"
             );
             assert_eq!(std::fs::read(&original).unwrap(), b"Exact original PNG");
-            assert!(shared.lock().unwrap().undo.is_empty());
+            assert!(shared.lock().unwrap().resident_state().unwrap().undo.is_empty());
             drop(shared);
             std::fs::remove_dir_all(root).unwrap();
         }
@@ -3915,11 +4120,11 @@ mod save_loss_tests {
                 std::fs::create_dir_all(&root).unwrap();
                 let path = root.join("Original.png");
                 let mut engine = Engine::new();
-                engine.doc = Document::new_depth(8, 6, depth).unwrap();
+                engine.resident_state_mut().expect("resident fixture").document = Document::new_depth(8, 6, depth).unwrap();
                 let shared = Arc::new(Mutex::new(engine));
                 export(&shared, &path).unwrap();
                 let original = std::fs::read(&path).unwrap();
-                let source = shared.lock().unwrap().doc.clone();
+                let source = shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
                 let before = serde_json::to_value(&source).unwrap();
                 let control = crate::production_export::Control::default();
                 let error=export_derived_guarded(&shared,&path,&json!({"document_id":source.id,"expected_revision":source.revision,"overwrite":true}),&control,|doc|{
@@ -3935,14 +4140,14 @@ mod save_loss_tests {
                 let engine = shared.lock().unwrap();
                 assert_eq!(engine.saved_revision, 0);
                 if cancel {
-                    assert_eq!(serde_json::to_value(&engine.doc).unwrap(), before);
-                    assert!(engine.undo.is_empty());
+                    assert_eq!(serde_json::to_value(&engine.resident_state().expect("resident fixture").document).unwrap(), before);
+                    assert!(engine.resident_state().expect("resident fixture").undo.is_empty());
                 } else {
                     assert_eq!(
-                        engine.doc.layers[0].pixels.get16(1, 2),
+                        engine.resident_state().expect("resident fixture").document.layers[0].pixels.get16(1, 2),
                         [53 * 257, 97 * 257, 173 * 257, 65535]
                     );
-                    assert_eq!(engine.undo.len(), 1);
+                    assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), 1);
                 }
                 drop(engine);
                 drop(shared);
@@ -3958,13 +4163,13 @@ mod save_loss_tests {
             std::fs::create_dir_all(&root).unwrap();
             let path = root.join("Original.psd");
             let mut engine = Engine::new();
-            engine.doc = Document::new_depth(8, 6, depth).unwrap();
+            engine.resident_state_mut().expect("resident fixture").document = Document::new_depth(8, 6, depth).unwrap();
             let shared = Arc::new(Mutex::new(engine));
             save(&shared, &path).unwrap();
             let original = std::fs::read(&path).unwrap();
             let (document, revision, layer) = {
                 let mut engine = shared.lock().unwrap();
-                let layer = engine.doc.layers[0].id.clone();
+                let layer = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
                 engine
                     .edit(
                         "human",
@@ -3974,7 +4179,7 @@ mod save_loss_tests {
                         "Editable effect",
                     )
                     .unwrap();
-                (engine.doc.id.clone(), engine.doc.revision, layer)
+                (engine.resident_state().expect("resident fixture").document.id.clone(), engine.resident_state().expect("resident fixture").document.revision, layer)
             };
             let error = save_prepared(&shared, &path, &json!({"document_id":document,"expected_revision":revision,"accept_editability_loss":true}), || {
                 shared.lock().unwrap().edit("human", &[json!({"op":"fill","layer":layer,"rect":[1,2,3,4],"color":[53,97,173,255]})], None, None, "Later human pixels").unwrap();
@@ -3982,11 +4187,11 @@ mod save_loss_tests {
             assert!(error.contains("source changed"), "{error}");
             assert_eq!(std::fs::read(&path).unwrap(), original);
             let engine = shared.lock().unwrap();
-            assert_eq!(engine.doc.revision, revision + 1);
+            assert_eq!(engine.resident_state().expect("resident fixture").document.revision, revision + 1);
             assert_eq!(engine.saved_revision, 0);
-            assert_eq!(engine.undo.len(), 2);
-            assert_ne!(engine.doc.layers[0].pixels.get16(1, 2)[3], 0);
-            assert_eq!(engine.doc.layers[0].effects.len(), 1);
+            assert_eq!(engine.resident_state().expect("resident fixture").undo.len(), 2);
+            assert_ne!(engine.resident_state().expect("resident fixture").document.layers[0].pixels.get16(1, 2)[3], 0);
+            assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].effects.len(), 1);
             drop(engine);
             drop(shared);
             std::fs::remove_dir_all(root).unwrap();
@@ -4164,8 +4369,8 @@ mod connection_tests {
             .mcp_clients
             .insert("direct-mcp".into(), 123);
         let snapshot = |engine: &Engine| {
-            json!({"doc":engine.doc,"clients":engine.mcp_clients,
-            "undo":engine.undo.len(),"redo":engine.redo.len(),"saved":engine.saved_revision,
+            json!({"doc":engine.resident_state().expect("resident fixture").document,"clients":engine.mcp_clients,
+            "undo":engine.resident_state().expect("resident fixture").undo.len(),"redo":engine.resident_state().expect("resident fixture").redo.len(),"saved":engine.saved_revision,
             "focus":engine.focus_requested,"activity":engine.activity,"status":engine.status})
         };
         let before = snapshot(&shared.lock().unwrap());

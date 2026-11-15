@@ -22,6 +22,7 @@ pub(super) enum Place {
     BackupOrdinal(u32),
     CreatedBackup,
     Temporary,
+    RetainedOriginal,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct Binding {
@@ -122,6 +123,7 @@ impl ClosedFrame {
         let mut target = false;
         let mut created = false;
         let mut temporary = false;
+        let mut retained_original = false;
         let mut backups = 0;
         for (at, binding) in self.bindings.iter().enumerate() {
             if self.retired.contains(&binding.fact.identity)
@@ -176,6 +178,18 @@ impl ClosedFrame {
                         return Err("Partial temporary cannot settle external debt".into());
                     }
                 }
+                Place::RetainedOriginal => {
+                    retained_original = true;
+                    if original.expected.is_none_or(|old| {
+                        old.identity != binding.fact.identity
+                            || old.bytes != binding.fact.bytes
+                            || old.modified != binding.fact.modified
+                    }) {
+                        return Err(
+                            "Relocated original differs from its admitted physical owner".into(),
+                        );
+                    }
+                }
             }
         }
         if backups
@@ -184,8 +198,19 @@ impl ClosedFrame {
                 .iter()
                 .filter(|f| f.role == Role::Backup)
                 .count()
-            || (!target && original.expected.is_some())
-            || usize::from(target) + usize::from(created) + usize::from(temporary) + backups
+            || (!target && original.expected.is_some() && !retained_original)
+            || original.expected.is_some_and(|old| {
+                !self.retired.contains(&old.identity)
+                    && !self
+                        .bindings
+                        .iter()
+                        .any(|binding| binding.fact.identity == old.identity)
+            })
+            || usize::from(target)
+                + usize::from(created)
+                + usize::from(temporary)
+                + usize::from(retained_original)
+                + backups
                 != self.bindings.len()
             || self.retired.iter().any(|id| {
                 original
@@ -229,6 +254,7 @@ impl ClosedFrame {
                 Place::BackupOrdinal(n) => (2, n),
                 Place::CreatedBackup => (3, 0),
                 Place::Temporary => (4, 0),
+                Place::RetainedOriginal => (5, 0),
             };
             put(&mut cursor, &[tag])?;
             put(&mut cursor, &ordinal.to_be_bytes())?;
@@ -307,6 +333,7 @@ impl ClosedFrame {
                 (2, n) => Place::BackupOrdinal(n),
                 (3, 0) => Place::CreatedBackup,
                 (4, 0) => Place::Temporary,
+                (5, 0) => Place::RetainedOriginal,
                 _ => return Err("Invalid closed location binding".into()),
             };
             bindings.push(Binding {
@@ -465,6 +492,39 @@ mod tests {
         assert_eq!(pool.used(), baseline);
         drop(out);
         assert_eq!(pool.used(), 0);
+    }
+    #[test]
+    fn relocated_original_roundtrips_and_settles_an_absent_target_without_retiring_it() {
+        let original = original();
+        let pool = ResidentBudget::new(8 * 1024 * 1024).unwrap();
+        let mut out = ScratchBytes::new(&pool, BYTES, BYTES).unwrap();
+        let mut f = closed();
+        f.retired.clear();
+        assert!(f.validate(&original, [10; 32]).is_err());
+        f.bindings.push(Binding {
+            place: Place::RetainedOriginal,
+            fact: fact(1, 4),
+        });
+        f.bindings.sort_unstable_by_key(|b| b.fact.identity);
+        f.encode(&original, [10; 32], &mut out, &pool, &|| Ok(()))
+            .unwrap();
+        let decoded = ClosedFrame::decode(&out, &original, [10; 32], &pool, &|| Ok(())).unwrap();
+        assert_eq!(decoded.bindings, f.bindings);
+        assert!(decoded.retired.is_empty());
+        drop(decoded);
+        // A refused publication may retain the complete candidate and original
+        // without recreating a destination or inventing a retirement/refund.
+        f.bindings
+            .iter_mut()
+            .find(|b| b.place == Place::Target)
+            .unwrap()
+            .place = Place::Temporary;
+        f.validate(&original, [10; 32]).unwrap();
+        f.bindings[0].fact.modified += 1;
+        assert!(f.validate(&original, [10; 32]).is_err());
+        f.bindings[0].fact = fact(9, 4);
+        f.bindings.sort_unstable_by_key(|b| b.fact.identity);
+        assert!(f.validate(&original, [10; 32]).is_err());
     }
     #[test]
     fn corrupt_partial_noncanonical_wrong_intent_and_budget_refuse_without_metadata_leak() {

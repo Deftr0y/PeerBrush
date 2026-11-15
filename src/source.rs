@@ -3,7 +3,9 @@ use crate::{
     engine::{id, Document, Layer},
     raster::{check_size, Raster},
 };
-use ab_glyph::{point, Font, FontArc, FontRef, PxScale, ScaleFont};
+use ab_glyph::{Font, FontArc, FontRef};
+#[cfg(test)]
+use ab_glyph::point;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 #[path = "source/native_svg.rs"]
@@ -11,6 +13,7 @@ mod native_svg;
 #[path = "source/prepared.rs"]
 pub(crate) mod prepared;
 mod shaping;
+pub(crate) mod text_position;
 #[path = "source/stage.rs"]
 pub(crate) mod stage;
 
@@ -35,10 +38,14 @@ pub enum TextLayout {
     #[default]
     Legacy,
     Shaped,
+    Paragraph,
 }
 impl TextLayout {
     fn is_legacy(&self) -> bool {
         *self == Self::Legacy
+    }
+    pub(crate) fn uses_shaping(self) -> bool {
+        self != Self::Legacy
     }
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -148,10 +155,7 @@ impl Source {
         let font = self.validated_font()?;
         if matches!(
             self.content,
-            Content::Text {
-                layout: TextLayout::Shaped,
-                ..
-            }
+            Content::Text { layout, .. } if layout.uses_shaping()
         ) {
             self.validate_shaped_snapshot(font.as_ref().ok_or("Validated text font is missing")?)?;
         }
@@ -162,10 +166,7 @@ impl Source {
         self.validate_definition()?;
         if !matches!(
             self.content,
-            Content::Text {
-                layout: TextLayout::Shaped,
-                ..
-            }
+            Content::Text { layout, .. } if layout.uses_shaping()
         ) {
             return Err("Shaped validation requires a shaped text source".into());
         }
@@ -278,7 +279,7 @@ impl Source {
                 if text.len() > 16384
                     || text.chars().count() > 4096
                     || text.lines().count() > 96
-                    || (*layout == TextLayout::Shaped && text.split('\n').count() > 96)
+                    || (layout.uses_shaping() && text.split('\n').count() > 96)
                     || !size.is_finite()
                     || !(1. ..=1024.).contains(size)
                     || !line_height.is_finite()
@@ -295,7 +296,7 @@ impl Source {
                 for ch in text.chars().filter(|c| *c != '\n') {
                     if ch.is_control()
                         || matches!(ch as u32,0x200e..=0x200f|0x202a..=0x202e|0x2066..=0x2069)
-                        || (*layout == TextLayout::Shaped
+                        || (layout.uses_shaping()
                             && matches!(ch, '\u{061c}' | '\u{2028}' | '\u{2029}'))
                         || (*layout == TextLayout::Legacy
                             && (matches!(ch as u32, 0x200c..=0x200d)
@@ -394,10 +395,7 @@ impl Source {
         }
         let shaped = if matches!(
             self.content,
-            Content::Text {
-                layout: TextLayout::Shaped,
-                ..
-            }
+            Content::Text { layout, .. } if layout.uses_shaping()
         ) {
             Some(shaping::layout(
                 self,
@@ -413,10 +411,10 @@ impl Source {
             }
             Content::Svg { .. } => unreachable!("SVG projects directly from its vector definition"),
             Content::Text {
-                layout: TextLayout::Shaped,
+                layout,
                 color,
                 ..
-            } => {
+            } if layout.uses_shaping() => {
                 shaping::paint(
                     &mut base,
                     *color,
@@ -434,35 +432,17 @@ impl Source {
                 ..
             } => {
                 let f = font.ok_or("Validated text font is missing")?;
-                let scaled = f.as_scaled(PxScale::from(*size));
+                let style = text_position::LegacyStyle {
+                    width: self.width,
+                    size: *size,
+                    line_height: *line_height,
+                    letter_spacing: *letter_spacing,
+                    align,
+                };
                 let mut work = 0u64;
                 for (row, line) in text.split('\n').enumerate() {
-                    let mut advance = 0.;
-                    let mut previous = None;
-                    for ch in line.chars() {
-                        let g = scaled.glyph_id(ch);
-                        if let Some(p) = previous {
-                            advance += scaled.kern(p, g);
-                            advance += *letter_spacing;
-                        }
-                        advance += scaled.h_advance(g);
-                        previous = Some(g);
-                    }
-                    let start = match align.as_str() {
-                        "center" => (self.width as f32 - advance) * 0.5,
-                        "right" => self.width as f32 - advance,
-                        _ => 0.,
-                    };
-                    let mut x = start;
-                    let mut previous = None;
-                    let y = scaled.ascent() + row as f32 * scaled.height() * line_height;
-                    for ch in line.chars() {
-                        let gid = scaled.glyph_id(ch);
-                        if let Some(p) = previous {
-                            x += scaled.kern(p, gid);
-                            x += *letter_spacing;
-                        }
-                        let g = gid.with_scale_and_position(*size, point(x, y));
+                    let (_, glyphs) = style.line(f, row, line);
+                    for (_, g, _) in glyphs {
                         if let Some(outline) = f.outline_glyph(g) {
                             let bounds = outline.px_bounds();
                             work = outline_work(bounds, work)?;
@@ -491,8 +471,6 @@ impl Source {
                                 });
                             }
                         }
-                        x += scaled.h_advance(gid);
-                        previous = Some(gid);
                     }
                 }
             }
@@ -619,18 +597,22 @@ impl Source {
         }))
     }
     pub fn prepend(&mut self, n: [f32; 6]) {
-        let [a, b, c, d, x, y] = self.matrix;
-        let [e, f, g, h, u, v] = n;
-        self.matrix = [
-            e * a + g * b,
-            f * a + h * b,
-            e * c + g * d,
-            f * c + h * d,
-            e * x + g * y + u,
-            f * x + h * y + v,
-        ];
+        self.matrix = prepend_matrix(n, self.matrix);
     }
 }
+pub(crate) fn prepend_matrix(n: [f32; 6], matrix: [f32; 6]) -> [f32; 6] {
+    let [a, b, c, d, x, y] = matrix;
+    let [e, f, g, h, u, v] = n;
+    [
+        e * a + g * b,
+        f * a + h * b,
+        e * c + g * d,
+        f * c + h * d,
+        e * x + g * y + u,
+        f * x + h * y + v,
+    ]
+}
+
 fn segment_distance(p: [f32; 2], a: [f32; 2], b: [f32; 2]) -> f32 {
     let dx = b[0] - a[0];
     let dy = b[1] - a[1];
@@ -646,11 +628,18 @@ fn segment_distance(p: [f32; 2], a: [f32; 2], b: [f32; 2]) -> f32 {
 pub fn parse(c: &Value) -> Result<Source, String> {
     serde_json::from_value(c["source"].clone()).map_err(|e| format!("Invalid editable source: {e}"))
 }
+
+pub(crate) fn fit_text_requested(c: &Value) -> Result<bool, String> {
+    c.get("fit_text").map_or(Ok(false), |value| {
+        value.as_bool().ok_or_else(|| "fit_text must be true or false".into())
+    })
+}
+
 pub fn add(doc: &mut Document, c: &Value) -> Result<(), String> {
     if doc.layers.len() >= 100 {
         return Err("Layer limit reached".into());
     }
-    let source = parse(c)?;
+    let mut source = parse(c)?;
     source.validate_structure()?;
     let parent = c["parent"].as_str();
     if c.get("parent")
@@ -680,10 +669,80 @@ pub fn add(doc: &mut Document, c: &Value) -> Result<(), String> {
         }
     }
     layer.parent = parent.map(String::from);
-    layer.pixels = source.render(source.width, source.height, doc.bit_depth)?;
+    let mut frame = [source.width, source.height];
+    if fit_text_requested(c)? {
+        if !matches!(&source.content, Content::Text { .. }) {
+            return Err("Only editable text can fit its transformed field".into());
+        }
+        let origin;
+        (frame, origin, source.matrix) = projected_text_frame(source.matrix, frame, None, [layer.x, layer.y])?;
+        [layer.x, layer.y] = origin;
+    }
+    layer.pixels = source.render(frame[0], frame[1], doc.bit_depth)?;
     layer.source = Some(source.into());
     doc.layers.insert(0, layer);
     Ok(())
+}
+/// Preserve the old projection while expanding a changed text field's bounds.
+/// Both engines apply their own pixel/work admission before rendering this frame.
+pub(crate) fn resized_text_frame(
+    matrix: [f32; 6],
+    source_frame: [u32; 2],
+    projection_frame: [u32; 2],
+    origin: [i32; 2],
+) -> Result<([u32; 2], [i32; 2], [f32; 6]), String> {
+    projected_text_frame(matrix, source_frame, Some(projection_frame), origin)
+}
+
+/// A new layer fits the projected field. An existing layer retains its old
+/// projection frame so companion masks can be reframed at document coordinates.
+pub(crate) fn projected_text_frame(
+    matrix: [f32; 6],
+    source_frame: [u32; 2],
+    projection_frame: Option<[u32; 2]>,
+    origin: [i32; 2],
+) -> Result<([u32; 2], [i32; 2], [f32; 6]), String> {
+    if matrix.into_iter().any(|value| !value.is_finite()) {
+        return Err("Invalid editable-source transform".into());
+    }
+    let [a, b, c, d, tx, ty] = matrix.map(f64::from);
+    let corners = [
+        [0., 0.],
+        [f64::from(source_frame[0]), 0.],
+        [f64::from(source_frame[0]), f64::from(source_frame[1])],
+        [0., f64::from(source_frame[1])],
+    ]
+    .map(|[x, y]| [a * x + c * y + tx, b * x + d * y + ty]);
+    let low = if projection_frame.is_some() { 0. } else { f64::INFINITY };
+    let high = projection_frame.map_or([f64::NEG_INFINITY; 2], |frame| frame.map(f64::from));
+    let left = corners.iter().map(|p| p[0]).fold(low, f64::min).floor();
+    let top = corners.iter().map(|p| p[1]).fold(low, f64::min).floor();
+    let right = corners
+        .iter()
+        .map(|p| p[0])
+        .fold(high[0], f64::max)
+        .ceil();
+    let bottom = corners
+        .iter()
+        .map(|p| p[1])
+        .fold(high[1], f64::max)
+        .ceil();
+    let x = f64::from(origin[0]) + left;
+    let y = f64::from(origin[1]) + top;
+    if [left, top, right, bottom, x, y]
+        .iter()
+        .any(|v| !v.is_finite() || v.abs() > 100000.)
+    {
+        return Err("Text field projection exceeds coordinate limits".into());
+    }
+    let mut matrix = matrix;
+    matrix[4] = (tx - left) as f32;
+    matrix[5] = (ty - top) as f32;
+    Ok((
+        [(right - left) as u32, (bottom - top) as u32],
+        [x as i32, y as i32],
+        matrix,
+    ))
 }
 pub fn update(layer: &mut Layer, c: &Value) -> Result<(), String> {
     let old = layer
@@ -691,61 +750,37 @@ pub fn update(layer: &mut Layer, c: &Value) -> Result<(), String> {
         .as_ref()
         .ok_or("This layer has no editable text/vector source")?;
     let mut source = parse(c)?;
-    if (source.width, source.height) != (old.width, old.height) {
+    let fit_text = fit_text_requested(c)?;
+    if (source.width, source.height) != (old.width, old.height) || fit_text {
         if !matches!(old.content, Content::Text { .. })
             || !matches!(source.content, Content::Text { .. })
         {
             return Err("Only editable text fields can change source dimensions".into());
         }
         source.validate_structure()?;
-        let [a, b, c, d, tx, ty] = source.matrix.map(f64::from);
-        let corners = [
-            [0., 0.],
-            [f64::from(source.width), 0.],
-            [f64::from(source.width), f64::from(source.height)],
-            [0., f64::from(source.height)],
-        ]
-        .map(|[x, y]| [a * x + c * y + tx, b * x + d * y + ty]);
-        // Keep the old projection frame so resizing never crops attached mask sources.
-        let left = corners.iter().map(|p| p[0]).fold(0., f64::min).floor();
-        let top = corners.iter().map(|p| p[1]).fold(0., f64::min).floor();
-        let right = corners
-            .iter()
-            .map(|p| p[0])
-            .fold(f64::from(layer.pixels.width), f64::max)
-            .ceil();
-        let bottom = corners
-            .iter()
-            .map(|p| p[1])
-            .fold(f64::from(layer.pixels.height), f64::max)
-            .ceil();
-        let x = f64::from(layer.x) + left;
-        let y = f64::from(layer.y) + top;
-        if [left, top, right, bottom, x, y]
-            .iter()
-            .any(|v| !v.is_finite() || v.abs() > 100000.)
-        {
-            return Err("Text field projection exceeds coordinate limits".into());
-        }
-        let (width, height) = ((right - left) as u32, (bottom - top) as u32);
+        let ([width, height], [x, y], matrix) = resized_text_frame(
+            source.matrix,
+            [source.width, source.height],
+            [layer.pixels.width, layer.pixels.height],
+            [layer.x, layer.y],
+        )?;
         check_size(width, height)?;
         crate::transform::work_budget(
             width,
             height,
             1 + layer.mask.as_ref().map_or(0, |mask| mask.steps.len()),
         )?;
-        source.matrix[4] = (tx - left) as f32;
-        source.matrix[5] = (ty - top) as f32;
+        source.matrix = matrix;
         let mut replacement = layer.clone();
-        crate::transform::reframe_mask(&mut replacement, x as i32, y as i32, width, height)?;
-        if left != 0. || top != 0. {
+        crate::transform::reframe_mask(&mut replacement, x, y, width, height)?;
+        if x != layer.x || y != layer.y {
             for effect in &mut replacement.effects {
                 if effect.kind == "liquify" {
                     crate::geometry::map_effect(
                         &effect.kind,
                         std::sync::Arc::make_mut(&mut effect.settings),
                         [1., 1.],
-                        [-left as i32, -top as i32],
+                        [layer.x - x, layer.y - y],
                         true,
                     )?;
                 }
@@ -870,12 +905,12 @@ mod tests {
             "task":entry.task,"scopes":entry.scopes,"gesture":entry.gesture,"reverted":entry.reverted,
         })).collect::<Vec<_>>()
         };
-        json!({"document":engine.doc,"png":engine.doc.export_png().unwrap(),
-            "undo":history(&engine.undo),"redo":history(&engine.redo)})
+        json!({"document":engine.resident_state().expect("resident fixture").document,"png":engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
+            "undo":history(&engine.resident_state().expect("resident fixture").undo),"redo":history(&engine.resident_state().expect("resident fixture").redo)})
     }
     fn fixture(depth: u16, font: TextFont) -> Engine {
         let mut engine = Engine::new();
-        engine.doc = Document::new_depth(200, 120, depth).unwrap();
+        engine.resident_state_mut().expect("resident fixture").document = Document::new_depth(200, 120, depth).unwrap();
         let source = text("regular".into());
         let mut layer = Layer::new(
             "Installed text fixture",
@@ -885,7 +920,7 @@ mod tests {
         );
         layer.pixels = source.render(source.width, source.height, depth).unwrap();
         layer.source = Some(text(font).into());
-        engine.doc.layers.insert(0, layer);
+        engine.resident_state_mut().expect("resident fixture").document.layers.insert(0, layer);
         engine
     }
     #[test]
@@ -938,26 +973,26 @@ mod tests {
                     error.to_string()
                 );
                 assert_eq!(guard.requests(), 2);
-                crate::psd::validate(&engine.doc).unwrap();
+                crate::psd::validate(&engine.resident_state().expect("resident fixture").document).unwrap();
                 for bytes in [
-                    crate::psd::encode(&engine.doc).unwrap(),
-                    crate::psd::encode_psb(&engine.doc).unwrap(),
+                    crate::psd::encode(&engine.resident_state().expect("resident fixture").document).unwrap(),
+                    crate::psd::encode_psb(&engine.resident_state().expect("resident fixture").document).unwrap(),
                 ] {
                     let reopened = crate::psd::decode(&bytes).unwrap();
                     assert!(!reopened.read_only);
                     assert_eq!(reopened.bit_depth, depth);
-                    assert_eq!(reopened.layers[0].source, engine.doc.layers[0].source);
+                    assert_eq!(reopened.layers[0].source, engine.resident_state().expect("resident fixture").document.layers[0].source);
                     assert_eq!(
                         reopened.layers[0].pixels.rgba16(),
-                        engine.doc.layers[0].pixels.rgba16()
+                        engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16()
                     );
                     assert_eq!(
                         reopened.export_png().unwrap(),
-                        engine.doc.export_png().unwrap()
+                        engine.resident_state().expect("resident fixture").document.export_png().unwrap()
                     );
                 }
                 let snapshot =
-                    crate::layer_clipboard::copy(&engine.doc, &[engine.doc.layers[0].id.clone()])
+                    crate::layer_clipboard::copy(&engine.resident_state().expect("resident fixture").document, &[engine.resident_state().expect("resident fixture").document.layers[0].id.clone()])
                         .unwrap();
                 let mut target = Document::new_depth(200, 120, depth).unwrap();
                 crate::layer_clipboard::paste(&mut target, &snapshot, "").unwrap();
@@ -966,8 +1001,8 @@ mod tests {
                     .iter()
                     .find(|layer| layer.source.is_some())
                     .unwrap();
-                assert_eq!(pasted.source, engine.doc.layers[0].source);
-                assert_eq!(pasted.pixels.rgba16(), engine.doc.layers[0].pixels.rgba16());
+                assert_eq!(pasted.source, engine.resident_state().expect("resident fixture").document.layers[0].source);
+                assert_eq!(pasted.pixels.rgba16(), engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16());
                 assert_eq!(guard.requests(), 2);
                 assert_eq!(state(&engine), before);
             }
@@ -979,8 +1014,8 @@ mod tests {
         for depth in [8, 16] {
             let mut engine = fixture(depth, TextFont::Installed(reference.clone()));
             let guard = fonts::test_fonts(vec![(reference.clone(), Err(FontError::Missing))]);
-            let id = engine.doc.layers[0].id.clone();
-            let mut updated = engine.doc.layers[0].source.as_deref().cloned().unwrap();
+            let id = engine.resident_state().expect("resident fixture").document.layers[0].id.clone();
+            let mut updated = engine.resident_state().expect("resident fixture").document.layers[0].source.as_deref().cloned().unwrap();
             if let Content::Text { text, .. } = &mut updated.content {
                 *text = "Changed human text".into();
             }
@@ -1008,12 +1043,12 @@ mod tests {
                     .unwrap_err();
                 assert_eq!(error, FontError::Missing.to_string());
                 assert_eq!(state(&engine), before);
-                assert!(Engine::preview_edits(engine.doc.clone(), &[command]).is_err());
+                assert!(Engine::preview_edits(engine.resident_state().expect("resident fixture").document.clone(), &[command]).is_err());
                 assert_eq!(state(&engine), before);
             }
             let requests = guard.requests();
-            let words = engine.doc.layers[0].pixels.rgba16();
-            let definition = engine.doc.layers[0].source.clone();
+            let words = engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16();
+            let definition = engine.resident_state().expect("resident fixture").document.layers[0].source.clone();
             for command in [
                 json!({"op":"move","layer":id,"dx":3,"dy":2,"selection_only":false}),
                 json!({"op":"effect.add","layer":id,"kind":"invert","settings":{}}),
@@ -1031,8 +1066,8 @@ mod tests {
                     .unwrap();
             }
             assert_eq!(guard.requests(), requests);
-            assert_eq!(engine.doc.layers[0].source, definition);
-            assert_eq!(engine.doc.layers[0].pixels.rgba16(), words);
+            assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].source, definition);
+            assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(), words);
             let before = state(&engine);
             engine
                 .edit(
@@ -1043,16 +1078,16 @@ mod tests {
                     "Explicit rasterize",
                 )
                 .unwrap();
-            assert!(engine.doc.layers[0].source.is_none());
-            assert_eq!(engine.doc.layers[0].pixels.rgba16(), words);
+            assert!(engine.resident_state().expect("resident fixture").document.layers[0].source.is_none());
+            assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(), words);
             assert_eq!(
-                engine.doc.export_png().unwrap(),
-                engine.undo.last().unwrap().before.export_png().unwrap()
+                engine.resident_state().expect("resident fixture").document.export_png().unwrap(),
+                engine.resident_state().expect("resident fixture").undo.last().unwrap().before.export_png().unwrap()
             );
             engine.undo("human").unwrap();
-            assert_eq!(engine.doc.layers[0].source, definition);
-            assert_eq!(engine.doc.layers[0].pixels.rgba16(), words);
-            assert_eq!(json!(engine.doc.layers), before["document"]["layers"]);
+            assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].source, definition);
+            assert_eq!(engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16(), words);
+            assert_eq!(json!(engine.resident_state().expect("resident fixture").document.layers), before["document"]["layers"]);
             assert_eq!(guard.requests(), requests);
         }
     }
@@ -1155,24 +1190,24 @@ mod tests {
         for depth in [8, 16] {
             let mut engine = fixture(depth, TextFont::Installed(reference.clone()));
             if let Content::Text { text, .. } =
-                &mut std::sync::Arc::make_mut(engine.doc.layers[0].source.as_mut().unwrap()).content
+                &mut std::sync::Arc::make_mut(engine.resident_state_mut().expect("resident fixture").document.layers[0].source.as_mut().unwrap()).content
             {
                 *text = "שלום مرحبا हिन्दी \u{1820} A\u{0301}\u{1ab0}".into();
             }
             for bytes in [
-                crate::psd::encode(&engine.doc).unwrap(),
-                crate::psd::encode_psb(&engine.doc).unwrap(),
+                crate::psd::encode(&engine.resident_state().expect("resident fixture").document).unwrap(),
+                crate::psd::encode_psb(&engine.resident_state().expect("resident fixture").document).unwrap(),
             ] {
                 let reopened = crate::psd::decode(&bytes).unwrap();
                 assert!(!reopened.read_only);
-                assert_eq!(reopened.layers[0].source, engine.doc.layers[0].source);
+                assert_eq!(reopened.layers[0].source, engine.resident_state().expect("resident fixture").document.layers[0].source);
                 assert_eq!(
                     reopened.layers[0].pixels.rgba16(),
-                    engine.doc.layers[0].pixels.rgba16()
+                    engine.resident_state().expect("resident fixture").document.layers[0].pixels.rgba16()
                 );
                 assert_eq!(
                     reopened.export_png().unwrap(),
-                    engine.doc.export_png().unwrap()
+                    engine.resident_state().expect("resident fixture").document.export_png().unwrap()
                 );
             }
         }

@@ -53,8 +53,14 @@ def dependencies(depends, require_runtime=False):
 def deb_version(version):
     if not isinstance(version, str) or not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?', version):
         raise ValueError('Expected a bounded application SemVer without build metadata')
-    # Debian's tilde sorts development/prerelease versions before their release.
-    return version.replace('-', '~', 1) + '-1'
+    # A Debian epoch lets the 0.4 series upgrade the published 0.30 series.
+    # Tilde keeps prerelease versions before their release.
+    epoch = '1:' if version.startswith('0.4.') else ''
+    return epoch + version.replace('-', '~', 1) + '-1'
+
+
+def deb_filename(version):
+    return f'peerbrush_{deb_version(version).split(":")[-1]}_amd64.deb'
 
 
 def control(version, depends, size, maintainer):
@@ -257,7 +263,7 @@ def inspect_final(root, portable, package, *, commit, version, portable_sha256, 
     package = regular_file(package.absolute().parent, package.name)
     if (not isinstance(commit, str) or not re.fullmatch(r'[0-9a-f]{40}', commit)
             or not isinstance(package_sha256, str) or not re.fullmatch(r'[0-9a-f]{64}', package_sha256)
-            or package.name != f'peerbrush_{deb_version(version)}_amd64.deb'
+            or package.name != deb_filename(version)
             or not 0 < package.stat().st_size <= MAX_DEB_BYTES or digest(package) != package_sha256):
         raise ValueError('DEB filename, source identity or bytes differ from the selected candidate')
     checked, inputs = portable_payload(root, portable, portable_sha256, commit, version)
@@ -296,6 +302,7 @@ def inspect_final(root, portable, package, *, commit, version, portable_sha256, 
                            platform='Linux', architecture='amd64', binary_source_commit=commit,
                            source_sha256=checked['manifest']['source_sha256']),
             'executable_sha256': checked['manifest']['executable_sha256'], 'portable_sha256': portable_sha256,
+            'control': text,
             'content_checks': ['exact-source-portable-and-installed-payload', 'root-ownership-and-exact-modes',
                                'approved-maintainer-and-exact-control-fields', 'bounded-xz-ar-and-tar-without-installation-scripts',
                                'native-dependency-syntax-and-mandatory-runtime-packages']}
@@ -348,7 +355,7 @@ def build(root, archive, output, maintainer, expected_sha256):
         (stage / 'DEBIAN').chmod(0o755)
         (stage / 'DEBIAN/control').write_text(control(receipt['version'], depends, size, maintainer), encoding='utf-8')
         (stage / 'DEBIAN/control').chmod(0o644)
-        filename = f'peerbrush_{deb_version(receipt["version"])}_amd64.deb'
+        filename = deb_filename(receipt["version"])
         candidate = work / filename
         run(['dpkg-deb', '--root-owner-group', '-Zxz', '--uniform-compression', '--build', str(stage), str(candidate)])
         verify_tar(run(['dpkg-deb', '--fsys-tarfile', str(candidate)], binary=True), stage_inventory(stage))

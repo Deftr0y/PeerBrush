@@ -7,106 +7,20 @@ use super::{
     SelectionSource,
 };
 use crate::{
-    image_import::prepared_png::{self, ColorPolicy, Complete, EncodedPng, Header, Limits},
-    large_document::{Error, Result, ScratchBytes, Store},
+    image_import::{
+        png_admission,
+        prepared_png::{self, ColorPolicy, Complete, EncodedPng, FilePng, Header, Limits},
+    },
+    large_document::{Result, Store},
     raster::surface::Surface,
+    workspace::source_runtime::SourceSession,
 };
 use serde_json::Value;
-use std::{
-    fs::File,
-    io::Read,
-    path::{Path, PathBuf},
-};
+use std::path::Path;
 
-struct FileGuard {
-    path: PathBuf,
-    file: File,
-    version: crate::file_safety::Version,
-}
-impl FileGuard {
-    fn verify(
-        &self,
-        hash: [u8; 32],
-        check: &dyn Fn() -> Result<()>,
-    ) -> std::result::Result<(), String> {
-        check().map_err(|e| e.to_string())?;
-        if crate::file_safety::identity(&self.file)? != self.version.identity
-            || self.file.metadata().map_err(|e| e.to_string())?.len() != self.version.bytes
-        {
-            return Err("Selection image file changed while preparing its source".into());
-        }
-        let actual =
-            crate::file_safety::verified_version(&self.path, self.version.bytes, hash, || {
-                check().map_err(|e| e.to_string())
-            })?;
-        if actual != self.version {
-            return Err("Selection image path or bytes changed while preparing its source".into());
-        }
-        Ok(())
-    }
-}
-
-fn transport(
-    command: &Value,
-    store: &Store,
-    check: &dyn Fn() -> Result<()>,
-) -> std::result::Result<(EncodedPng, Option<FileGuard>), String> {
-    let pool = store.resident_budget();
-    match (command["png"].as_str(), command["path"].as_str()) {
-        (Some(text), None) => Ok((
-            EncodedPng::base64(text, Limits::SELECTION, &pool, &mut || {
-                check().map_err(|e| e.to_string())
-            })?,
-            None,
-        )),
-        (None, Some(path)) => {
-            let path = Path::new(path);
-            if !path.metadata().map_err(|e| e.to_string())?.is_file() {
-                return Err("Selection mask must be a regular PNG file".into());
-            }
-            let version = crate::file_safety::version_with_check(path, || {
-                check().map_err(|e| e.to_string())
-            })?;
-            if version.bytes == 0 || version.bytes > Limits::SELECTION.encoded as u64 {
-                return Err("Selection mask must be a bounded PNG image".into());
-            }
-            let mut file = File::open(path).map_err(|e| e.to_string())?;
-            if crate::file_safety::identity(&file)? != version.identity
-                || !file.metadata().map_err(|e| e.to_string())?.is_file()
-            {
-                return Err("Selection image ownership changed while opening it".into());
-            }
-            let mut bytes =
-                ScratchBytes::new(&pool, version.bytes as usize, Limits::SELECTION.encoded)
-                    .map_err(|e| e.to_string())?;
-            for part in bytes.chunks_mut(64 * 1024) {
-                check().map_err(|e| e.to_string())?;
-                file.read_exact(part).map_err(|e| e.to_string())?;
-            }
-            let encoded = EncodedPng::from_charged_bytes(
-                bytes.freeze(),
-                version.bytes as usize,
-                Limits::SELECTION,
-                &pool,
-                &mut || check().map_err(|e| e.to_string()),
-            )?;
-            Ok((
-                encoded,
-                Some(FileGuard {
-                    path: path.to_owned(),
-                    file,
-                    version,
-                }),
-            ))
-        }
-        _ => Err("Supply exactly one PNG path or base64 png".into()),
-    }
-}
-
-pub(crate) struct ImageSource {
+struct ImageSource {
     source: Surface,
     complete: Complete,
-    file: Option<FileGuard>,
 }
 impl ImageSource {
     pub(crate) fn source(&self) -> &Surface {
@@ -115,24 +29,21 @@ impl ImageSource {
     pub(crate) fn header(&self) -> Header {
         self.complete.header()
     }
-    pub(crate) fn source_sha256(&self) -> [u8; 32] {
-        self.complete.source_sha256()
-    }
-    pub(crate) fn verify(&self, check: &dyn Fn() -> Result<()>) -> std::result::Result<(), String> {
-        if let Some(file) = &self.file {
-            file.verify(self.source_sha256(), check)?;
-        }
-        check().map_err(|e| e.to_string())
-    }
 }
 
-pub(crate) fn decode(
+fn decode(
     command: &Value,
     store: Store,
     check: &dyn Fn() -> Result<()>,
 ) -> std::result::Result<ImageSource, String> {
-    let (encoded, file) = transport(command, &store, check)?;
+    let text = match (command["png"].as_str(), command["path"].as_str()) {
+        (Some(text), None) => text,
+        _ => return Err("Supply exactly one PNG path or base64 png".into()),
+    };
     let pool = store.resident_budget();
+    let encoded = EncodedPng::base64(text, Limits::SELECTION, &pool, &mut || {
+        check().map_err(|e| e.to_string())
+    })?;
     let mut rows: Option<Rows> = None;
     let mut first: Option<Header> = None;
     let complete = prepared_png::decode_rows(
@@ -165,13 +76,7 @@ pub(crate) fn decode(
         .ok_or("Selection PNG contains no decoded source rows")?
         .finish(&mut || check())
         .map_err(|e| e.to_string())?;
-    let image = ImageSource {
-        source,
-        complete,
-        file,
-    };
-    image.verify(check)?;
-    Ok(image)
+    Ok(ImageSource { source, complete })
 }
 
 pub(crate) fn prepare(
@@ -180,6 +85,7 @@ pub(crate) fn prepare(
     height: u32,
     prior: Option<&SelectionSource>,
     store: Store,
+    session: &SourceSession,
     check: &dyn Fn() -> Result<()>,
 ) -> std::result::Result<CoverageSource, String> {
     let area = command
@@ -211,27 +117,53 @@ pub(crate) fn prepare(
         "alpha" => Channel::Alpha,
         _ => return Err("Selection mask channel must be luma or alpha".into()),
     };
-    let image = decode(command, store.clone(), check)?;
-    let header = image.header();
     // Preserve the current ImageReader PNG channel interpretation. Raw cICP
     // remains decoder metadata; it is not applied by that existing loader.
-    let candidate = regional_import::prepare_source(
-        image.source(),
-        ImageChannels {
-            has_alpha: header.has_alpha,
-            grayscale: header.grayscale,
-            cicp: image::metadata::Cicp::SRGB,
-        },
-        channel,
-        width,
-        height,
-        area,
-        mode,
-        prior,
-        store,
-        check,
-    )?;
-    image.verify(check)?;
+    let sample = |source: &Surface, header: Header| {
+        regional_import::prepare_source(
+            source,
+            ImageChannels {
+                has_alpha: header.has_alpha,
+                grayscale: header.grayscale,
+                cicp: image::metadata::Cicp::SRGB,
+            },
+            channel,
+            width,
+            height,
+            area,
+            mode,
+            prior,
+            store.clone(),
+            check,
+        )
+    };
+    if let (None, Some(path)) = (command["png"].as_str(), command["path"].as_str()) {
+        let mut checked = || check().map_err(|e| e.to_string());
+        let mut file = FilePng::open(
+            session,
+            Path::new(path),
+            prepared_png::apng::NATIVE_OPEN_LIMITS,
+            ColorPolicy::RawSelection,
+            &mut checked,
+        )?;
+        let staged = png_admission::stage_file(session, &mut file, &mut checked)?;
+        let candidate = sample(staged.surface(), staged.complete().header())
+            .and_then(|candidate| file.verify(&mut checked).map(|()| candidate));
+        let cleanup = staged.abort(session);
+        return match (candidate, cleanup) {
+            (Ok(candidate), Ok(())) => Ok(candidate),
+            (Err(reason), Ok(())) => Err(reason),
+            (Ok(_), Err(cleanup)) => Err(format!(
+                "Selection PNG source retirement refused: {cleanup}"
+            )),
+            (Err(reason), Err(cleanup)) => Err(format!(
+                "{reason}; selection PNG source retirement refused: {cleanup}"
+            )),
+        };
+    }
+    let image = decode(command, store.clone(), check)?;
+    let candidate = sample(image.source(), image.header())?;
+    check().map_err(|e| e.to_string())?;
     Ok(candidate)
 }
 
@@ -239,27 +171,25 @@ pub(crate) fn prepare(
 mod tests {
     use super::*;
     use crate::{
-        large_document::{DiskBudget, Limits as StoreLimits, ResidentBudget},
+        large_document::{Error, Limits as StoreLimits},
         raster::backed::Region,
     };
     use base64::Engine;
     use serde_json::json;
 
     #[test]
-    fn complete_file_and_base64_png_sources_match_legacy_import_and_refuse_late_changes_or_crc() {
+    fn file_and_base64_png_sources_match_legacy_import_and_refuse_crc_or_cancellation() {
         for depth in [8, 16] {
-            let pool = ResidentBudget::new(128 * 1024 * 1024).unwrap();
-            let base = std::fs::canonicalize(std::env::temp_dir())
-                .unwrap()
-                .join(format!(
-                    "peerbrush-selection-image-source-{}",
-                    crate::engine::id()
-                ));
-            std::fs::create_dir(&base).unwrap();
+            let fixture = crate::engine::native::worker::tests::Fixture::new();
+            let (runtime, connection) =
+                fixture.runtime_with_budgets(128 * 1024 * 1024, 128 * 1024 * 1024);
+            let session = runtime.begin().unwrap();
+            let pool = runtime.resident();
+            let base = fixture.path();
             let store = Store::create_with_disk_budget(
                 &base.join("store"),
                 pool.clone(),
-                DiskBudget::new(64 * 1024 * 1024, 4).unwrap(),
+                runtime.disk(),
                 StoreLimits {
                     disk_bytes: 64 * 1024 * 1024,
                     max_blocks: 256,
@@ -307,8 +237,13 @@ mod tests {
                 json!({"path":path,"rect":[3,2,29,28],"channel":"luma"}),
                 json!({"png":base64::engine::general_purpose::STANDARD.encode(&encoded),"rect":[3,2,29,28],"channel":"alpha"}),
             ] {
-                let source = decode(&command, store.clone(), &|| Ok(())).unwrap();
-                assert_eq!(source.source_sha256(), expected_hash);
+                let source = decode(
+                    &json!({"png":base64::engine::general_purpose::STANDARD.encode(&encoded)}),
+                    store.clone(),
+                    &|| Ok(()),
+                )
+                .unwrap();
+                assert_eq!(source.complete.source_sha256(), expected_hash);
                 assert_eq!(source.source.depth(), depth);
                 let view = source
                     .source
@@ -333,7 +268,8 @@ mod tests {
                 let mut doc = crate::engine::Document::new(33, 31).unwrap();
                 crate::selection::import::apply(&mut doc, &command).unwrap();
                 let expected = crate::selection::current(&doc).unwrap();
-                let actual = prepare(&command, 33, 31, None, store.clone(), &|| Ok(())).unwrap();
+                let actual =
+                    prepare(&command, 33, 31, None, store.clone(), &session, &|| Ok(())).unwrap();
                 let view = actual
                     .prepare_region(Region::new([0, 0, 33, 31]).unwrap(), &pool, &mut || Ok(()))
                     .unwrap();
@@ -343,13 +279,20 @@ mod tests {
                     }
                 }
             }
-            let source = decode(&json!({"path":path}), store.clone(), &|| Ok(())).unwrap();
             let mut changed = encoded.clone();
             let last = changed.len() - 1;
             changed[last] ^= 1;
             std::fs::write(&path, &changed).unwrap();
-            assert!(source.verify(&|| Ok(())).is_err());
-            drop(source);
+            assert!(prepare(
+                &json!({"path":path,"rect":[0,0,33,31]}),
+                33,
+                31,
+                None,
+                store.clone(),
+                &session,
+                &|| Ok(())
+            )
+            .is_err());
             assert!(decode(
                 &json!({"png":base64::engine::general_purpose::STANDARD.encode(&changed)}),
                 store.clone(),
@@ -362,9 +305,8 @@ mod tests {
                 &|| Err(Error::Cancelled)
             )
             .is_err());
-            drop(store);
+            drop((store, session, runtime, connection));
             assert_eq!(pool.used(), 0);
-            std::fs::remove_dir_all(base).unwrap();
         }
     }
 }

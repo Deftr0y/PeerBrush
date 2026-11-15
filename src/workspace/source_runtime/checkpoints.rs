@@ -9,6 +9,11 @@ use crate::{
     recovery::backed::CheckpointProof,
 };
 use std::{fs, sync::Arc};
+#[path = "checkpoints/retirement.rs"]
+mod retirement;
+pub(crate) use retirement::RetiredMarker;
+#[cfg(test)]
+pub(crate) use retirement::RetirementFault;
 
 pub(super) struct Registry {
     entries: Vec<Registered>,
@@ -37,6 +42,12 @@ impl CheckpointCensus {
     }
 }
 impl Registry {
+    pub(super) fn retain_uncertain_publication(&mut self) {
+        self.ambiguous = true;
+    }
+    pub(super) fn ambiguous(&self) -> bool {
+        self.ambiguous
+    }
     pub(super) fn new(maximum: usize) -> Result<Self, String> {
         let mut entries = Vec::new();
         // The encompassing inventory reserves >=8192 bytes per entry before
@@ -131,12 +142,151 @@ struct Member {
     kind: u8,
     identity: (u64, u64),
     child: (u64, u64),
+    journal_sha256: [u8; 32],
 }
 struct Members {
     entries: Vec<Member>,
     _charge: Reservation,
 }
 impl SourceSession {
+    /// Reuse a fully registered source selection, not an inferred file head.
+    pub(super) fn retained_checkpoint_source(
+        &self,
+        store: &crate::large_document::Store,
+        needed: &mut [([u8; 32], bool)],
+    ) -> Result<Option<Snapshot>, String> {
+        self.check()?;
+        let (epoch, count) = {
+            let state = self
+                .runtime
+                .inventory
+                .try_lock()
+                .map_err(|_| "Source inventory is busy")?;
+            let registry = &state
+                .as_ref()
+                .ok_or("Source inventory unavailable")?
+                .checkpoints;
+            if registry.ambiguous {
+                return Err("Checkpoint registration is uncertain; sources retained".into());
+            }
+            (registry.epoch, registry.entries.len())
+        };
+        for at in 0..count {
+            let source = {
+                let state = self
+                    .runtime
+                    .inventory
+                    .try_lock()
+                    .map_err(|_| "Source inventory is busy")?;
+                let registry = &state
+                    .as_ref()
+                    .ok_or("Source inventory unavailable")?
+                    .checkpoints;
+                if registry.ambiguous || registry.epoch != epoch {
+                    return Err("Checkpoint registrations changed; sources retained".into());
+                }
+                registry.entries[at]
+                    .sources
+                    .iter()
+                    .find(|source| source.store().same_owner(store))
+                    .cloned()
+            };
+            let Some(source) = source else { continue };
+            self.check_owned_checkpoint_source(&source, &|| self.check())?;
+            needed.iter_mut().for_each(|(_, covered)| *covered = false);
+            source
+                .visit_blocks(
+                    &mut || {
+                        self.check()
+                            .map_err(|_| crate::large_document::Error::Changed)
+                    },
+                    |reference| {
+                        if let Ok(at) =
+                            needed.binary_search_by_key(&reference.fingerprint(), |(key, _)| *key)
+                        {
+                            needed[at].1 = true;
+                        }
+                        Ok(())
+                    },
+                )
+                .map_err(|e| e.to_string())?;
+            let unchanged = {
+                let state = self
+                    .runtime
+                    .inventory
+                    .try_lock()
+                    .map_err(|_| "Source inventory is busy")?;
+                let registry = &state
+                    .as_ref()
+                    .ok_or("Source inventory unavailable")?
+                    .checkpoints;
+                !registry.ambiguous && registry.epoch == epoch
+            };
+            if !unchanged {
+                return Err("Checkpoint registrations changed; sources retained".into());
+            }
+            if needed.iter().all(|(_, covered)| *covered) {
+                return Ok(Some(source));
+            }
+        }
+        Ok(None)
+    }
+    /// Re-read the exact registered marker before off-lock recovery adoption.
+    /// The in-memory registry supplies the digest; a caller cannot supply one.
+    pub(crate) fn recheck_checkpoint(
+        &self,
+        marker: &mut NativeMarker<'_>,
+        check: &dyn Fn() -> Result<(), String>,
+    ) -> Result<(), String> {
+        check()?;
+        marker.check_session(self)?;
+        let expected = {
+            let state = self
+                .runtime
+                .inventory
+                .try_lock()
+                .map_err(|_| "Source inventory is busy")?;
+            let registry = &state
+                .as_ref()
+                .ok_or("Source inventory unavailable")?
+                .checkpoints;
+            if registry.ambiguous {
+                return Err("Checkpoint registration is ambiguous; sources retained".into());
+            }
+            let at = registry
+                .entries
+                .binary_search_by_key(&marker.snapshot(), |e| e.marker.snapshot)
+                .map_err(|_| "Recovery marker has no validated checkpoint registration")?;
+            let entry = &registry.entries[at];
+            Observation {
+                marker: entry.marker,
+                sha256: entry.sha256,
+            }
+        };
+        if marker.verify_digest(expected.sha256, check)? != expected.marker {
+            return Err("Recovery checkpoint changed before registration; sources retained".into());
+        }
+        check()?;
+        self.check()?;
+        let state = self
+            .runtime
+            .inventory
+            .try_lock()
+            .map_err(|_| "Source inventory is busy")?;
+        let registry = &state
+            .as_ref()
+            .ok_or("Source inventory unavailable")?
+            .checkpoints;
+        if registry.ambiguous
+            || !registry
+                .entries
+                .iter()
+                .any(|e| e.marker == expected.marker && e.sha256 == expected.sha256)
+        {
+            return Err("Recovery checkpoint registration changed; sources retained".into());
+        }
+        Ok(())
+    }
     pub(crate) fn check_owned_checkpoint_source(
         &self,
         source: &Snapshot,
@@ -287,9 +437,17 @@ impl SourceSession {
             epoch,
         };
         let first = self.checkpoint_members(check)?;
+        let journals = first
+            .entries
+            .iter()
+            .filter(|member| member.kind == 3)
+            .count();
+        if self.publication_member_count()? != journals {
+            return Err("Publication registration differs from complete namespace census".into());
+        }
         let mut count = 0;
         for member in &first.entries {
-            if member.kind == 2 {
+            if matches!(member.kind, 2 | 3) {
                 continue;
             }
             let end = member
@@ -328,6 +486,9 @@ impl SourceSession {
         let second = self.checkpoint_members(check)?;
         if first.entries != second.entries {
             return Err("Checkpoint namespace membership changed; roots retained".into());
+        }
+        if self.publication_member_count()? != journals {
+            return Err("Publication registrations changed during census".into());
         }
         check()?;
         self.check()?;
@@ -392,6 +553,7 @@ impl SourceSession {
             }
             let metadata =
                 fs::symlink_metadata(&path).map_err(|_| "Checkpoint member unavailable")?;
+            let mut journal_sha256 = [0; 32];
             let (kind, identity, child) = if metadata.is_dir() && !metadata.file_type().is_symlink()
             {
                 let directory = Directory::open(&path)?;
@@ -452,6 +614,12 @@ impl SourceSession {
                     return Err("Checkpoint alias retained".into());
                 }
                 (1, crate::file_safety::identity(&file)?, (0, 0))
+            } else if super::publication::recognized_name(&name) {
+                let file = crate::file_safety::open_native_identity(&path)
+                    .map_err(|_| "Publication member unavailable")?;
+                let identity = crate::file_safety::identity(&file)?;
+                journal_sha256 = self.check_publication_member(&name, identity, check)?;
+                (3, identity, (0, 0))
             } else {
                 return Err("Unknown checkpoint member type retained".into());
             };
@@ -462,6 +630,7 @@ impl SourceSession {
                 kind,
                 identity,
                 child,
+                journal_sha256,
             });
         }
         entries.sort_unstable();

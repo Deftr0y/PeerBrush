@@ -12,10 +12,15 @@ struct Preference {
 
 pub(crate) fn validate_file(path: &Path) -> Result<(), String> {
     if let Some(bytes) = crate::tool_settings::read_owned(path)? {
-        let value: Preference = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-        if value.version != 1 || !value.answered {
-            return Err("Unsupported default-editor preference".into());
-        }
+        validate_preference(&bytes)?;
+    }
+    Ok(())
+}
+
+fn validate_preference(bytes: &[u8]) -> Result<(), String> {
+    let value: Preference = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+    if value.version != 1 || !value.answered {
+        return Err("Unsupported default-editor preference".into());
     }
     Ok(())
 }
@@ -25,7 +30,6 @@ pub(super) struct Welcome {
     original: Option<Vec<u8>>,
     open: bool,
     error: Option<String>,
-    icon: Option<TextureHandle>,
     pending: Option<mpsc::Receiver<Result<(), String>>>,
     completed: usize,
 }
@@ -34,18 +38,17 @@ impl Welcome {
     pub(super) fn load(preferences: &Path) -> Self {
         let path = preferences.join("associations.json");
         let loaded = crate::tool_settings::read_owned(&path);
-        let error = loaded
-            .as_ref()
-            .err()
-            .cloned()
-            .or_else(|| validate_file(&path).err());
+        let error = match &loaded {
+            Ok(Some(bytes)) => validate_preference(bytes).err(),
+            Ok(None) => None,
+            Err(error) => Some(error.clone()),
+        };
         let original = loaded.ok().flatten();
         Self {
             open: original.is_none() && error.is_none(),
             path,
             original,
             error,
-            icon: None,
             pending: None,
             completed: 0,
         }
@@ -57,25 +60,23 @@ impl Welcome {
     }
 
     fn dismiss(&mut self) -> Result<(), String> {
-        let _lease = crate::file_safety::Lease::acquire(&self.path)?;
         let bytes = serde_json::to_vec(&Preference {
             version: 1,
             answered: true,
         })
         .map_err(|e| e.to_string())?;
-        server::atomic_write_checked(&self.path, &bytes, |_| {
-            if crate::tool_settings::read_owned(&self.path)? == self.original {
-                Ok(())
-            } else {
-                Err("Default-editor preferences changed on disk; restart before saving".into())
-            }
-        })?;
+        crate::tool_settings::write_owned(
+            &self.path,
+            &bytes,
+            self.original.as_deref(),
+            "Default-editor preferences changed on disk; restart before saving",
+        )?;
         self.original = Some(bytes);
         self.open = false;
         Ok(())
     }
 
-    pub(super) fn show(&mut self, ctx: &egui::Context) {
+    pub(super) fn show(&mut self, ctx: &egui::Context, logo: &TextureHandle) {
         if !self.open {
             return;
         }
@@ -97,28 +98,11 @@ impl Welcome {
         if !self.open {
             return;
         }
-        if self.icon.is_none() {
-            if let Ok(image) =
-                image::load_from_memory(include_bytes!("../../../assets/peerbrush-logo.png"))
-            {
-                let image = image.to_rgba8();
-                self.icon = Some(ctx.load_texture(
-                    "welcome_peerbrush",
-                    egui::ColorImage::from_rgba_unmultiplied(
-                        [image.width() as usize, image.height() as usize],
-                        image.as_raw(),
-                    ),
-                    Default::default(),
-                ));
-            }
-        }
         let response = egui::Modal::new(egui::Id::new("first_launch_default_editor")).show(ctx, |ui| {
             dialogs::body(ui, 440.);
             ui.add_space(10.);
             ui.vertical_centered(|ui| {
-                if let Some(icon) = &self.icon {
-                    ui.add(egui::Image::new(icon).fit_to_exact_size(Vec2::splat(64.)));
-                }
+                ui.add(egui::Image::new(logo).fit_to_exact_size(Vec2::splat(64.)));
                 ui.add_space(12.);
                 ui.label(RichText::new("WELCOME TO PEERBRUSH").size(11.).color(ACCENT).strong());
                 ui.add_space(8.);

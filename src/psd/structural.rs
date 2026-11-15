@@ -17,6 +17,10 @@ impl Format {
         self == Self::Psb
     }
 
+    pub(super) fn rle_count_width(self) -> usize {
+        if self.large() { 4 } else { 2 }
+    }
+
     fn tag_large(self, key: &[u8; 4]) -> bool {
         // Match the existing codec's reviewed PSB key-width policy. An 8B64
         // signature alone does not widen an arbitrary key's length field.
@@ -46,6 +50,57 @@ impl Format {
                     | b"artd"
             )
     }
+}
+
+pub(super) fn rle_row_length(word: &[u8], row_bytes: u64) -> Result<u64, String> {
+    let length = if word.len() == 4 {
+        u64::from(u32::from_be_bytes(word.try_into().unwrap()))
+    } else {
+        u64::from(u16::from_be_bytes(word.try_into().unwrap()))
+    };
+    if length > row_bytes.saturating_mul(2).saturating_add(1024) {
+        return Err("Packed Photoshop row exceeds transfer budget".into());
+    }
+    Ok(length)
+}
+
+/// The caller has already bounded the count table to its indexed source span.
+pub(super) fn sum_rle_table(
+    input: &mut impl Read,
+    format: Format,
+    mut rows: u64,
+    row_bytes: u64,
+    scratch: &mut [u8],
+    check: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<u64, String> {
+    let width = format.rle_count_width();
+    let capacity = scratch.len() / width;
+    if capacity == 0 { return Err("Missing Photoshop row table scratch".into()); }
+    let mut packed = 0u64;
+    while rows != 0 {
+        let count = rows.min(capacity as u64) as usize;
+        let bytes = &mut scratch[..count * width];
+        let mut rest = &mut *bytes;
+        while !rest.is_empty() {
+            check()?;
+            let read = match input.read(rest) {
+                Ok(read) => read,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return Err("Cannot read Photoshop row table".into()),
+            };
+            if read == 0 || read > rest.len() {
+                return Err("Truncated or invalid Photoshop row table".into());
+            }
+            rest = &mut rest[read..];
+        }
+        for word in bytes.chunks_exact(width) {
+            packed = packed.checked_add(rle_row_length(word, row_bytes)?)
+                .ok_or("Photoshop packed row length overflow")?;
+        }
+        rows -= count as u64;
+    }
+    check()?;
+    Ok(packed)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -78,23 +133,54 @@ pub(crate) struct Limits {
     pub coordinate: u32,
 }
 
+// The private manifest and either the ICC profile or untagged declaration.
+pub(super) const SOURCE36_BASE_RESOURCES: usize = 2;
+
 impl Limits {
     /// Existing admission only. A different index profile cannot change engine admission.
     pub(crate) const fn current() -> Self {
         Self {
-            file_bytes: 256 * 1024 * 1024,
-            max_edge: 8192,
-            pixels: 32 * 1024 * 1024,
+            file_bytes: crate::file_safety::RESIDENT_FILE_BYTES,
+            max_edge: crate::raster::MAX_EDGE,
+            pixels: crate::raster::MAX_PIXELS,
             layers: 200,
             channels: 8,
             resources: 4096,
             tags: 4096,
-            row_bytes: 8192 * 2,
+            row_bytes: crate::raster::MAX_EDGE as u64 * 2,
             mask_edge: 200_000,
             mask_pixels8: 32 * 1024 * 1024,
             mask_pixels16: 128 * 1024 * 1024,
             coordinate: 100_000,
         }
+    }
+
+    pub(crate) fn native_standard() -> Self {
+        let edge = crate::raster::NATIVE_EDGE;
+        let pixels = u64::from(edge) * u64::from(edge);
+        Self {
+            file_bytes: crate::file_safety::NATIVE_FILE_BYTES,
+            max_edge: edge,
+            pixels,
+            row_bytes: u64::from(edge) * 2,
+            mask_pixels8: pixels,
+            mask_pixels16: pixels,
+            ..Self::current()
+        }
+    }
+
+    pub(crate) fn source36(file_bytes: u64, chunks: usize) -> Result<Self, String> {
+        Ok(Self {
+            file_bytes,
+            layers: super::standard36::MAX_STANDARD_RECORDS,
+            coordinate: 100000 + crate::raster::NATIVE_EDGE,
+            tags: chunks
+                .checked_add(4096)
+                .ok_or("Source36 index tag admission overflow")?,
+            resources: SOURCE36_BASE_RESOURCES + super::DocumentResources::SOURCE36_FIXED_IDS.len()
+                + super::file_info::IDS.len(),
+            ..Self::native_standard()
+        })
     }
 }
 
@@ -186,6 +272,7 @@ pub(crate) enum Ambiguity {
 pub(crate) struct Index {
     pub file_bytes: u64,
     pub header: Header,
+    pub color_channels: u16,
     pub color_data: Span,
     pub resources: Vec<Resource>,
     pub layer_and_mask: Span,
@@ -402,27 +489,14 @@ impl<R: Read + Seek, C: FnMut() -> Result<(), String>> Scanner<'_, R, C> {
             0 => Compression::Raw,
             1 => {
                 let bytes = rows
-                    .checked_mul(if format.large() { 4 } else { 2 })
+                    .checked_mul(format.rle_count_width() as u64)
                     .ok_or("Photoshop row table overflow")?;
                 let start = self.position()?;
                 let table_end = start
                     .checked_add(bytes)
                     .filter(|n| *n <= end)
                     .ok_or("Truncated Photoshop row table")?;
-                let mut packed = 0u64;
-                for _ in 0..rows {
-                    let bytes = if format.large() {
-                        u64::from(self.u32(table_end)?)
-                    } else {
-                        u64::from(self.u16(table_end)?)
-                    };
-                    if bytes > row_bytes.saturating_mul(2).saturating_add(1024) {
-                        return Err("Photoshop packed row exceeds index limits".into());
-                    }
-                    packed = packed
-                        .checked_add(bytes)
-                        .ok_or("Photoshop packed row length overflow")?;
-                }
+                let packed = sum_rle_table(self.input, format, rows, row_bytes, &mut [0; 4096], self.check)?;
                 if packed != end - table_end {
                     return Err("Photoshop row table does not cover its channel exactly".into());
                 }
@@ -530,7 +604,7 @@ impl<R: Read + Seek, C: FnMut() -> Result<(), String>> Scanner<'_, R, C> {
             self.seek(extra.offset)?;
             let extra_end = extra.end()?;
             let mask = self.block(extra_end, false)?;
-            let mask_dimensions = if mask.bytes >= 18 {
+            let (mask_dimensions, user_mask_dimensions) = if mask.bytes >= 18 {
                 let next = self.position()?;
                 self.seek(mask.offset)?;
                 let bounds = self.bounds(mask.end()?)?;
@@ -540,23 +614,35 @@ impl<R: Read + Seek, C: FnMut() -> Result<(), String>> Scanner<'_, R, C> {
                 {
                     return Err("PSD mask coordinates exceed initial limits".into());
                 }
-                let [_default, flags] = self.read::<2>(mask.end()?)?;
-                let ordinary =
-                    mask.bytes == 20 && flags & !2 == 0 && self.read::<2>(mask.end()?)? == [0; 2];
-                let result = if ordinary {
-                    Some(self.mask_dimensions(bounds, header.depth)?)
+                self.seek(mask.offset)?;
+                let info = match mask.bytes {
+                    20 => super::standard_mask_header(&self.read::<20>(mask.end()?)?),
+                    27 => super::standard_mask_header(&self.read::<27>(mask.end()?)?),
+                    28 => super::standard_mask_header(&self.read::<28>(mask.end()?)?),
+                    36 => super::standard_mask_header(&self.read::<36>(mask.end()?)?),
+                    _ => None,
+                };
+                let result = if let Some(info) = info {
+                    let user = if info.rendered_bounds.is_some() {
+                        Some(self.mask_dimensions(info.bounds, header.depth)?)
+                    } else {
+                        None
+                    };
+                    (Some(self.mask_dimensions(bounds, header.depth)?), user)
                 } else {
-                    None
+                    (None, None)
                 };
                 self.seek(next)?;
                 result
             } else {
-                None
+                (None, None)
             };
             for channel in &mut channels {
-                if channel.id == -2 {
-                    channel.dimensions = mask_dimensions;
-                }
+                channel.dimensions = match channel.id {
+                    -2 => mask_dimensions,
+                    -3 => user_mask_dimensions,
+                    _ => channel.dimensions,
+                };
             }
             let blending_ranges = self.block(extra_end, false)?;
             let length = u64::from(self.read::<1>(extra_end)?[0]);
@@ -616,7 +702,7 @@ impl<R: Read + Seek, C: FnMut() -> Result<(), String>> Scanner<'_, R, C> {
                         1,
                         header.depth,
                         header.format,
-                        channel.id == -2,
+                        matches!(channel.id, -2 | -3),
                         true,
                     );
                     match result {
@@ -652,6 +738,221 @@ impl<R: Read + Seek, C: FnMut() -> Result<(), String>> Scanner<'_, R, C> {
     }
 }
 
+impl<R: Read + Seek, F: FnMut() -> Result<(), String>> Scanner<'_, R, F> {
+    fn resource(&mut self, end: u64) -> Result<Resource, String> {
+        if self.read::<4>(end)? != *b"8BIM" {
+            return Err("Invalid Photoshop resource signature".into());
+        }
+        let id = self.u16(end)?;
+        let length = u64::from(self.read::<1>(end)?[0]);
+        let name = self.span(length, end)?;
+        self.pad(length + 1, 2, end)?;
+        let data = self.block(end, false)?;
+        let after = self.position()?;
+        let peerbrush_source = if id == 4000 && data.bytes >= 4 {
+            self.seek(data.offset)?;
+            self.read::<4>(data.end()?)? == *b"PBR1"
+        } else {
+            false
+        };
+        self.seek(after)?;
+        self.pad(data.bytes, 2, end)?;
+        Ok(Resource {
+            id,
+            name,
+            data,
+            peerbrush_source,
+        })
+    }
+}
+
+/// Classify only the canonical native writer prefix, including empty chunk
+/// lists. Full indexing, stream verification and semantic admission follow on
+/// the actual owned decoder handle. This probe allocates no metadata tree.
+pub(crate) fn native_manifest_candidate<R: Read + Seek>(
+    input: &mut R,
+    mut check: impl FnMut() -> Result<(), String>,
+) -> Result<bool, String> {
+    let file_bytes = input.seek(SeekFrom::End(0)).map_err(|e| e.to_string())?;
+    let mut scan = Scanner {
+        input,
+        check: &mut check,
+        limits: Limits::current(),
+        tags: 0,
+        semantic_only: true,
+    };
+    if file_bytes < 26 {
+        return Ok(false);
+    }
+    scan.seek(0)?;
+    if scan.read::<4>(file_bytes)? != *b"8BPS" {
+        return Ok(false);
+    }
+    scan.seek(26)?;
+    scan.block(file_bytes, false)?;
+    let section = scan.block(file_bytes, false)?;
+    scan.seek(section.offset)?;
+    let end = section.end()?;
+    let mut native = false;
+    let mut saw_effects_visibility = false;
+    let mut saw_pixel_aspect = false;
+    let mut saw_grid = false;
+    let mut saw_layer_id_seed = false;
+    let mut saw_print_flags = false;
+    let mut saw_print_flags_info = false;
+    let mut saw_copyright = false;
+    let mut saw_global_angle = false;
+    let mut saw_global_altitude = false;
+    let mut saw_profile = false;
+    let mut untagged = None;
+    for _ in 0..scan.limits.resources {
+        if scan.position()? == end {
+            break;
+        }
+        let resource = scan.resource(end)?;
+        if super::unsupported_document_resource(resource.id).is_some() {
+            return Ok(false);
+        }
+        if resource.id == super::EFFECTS_VISIBILITY_RESOURCE_ID {
+            let flag = if resource.data.bytes == 1 {
+                let resume = scan.position()?;
+                scan.seek(resource.data.offset)?;
+                let flag = scan.read::<1>(resource.data.end()?)?[0];
+                scan.seek(resume)?;
+                Some(flag)
+            } else {
+                None
+            };
+            if super::effects_visibility_warning(&mut saw_effects_visibility, flag).is_some() {
+                return Ok(false);
+            }
+        }
+        if resource.id == super::PIXEL_ASPECT_RESOURCE_ID {
+            if std::mem::replace(&mut saw_pixel_aspect, true) || resource.data.bytes != 12 {
+                return Ok(false);
+            }
+            let resume = scan.position()?;
+            scan.seek(resource.data.offset)?;
+            let bytes = scan.read::<12>(resource.data.end()?)?;
+            scan.seek(resume)?;
+            if super::parse_pixel_aspect(&bytes).is_err() {
+                return Ok(false);
+            }
+        }
+        if resource.id == super::GRID_RESOURCE_ID {
+            if std::mem::replace(&mut saw_grid, true) || resource.data.bytes != 16 {
+                return Ok(false);
+            }
+            let resume = scan.position()?;
+            scan.seek(resource.data.offset)?;
+            let bytes = scan.read::<16>(resource.data.end()?)?;
+            scan.seek(resume)?;
+            if super::parse_grid(&bytes).is_err() {
+                return Ok(false);
+            }
+        }
+        if resource.id == super::LAYER_ID_SEED_RESOURCE_ID
+            && (std::mem::replace(&mut saw_layer_id_seed, true) || resource.data.bytes != 4)
+        {
+            return Ok(false);
+        }
+        if resource.id == super::PRINT_FLAGS_RESOURCE_ID {
+            if std::mem::replace(&mut saw_print_flags, true) || resource.data.bytes != 9 {
+                return Ok(false);
+            }
+            let resume = scan.position()?;
+            scan.seek(resource.data.offset)?;
+            let bytes = scan.read::<9>(resource.data.end()?)?;
+            scan.seek(resume)?;
+            if super::parse_print_flags(&bytes).is_err() {
+                return Ok(false);
+            }
+        }
+        if resource.id == super::PRINT_FLAGS_INFO_RESOURCE_ID {
+            if std::mem::replace(&mut saw_print_flags_info, true) || resource.data.bytes != 10 {
+                return Ok(false);
+            }
+            let resume = scan.position()?;
+            scan.seek(resource.data.offset)?;
+            let bytes = scan.read::<10>(resource.data.end()?)?;
+            scan.seek(resume)?;
+            if super::parse_print_flags_info(&bytes).is_err() {
+                return Ok(false);
+            }
+        }
+        if resource.id == super::COPYRIGHT_RESOURCE_ID {
+            if std::mem::replace(&mut saw_copyright, true) || resource.data.bytes != 1 {
+                return Ok(false);
+            }
+            let resume = scan.position()?;
+            scan.seek(resource.data.offset)?;
+            let bytes = scan.read::<1>(resource.data.end()?)?;
+            scan.seek(resume)?;
+            if super::parse_copyright(&bytes).is_err() {
+                return Ok(false);
+            }
+        }
+        if resource.id == super::GLOBAL_ANGLE_RESOURCE_ID {
+            if std::mem::replace(&mut saw_global_angle, true) || resource.data.bytes != 4 {
+                return Ok(false);
+            }
+            let resume = scan.position()?;
+            scan.seek(resource.data.offset)?;
+            let bytes = scan.read::<4>(resource.data.end()?)?;
+            scan.seek(resume)?;
+            if super::parse_global_angle(&bytes).is_err() {
+                return Ok(false);
+            }
+        }
+        if resource.id == super::GLOBAL_ALTITUDE_RESOURCE_ID
+            && (std::mem::replace(&mut saw_global_altitude, true) || resource.data.bytes != 4)
+        {
+            return Ok(false);
+        }
+        if resource.id == 1039 {
+            if std::mem::replace(&mut saw_profile, true) {
+                return Ok(false);
+            }
+            let resume = scan.position()?;
+            scan.seek(resource.data.offset)?;
+            let working = super::read_working_srgb(
+                (&mut *scan.input).take(resource.data.bytes),
+                resource.data.bytes,
+            )?;
+            scan.seek(resume)?;
+            if !working {
+                return Ok(false);
+            }
+        }
+        if resource.id == super::UNTAGGED_PROFILE_RESOURCE_ID {
+            if untagged.is_some() || resource.data.bytes != 1 {
+                return Ok(false);
+            }
+            let resume = scan.position()?;
+            scan.seek(resource.data.offset)?;
+            let flag = scan.read::<1>(resource.data.end()?)?;
+            scan.seek(resume)?;
+            let Ok([value]) = super::parse_untagged_profile(&flag) else { return Ok(false) };
+            untagged = Some(value);
+        }
+        if saw_profile && untagged == Some(1) {
+            return Ok(false);
+        }
+        if native || !resource.peerbrush_source {
+            continue;
+        }
+        let resume = scan.position()?;
+        scan.seek(resource.data.offset + 4)?;
+        let mut input = flate2::read::ZlibDecoder::new(
+            (&mut *scan.input).take((resource.data.bytes - 4).min(65536)),
+        );
+        let mut prefix = [0; 11];
+        native = input.read_exact(&mut prefix).is_ok() && prefix == *b"{\"chunks\":[";
+        scan.seek(resume)?;
+    }
+    Ok(native)
+}
+
 /// Index the current RGB8/16 stream with bounded metadata and no section-sized buffer.
 /// ZIP payload bytes are authenticated/fully consumed by the row reader, not by this index.
 pub(crate) fn index<R: Read + Seek>(
@@ -659,7 +960,14 @@ pub(crate) fn index<R: Read + Seek>(
     limits: Limits,
     check: impl FnMut() -> Result<(), String>,
 ) -> Result<Index, String> {
-    index_with(input, limits, false, check)
+    index_with(input, limits, false, false, check)
+}
+
+pub(crate) fn index_protected<R: Read + Seek>(
+    input: &mut R,
+    check: impl FnMut() -> Result<(), String>,
+) -> Result<Index, String> {
+    index_with(input, Limits::native_standard(), false, true, check)
 }
 
 /// Match the active decoder's semantic resource/record policy without retaining
@@ -669,13 +977,14 @@ pub(crate) fn index_for_decode<R: Read + Seek>(
     input: &mut R,
     check: impl FnMut() -> Result<(), String>,
 ) -> Result<Index, String> {
-    index_with(input, Limits::current(), true, check)
+    index_with(input, Limits::current(), true, true, check)
 }
 
 fn index_with<R: Read + Seek>(
     input: &mut R,
     limits: Limits,
     semantic_only: bool,
+    allow_grayscale: bool,
     mut check: impl FnMut() -> Result<(), String>,
 ) -> Result<Index, String> {
     check()?;
@@ -709,6 +1018,11 @@ fn index_with<R: Read + Seek>(
     let width = scan.u32(file_bytes)?;
     let depth = scan.u16(file_bytes)?;
     let mode = scan.u16(file_bytes)?;
+    let color_channels = match (mode, channels) {
+        (3, 3..=4) => 3,
+        (1, 1..=2) if allow_grayscale => 1,
+        _ => return Err("Photoshop header exceeds RGB8/16 index limits".into()),
+    };
     if width == 0
         || height == 0
         || width > if format.large() { 300_000 } else { 30_000 }
@@ -719,8 +1033,6 @@ fn index_with<R: Read + Seek>(
             .checked_mul(u64::from(height))
             .is_none_or(|n| n > limits.pixels)
         || ![8, 16].contains(&depth)
-        || mode != 3
-        || !(3..=4).contains(&channels)
         || u64::from(width) * u64::from(depth / 8) > limits.row_bytes
     {
         return Err("Photoshop header exceeds RGB8/16 index limits".into());
@@ -732,7 +1044,13 @@ fn index_with<R: Read + Seek>(
         depth,
         channels,
     };
+    // Protected grayscale reports need the bounded original record inventory.
+    let semantic_only = semantic_only && color_channels == 3;
+    scan.semantic_only = semantic_only;
     let color_data = scan.block(file_bytes, false)?;
+    if color_channels == 1 && color_data.bytes != 0 {
+        return Err("Photoshop grayscale preview has unexpected color-mode data".into());
+    }
     let resource_section = scan.block(file_bytes, false)?;
     let next = scan.position()?;
     scan.seek(resource_section.offset)?;
@@ -744,21 +1062,9 @@ fn index_with<R: Read + Seek>(
         if !semantic_only && resources.len() >= limits.resources {
             return Err("Too many Photoshop image resources".into());
         }
-        if scan.read::<4>(resource_section.end()?)? != *b"8BIM" {
-            return Err("Invalid Photoshop resource signature".into());
-        }
-        let id = scan.u16(resource_section.end()?)?;
-        let length = u64::from(scan.read::<1>(resource_section.end()?)?[0]);
-        let name = scan.span(length, resource_section.end()?)?;
-        scan.pad(length + 1, 2, resource_section.end()?)?;
-        let data = scan.block(resource_section.end()?, false)?;
-        let after = scan.position()?;
-        let source = if id == 4000 && data.bytes >= 4 {
-            scan.seek(data.offset)?;
-            scan.read::<4>(data.end()?)? == *b"PBR1"
-        } else {
-            false
-        };
+        let resource = scan.resource(resource_section.end()?)?;
+        let id = resource.id;
+        let source = resource.peerbrush_source;
         if source && peerbrush && !ambiguities.contains(&Ambiguity::PeerBrushSources) {
             ambiguities.push(Ambiguity::PeerBrushSources);
         }
@@ -769,27 +1075,24 @@ fn index_with<R: Read + Seek>(
             }
             profile = true;
         }
-        let resource = Resource {
-            id,
-            name,
-            data,
-            peerbrush_source: source,
-        };
         if !semantic_only {
             resources.push(resource);
-        } else if id == 1057 {
-            if let Some(previous) = resources.iter_mut().find(|old| old.id == 1057) {
-                *previous = resource;
-            } else {
-                resources.push(resource);
-            }
         } else if (source && resources.iter().filter(|old| old.peerbrush_source).count() < 2)
-            || (id == 1039 && resources.iter().filter(|old| old.id == 1039).count() < 2)
+            || (matches!(id, 1039 | super::RESOLUTION_RESOURCE_ID | super::PRINT_SCALE_RESOURCE_ID
+                | super::EFFECTS_VISIBILITY_RESOURCE_ID | super::PIXEL_ASPECT_RESOURCE_ID
+                | super::VERSION_INFO_RESOURCE_ID | super::UNTAGGED_PROFILE_RESOURCE_ID
+                | super::GRID_RESOURCE_ID | super::LAYER_ID_SEED_RESOURCE_ID
+                | super::PRINT_FLAGS_RESOURCE_ID | super::PRINT_FLAGS_INFO_RESOURCE_ID
+                | super::COPYRIGHT_RESOURCE_ID | super::GLOBAL_ANGLE_RESOURCE_ID
+                | super::GLOBAL_ALTITUDE_RESOURCE_ID)
+                && resources.iter().filter(|old| old.id == id).count() < 2)
+            || (super::file_info::supported(id)
+                && resources.iter().filter(|old| old.id == id).count() < 2)
+            || super::unsupported_document_resource(id).is_some_and(|reason|
+                !resources.iter().any(|old| super::unsupported_document_resource(old.id) == Some(reason)))
         {
             resources.push(resource);
         }
-        scan.seek(after)?;
-        scan.pad(data.bytes, 2, resource_section.end()?)?;
     }
     scan.seek(next)?;
     let layer_and_mask = scan.block(file_bytes, format.large())?;
@@ -869,6 +1172,7 @@ fn index_with<R: Read + Seek>(
     Ok(Index {
         file_bytes,
         header,
+        color_channels,
         color_data,
         resources,
         layer_and_mask,
@@ -1334,34 +1638,67 @@ pub(crate) mod tests {
         }
     }
 
+    struct Counted {
+        inner: Cursor<Vec<u8>>,
+        total: usize,
+        max: usize,
+        reads: usize,
+    }
+    impl Read for Counted {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            self.reads += 1;
+            self.max = self.max.max(out.len());
+            let n = self.inner.read(out)?;
+            self.total += n;
+            Ok(n)
+        }
+    }
+    impl Seek for Counted {
+        fn seek(&mut self, p: SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(p)
+        }
+    }
+
     #[test]
     fn raw_index_never_reads_or_allocates_whole_resource_or_channel_payloads() {
-        struct Counted {
-            inner: Cursor<Vec<u8>>,
-            total: usize,
-            max: usize,
-        }
-        impl Read for Counted {
-            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
-                self.max = self.max.max(out.len());
-                let n = self.inner.read(out)?;
-                self.total += n;
-                Ok(n)
-            }
-        }
-        impl Seek for Counted {
-            fn seek(&mut self, p: SeekFrom) -> std::io::Result<u64> {
-                self.inner.seek(p)
-            }
-        }
         let mut reader = Counted {
             inner: Cursor::new(fixture(Format::Psb, 16, false)),
             total: 0,
             max: 0,
+            reads: 0,
         };
         index(&mut reader, Limits::current(), || Ok(())).unwrap();
         assert!(reader.total < 1024);
         assert!(reader.max <= 8);
+    }
+
+    #[test]
+    fn packbits_index_reads_the_complete_row_table_in_bounded_batches() {
+        let height = 4097usize;
+        for format in [Format::Psd, Format::Psb] {
+            let width = format.rle_count_width();
+            let table_bytes = height * width;
+            let mut bytes = 1u16.to_be_bytes().to_vec();
+            for _ in 0..height {
+                bytes.extend_from_slice(&2u32.to_be_bytes()[4 - width..]);
+            }
+            bytes.resize(2 + table_bytes + height * 2, 0);
+            let span = Span { offset: 0, bytes: bytes.len() as u64 };
+            let mut reader = Counted { inner: Cursor::new(bytes), total: 0, max: 0, reads: 0 };
+            let encode = |reader: &mut Counted| {
+                Scanner { input: reader, check: &mut || Ok(()), limits: Limits::current(),
+                    tags: 0, semantic_only: false }
+                    .encoding(span, 1, height as u32, 1, 8, format, false, false)
+            };
+            let encoding = encode(&mut reader).unwrap();
+            assert_eq!(encoding.counts, Some(Span { offset: 2, bytes: table_bytes as u64 }));
+            assert_eq!(encoding.payload.offset, (2 + table_bytes) as u64);
+            assert_eq!(reader.total, 2 + table_bytes);
+            assert_eq!(reader.reads, 1 + table_bytes.div_ceil(4096));
+            assert_eq!(reader.max, 4096);
+            reader.inner.get_mut()[1 + table_bytes] = 3;
+            assert!(encode(&mut reader).unwrap_err().contains("does not cover"));
+        }
     }
 
     #[test]
@@ -1430,10 +1767,7 @@ pub(crate) mod tests {
             read: 0,
         };
         assert!(index(&mut input, Limits::current(), || Ok(())).is_err());
-        let profile = Limits {
-            file_bytes: input.length,
-            ..Limits::current()
-        };
+        let profile = Limits::native_standard();
         let value = index(&mut input, profile, || Ok(())).unwrap();
         assert_eq!(value.global_tags[0].data.bytes, payload);
         assert_eq!(value.composite.span.offset, composite);
