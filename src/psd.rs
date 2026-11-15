@@ -4636,8 +4636,7 @@ fn decode_parts(
                             }
                         }
                         b"luni" => match unicode_layer_name(payload, MAX_LAYER_NAME_UNITS) {
-                            Ok((decoded, _)) if signature == b"8BIM" => name = decoded,
-                            Ok(_) => warnings.push("Invalid Photoshop Unicode layer name signature".into()),
+                            Ok((decoded, _)) => name = decoded,
                             Err(error) => warnings.push(error),
                         },
                         b"lsct" | b"lsdk" => {

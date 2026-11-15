@@ -816,8 +816,7 @@ fn indexed_structure<R: Read + Seek>(
         let mut details_truncated = layer.tags.len() > 64;
         let mut unicode = layer.tags.iter().filter(|tag| tag.key == *b"luni");
         if let Some(tag) = unicode.next() {
-            if unicode.next().is_none() && tag.signature == *b"8BIM"
-                && tag.data.bytes <= MAX_LAYER_NAME_BYTES as u64
+            if unicode.next().is_none() && tag.data.bytes <= MAX_LAYER_NAME_BYTES as u64
             {
                 let mut bytes = [0; MAX_LAYER_NAME_BYTES];
                 let payload = &mut bytes[..tag.data.bytes as usize];

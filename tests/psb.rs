@@ -410,7 +410,9 @@ fn protocol_psb_save_open_external_conflict_and_failed_open_preserve_original_wo
     std::fs::create_dir_all(&temp).unwrap();
     let path = temp.join("Artwork.PSB");
     let mut engine = Engine::new();
-    engine.resident_state_mut().expect("resident fixture").document = psd::decode(&fixture(16, 2, false, false)).unwrap();
+    let imported = psd::decode(&fixture(16, 2, false, false)).unwrap();
+    assert!(!imported.read_only, "{:?}", imported.warnings);
+    engine.resident_state_mut().expect("resident fixture").document = imported;
     let shared = Arc::new(Mutex::new(engine));
     peerbrush::workspace::attach(&shared);
     let before = shared.lock().unwrap().resident_state().expect("resident fixture").document.export_png().unwrap();
@@ -422,11 +424,11 @@ fn protocol_psb_save_open_external_conflict_and_failed_open_preserve_original_wo
         &json!({"action":"save_report","document_id":document,"expected_revision":revision}),
     )
     .unwrap();
-    assert!(report["has_editability_losses"].as_bool().unwrap());
+    assert_eq!(report["has_editability_losses"], false);
     server::dispatch(
         &shared,
         "document",
-        &json!({"action":"save","path":path,"actor":"human","document_id":document,"expected_revision":revision,"accept_editability_loss":true}),
+        &json!({"action":"save","path":path,"actor":"human","document_id":document,"expected_revision":revision}),
     )
     .unwrap();
     assert_eq!(&std::fs::read(&path).unwrap()[4..6], &2u16.to_be_bytes());
@@ -437,12 +439,11 @@ fn protocol_psb_save_open_external_conflict_and_failed_open_preserve_original_wo
     )
     .is_err());
     // Save As releases the original before the protocol opens it as an independent project.
-    server::save_accepted_source(
+    server::save_reviewed_source(
         &shared,
         &temp.join("Working.psb"),
         &document,
         revision,
-        false,
     )
     .unwrap();
     let opened = server::dispatch(
