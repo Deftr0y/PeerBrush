@@ -1043,11 +1043,18 @@ pub(crate) fn decode_protected<R: Read + Seek>(
         drop(batch);
         drop(encoded);
         let spool = spool.finish(version.sha256(), &mut || check())?;
-        let staged = stage(&mut |channel, y, stripe| {
-            spool.check()?;
-            spool.bytes().read_range_into(channel * plane + u64::from(y) * stride as u64,
-                stripe, &mut || check().map_err(|_| Error::Cancelled)).map_err(|e| e.to_string())
-        });
+        let staged = (|| {
+            let mut guarded = || check().map_err(|_| Error::Cancelled);
+            let bytes = spool.bytes();
+            let mut reader = bytes.cursor(0, bytes.payload_length(), &mut guarded)
+                .map_err(|e| e.to_string())?;
+            stage(&mut |channel, y, stripe| {
+                spool.check()?;
+                reader.seek(SeekFrom::Start(channel * plane + u64::from(y) * stride as u64))
+                    .and_then(|_| reader.read_exact(stripe))
+                    .map_err(|e| e.to_string())
+            })
+        })();
         match (staged, spool.retire(&mut || session.cleanup_check())) {
             (result, Ok(())) => result?,
             (Ok(_), Err(cleanup)) => return Err(format!("Photoshop composite spool retained: {cleanup}")),

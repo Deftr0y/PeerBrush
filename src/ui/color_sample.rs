@@ -215,7 +215,7 @@ impl<T: Send + 'static> Sampler<T> {
         &mut self,
         request: Arc<Request>,
         ctx: &egui::Context,
-        work: impl FnOnce(&dyn Fn() -> Result<(), String>) -> Result<T, String> + Send + 'static,
+        work: impl FnOnce(&(dyn Fn() -> Result<(), String> + Sync)) -> Result<T, String> + Send + 'static,
     ) -> Result<Ticket, String> {
         let ticket = Ticket(self.epoch.fetch_add(1, Ordering::Relaxed).wrapping_add(1));
         let epoch = self.epoch.clone();
@@ -483,7 +483,7 @@ fn capture(
 fn render(
     shared: &Shared,
     request: &Request,
-    check: &dyn Fn() -> Result<(), String>,
+    check: &(dyn Fn() -> Result<(), String> + Sync),
 ) -> Result<Color, String> {
     let capture = capture(shared, request, check)?;
     let target = request.mask.then_some(request.layer.as_str());

@@ -62,7 +62,7 @@ pub(crate) fn resident_color(
     doc: &Document,
     point: [i32; 2],
     mask_target: Option<&str>,
-    check: &dyn Fn() -> Result<(), String>,
+    check: &(dyn Fn() -> Result<(), String> + Sync),
 ) -> Result<Color, String> {
     check()?;
     let rect = rect([doc.width, doc.height], point)?;
