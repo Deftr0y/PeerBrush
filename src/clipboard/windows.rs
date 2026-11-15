@@ -37,6 +37,7 @@ extern "system" {
     fn TranslateMessage(message: *const Message) -> i32;
     fn DispatchMessageW(message: *const Message) -> isize;
     fn SetClipboardData(format: u32, memory: Handle) -> Handle;
+    fn GetClipboardOwner() -> Handle;
 }
 #[link(name = "kernel32")]
 extern "system" {
@@ -214,7 +215,8 @@ pub(super) fn write_image(
     let PreparedImage { png, dib, png_size, digest } = prepare_image(image, budget, check)?;
     check()?;
     let generation = OWNER.with(|owner| -> Result<_, String> {
-        let _clipboard = owner.get_or_init(Owner::new).open()?;
+        let owner = owner.get_or_init(Owner::new);
+        let clipboard = owner.open()?;
         check()?;
         clipboard_win::raw::empty()
             .map_err(|e| format!("Cannot clear clipboard for image copy: {e}"))?;
@@ -225,9 +227,17 @@ pub(super) fn write_image(
         if clipboard_win::size(format.get()).map(|value| value.get()) != Some(png_size) {
             return Err("Cannot verify the written Windows clipboard PNG".into());
         }
-        Ok(clipboard_win::seq_num().map(|sequence| sequence.get() as u64))
+        // Closing the clipboard can change its sequence as Windows publishes
+        // synthesized formats. Record the resulting generation while the
+        // same window still owns the data.
+        drop(clipboard);
+        let generation = clipboard_win::seq_num().ok_or("Cannot read the Windows clipboard sequence")?;
+        if unsafe { GetClipboardOwner() } != owner.0 {
+            return Err("Windows clipboard ownership changed during image copy".into());
+        }
+        Ok(generation.get() as u64)
     })?;
-    Ok(generation.map(|generation| ImageIdentity::Png { digest, generation: Some(generation) }))
+    Ok(Some(ImageIdentity::Png { digest, generation: Some(generation) }))
 }
 
 struct PreparedImage {
