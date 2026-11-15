@@ -8,10 +8,12 @@ import subprocess
 import sys
 import tomllib
 
+from sparkle_upgrade_evidence import BASELINE_VERSION, TARGET_VERSION
+
 
 ROOT = Path(__file__).resolve().parents[1]
 PATCH = 'scripts/sparkle-baseline.patch'
-SHA256 = '870c21e49b18c947133a5aca058da25ff2578bbc0519b118c9cc52acae2f4248'
+SHA256 = '6aa80a030ba2c96dbf4dddb55c8a8c60936e158fef3c9257815010b2c760e100'
 FILES = {'Cargo.toml', 'Cargo.lock', 'src/sparkle/discovery.rs', 'src/sparkle/macos.rs', 'scripts/package.py'}
 
 
@@ -23,6 +25,8 @@ def derive(root, parent, dest):
     if (not re.fullmatch('[0-9a-f]{40}', parent) or git(root, 'rev-parse', 'HEAD').decode().strip() != parent
             or dest.exists() or dest.is_symlink() or dest.resolve().is_relative_to(root.resolve())):
         raise ValueError('Expected the exact reviewed parent and a fresh external checkout.')
+    if tomllib.loads(git(root, 'show', f'{parent}:Cargo.toml').decode())['package']['version'] != TARGET_VERSION:
+        raise ValueError('Unexpected target build version.')
     patch = git(root, 'show', f'{parent}:{PATCH}')
     if hashlib.sha256(patch).hexdigest() != SHA256:
         raise ValueError('Starting-build patch differs from the reviewed selection.')
@@ -37,8 +41,8 @@ def derive(root, parent, dest):
         raise ValueError('Unexpected change in test source.')
     def read(path):
         return tomllib.loads(git(dest, 'show', ':' + path).decode())
-    if (read('Cargo.toml')['package']['version'] != '0.29.99' or
-            [p['version'] for p in read('Cargo.lock')['package'] if p['name'] == 'peerbrush'] != ['0.29.99']):
+    if (read('Cargo.toml')['package']['version'] != BASELINE_VERSION or
+            [p['version'] for p in read('Cargo.lock')['package'] if p['name'] == 'peerbrush'] != [BASELINE_VERSION]):
         raise ValueError('Unexpected starting build version.')
     humans = json.loads(git(root, 'show', parent + ':.github/human-contributors.json'))['humans']
     name, email = git(root, 'show', '-s', '--format=%an%x00%ae', parent).decode().strip().split('\0')
@@ -50,7 +54,7 @@ def derive(root, parent, dest):
         for key, value in [('NAME', name), ('EMAIL', email), ('DATE', date)]:
             identity[f'GIT_{role}_{key}'] = value
     tree = git(dest, 'write-tree').decode().strip()
-    commit = git(dest, 'commit-tree', tree, '-p', parent, '-m', 'Private Sparkle upgrade starting fixture 0.29.99',
+    commit = git(dest, 'commit-tree', tree, '-p', parent, '-m', f'Private Sparkle upgrade starting fixture {BASELINE_VERSION}',
                  env=identity).decode().strip()
     git(dest, 'checkout', '--quiet', '--detach', commit)
     if git(dest, 'status', '--porcelain') or git(dest, 'remote'):

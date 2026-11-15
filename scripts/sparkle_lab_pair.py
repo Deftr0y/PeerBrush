@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 from package import digest, git
 from prepare_sparkle_feed import prepare
+from sparkle_upgrade_evidence import BASELINE_VERSION, TARGET_VERSION
 from verify_release import inspect_archive
 
 
@@ -19,9 +20,9 @@ def main(action):
     if (os.environ.get('GITHUB_WORKFLOW_SHA') != parent or os.environ.get('GITHUB_SHA') != parent
             or (git(root, 'rev-parse', 'HEAD^').decode().strip() if baseline else commit) != parent):
         raise ValueError('Wrong reviewed source for private exercise.')
-    version = '0.29.99' if baseline else '0.30.0'
+    version = BASELINE_VERSION if baseline else TARGET_VERSION
     if action == 'unsigned' and baseline:
-        archive = temp / 'PeerBrush-0.29.99-macOS-arm64.zip'
+        archive = temp / f'PeerBrush-{version}-macOS-arm64.zip'
         checked = inspect_archive(archive, commit, version, root)
         if (checked['record']['native_publisher_signing'] != 'not-configured' or checked['packaging_correction']
                 or checked['record']['binary_source_commit'] != commit):
@@ -38,7 +39,7 @@ def main(action):
     image = folder / (name + '-dmg-signed-r' + ('1' if baseline else os.environ['DMG_REVISION']) + '.dmg')
     notes = temp / ('private-notes-' + version)
     notes.write_text('Private installed update exercise.', encoding='utf-8')
-    args = SimpleNamespace(version=version, previous_version='0.29.98' if baseline else '0.29.99',
+    args = SimpleNamespace(version=version, previous_version='0.29.98' if baseline else BASELINE_VERSION,
                            commit=commit, archive=archive, image=image, archive_sha256=digest(archive),
                            image_sha256=digest(image), work=temp / ('lab-inspect-' + version),
                            output=temp / ('lab-feed-' + version), signer=temp / 'sign_update', notes=notes)

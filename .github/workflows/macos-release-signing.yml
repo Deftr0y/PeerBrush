@@ -99,7 +99,7 @@ jobs:
           FEED_ENABLED: ${{ vars.PEERBRUSH_SPARKLE_FEED_ENABLED }}
         run: |
           test "$NATIVE_ENABLED" = true && test "$FEED_ENABLED" = true
-          python3 -I -c 'import tomllib; assert tomllib.load(open("Cargo.toml","rb"))["package"]["version"] == "0.30.0"'
+          python3 -I -c 'import sys,tomllib; sys.path.insert(0,"scripts"); from sparkle_upgrade_evidence import TARGET_VERSION; assert tomllib.load(open("Cargo.toml","rb"))["package"]["version"] == TARGET_VERSION'
       - name: Select existing native codec tools
         run: python3 -B scripts/jxl_build.py --github-env
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # Rust 1.92.0
@@ -256,7 +256,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          test "$SELECTED_VERSION" = 0.30.0
           python3 -B scripts/prepare_sparkle_baseline.py "$SELECTED_COMMIT"
           python3 -B scripts/sparkle_lab_transport.py fetch-cert editor
           python3 -B scripts/sparkle_lab_transport.py decrypt signer "$RUNNER_TEMP/PeerBrush-0.29.99-macOS-arm64.zip"
@@ -388,8 +387,8 @@ jobs:
         if: inputs.private_upgrade_test
         run: |
           cd "$RUNNER_TEMP"
-          target="macos-signed/PeerBrush-0.30.0-macOS-arm64-apple-signed-r$ZIP_REVISION"
-          tar -cf lab.tar baseline-signed/PeerBrush-0.29.99-macOS-arm64-apple-signed-r1.zip baseline-signed/PeerBrush-0.29.99-macOS-arm64-apple-signed-r1-dmg-signed-r1.dmg lab-feed-0.29.99/appcast.xml lab-feed-0.30.0/appcast.xml "$target.zip" "$target-dmg-signed-r$DMG_REVISION.dmg"
+          target="macos-signed/PeerBrush-$SELECTED_VERSION-macOS-arm64-apple-signed-r$ZIP_REVISION"
+          tar -cf lab.tar baseline-signed/PeerBrush-0.29.99-macOS-arm64-apple-signed-r1.zip baseline-signed/PeerBrush-0.29.99-macOS-arm64-apple-signed-r1-dmg-signed-r1.dmg lab-feed-0.29.99/appcast.xml "lab-feed-$SELECTED_VERSION/appcast.xml" "$target.zip" "$target-dmg-signed-r$DMG_REVISION.dmg"
           python3 -B "$GITHUB_WORKSPACE/scripts/sparkle_lab_transport.py" encrypt editor "$RUNNER_TEMP/lab.tar"
       - name: Hand off delivery-editor
         if: inputs.private_upgrade_test
@@ -640,7 +639,7 @@ jobs:
   private-upgrade:
     name: Private installed Sparkle upgrade
     needs: build
-    if: inputs.private_upgrade_test && needs.build.outputs.version == '0.30.0' && vars.PEERBRUSH_NATIVE_QUALIFICATION_ENABLED == 'true' && github.ref == 'refs/heads/main' && github.run_attempt == 1
+    if: inputs.private_upgrade_test && vars.PEERBRUSH_NATIVE_QUALIFICATION_ENABLED == 'true' && github.ref == 'refs/heads/main' && github.run_attempt == 1
     permissions:
       actions: read
       contents: read

@@ -18,4 +18,6 @@ PeerBrush 0.4.0 is unreleased. These notes describe the changes on `version/0.4`
 
 ## Before publication
 
+For a one-time upgrade from macOS 0.30.1, download the 0.4.0 DMG after publication and replace PeerBrush in Applications. The 0.30.1 updater cannot use the new version numbering.
+
 The production release gate, native acceptance and package verification remain pending for this source. Earlier development results are recorded in the [backlog](../FOLLOWUPS.MD). Scoop, Homebrew, apt and Nix definitions and support are in source. Their installs, upgrades and public delivery still need qualification. [GitHub issue #59](https://github.com/Deftr0y/PeerBrush/issues/59)

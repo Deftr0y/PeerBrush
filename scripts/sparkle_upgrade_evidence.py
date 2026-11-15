@@ -2,6 +2,8 @@
 import re
 
 
+BASELINE_VERSION = '0.29.99'
+TARGET_VERSION = '0.4.0'
 CASES = ('no-update', 'network-error', 'cancel-check', 'cancel-download',
          'interrupted-before-quit', 'interrupted-install', 'success')
 
@@ -11,7 +13,7 @@ def validate(record, commit, version, archive_sha256, image_sha256, run=None):
               'target_zip_sha256', 'target_dmg_sha256', 'starting_zip_sha256', 'starting_dmg_sha256'}
     if (not isinstance(record, dict) or set(record) != fields or type(record['schema']) is not int
             or record['schema'] != 1 or record['commit'] != commit or record['version'] != version
-            or version != '0.30.0' or record['starting_version'] != '0.29.99'
+            or version not in ('0.30.0', TARGET_VERSION) or record['starting_version'] != BASELINE_VERSION
             or record['cases'] != list(CASES) or type(record['run_id']) is not str
             or not re.fullmatch(r'[1-9][0-9]{0,19}', record['run_id']) or run is not None and record['run_id'] != run
             or record['target_zip_sha256'] != archive_sha256 or record['target_dmg_sha256'] != image_sha256
