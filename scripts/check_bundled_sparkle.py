@@ -62,7 +62,15 @@ def main():
     args = parser.parse_args()
     try:
         check(pathlib.Path(__file__).resolve().parents[1], **vars(args))
-    except Exception:
+    except Exception as error:
+        failure = error.__traceback__
+        fixture_line = None
+        while failure is not None:
+            if failure.tb_frame.f_globals.get('__name__') == 'check_macos_editor_relaunch':
+                fixture_line = failure.tb_lineno
+            failure = failure.tb_next
+        if fixture_line is not None:
+            print(f'Mac editor acceptance failed at check_macos_editor_relaunch.py:{fixture_line}.', file=sys.stderr)
         print('Bundled Sparkle component failed; preserve private fixture for inspection.', file=sys.stderr)
         return 1
     print('Exact dormant unsigned Sparkle bundle preserved through ZIP and mounted image; no signing/install/update acceptance claimed.')
