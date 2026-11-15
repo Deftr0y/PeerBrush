@@ -309,7 +309,7 @@ class Transactions(unittest.TestCase):
         preflight = text.split('      - name: Revalidate actual final inputs through the publication preflight\n', 1)[1].split('\n      - ', 1)[0]
         self.assertIn('scripts/publish_release.py --source-root', preflight)
         self.assertIn('--final-input-index-sha256 "$FINAL_INPUTS_INDEX_SHA256"', preflight)
-        self.assertIn('--notes "$GITHUB_WORKSPACE/docs/release-0.30.md" --notes-sha256 "$RELEASE_NOTES_SHA256"', preflight)
+        self.assertIn('--notes "$GITHUB_WORKSPACE/docs/release-0.4.md" --notes-sha256 "$RELEASE_NOTES_SHA256"', preflight)
         self.assertNotIn('--execute', preflight)
         self.assertNotIn('GH_TOKEN:', preflight)
 
