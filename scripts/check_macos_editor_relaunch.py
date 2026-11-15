@@ -13,6 +13,16 @@ from sign_macos import verify_native
 from test_deb_version_upgrade import PROJECT_SIZE, png_samples
 
 
+BUSY = frozenset({
+    'Source inventory is busy',
+    'Source inventory validation is busy',
+    'Project is busy; source capture deferred',
+    'Workspace is busy; source capture deferred',
+    'Native backing is busy; retry without changing the document',
+    'Export workspace is busy',
+})
+
+
 def exercise(app, work, executable_sha256, manual_upgrade=False, signed_team=None):
     if (sys.platform != 'darwin' or os.environ.get('RUNNER_ENVIRONMENT') != 'github-hosted'
             or os.environ.get('RUNNER_ARCH') != 'ARM64'):
@@ -39,12 +49,22 @@ def exercise(app, work, executable_sha256, manual_upgrade=False, signed_team=Non
     pixels = struct.pack('>4H', *rgb, 65535) * (width * height)
 
     def rpc(method, **params):
-        result = subprocess.run([exe, 'cli', method, json.dumps(dict(actor='human', **params))],
-                                stdout=subprocess.PIPE, timeout=12, check=True, **options)
-        reply = json.loads(result.stdout)
-        if reply.get('ok') is not True:
-            raise ValueError('The real editor refused the fixture operation.')
-        return reply['result']
+        request = json.dumps(dict(actor='human', **params))
+        readback = method == 'observe' or method == 'tool_settings' and params.get('action') == 'get'
+        export = method == 'document' and params.get('action') == 'export'
+        for attempt in range(5):
+            result = subprocess.run([exe, 'cli', method, request], stdout=subprocess.PIPE,
+                                    timeout=12, **options)
+            if not result.stdout:
+                result.check_returncode()
+            reply = json.loads(result.stdout)
+            if reply.get('ok') is True:
+                result.check_returncode()
+                return reply['result']
+            busy = reply.get('error') in BUSY
+            if attempt == 4 or not busy or not (readback or export and not os.path.lexists(params['path'])):
+                raise ValueError('The real editor refused the fixture operation.')
+            time.sleep(0.2)
 
     legacy = None
     if manual_upgrade:
