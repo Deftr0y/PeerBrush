@@ -968,7 +968,7 @@ fn drag_text_field(
     for (rect, icon, label, tip, cursor, handle) in [
         (controls[0], Icon::Move, "Move text field", "Drag to move · Arrow keys move 1 px, or 10 px with Shift",
             egui::CursorIcon::Move, FieldHandle::Move),
-        (controls[1], Icon::Rotate, "Shift-drag snaps to 15° · Arrow keys rotate 1°, or 10° with Shift",
+        (controls[1], Icon::Rotate, "Rotate text field", "Shift-drag snaps to 15° · Arrow keys rotate 1°, or 10° with Shift",
             egui::CursorIcon::Grab, FieldHandle::Rotate),
     ] {
         let sense = if allow_input && !dragging && painter.clip_rect().intersects(rect) {
