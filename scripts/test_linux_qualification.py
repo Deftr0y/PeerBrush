@@ -606,6 +606,9 @@ class LinuxFacts(unittest.TestCase):
         class GuardPassed(Exception):
             pass
         for index, (prefix, body) in enumerate(commands):
+            packages = next(row for row in body.splitlines() if 'apt-get install ' in row).split()
+            self.assertTrue({'shared-mime-info', 'desktop-file-utils', 'libfile-mimeinfo-perl',
+                             'file', 'passwd'} <= set(packages))
             tokens = shlex.split(prefix.replace('\\\n', ' '))
             environment = dict(tokens[i + 1].split('=', 1) for i, token in enumerate(tokens) if token == '-e')
             self.assertEqual(environment.get('PEERBRUSH_DISPOSABLE_PACKAGE_TEST'), '1')
