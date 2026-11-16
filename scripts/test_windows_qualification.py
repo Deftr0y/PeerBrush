@@ -236,10 +236,13 @@ class WindowsFacts(unittest.TestCase):
             if host == 'api.github.com':
                 self.assertEqual(options['token'], 'SYNTHETIC_READ_TOKEN')
                 if target.endswith('/zip'):
+                    self.assertEqual(limit, 8192)
+                    self.assertTrue(options['redirect'])
                     return 'https://fixture.blob.core.windows.net/' + target.split('/')[-2]
                 identifier = target.rsplit('/', 1)[1]
                 return json.dumps(runs[identifier] if '/runs/' in target else artifacts[identifier]).encode()
             self.assertNotIn('token', options)
+            self.assertEqual(limit, len(wrappers[target[1:]]))
             with options['destination'].open('xb') as stream:
                 stream.write(wrappers[target[1:]])
         selected = dict(commit=self.f.fixture.commit, qualification=q, transport=dict(

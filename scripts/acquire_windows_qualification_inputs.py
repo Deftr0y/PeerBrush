@@ -43,11 +43,11 @@ def acquire_artifact(root, output, *, commit, run_id, artifact_id, artifact_sha2
     output.mkdir(mode=0o700)
     output.chmod(0o700)
     private_inspection_directory(output, root, fresh=False)
-    location = transport.request('api.github.com', artifact_route + '/zip', transport.MAX_ARTIFACT, token=token, redirect=True)
+    location = transport.request('api.github.com', artifact_route + '/zip', 8192, token=token, redirect=True)
     parsed = urlsplit(location)
     target = parsed.path + ('?' + parsed.query if parsed.query else '')
     archive = output / 'selected-artifact.zip'
-    transport.request(parsed.hostname, target, transport.MAX_ARTIFACT, destination=archive)
+    transport.request(parsed.hostname, target, expected_size, destination=archive)
     if bounded_file(archive, transport.MAX_ARTIFACT) != (artifact_sha256, expected_size):
         raise ValueError('Selected outer Windows artifact differs from its reviewed bytes.')
     transport.extract(archive, output, files)
