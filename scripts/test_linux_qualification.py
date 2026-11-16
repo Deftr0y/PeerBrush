@@ -564,9 +564,13 @@ class LinuxFacts(unittest.TestCase):
             calls.append((host, target))
             if host == 'api.github.com':
                 self.assertEqual(options['token'], 'SYNTHETIC_READ_TOKEN')
-                if target.endswith('/zip'): return 'https://fixture.blob.core.windows.net/' + target.split('/')[-2]
+                if target.endswith('/zip'):
+                    self.assertEqual(limit, 8192)
+                    self.assertTrue(options['redirect'])
+                    return 'https://fixture.blob.core.windows.net/' + target.split('/')[-2]
                 return json.dumps(run if '/runs/' in target else artifacts[target.rsplit('/', 1)[1]]).encode()
             self.assertNotIn('token', options)
+            self.assertEqual(limit, len(wrappers[target[1:]]))
             with options['destination'].open('xb') as stream: stream.write(wrappers[target[1:]])
         selected = dict(commit=q['commit'], qualification=q, transport=dict(run_id='101', portable_artifact_id='201',
             portable_artifact_sha256=sha(wrappers['201']), deb_artifact_id='202', deb_artifact_sha256=sha(wrappers['202']),
