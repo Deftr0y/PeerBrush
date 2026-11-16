@@ -171,7 +171,7 @@
       <article class="spot"><svg class="feature-icon"><use href="#brush"/></svg><h2>Painting</h2><p>Pressure, texture, taper and flow. Brush, erase, clone and heal.</p></article>
       <article class="spot"><svg class="feature-icon"><use href="#layers"/></svg><h2>Layers & masks</h2><p>Folders, blend modes, selections and separate color and mask editing.</p></article>
       <article class="spot"><svg class="feature-icon"><use href="#effects"/></svg><h2>Editable effects</h2><p>Curves, levels, color balance, bloom and liquify with live previews.</p></article>
-      <article class="spot"><svg class="feature-icon"><use href="#file"/></svg><h2>8 & 16 bit</h2><p>Native channel precision through editing, transforms and PSD / PNG saves.</p></article>
+      <article class="spot"><svg class="feature-icon"><use href="#file"/></svg><h2>8 & 16 bit</h2><p>Native channel precision through editing, transforms and PSD / PSB / PNG saves.</p></article>
     </section>
 
     <section class="gallery-section section wrap" id="workspace" aria-labelledby="workspace-title">
@@ -243,13 +243,13 @@
         <table>
           <thead><tr><th scope="col">Format</th><th scope="col">Current support</th><th scope="col">Behavior</th></tr></thead>
           <tbody>
-            <tr><th scope="row">PSD <span>v1 · RGB · 8 / 16 bit</span></th><td><span class="support-dot"></span>Editable, supported structures</td><td>Raster layers, groups, supported blends and raster masks. Saves include a current merged composite.</td></tr>
+            <tr><th scope="row">PSD / PSB <span>RGB · 8 / 16 bit</span></th><td><span class="support-dot"></span>Editable, supported structures</td><td>Open, edit and save supported raster layers, groups, blends and raster masks. Saves retain native channel precision and include a current merged composite.</td></tr>
             <tr><th scope="row">PNG <span>8 / 16 bit</span></th><td><span class="support-dot"></span>Import & export</td><td>Export retains the document’s native channel depth.</td></tr>
             <tr><th scope="row">JPEG / BMP / GIF / TIFF / WebP / ICO / Netpbm / TGA / QOI</th><td><span class="support-dot"></span>Image import</td><td>Supported static images, with explicit frame, page or icon choices where needed. Supported native 16-bit samples retain their precision.</td></tr>
             <tr><th scope="row">SVG / SVGZ</th><td><span class="support-dot"></span>Editable vector import</td><td>Supported self-contained static artwork. Outline text; unsupported visual features are rejected. Vector coverage renders at 8 bit.</td></tr>
             <tr><th scope="row">RGB ICC profiles</th><td><span class="support-dot"></span>Bounded color management</td><td>Matrix/TRC and classic RGB LUT profiles. Supported image imports normalize to sRGB at source depth; protected PSDs require an explicit editable copy.</td></tr>
-            <tr><th scope="row">Unsupported PSD structures</th><td><span class="support-dot protected"></span>Protected preview</td><td>Read-only merged preview. An explicit flattened copy retains the original precision.</td></tr>
-            <tr><th scope="row">PSB / other color modes</th><td><span class="support-dot limited"></span>Not supported</td><td>CMYK, HDR/32-bit, broader Photoshop layer styles and newer ICC LUT structures remain unsupported. Supported RGB PSB sources retain native 8/16-bit precision.</td></tr>
+            <tr><th scope="row">Unsupported PSD / PSB structures</th><td><span class="support-dot protected"></span>Protected preview</td><td>Read-only merged preview. An explicit flattened copy retains the original precision.</td></tr>
+            <tr><th scope="row">Other color modes / unsupported structures</th><td><span class="support-dot limited"></span>Not supported</td><td>CMYK, HDR/32-bit, broader Photoshop layer styles and newer ICC LUT structures remain unsupported.</td></tr>
           </tbody>
         </table>
       </div>
