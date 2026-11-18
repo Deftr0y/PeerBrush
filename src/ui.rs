@@ -6497,7 +6497,7 @@ impl PeerBrush {
                 }
                 Tool::Rotate => command["angle"] = json!(f64::from(x - y) * 0.1),
                 Tool::Scale => {
-                    let amount = 1.01_f64.powi(x - y);
+                    let amount = 1.01_f64.powi(x - y).clamp(0.05, 20.);
                     command["scale_x"] = json!(amount);
                     command["scale_y"] = json!(amount);
                 }

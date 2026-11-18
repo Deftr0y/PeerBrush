@@ -28,7 +28,7 @@ pub(crate) fn layer_insert_slot(
         command["parent"].as_str()
     };
     let mut ancestor = parent;
-    for _ in 0..16 {
+    for _ in 0..=16 {
         let Some(id) = ancestor else {
             return Ok((index, parent.map(str::to_owned)));
         };
