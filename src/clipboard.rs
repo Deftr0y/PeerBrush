@@ -454,6 +454,12 @@ pub(crate) enum EditRequest {
         doc: DocumentSnapshot,
         target: String,
     },
+    CopyAndPaste {
+        copy: Box<EditRequest>,
+        shared: Shared,
+        doc: DocumentSnapshot,
+        target: String,
+    },
     Layers {
         doc: DocumentSnapshot,
         ids: Vec<String>,
@@ -473,7 +479,8 @@ impl EditRequest {
     fn document(&self) -> &str {
         match self {
             Self::Resident(request) => request.document(),
-            Self::Layers { doc, .. } | Self::Pixels { doc, .. } | Self::Paste { doc, .. } => {
+            Self::Layers { doc, .. } | Self::Pixels { doc, .. } | Self::Paste { doc, .. }
+                | Self::CopyAndPaste { doc, .. } => {
                 doc.view().id()
             }
         }
@@ -892,7 +899,25 @@ impl Session {
                     target,
                 },
                 Some(doc.view()),
+                false,
             ),
+            EditRequest::CopyAndPaste { copy, shared, doc, target } => {
+                let copied = self.process_edit(clipboard, *copy);
+                if copied.result.is_err() {
+                    return copied;
+                }
+                self.process_observed(
+                    clipboard,
+                    Request::Paste {
+                        shared,
+                        document: doc.view().id().to_owned(),
+                        revision: doc.view().revision(),
+                        target,
+                    },
+                    Some(doc.view()),
+                    true,
+                )
+            }
             EditRequest::Layers { doc, ids, cut } => Reply {
                 document: doc.view().id().to_owned(),
                 result: self.copy_layers(clipboard, doc.view(), ids, cut),
@@ -1107,13 +1132,14 @@ impl Session {
         }
     }
     fn process(&mut self, clipboard: &mut dyn Provider, request: Request) -> Reply {
-        self.process_observed(clipboard, request, None)
+        self.process_observed(clipboard, request, None, false)
     }
     fn process_observed(
         &mut self,
         clipboard: &mut dyn Provider,
         request: Request,
         source: Option<DocumentView<'_>>,
+        require_copy: bool,
     ) -> Reply {
         let document = request.document().to_owned();
         let mut selected = None;
@@ -1194,6 +1220,10 @@ impl Session {
                     selected = selected_layers.first().cloned();
                     return Ok(edit_status(&reply, "Pasted editable layers".into()));
                 }
+                let replaced = "Clipboard no longer contains the new copy; paste skipped";
+                if require_copy && (!files.is_empty() || self.layers.is_some()) {
+                    return Err(replaced.into());
+                }
                 let mut images = vec![];
                 let mut commands = vec![];
                 let mut received = None;
@@ -1210,6 +1240,9 @@ impl Session {
                         }
                         (_, expected) => identity.is_some() && expected == identity,
                     });
+                    if require_copy && retained.is_none() {
+                        return Err(replaced.into());
+                    }
                     match image {
                         // Exact bytes came from our validated encoder. Keep the
                         // admitted native pixels and skip a second PNG decode.
@@ -1235,6 +1268,8 @@ impl Session {
                                 } else {
                                     Some(&*received.insert(image.into()))
                                 }
+                            } else if require_copy {
+                                return Err(replaced.into());
                             } else {
                                 Some(&*received.insert(image.into()))
                             }
@@ -1529,6 +1564,44 @@ mod tests {
         assert_eq!(engine.resident_state().unwrap().document.layers[0].id, target);
         assert_eq!(engine.history_lengths(), [0, 0]);
     }
+    #[test]
+    fn paired_copy_and_paste_refuses_an_older_clipboard_after_copy_failure_or_takeover() {
+        let (shared, doc, target) = fixture();
+        let snapshot: DocumentSnapshot = doc.into();
+        let old = Image::from_raster(Raster::from_rgba(1, 1, &[21, 43, 65, 255]).unwrap());
+        for fail_write in [true, false] {
+            let mut clipboard = Fake {
+                image_reads: [Ok(ClipboardImage::Bitmap(old.clone()))].into(),
+                sequence: Some(17),
+                fail_write,
+                replace_after_write: !fail_write,
+                ..Default::default()
+            };
+            let request = EditRequest::CopyAndPaste {
+                copy: Box::new(EditRequest::Pixels {
+                    shared: shared.clone(),
+                    doc: snapshot.clone(),
+                    target: target.clone(),
+                    mask: false,
+                    merged: false,
+                    cut: false,
+                    step: None,
+                }),
+                shared: shared.clone(),
+                doc: snapshot.clone(),
+                target: target.clone(),
+            };
+            let reply = Session::default().process_edit(&mut clipboard, request);
+            let expected = if fail_write { "clipboard write failed" } else {
+                "Clipboard no longer contains the new copy; paste skipped"
+            };
+            assert_eq!(reply.result.unwrap_err(), expected);
+            let engine = shared.lock().unwrap();
+            assert_eq!(engine.history_lengths(), [0, 0]);
+            assert_eq!(crate::engine::view::current(&engine).layer_count(), 1);
+        }
+    }
+
     #[test]
     fn resident_oversized_selection_refuses_before_render_or_clipboard_write() {
         let (shared, _, _) = fixture();

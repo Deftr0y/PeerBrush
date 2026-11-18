@@ -6360,13 +6360,26 @@ impl PeerBrush {
                 (copy, cut, paste)
             });
             let merged = copy.unwrap_or(false);
+            let copy_and_paste = copy.is_some() && paste && !cut;
             if copy.is_some() || cut {
                 if let Some(request) = self.copy_request(&self.doc_snapshot, cut, merged) {
+                    let request = if copy_and_paste {
+                        crate::clipboard::EditRequest::CopyAndPaste {
+                            copy: Box::new(request),
+                            shared: self.shared.clone(),
+                            doc: self.doc_snapshot.clone(),
+                            target: self.selected.clone(),
+                        }
+                    } else {
+                        request
+                    };
                     self.message = self
                         .clipboard
                         .request_snapshot(request)
                         .map(|_| {
-                            if cut {
+                            if copy_and_paste {
+                                "Copying and pasting…".into()
+                            } else if cut {
                                 if doc.selection().is_some() {
                                     "Cutting selected pixels…".into()
                                 } else {
@@ -6382,7 +6395,7 @@ impl PeerBrush {
                         .into();
                 }
             }
-            if paste {
+            if paste && !copy_and_paste {
                 self.message = self
                     .clipboard
                     .request_snapshot(crate::clipboard::EditRequest::Paste {
@@ -15004,6 +15017,34 @@ mod tests {
             assert!(matches!(app.clipboard.replies.recv_timeout(Duration::from_millis(50)), Err(mpsc::RecvTimeoutError::Timeout)));
         }
     }
+    #[test]
+    fn copy_and_paste_in_the_wand_release_frame_uses_only_the_new_selection() {
+        for depth in [8, 16] {
+            let (mut app, ctx, point, before) = pressed_wand_fixture(depth);
+            frame(
+                &mut app,
+                &ctx,
+                vec![
+                    primary_release(point),
+                    egui::Event::Copy,
+                    egui::Event::Paste(String::new()),
+                ],
+                Default::default(),
+            );
+            let reply = app.clipboard.replies.recv_timeout(Duration::from_secs(3)).unwrap();
+            assert!(reply.result.is_ok(), "{:?}", reply.result);
+            let engine = app.shared.lock().unwrap();
+            let state = engine.resident_state().unwrap();
+            let paste = state.document.layers.iter()
+                .find(|layer| Some(&layer.id) == reply.selected.as_ref()).unwrap();
+            assert_eq!([paste.x, paste.y], [4, 5]);
+            assert_eq!([paste.pixels.width, paste.pixels.height], [8, 8]);
+            assert_eq!(paste.pixels.depth, depth);
+            assert_eq!(paste.pixels.get16(0, 0), before.layers[0].pixels.get16(4, 5));
+            assert_eq!(state.undo.len(), 2);
+        }
+    }
+
     #[test]
     fn wand_release_before_copy_cut_or_delete_uses_current_selected_pixels() {
         for depth in [8, 16] {
