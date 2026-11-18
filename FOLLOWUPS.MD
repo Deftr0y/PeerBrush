@@ -534,6 +534,8 @@ PB-122 Photoshop import now validates and retains supported global metadata in o
 
 PB-110 Copy and Paste delivered in the same frame now share one clipboard job. Paste uses the newly copied pixels or layers only after the copy succeeds and the clipboard still contains that copy. Focused regression source covers a wand release followed by both shortcuts at native 8/16-bit depth, failed clipboard writes and clipboard takeover. Runtime verification remains open.
 
+A Paste received while a native selection edit is pending or in the frame that receives its result can now follow a queued Copy. Both use the selection that actually committed, with the existing project, revision, tool and target checks. Native RGB8/16 regression source covers Paste arriving when the selection completes.
+
 The layer panel now uses an indexed parent lookup for reservation indicators and checks multi-layer selections in one pass through the layer list. Folder descendants and ancestors use the shared reservation rules. Native timing remains unmeasured.
 
 Desktop rendering captures the active proposal with the document frame and reads loading progress from the same frame. The proposal window serializes only the open review. Preview requests and acceptance still validate the live proposal. Native timing remains unmeasured.

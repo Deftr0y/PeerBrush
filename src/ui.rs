@@ -520,6 +520,23 @@ struct DeferredSelectionShortcuts {
     step: Option<String>,
     _charge: Arc<crate::psd::memory36::MetadataCharge>,
 }
+impl DeferredSelectionShortcuts {
+    fn follow_copy_with_paste(&mut self, incoming: &[egui::Event]) -> bool {
+        let is_paste = |event: &egui::Event| matches!(clipboard_shortcut(event), Some(ClipboardShortcut::Paste));
+        if incoming.is_empty()
+            || !incoming.iter().all(is_paste)
+            || !self.events.iter().any(|event| matches!(clipboard_shortcut(event), Some(ClipboardShortcut::Copy(_))))
+            || self.events.iter().any(|event| !matches!(clipboard_shortcut(event), Some(ClipboardShortcut::Copy(_) | ClipboardShortcut::Paste)))
+            || self.events.len() >= 8
+        {
+            return false;
+        }
+        if !self.events.iter().any(is_paste) {
+            self.events.push(egui::Event::Paste(String::new()));
+        }
+        true
+    }
+}
 enum TabPreviewOutput {
     Resident(crate::workspace::TransferImage),
     Native(crate::workspace::TransferSummary, native_texture::Prepared),
@@ -6128,11 +6145,19 @@ impl PeerBrush {
     }
 
     fn queue_selection_shortcuts(&mut self, doc: DocumentView<'_>, events: Vec<egui::Event>, modifiers: egui::Modifiers) {
-        if events.is_empty() || self.deferred_selection_shortcuts.is_some() { return; }
+        if events.is_empty() { return; }
         let Some(document) = doc.native() else { return; };
         let Some(request) = self.edit_worker.request_owner().filter(|request| {
             request.selection_edit && request.project == self.project_id && request.document == doc.id()
         }) else { return; };
+        if let Some(queued) = self.deferred_selection_shortcuts.as_mut() {
+            if Arc::ptr_eq(&queued.request, &request) && queued.layer == self.selected
+                && queued.tool == self.tool && queued.mask == self.mask && queued.step == self.mask_step
+            {
+                queued.follow_copy_with_paste(&events);
+            }
+            return;
+        }
         let bytes = 2048 + self.selected.len() + self.mask_step.as_ref().map_or(0, String::len);
         let charge = match crate::psd::memory36::MetadataCharge::reserve(document.budget(), bytes, &|| Ok(())) {
             Ok(charge) => charge,
@@ -6146,13 +6171,20 @@ impl PeerBrush {
 
     fn replay_selection_shortcuts(&mut self, ctx: &egui::Context, doc: DocumentView<'_>) {
         if self.edit_worker.pending() { return; }
-        let Some(queued) = self.deferred_selection_shortcuts.take() else { return; };
+        let Some(mut queued) = self.deferred_selection_shortcuts.take() else { return; };
         let Some((revision, source)) = queued.committed else { return; };
         if queued.request.project != self.project_id || queued.request.document != doc.id()
             || queued.tool != self.tool || queued.layer != self.selected
             || queued.mask != self.mask || queued.step != self.mask_step
             || self.document_shortcut_typing(ctx) || self.free_transform.is_some() || self.free_transform_frame
         { return; }
+        let incoming = ctx.input(|input| self.selection_shortcut_events(&input.events));
+        let following_paste = queued.follow_copy_with_paste(&incoming);
+        if following_paste {
+            ctx.input_mut(|input| input.events.retain(|event| {
+                !matches!(clipboard_shortcut(event), Some(ClipboardShortcut::Paste))
+            }));
+        }
         let current = self.shared.try_lock().ok().map(|engine| {
             let live = crate::engine::view::current(&engine);
             live.id() == doc.id() && live.revision() == revision
@@ -6165,9 +6197,7 @@ impl PeerBrush {
             return;
         }
         if doc.revision() != revision || doc.native().is_none_or(|document| document.key() != source)
-            || ctx.input(|input| input.events.iter().any(|event| {
-                !matches!(event, egui::Event::Key { repeat: true, .. }) && self.shortcuts.selection_dependent_event(event)
-            }))
+            || (!following_paste && !incoming.is_empty())
         { return; }
         if doc.selection().is_none() {
             self.message = "Selection is empty; shortcut skipped".into();
@@ -14736,11 +14766,12 @@ mod tests {
     fn native_wand_replays_release_frame_clipboard_and_transform_shortcuts() {
         use crate::engine::{native::{worker::tests::Fixture, NativeDocument}, scene::{CapturedScene, LegacyTileCache}};
         for depth in [8, 16] {
-            for (event, tool) in [
-                (egui::Event::Copy, Tool::MagicWand),
-                (shortcut_press(egui::Key::W), Tool::Move),
-                (shortcut_press(egui::Key::E), Tool::Rotate),
-                (shortcut_press(egui::Key::R), Tool::Scale),
+            for (event, tool, following_paste) in [
+                (egui::Event::Copy, Tool::MagicWand, false),
+                (egui::Event::Copy, Tool::MagicWand, true),
+                (shortcut_press(egui::Key::W), Tool::Move, false),
+                (shortcut_press(egui::Key::E), Tool::Rotate, false),
+                (shortcut_press(egui::Key::R), Tool::Scale, false),
             ] {
                 let fixture = Fixture::new();
                 let (runtime, _connection) = fixture.runtime();
@@ -14781,6 +14812,17 @@ mod tests {
                 frame(&mut app, &ctx, vec![primary_release(point), event], Default::default());
                 assert!(app.deferred_selection_shortcuts.is_some());
                 let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                if following_paste {
+                    // Finish the worker without drawing, so Paste reaches the same
+                    // frame that will replay the queued Copy against the selection.
+                    while app.edit_worker.pending() {
+                        assert!(std::time::Instant::now() < deadline);
+                        app.poll_edit_job();
+                        std::thread::yield_now();
+                    }
+                    assert!(app.deferred_selection_shortcuts.as_ref().unwrap().committed.is_some());
+                    frame(&mut app, &ctx, vec![egui::Event::Paste(String::new())], Default::default());
+                }
                 while app.deferred_selection_shortcuts.is_some() || app.edit_worker.pending() {
                     assert!(std::time::Instant::now() < deadline);
                     frame(&mut app, &ctx, vec![], Default::default());
@@ -14789,19 +14831,24 @@ mod tests {
                 assert!(app.tool == tool);
                 let snapshot = {
                     let engine = shared.lock().unwrap();
-                    assert_eq!(engine.history_lengths(), [1, 0]);
+                    if !following_paste {
+                        assert_eq!(engine.history_lengths(), [1, 0]);
+                    }
                     assert_eq!(engine.native_document().unwrap().metadata().selection(), Some([4, 5, 12, 13]));
                     engine.doc_snapshot()
                 };
                 if tool == Tool::MagicWand {
-                    let copy = app.clipboard.replies.recv_timeout(Duration::from_secs(5)).unwrap();
-                    assert!(copy.result.is_ok(), "{:?}", copy.result);
-                    app.clipboard.request_snapshot(crate::clipboard::EditRequest::Paste {
-                        shared: shared.clone(), doc: snapshot, target: layer,
-                    }).unwrap();
+                    if !following_paste {
+                        let copy = app.clipboard.replies.recv_timeout(Duration::from_secs(5)).unwrap();
+                        assert!(copy.result.is_ok(), "{:?}", copy.result);
+                        app.clipboard.request_snapshot(crate::clipboard::EditRequest::Paste {
+                            shared: shared.clone(), doc: snapshot, target: layer,
+                        }).unwrap();
+                    }
                     let paste = app.clipboard.replies.recv_timeout(Duration::from_secs(5)).unwrap();
                     assert!(paste.result.is_ok(), "{:?}", paste.result);
                     let engine = shared.lock().unwrap();
+                    assert_eq!(engine.history_lengths(), [2, 0]);
                     let document = engine.native_document().unwrap();
                     let pasted = document.metadata().layers().find(|layer| Some(layer.id()) == paste.selected.as_deref()).unwrap();
                     let raster = pasted.pixels();
