@@ -13,7 +13,7 @@
 [![Rust](https://img.shields.io/badge/built_with-Rust-dea584.svg)](Cargo.toml)
 [![MCP](https://img.shields.io/badge/AI_interface-MCP-5aaaff.svg)](docs/mcp.md)
 
-[Website](https://peerbrush.com/) · [Watch the trailer](https://peerbrush.com/#demo) · [Windows Store](https://apps.microsoft.com/detail/9PNR6T1Q2ZL9) · [macOS and Linux downloads](https://peerbrush.com/#downloads) · [Published releases](https://github.com/Deftr0y/PeerBrush/releases) · [Get started](docs/getting-started.md) · [Connect your AI](docs/mcp.md) · [Development guide](docs/development-guide.md) · [Roadmap](FOLLOWUPS.MD)
+[Website](https://peerbrush.com/) · [Watch the trailer](https://peerbrush.com/#demo) · [Windows Store](https://apps.microsoft.com/detail/9PNR6T1Q2ZL9) · [macOS and Linux downloads](https://peerbrush.com/#downloads) · [Published releases](https://github.com/Deftr0y/PeerBrush/releases) · [Get started](docs/getting-started.md) · [Connect your AI](docs/mcp.md) · [Development guide](docs/development-guide.md) · [Backlog](BACKLOG.md)
 
 </div>
 
@@ -127,7 +127,7 @@ The long-term goal is an MCP-native creative application where compatible AI age
 - Local and remote model support through connected agents
 - Extensible tool and plugin architecture
 
-PeerBrush includes retained regional and broader GPU previews, folder transforms, selective agent-task undo, refined selections, optional external learned selection, native clone/heal, crop/canvas/image resizing, editable text/vector sources, retained transform originals, progressive loading, AI proposals and live code editing, stronger RGB PSD/color-profile support, brush and preset libraries, compact weighted effects and independent project tabs. The living [FOLLOWUPS.MD](FOLLOWUPS.MD) records requests and their status; [learned-selection setup](docs/segmentation.md) keeps model choice outside the editor, and [AI collaboration](docs/collaboration.md) describes optional review.
+PeerBrush includes retained regional and broader GPU previews, folder transforms, selective agent-task undo, refined selections, optional external learned selection, native clone/heal, crop/canvas/image resizing, editable text/vector sources, retained transform originals, progressive loading, AI proposals and live code editing, stronger RGB PSD/color-profile support, brush and preset libraries, compact weighted effects and independent project tabs. The [project backlog](BACKLOG.md) records requests, acceptance and release status. [Learned-selection setup](docs/segmentation.md) keeps model choice outside the editor, and [AI collaboration](docs/collaboration.md) describes optional review.
 
 ## Status
 

@@ -1,6 +1,6 @@
 # PeerBrush 0.26 development
 
-Historical implementation and acceptance record for 0.26, developed from published 0.25 on `version/0.26`. Version 0.26.0 Mac/Linux downloads and the website are published; Windows Store delivery remains pending. All remaining feature and acceptance work is now planned for [v0.3](development-0.3.md), with full original criteria in [FOLLOWUPS.MD](../FOLLOWUPS.MD). The separate high-priority installation/release foundations have no assigned release version. Preserve the evidence below; it does not establish that outstanding acceptance passed.
+Historical implementation and acceptance record for 0.26, developed from published 0.25 on `version/0.26`. Version 0.26.0 Mac/Linux downloads and the website are published; Windows Store delivery remains pending. At this checkpoint, remaining work moved to [v0.3](development-0.3.md). Original criteria remain in the [historical record](../FOLLOWUPS.MD). Current scope, status and priorities are in the [canonical backlog](../BACKLOG.md). Preserve the evidence below; it does not establish that outstanding acceptance passed.
 
 The original 0.26 priority order below is retained as historical context. Continue its unfinished work through the v0.3 queue, where PB-108 remains priority #1:
 

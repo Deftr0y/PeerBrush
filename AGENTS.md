@@ -1,5 +1,7 @@
 # PeerBrush development
 
+- [BACKLOG.md](BACKLOG.md) is the canonical project backlog. Record each new request, status change, verification result and release in BACKLOG.md in the same PR or direct version-branch change as the related work. Use the existing PB ID and include exact acceptance evidence, source/build, version, and platform where applicable. Link discussion and historical evidence to the canonical item.
+
 - Develop directly on the appropriate `version/<version>` branch. The active development branch is `version/0.5`, with 0.5.0 as the working version. Do not create routine feature/fix PRs or run development CI. Production is `main`. A version-to-`main` release candidate receives the essential gate once before promotion. `dev` and existing feature branches retain historical/WIP work. Never force-push or delete that history. Historical maintenance and website content have separate roles in the [development guide](docs/development-guide.md).
 
 - Git attribution belongs to the human contributor. Never register an LLM or AI tool as a commit author, committer, co-author or contributor, or add automated contributor badges. Use an approved human identity from `.github/human-contributors.json`; adding another identity requires the maintainer to verify that it belongs to a human. GitHub's signing service is allowed only as a committer. Keep the README's AI-development disclosure.

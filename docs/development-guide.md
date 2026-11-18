@@ -1,6 +1,6 @@
 # PeerBrush development guide
 
-PeerBrush is a GPL v3 native image editor built with Rust, egui/eframe and wgpu. Document editing, codecs and transports share one engine. Read [AGENTS.md](../AGENTS.md) and the [0.5 backlog](../FOLLOWUPS.MD#peerbrush-05--remaining-development-and-acceptance) before changing behavior. Version 0.5 carries forward the remaining backlog, with PB-108 first.
+PeerBrush is a GPL v3 native image editor built with Rust, egui/eframe and wgpu. Document editing, codecs and transports share one engine. Read [AGENTS.md](../AGENTS.md) and the [canonical backlog](../BACKLOG.md) before changing behavior. Record requests, status, verification and release evidence in that file in the same PR or version-branch change as the work. The 0.5 checklist and older follow-up milestones are listed there.
 
 ## Direct version development and release promotion
 
@@ -48,8 +48,7 @@ validates the selection without executing application tests.
 Actual artifact identity, signatures, Store/notarization requirements, package
 installation, native feature acceptance and publication protections still apply.
 Release/signing producers build and validate their exact artifacts without
-repeating the broad code suite. The 16000 × 16000 editor (PB-068) is in scope
-for the next version and requires acceptance at those limits before release.
+repeating the broad code suite. Any candidate claiming 16000 × 16000 editing (PB-068) requires native acceptance at those limits.
 
 Use Rust 1.92.0 and the [native JPEG XL prerequisites](jpeg-xl-build.md). For an
 explicit build use `python scripts/jxl_build.py -- build --locked --bin peerbrush`.

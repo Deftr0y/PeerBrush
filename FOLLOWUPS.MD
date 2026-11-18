@@ -1,3 +1,5 @@
+> **Historical record.** [BACKLOG.md](BACKLOG.md) tracks current requests, acceptance, verification and shipment. The content and claims below describe their original checkpoints.
+
 Unreleased development update, 2026-11-13. A Windows development build saved a dense 16000 × 16000 RGB16 PSB, matched every standard layer and merged channel sample, reopened the layer for editing and matched exact PNG crop exports. The 6.18 GB fixture took about 43 minutes to save. The latest build also reopened it with exact crop exports. [Timings, memory and scope](docs/large-documents.md). Full-size performance, multilayer workloads, Photoshop and cross-platform acceptance remain open.
 
 Unreleased development update, 2026-11-13. Native whole-layer affine transforms admit a dense 16000 × 16000 plane under shared work, source and storage budgets. Windows diagnostics verified a dense RGB16 layer upscale and a downscale that splits source windows, including exact sampled pixels, retained originals and one-step Undo. [Measurements and scope](docs/large-documents.md). Large linked-plane transforms, interactive performance and cross-platform acceptance remain open.
@@ -175,8 +177,6 @@ Unreleased source update, 2026-11-07: Windows Scoop installations now retain pac
 Unreleased source correction, 2026-11-07: the Nix pre-build hook now supplies its temporary native-tool environment file through GITHUB_ENV, matching the existing qualifier CLI, then removes the file after importing its quoted assignments. The prior filename argument was invalid and would stop the build before Cargo. Linux regression source exercises the actual hook with synthetic version-only launchers, including spaced paths, inherited-destination isolation and refusal before build continuation when a tool is unqualified. Python/embedded-Python syntax and whitespace review only; tests, Nix evaluation/build, toolchain qualification and installed acceptance remain unperformed. PB-158 and the wider release backlog remain open.
 
 # PeerBrush follow-ups
-
-[PeerBrush 0.5](#peerbrush-05--remaining-development-and-acceptance) is the active development milestone and includes all open backlog work.
 
 Unreleased source update, 2026-11-09. PB-068 native static PNG layer import shares the large held-file limits with Open, charges actual stored tiles, and retains the existing canvas through 16-bit promotion. The native UI inspects mixed-format batches with bounded reads and binds each choice to its original file digest and captured document generation. Regression source covers a mixed 16-bit PNG and selected GIF frame, rollback after the second file changes, and a successful retry recorded as one undo step. Windows all-target compile-only checking passed. Tests and dense full-size runtime qualification remain pending.
 
@@ -373,9 +373,9 @@ The high-priority installation, updates and production-publishing foundations be
 PB-110 additionally preserves the actual click-release location when later hover movement arrives in the same frame. Lasso anchor release cannot clear earlier shared coverage by using the new hover location. The focused native8/16 focus-loss regression and combined local run passed with explicit coverage preservation before cancellation. A separately reported recurrence remains unresolved.
 
 
-This is the living backlog for ideas raised during development. Add new requests here as they arrive, keep the user's intent, and move them to the appropriate milestone. Update status only after implementation and verification.
+This is the historical record for requests raised during development. Keep the original wording and update current work in [BACKLOG.md](BACKLOG.md).
 
-Status cells retain their historical checkpoint wording and evidence. Unfinished development and acceptance carry forward to 0.5.
+Status cells describe their historical checkpoints. Current follow-up status belongs in [BACKLOG.md](BACKLOG.md).
 
 Clean `6937edb` subsequently passed 1,001 Rust checks, formatting, all-target Clippy with warnings and seven offscreen GPU checks. Python/fresh-runtime coverage passed 197 of 203 cases, with zero assertion failures, the known older-SDK error and five skips. Native CI passed all three platforms' test/build/package steps, the actual Mac DMG and disabled Sparkle components, and the full source-bound Ubuntu installation lifecycle; final aggregate package/source inspection also passed. Exact source/merge provenance and acceptance limits are recorded in the [latest checkpoint](docs/development-0.3.md#combined-diagnostics-and-installation-checkpoint--2026-10-20). The next integrated Text/field/spacing and early PSD/PSB saveability slices have regression coverage written but still require combined execution and native acceptance.
 
@@ -457,7 +457,7 @@ Regression source is added; execution/native acceptance remain pending. Live nat
 authority and large-document limits are unchanged. See the
 [current development increment](docs/development-0.3.md#next-version-scope-and-current-increment--2026-11-06).
 
-All unfinished backlog items are in the next-version scope; see the [current implementation increment and remaining work](docs/development-0.3.md#next-version-scope-and-current-increment--2026-11-06). Preserve the existing priority order and implementation evidence below. Development source does not establish release readiness. The Photoshop request expands PB-122 rather than creating a separate competing import workstream.
+The planning checkpoint placed all unfinished items in the next-version scope; see the [current implementation increment and remaining work](docs/development-0.3.md#next-version-scope-and-current-increment--2026-11-06). Preserve the existing priority order and implementation evidence below. Development source does not establish release readiness. The Photoshop request expands PB-122 rather than creating a separate competing import workstream.
 
 | ID | Work | Status | Acceptance |
 | --- | --- | --- | --- |
@@ -518,15 +518,17 @@ The consolidated source is reviewable in [PR #49](https://github.com/Deftr0y/Pee
 | PB-155 | Per-user persistent settings and migration | High priority — profile and migration implemented; installed upgrade acceptance pending | Define platform-standard per-user configuration/data locations outside the installed application and sealed package. Persist documented preferences across restart and upgrades; keep runtime/cache/recovery data distinct, respect user permissions, and preserve existing portable settings through a versioned, validated migration with backup and safe failure behavior. Do not reset custom settings, expose private configuration or alter project artwork. Decide the uninstall retention/removal experience explicitly. Verify first run, restart, upgrade, migration, invalid/older settings, interrupted writes and reinstall; coordinate update recovery with PB-147. |
 | PB-154 | Main-to-production release and store automation | High priority — candidate and immutable-byte qualification implemented; publication and Store gates open | Plan a trusted main-push pipeline gated by exact-source tests, coherent application/package versions, required reviews and protected signing/notarization approval. Use one immutable source SHA per release; publish final versioned installers, matching GPLv3 source/notices and post-signing checksums without moving tags or replacing released bytes. Update website latest/downloads and append dated history only from verified public assets, with explicit per-platform readiness and pending status. Submit the validated Windows package through the authorized Store path; model submission, certification delay, rejection, publication and public availability separately. Add bounded retry/reconciliation, duplicate-submission prevention, resumable failures and status reporting; never claim a submitted package is publicly available. Keep a common release contract extensible to future stores. Current manual workflows and inactive/untested Store tooling are not completed automation; no credential, signing-gate or deployment-setting change is authorized by this planning item. |
 
-## PeerBrush 0.5 — remaining development and acceptance
+<a name="peerbrush-05--remaining-development-and-acceptance"></a>
 
-PeerBrush 0.5.0 is in development. Its scope is every open item in this backlog, including the November requests above, the installation and publishing foundations, and unfinished acceptance recorded with earlier implementations. When an earlier checkpoint closes an item, retain its evidence and carry forward any separate reopened report or outstanding acceptance check. Standing UI, engine, precision and save-safety requirements apply.
+## PeerBrush 0.4 — remaining development and acceptance
+
+The original 0.4 scope included the remaining backlog and earlier acceptance records. The [0.5 owner intake](#peerbrush-05-owner-requested-intake) and [canonical backlog](BACKLOG.md) supersede that planning scope.
 
 PB-154 production preparation now selects the reviewed notes for the exact Cargo version. The candidate version and independently supplied notes digest must match before any public operation. The 0.5 notes are a development draft.
 
 ### Ordered reliability work
 
-PB-108 is the first reliability priority for PeerBrush 0.5, followed by PB-122 and PB-110.
+PB-108 was the first reliability priority for PeerBrush 0.4, followed by PB-122 and PB-110.
 
 Adjustment rows in the layer stack now draw their type icon during normal display and drag, without scheduling an unused color thumbnail. Mask thumbnails still follow the shared renderer. The kickoff package-version checks passed for Windows, macOS and Debian. The build, editor, engine, codec and protocol checks remain pending after Windows Application Control blocked a dependency build script. End-to-end responsiveness remains open.
 
@@ -562,7 +564,7 @@ After PB-110, preserve the existing relative order: recovery (PB-080/PB-138), ca
 
 ### Other open features, refinements and acceptance
 
-The two layer-stack requests below retain their higher priority among the queued refinements.
+The two layer-stack requests below were recorded during the 0.5 worktree kickoff. See the canonical backlog for their current status.
 
 | ID | Feature | Status | Acceptance |
 | --- | --- | --- | --- |
@@ -1242,3 +1244,31 @@ CI558 passed unfiltered Rust/Clippy on all three platforms, then macOS failed st
 The next reviewed source cohort remains pending one combined replay. PB-108 changes the repeated Windows Save identity open to request metadata access, preserving held/named identity, reparse refusal, bounded transfers, source/cancellation/quota and complete integrity checks. This deliberately avoids requesting file-data access for identity inspection; it does not preserve the incidental repeated data-read permission request. A real-handle regression and a separately ignored, twelve-row 2 MiB I/O diagnostic are prepared, not executed; no speed improvement is established.
 
 CI558 is now terminal: its complete Windows job passed; macOS and Ubuntu failed later acceptance, and the aggregate was skipped. The owned-PNG-root fixture correction and bounded Linux GUI bootstrap/phase diagnostics need fresh replay. The underlying Ubuntu child failure is still unknown. Windows source adds explicit authenticated CURRENT recovery-copy capture and keeps it held through NEW transfer/staging; stable newer-version discovery and immutable historical-package routing remain unfinished. No installation or recovery authority follows. [Pending cohort and unchanged release holds](docs/development-0.3.md#pending-save-and-native-acceptance-cohort-unreleased-2026-10-24-utc). Previous qualified local and mixed normal-Save results remain historical evidence for their exact sources. Remote control and add-ons remain excluded; completed history is preserved.
+
+## PeerBrush 0.5 owner-requested intake
+
+Recorded 2026-11-18 from the November 16 reports. These are 15 acceptance checks for 0.5, not claims that defects have been reproduced or fixes have shipped. Where a check maps to an existing PB item, carry its exact criteria into that item during backlog reconciliation rather than opening duplicate work.
+
+### Save safety and project lifecycle
+
+1. **Autosave at the 256 MiB channel limit.** Reproduce `Autosave failed: Uncompressed Photoshop channels alone exceed the 256 MiB file limit` on the affected build. Verify that a representative large editable project gets a usable recovery checkpoint and reopens; preserve depth, layers and masks. See [PB-105 investigation](docs/large-document-investigation.md) as background, not a verified diagnosis.
+2. **Normal PSD save with a full previous-version backup store.** A full backup store must not strand the current editable document. Verify both a normal save workflow and safe handling of existing destination and backup bytes. Do not bypass overwrite protection or silently discard backups. Track separately from the autosave size failure.
+3. **Image drop onto a second existing tab.** Drop an image into project A, switch to already-open project B, and drop another. Both should import into the intended project. Exercise native drag-and-drop.
+4. **Close blocked after a project operation.** Reproduce the stuck “finish the current operation” flow. Completion or cancellation must unblock close without losing unsaved work; a genuinely active operation must still be guarded.
+
+### Layer stack and AI collaboration
+
+5. **Folder thumbnails.** Show a composite preview of the folder contents inside its icon in the layer panel.
+6. **Contextual layer creation.** With a folder selected, create the new layer inside it. With a layer selected, create just above it in the same parent.
+7. **Hidden row styling.** Make hidden layer rows slightly darker gray while retaining readable selection and lock states.
+8. **Predictable layer and folder drag sorting.** Show the actual target and whether the drop inserts before, after, or into a folder. Confirm the result matches the preview.
+9. **Multi-layer Duplicate and Copy/Paste.** Reproduce the intermittent failures with many selected layers. Check that all intended layers and folder relationships survive and that undo is safe.
+10. **Stroke effect.** Adding Stroke to a layer must visibly work on the canvas. Reproduce the reported no-op and verify the rendered result.
+11. **AI reserves only what it needs.** Improve AI instructions so it reserves the relevant layers or regions while working, not the whole project, and preserves user takeover.
+12. **AI-created layer remains paintable.** After AI finishes working, the user can paint on the created layer. Clear stale AI ownership without overriding an intentional lock.
+13. **Active AI task animation.** Animate the current-task area in the top bar while AI is working; settle when it stops.
+
+### Editing
+
+14. **Transform arrow keys.** While W, E, R or Ctrl+T is active, use arrow presses for one-document-pixel directional adjustments where applicable and fine, mode-appropriate rotation/scale increments. Respect selection, text focus and undo.
+15. **Reduced-resolution editing previews off by default.** Keep the option available as an explicit opt-in. This is the existing PB-157 requirement; verify the default and the toggle rather than creating a duplicate feature.
