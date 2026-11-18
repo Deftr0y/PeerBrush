@@ -1,0 +1,25 @@
+name: Sync website after a PeerBrush release
+
+on:
+  release:
+    types: [published]
+  schedule:
+    # Also reconcile a later site review or publication made with GITHUB_TOKEN.
+    - cron: '23 4 * * *'
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  dispatch:
+    if: github.repository == 'Deftr0y/PeerBrush' && (github.event_name == 'schedule' || github.event.release.prerelease == false)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Dispatch the existing protected Pages workflow from main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          site=$(gh api repos/Deftr0y/PeerBrush/branches/site-content --jq .commit.sha)
+          [[ "$site" =~ ^[0-9a-f]{40}$ ]]
+          gh workflow run pages.yml --repo Deftr0y/PeerBrush --ref main -f expected_site_commit="$site" -f release_sync=true

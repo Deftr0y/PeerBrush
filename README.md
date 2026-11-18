@@ -62,7 +62,7 @@ You stay in control while AI works directly alongside you inside the same editin
 
 ## Run PeerBrush
 
-PeerBrush 0.30.0 is an unpublished release candidate. Windows users can install the earlier [Microsoft Store version](https://apps.microsoft.com/detail/9PNR6T1Q2ZL9) (MSIX 1.25.0.0). Apple silicon Mac and x64 Linux users can download [release 0.26.0](https://github.com/Deftr0y/PeerBrush/releases/tag/v0.26.0).
+Install PeerBrush from the [official downloads page](https://peerbrush.com/downloads.html). It lists the current platform downloads and the available Microsoft Store version. See the [latest stable GitHub release](https://github.com/Deftr0y/PeerBrush/releases/latest) for release notes, source and checksums.
 
 To develop from source:
 
