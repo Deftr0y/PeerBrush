@@ -64,14 +64,14 @@ def macos_sparkle_required(sources):
 def release_version_order(version):
     """Compare stable application cores in the order the release lines ship."""
     major, minor, patch = map(int, version.split('.'))
-    if (major, minor) == (0, 4):
-        return (0, 30, 1, patch)
+    if major == 0 and minor in (4, 5):
+        return (0, 30, minor - 3, patch)
     return (major, minor, 0, patch)
 
 
 def macos_bundle_version(version):
     # The installed build number must advance past 0.30.1.
-    return '1.4.' + version.removeprefix('0.4.') if version.startswith('0.4.') else version
+    return '1' + version[1:] if version.startswith(('0.4.', '0.5.')) else version
 
 
 def macos_info(version, sparkle=False, check_pins=None, check_layout=False):

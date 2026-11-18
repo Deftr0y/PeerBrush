@@ -200,7 +200,7 @@ Unreleased: destructive `adjust` accepts `layer`, optional document-coordinate `
 
 `peerbrush_capabilities` returns brush tip/settings, all blend modes and runnable commands. Use `paint` with `tip:dry|chalk|grain|bristle`, density/grain, pressure toggles and taper distances. Pressure points accept `[x,y,p]` with `p` in0–1; plain points remain compatible. `smudge` adds wetness/load/pickup and uses the same selection, layer and mask coordinates.
 
-`adjustment.add` accepts `layers`, `kind` and editable `settings`. A paint target gets a clipped adjustment; a folder target gets a scoped child; multiple roots become a shared folder. An existing pixel selection becomes its mask. `layer.clip` sets `base` to the next unclipped sibling below; `base:null` releases clipping. Preserve whole clipping units when copying or reorganizing.
+`adjustment.add` accepts `layers`, `kind`, editable `settings` and an optional `name`. The default name is “Adjustment layer”. A paint target gets a clipped adjustment. A folder target gets a scoped child, and multiple roots become a shared folder. An existing pixel selection becomes its mask. `layer.clip` sets `base` to the next unclipped sibling below. Use `base:null` to release clipping. Preserve whole clipping units when copying or reorganizing.
 
 Color effects add `color_balance`, `hsl`, `bloom` and `liquify`. Balance uses shadows/midtones/highlights RGB complementary-axis arrays in −1–1, with preserve_luminosity. HSL uses hue degrees −180–180 and saturation/lightness −1–1. Bloom uses threshold 0–1, spread 0–64 document pixels and strength 0–3.
 

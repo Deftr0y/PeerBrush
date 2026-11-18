@@ -124,6 +124,11 @@ fn native_adjustments_preserve_artwork_selection_masks_hierarchy_and_atomic_hist
                                 .key()
                         );
                     } else {
+                        if layer.kind() == "adjustment" {
+                            let name = command["name"].as_str().unwrap_or("Adjustment layer");
+                            assert_eq!(layer.name(), name);
+                            assert_eq!(expected.name, name);
+                        }
                         assert!(preview
                             .preview()
                             .source(layer.pixels().slot())

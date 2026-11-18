@@ -5,6 +5,14 @@ use crate::engine::{
 };
 const TREE_INDENT: f32 = 22.0;
 
+fn layer_type_icon(layer: LayerView<'_>) -> Option<(Icon, &'static str)> {
+    match layer.kind() {
+        "group" => Some((Icon::Folder, "Folder")),
+        "adjustment" => Some((Icon::AdjustmentLayer, crate::adjustment::DEFAULT_NAME)),
+        _ => None,
+    }
+}
+
 fn sweep_hits_eye(from: Pos2, to: Pos2, eye: Rect) -> bool {
     if !eye.is_positive() {
         return false;
@@ -720,18 +728,16 @@ impl PeerBrush {
             if !show_details {
                 return disclosure;
             }
-            if l.kind() == "group" {
+            if let Some((icon, title)) = layer_type_icon(l) {
                 let (r, response) = ui.allocate_exact_size(Vec2::splat(30.0), egui::Sense::click());
-                icons::paint(ui.painter(), r, Icon::Folder, true);
+                icons::paint(ui.painter(), r, icon, true);
+                response.widget_info(|| {
+                    egui::WidgetInfo::labeled(egui::WidgetType::Button, response.enabled(), title)
+                });
                 if response.clicked() {
                     self.select_row(ui, doc, tree.order, l.id());
                 }
-            } else if l.kind() == "adjustment" {
-                let (r, response) = ui.allocate_exact_size(Vec2::splat(30.), egui::Sense::click());
-                icons::paint(ui.painter(), r, Icon::Adjust, true);
-                if response.clicked() {
-                    self.select_row(ui, doc, &tree.order, l.id());
-                }
+                response.on_hover_text(title);
             } else if self
                 .thumb_button(
                     ui,
@@ -1109,7 +1115,7 @@ impl PeerBrush {
                     egui::WidgetType::Button, response.enabled(), self.selection_layers.contains(l.id()), l.name(),
                 ));
                 let floating_row = held && self.layer_drag.as_ref().is_some_and(|drag| drag.id == l.id());
-                let thumb = if l.kind() != "group" && (visible || floating_row) {
+                let thumb = if layer_type_icon(l).is_none() && ((!held && visible) || floating_row) {
                     self.thumbnail(ui, doc, l.id(), false)
                 } else {
                     None
@@ -1169,7 +1175,7 @@ impl PeerBrush {
                 painter.line_segment([rect.left_top(),rect.left_bottom()],Stroke::new(2.0_f32,ACCENT));
                 let x=rect.left()+75.0+depth as f32*TREE_INDENT;
                 let image_rect=Rect::from_min_size(egui::pos2(x,rect.top()+6.0),Vec2::splat(30.0));
-                if layer.kind()=="group"{icons::paint(&painter,image_rect,Icon::Folder,true);}
+                if let Some((icon,_))=layer_type_icon(layer){icons::paint(&painter,image_rect,icon,true);}
                 else if let Some(t)=thumb {painter.image(t.id(),image_rect,Rect::from_min_max(Pos2::ZERO,Pos2::new(1.0,1.0)),Color32::WHITE);}
                 let label=if drag.ids.len()>1 {format!("{}  +{}",layer.name(),drag.ids.len()-1)}else{layer.name().to_owned()};
                 painter.text(egui::pos2(x+38.0,rect.center().y),egui::Align2::LEFT_CENTER,label,egui::FontId::proportional(12.0),Color32::WHITE);

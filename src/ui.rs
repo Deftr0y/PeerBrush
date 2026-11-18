@@ -1931,7 +1931,7 @@ impl PeerBrush {
     fn create_panel_layer<'a>(
         &mut self,
         doc: impl Into<DocumentView<'a>>,
-        adjustment: Option<(&str, &str)>,
+        adjustment: Option<&str>,
     ) {
         let doc = doc.into();
         if self.busy || self.edit_worker.pending() || self.parameter_gesture.is_some() {
@@ -1963,9 +1963,9 @@ impl PeerBrush {
             }
         };
         let (command, label) = match adjustment {
-            Some((kind, name)) => (
-                json!({"op":"adjustment.add","layers":self.selected_layer_ids(doc),"kind":kind,"name":name}),
-                "New adjustment",
+            Some(kind) => (
+                json!({"op":"adjustment.add","layers":self.selected_layer_ids(doc),"kind":kind}),
+                "New adjustment layer",
             ),
             None => (
                 json!({"op":"layer.add","kind":"paint","name":format!("Paint {}",doc.layer_count()+1)}),
@@ -4345,18 +4345,18 @@ impl PeerBrush {
                             (crate::effects::legacy_brightness::KIND, "Legacy Brightness/Contrast"),
                         ] {
                             if effects::menu_effect(ui, kind, label, None).clicked() {
-                                self.create_panel_layer(doc, Some((kind, label)));
+                                self.create_panel_layer(doc, Some(kind));
                                 ui.close_menu();
                             }
                         }
                     },
                 )
                 .response
-                .on_hover_text("Add clipped adjustment · multiple layers become a shared color group");
+                .on_hover_text("Add adjustment layer · multiple layers become a shared color group");
                 adjustment.widget_info(|| {
                     egui::WidgetInfo::labeled(egui::WidgetType::Button, adjustment.enabled(), "Add adjustment layer")
                 });
-                icons::paint(ui.painter(), adjustment.rect.shrink(4.), Icon::Adjust, adjustment.enabled());
+                icons::paint(ui.painter(), adjustment.rect.shrink(4.), Icon::AdjustmentLayer, adjustment.enabled());
                 icons::paint_focus(ui, &adjustment);
                 if icons::button(ui, Icon::AddLayer, "New paint layer").clicked() {
                     self.create_panel_layer(doc, None);

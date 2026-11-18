@@ -1,11 +1,11 @@
 # PeerBrush development guide
 
-PeerBrush is a GPL v3 native image editor built with Rust, egui/eframe and wgpu. Document editing, codecs and transports share one engine. Read [AGENTS.md](../AGENTS.md), the [backlog](../FOLLOWUPS.MD) and the [development queue](development-0.3.md) before changing behavior. The latest published version is [0.30.1](https://github.com/Deftr0y/PeerBrush/releases/tag/v0.30.1). The next version carries forward the remaining backlog, with PB-108 first.
+PeerBrush is a GPL v3 native image editor built with Rust, egui/eframe and wgpu. Document editing, codecs and transports share one engine. Read [AGENTS.md](../AGENTS.md) and the [0.5 backlog](../FOLLOWUPS.MD#peerbrush-05--remaining-development-and-acceptance) before changing behavior. Version 0.5 carries forward the remaining backlog, with PB-108 first.
 
 ## Direct version development and release promotion
 
 Develop directly on the appropriate version branch. The active branch is
-`version/0.4`, with 0.4.0 as the working version. Development builds remain
+`version/0.5`, with 0.5.0 as the working version. Development builds remain
 unreleased. Production source is `main`. `dev` and existing feature/fix branches
 retain historical and explicitly unqualified WIP checkpoints. Do not delete,
 rewrite or automatically integrate those checkpoints.
@@ -18,12 +18,12 @@ candidate, not authorization to publish. Never force-push shared history. Websit
 maintenance remains separate: `maintenance/site-*` → `site-content`.
 
 ```sh
-git switch version/0.4
+git switch version/0.5
 ```
 
 Once the branch has an upstream, synchronize it with `git pull --ff-only` before editing. Commit the requested change directly on the version branch.
 
-The 0.4 series follows the published 0.30 series in PeerBrush release ordering. The app and release assets use 0.4.0. The 0.4.0 MSIX identity version is 2.4.0.0, the Debian package version is `1:0.4.0-1`, and the macOS bundle build version is 1.4.0. Each native package version sorts above its 0.30.1 predecessor. Once 0.4.0 is published, users of older portable builds can use the official download for a one-time manual upgrade. Those builds compare release tags numerically. Native package acceptance remains required.
+PeerBrush release order is 0.30, then 0.4, then 0.5. For 0.5.0 the MSIX identity version is 2.5.0.0, the Debian package version is `1:0.5.0-1`, and the macOS bundle build version is 1.5.0. This continues the installed upgrade numbering introduced in 0.4. Native package acceptance remains required.
 
 ## Essential release verification
 
