@@ -354,6 +354,8 @@ Descriptor versions for the additional tags are cross-checked against
 Admission of inactive forms is limited to the explicit fields described above;
 these references do not establish support for active OCIO or credentials.
 
+The protection report names the affected setting for unsupported Content Credentials, OpenColorIO, generative metadata, filter-mask display settings and compositor information. The protected document uses the saved composite at its original precision.
+
 Unreleased source-resource protection: multiple PeerBrush `PBR1` resources are
 ambiguous and retain a read-only standard preview, including identical duplicates.
 A supported resource cannot hide an unsupported source definition by appearing

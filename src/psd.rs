@@ -3961,29 +3961,8 @@ fn decode_parts(
     };
     let mut rr = Cursor::new(resources);
     let mut embedded = None;
-    let mut warnings = global_warnings(layer_section, depth, layout)?;
-    let (_, global_mask, global_tags) = global_blocks(layer_section, layout)?;
-    let mut global_metadata = Vec::<GlobalMetadata>::new();
-    for (key, data) in global_tags {
-        control.check()?;
-        if let Ok(key) = std::str::from_utf8(key) {
-            // Duplicates already force protection. Retain at most one bounded
-            // value per known key while inspecting the protected source.
-            if !global_metadata.iter().any(|old| old.key == key)
-                && global_metadata::validate_entry(key, data).is_ok()
-            {
-                global_metadata.push(GlobalMetadata {
-                    key: key.into(),
-                    data: data.to_vec(),
-                });
-            }
-        }
-    }
-    let global_mask_settings = (!global_mask.is_empty()
-        && validate_global_mask_settings(global_mask).is_ok())
-    .then(|| GlobalMaskSettings {
-        data: global_mask.to_vec(),
-    });
+    let (global_mask_settings, global_metadata, mut warnings) =
+        inspect_global_layers(layer_section, depth, layout, control)?;
     let mut saved_composite = None;
     let mut icc_profile = None;
     let mut seen_profile = false;
@@ -5614,32 +5593,62 @@ fn global_blocks(section: &[u8], layout: Layout) -> Result<GlobalBlocks<'_>, Str
     }
     Ok((primary, mask, tags))
 }
-fn global_warnings(section: &[u8], depth: u16, layout: Layout) -> Result<Vec<String>, String> {
+fn inspect_global_layers(
+    section: &[u8],
+    depth: u16,
+    layout: Layout,
+    control: &crate::loading::Control,
+) -> Result<(Option<GlobalMaskSettings>, Vec<GlobalMetadata>, Vec<String>), String> {
     let (primary, mask, tags) = global_blocks(section, layout)?;
-    let mut warnings = vec![];
-    if !mask.is_empty() && validate_global_mask_settings(mask).is_err() {
-        warnings
-            .push("Photoshop global layer masks are protected; using the saved composite".into());
-    }
+    let mut warnings = Vec::new();
+    let mut metadata = Vec::<GlobalMetadata>::new();
+    let mask = if mask.is_empty() {
+        None
+    } else if validate_global_mask_settings(mask).is_err() {
+        warnings.push("Photoshop global layer masks are protected; using the saved composite".into());
+        None
+    } else {
+        Some(GlobalMaskSettings { data: mask.to_vec() })
+    };
     let mut seen = std::collections::HashSet::new();
     for (key, data) in tags {
+        control.check()?;
         if !seen.insert(key) {
             warnings.push(format!(
                 "Duplicate global Photoshop layer tag: {}",
                 String::from_utf8_lossy(key)
             ));
         }
-        let supported = (depth == 8 && key == b"Layr")
+        let structural = (depth == 8 && key == b"Layr")
             || (depth == 16 && key == b"Lr16")
             || (data.is_empty()
-                && ((depth == 8 && key == b"Mtrn") || (depth == 16 && key == b"Mt16")))
-            || std::str::from_utf8(key)
-                .is_ok_and(|key| global_metadata::validate_entry(key, data).is_ok());
-        if !supported {
-            warnings.push(format!(
-                "Unsupported global Photoshop feature: {}",
-                String::from_utf8_lossy(key)
-            ));
+                && ((depth == 8 && key == b"Mtrn") || (depth == 16 && key == b"Mt16")));
+        if !structural {
+            let name = String::from_utf8_lossy(key);
+            if global_metadata::validate_entry(&name, data).is_ok() {
+                if !metadata.iter().any(|old| old.key.as_str() == name.as_ref()) {
+                    metadata.push(GlobalMetadata {
+                        key: name.into_owned(),
+                        data: data.to_vec(),
+                    });
+                }
+            } else {
+                // Pattern handling may discharge its own warning after all assets bind.
+                let detail = match key {
+                    b"CAI " => Some("Content Credentials settings"),
+                    b"OCIO" => Some("OpenColorIO display or color-management settings"),
+                    b"GenI" => Some("generative metadata settings"),
+                    b"FMsk" => Some("filter-mask display settings"),
+                    b"cinf" => Some("compositor information"),
+                    _ => None,
+                };
+                let mut warning = format!("Unsupported global Photoshop feature: {name}");
+                if let Some(detail) = detail {
+                    warning.push_str(" · ");
+                    warning.push_str(detail);
+                }
+                warnings.push(warning);
+            }
         }
         if (depth == 8 && key == b"Layr" && !primary.is_empty())
             || (depth == 16
@@ -5649,7 +5658,7 @@ fn global_warnings(section: &[u8], depth: u16, layout: Layout) -> Result<Vec<Str
             warnings.push("Conflicting primary and global Photoshop layer records".into());
         }
     }
-    Ok(warnings)
+    Ok((mask, metadata, warnings))
 }
 fn layer_info(section: &[u8], depth: u16, layout: Layout) -> Result<&[u8], String> {
     let (mut info, _, tags) = global_blocks(section, layout)?;
