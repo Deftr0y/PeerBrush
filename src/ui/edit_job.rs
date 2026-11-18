@@ -32,6 +32,7 @@ pub(super) enum Origin {
     Group,
     Masks,
     Parameter(eframe::egui::Id),
+    LayerColor(Option<crate::engine::native::DocumentKey>),
     Source(u64),
     CanvasGesture(crate::engine::native::DocumentKey),
     FreeTransform(eframe::egui::Id, Option<crate::engine::native::DocumentKey>),

@@ -455,7 +455,7 @@ impl<'a> LayerView<'a> {
             Self::Native(layer) => layer.blend_channels(),
         }
     }
-    pub(crate) fn color_label(self) -> &'static str {
+    pub(crate) fn color_label(self) -> &'a str {
         crate::psd::layer_color_label(match self {
             Self::Resident(layer) => &layer.psd_metadata,
             Self::Native(layer) => layer.psd_metadata(),

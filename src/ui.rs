@@ -781,6 +781,7 @@ pub struct PeerBrush {
     layer_rects: HashMap<String, Rect>,
     eye_rects: HashMap<String, Rect>,
     layer_context: Option<(String, egui::menu::MenuRootManager)>,
+    layer_color_edit: Option<layers::ColorEdit>,
     effect_add_rect: Option<Rect>,
     clipboard: crate::clipboard::Worker,
     zoom: f32,
@@ -1184,6 +1185,7 @@ impl PeerBrush {
             layer_rects: HashMap::new(),
             eye_rects: HashMap::new(),
             layer_context: None,
+            layer_color_edit: None,
             effect_add_rect: None,
             #[cfg(not(test))]
             clipboard: crate::clipboard::Worker::new(ctx.clone()),
@@ -1360,7 +1362,8 @@ impl PeerBrush {
             let (native, source) = match origin {
                 edit_job::Origin::FreeTransform(_, key)
                 | edit_job::Origin::Geometry(_, key)
-                | edit_job::Origin::Filter(_, key) => {
+                | edit_job::Origin::Filter(_, key)
+                | edit_job::Origin::LayerColor(key) => {
                     let source = key.is_none().then(|| {
                         if self.doc_snapshot.view().same_observation(view) {
                             self.doc_snapshot.clone()
@@ -1496,6 +1499,7 @@ impl PeerBrush {
             | edit_job::Origin::Pen(_, Some(key))
             | edit_job::Origin::NativeDuplicateRepeat(key)
             | edit_job::Origin::Geometry(_, Some(key))
+            | edit_job::Origin::LayerColor(Some(key))
             | edit_job::Origin::Filter(_, Some(key)) = request.origin {
             Some(self.doc_snapshot.view().native()
                 .filter(|doc| doc.key() == key)
@@ -3897,8 +3901,8 @@ impl PeerBrush {
         ui.add_enabled_ui(
             !doc.read_only() && !self.busy && !l.locked() && !reserved,
             |ui| {
-                ui.menu_button("Color label", |ui| {
-                    for &label in crate::psd::LAYER_COLOR_LABELS {
+                ui.menu_button("Color", |ui| {
+                    for label in layers::COLOR_LABEL_OPTIONS {
                         let title = format!("{}{}", label[..1].to_ascii_uppercase(), &label[1..]);
                         let option = match layers::label_color(label) {
                             Some(color) => RichText::new(format!("●  {title}")).color(color),
@@ -3908,10 +3912,13 @@ impl PeerBrush {
                         let response = ui.selectable_label(selected, option);
                         response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, ui.is_enabled(), selected, &title));
                         if response.clicked() {
-                            self.edit(vec![json!({"op":"layer.update", "layer":l.id(), "color_label":label,
-                                "document_id":doc.id(), "source_revision":doc.revision()})], "Layer color label");
+                            self.set_layer_color(doc, l.id(), label);
                             ui.close_menu();
                         }
+                    }
+                    if ui.button("Custom…").clicked() {
+                        self.layer_color_edit = Some(layers::ColorEdit::new(doc, l));
+                        ui.close_menu();
                     }
                 });
             },
@@ -5506,6 +5513,7 @@ impl PeerBrush {
             self.tab_transfer = None;
         }
         self.layer_context = None;
+        self.layer_color_edit = None;
         self.geometry = None;
         self.source_editor = None;
         self.filter_editor = None;
@@ -6175,6 +6183,7 @@ impl PeerBrush {
     fn document_shortcut_typing(&self, ctx: &egui::Context) -> bool {
         self.lifecycle.is_some()
             || self.source_editor.is_some()
+            || self.layer_color_edit.is_some()
             || (self.tool == Tool::Text
                 && ctx.input(|input| input.pointer.primary_down() || input.pointer.primary_pressed()))
             || self.shortcuts.open || self.filter_editor.is_some() || self.rename_edit.is_some()
@@ -7683,6 +7692,7 @@ impl PeerBrush {
             self.brush_settings(ctx);
         }
         self.color_window(ctx);
+        self.layer_color_window(ctx, doc, &reserved);
         self.task_history_review(ctx, doc);
         self.proposal_window(ctx, doc, frame.proposal.as_ref());
         self.refinement_window(ctx, doc);

@@ -38,12 +38,18 @@ fn sweep_hits_eye(from: Pos2, to: Pos2, eye: Rect) -> bool {
     enter <= exit
 }
 
+pub(super) const COLOR_LABEL_OPTIONS: [&str; 13] = [
+    "none", "red", "orange", "yellow", "green", "cyan", "blue", "violet", "gray", "seafoam",
+    "indigo", "magenta", "fuchsia",
+];
+
 pub(super) fn label_color(label: &str) -> Option<Color32> {
     let [r, g, b] = match label {
         "red" => [232, 104, 105],
         "orange" => [237, 143, 85],
         "yellow" => [238, 196, 99],
         "green" => [136, 192, 101],
+        "cyan" => [84, 194, 206],
         "blue" => [107, 165, 222],
         "violet" => [174, 136, 218],
         "gray" => [164, 161, 172],
@@ -51,9 +57,128 @@ pub(super) fn label_color(label: &str) -> Option<Color32> {
         "indigo" => [129, 139, 227],
         "magenta" => [221, 116, 192],
         "fuchsia" => [238, 123, 159],
+        _ if label.starts_with('#') => {
+            let [r, g, b, _] = color::parse_hex(label)?;
+            [r, g, b]
+        }
         _ => return None,
     };
     Some(Color32::from_rgb(r, g, b))
+}
+
+pub(super) struct ColorEdit {
+    document: String,
+    revision: u64,
+    native: Option<crate::engine::native::DocumentKey>,
+    layer: String,
+    hsv: egui::ecolor::Hsva,
+    hex: String,
+    field: Option<(u16, TextureHandle)>,
+}
+impl ColorEdit {
+    pub(super) fn new(doc: DocumentView<'_>, layer: LayerView<'_>) -> Self {
+        let rgb = label_color(layer.color_label()).unwrap_or(ACCENT).to_array();
+        Self {
+            document: doc.id().to_owned(),
+            revision: doc.revision(),
+            native: doc.native().map(|doc| doc.key()),
+            layer: layer.id().to_owned(),
+            hsv: egui::ecolor::Hsva::from_srgba_unmultiplied(rgb),
+            hex: color::format_hex(rgb),
+            field: None,
+        }
+    }
+
+    fn matches(&self, doc: DocumentView<'_>) -> bool {
+        self.document == doc.id()
+            && self.revision == doc.revision()
+            && self.native == doc.native().map(|doc| doc.key())
+    }
+
+    fn pixel(&self) -> Option<Pixel> {
+        let value = self.hex.trim();
+        let digits = value.strip_prefix('#').unwrap_or(value);
+        if !matches!(digits.len(), 3 | 6) {
+            return None;
+        }
+        color::parse_hex(digits)
+    }
+}
+
+impl PeerBrush {
+    pub(super) fn set_layer_color(&mut self, doc: DocumentView<'_>, layer: &str, label: &str) {
+        if doc.find_layer(layer).is_none_or(|layer| layer.color_label() == label) {
+            return;
+        }
+        self.finish_parameter(true);
+        self.cancel_free_transform();
+        self.close_proposal();
+        self.apply_action(
+            vec![json!({"op":"layer.update", "layer":layer, "color_label":label})],
+            "Layer color label",
+            Some((doc.id(), doc.revision())),
+            edit_job::Origin::LayerColor(doc.native().map(|doc| doc.key())),
+        );
+    }
+
+    pub(super) fn layer_color_window(
+        &mut self,
+        ctx: &egui::Context,
+        doc: DocumentView<'_>,
+        reserved: &HashSet<&str>,
+    ) {
+        let Some(mut draft) = self.layer_color_edit.take() else { return };
+        if !draft.matches(doc) || doc.read_only()
+            || doc.find_layer(&draft.layer).is_none_or(|layer| layer.locked())
+            || reserved.contains(draft.layer.as_str())
+        {
+            return;
+        }
+        let mut open = true;
+        let mut cancelled = false;
+        let mut apply = None;
+        egui::Window::new("Custom layer color")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                if color::picker(ui, &mut draft.hsv, &mut draft.field, 144., |hsv| {
+                    hsv.to_srgba_unmultiplied()
+                }).is_some() {
+                    draft.hex = color::format_hex(draft.hsv.to_srgba_unmultiplied());
+                    ctx.request_repaint();
+                }
+                ui.horizontal(|ui| {
+                    let label = ui.label("HEX");
+                    let entry = ui.add(egui::TextEdit::singleline(&mut draft.hex)
+                        .char_limit(7).desired_width(72.))
+                        .labelled_by(label.id);
+                    if entry.changed() {
+                        if let Some(pixel) = draft.pixel() {
+                            draft.hsv = egui::ecolor::Hsva::from_srgba_unmultiplied(pixel);
+                            ctx.request_repaint();
+                        }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    let pixel = draft.pixel();
+                    if ui.add_enabled(
+                        pixel.is_some() && !self.busy && !self.edit_worker.pending(),
+                        dialogs::primary("Apply"),
+                    ).clicked() {
+                        apply = pixel.map(color::format_hex);
+                    }
+                    cancelled = ui.button("Cancel").clicked();
+                });
+            });
+        if let Some(hex) = apply {
+            self.set_layer_color(doc, &draft.layer, &format!("#{hex}"));
+        } else if open && !cancelled && !ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+            self.layer_color_edit = Some(draft);
+        } else {
+            ctx.request_repaint();
+        }
+    }
 }
 
 pub(super) const BLEND_ENDPOINTS: [&str; 4] = ["Black low", "Black high", "White low", "White high"];
@@ -643,9 +768,18 @@ impl PeerBrush {
             let (grip, grip_response) = ui.allocate_exact_size(Vec2::new(6.0, 28.0), egui::Sense::hover());
             if show_details {
                 let label = l.color_label();
-                if let Some(color) = label_color(label) {
+                let draft = self.layer_color_edit.as_ref()
+                    .filter(|draft| !reserved && !l.locked() && draft.layer == l.id() && draft.matches(doc))
+                    .and_then(ColorEdit::pixel);
+                let color = draft.map(|[r, g, b, _]| Color32::from_rgb(r, g, b))
+                    .or_else(|| label_color(label));
+                if let Some(color) = color {
                     ui.painter().circle_filled(grip.center() - Vec2::new(0., 10.), 2.5, color);
-                    grip_response.on_hover_text(format!("Layer color label · {label}"));
+                    grip_response.on_hover_text(if draft.is_some() {
+                        "Layer color preview".to_owned()
+                    } else {
+                        format!("Layer color label · {label}")
+                    });
                 }
                 for x in 0..2 {
                     for y in 0..3 {

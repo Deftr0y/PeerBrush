@@ -1020,6 +1020,8 @@ mod tests {
                 json!({"op":"layer.update","layer":"top","name":"New name","opacity":0.45,"blend":"multiply","color":[1,2,3,4]}),
                 json!({"op":"layer.update","layer":"top","fill_opacity":128}),
                 json!({"op":"layer.update","layer":"top","color_label":"indigo"}),
+                json!({"op":"layer.update","layer":"top","color_label":"cyan"}),
+                json!({"op":"layer.update","layer":"top","color_label":"#12AbC3"}),
                 json!({"op":"layer.update","layer":"top","blend":"hard_mix","fill_opacity":128}),
                 json!({"op":"layer.update","layer":"bottom","blend_clipped_as_group":false}),
                 json!({"op":"layer.update","layer":"top","locked":true}),

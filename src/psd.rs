@@ -755,8 +755,7 @@ fn standard_flag(key: &[u8], bytes: &[u8]) -> Result<(), &'static str> {
     }
 }
 
-/// Non-rendering Photoshop layer information that remains standard PSD data.
-/// Only a small, validated allowlist can be emitted by this codec.
+/// Validated layer metadata. PeerBrush-only entries stay in editable sources.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LayerMetadata {
     pub key: String,
@@ -774,6 +773,17 @@ pub(crate) const LAYER_COLOR_LABELS: &[&str] = &[
     "indigo", "magenta", "fuchsia",
 ];
 
+const PEERBRUSH_LAYER_COLOR: &str = "peerbrush:layer_color";
+
+fn private_layer_color(data: &[u8]) -> Option<&str> {
+    let label = std::str::from_utf8(data).ok()?;
+    (label == "cyan"
+        || label.strip_prefix('#').is_some_and(|digits| {
+            digits.len() == 6 && digits.bytes().all(|byte| byte.is_ascii_hexdigit())
+        }))
+        .then_some(label)
+}
+
 fn parse_layer_color(data: &[u8]) -> Option<&'static str> {
     let [high, low, 0, 0, 0, 0, 0, 0] = *data else {
         return None;
@@ -783,11 +793,14 @@ fn parse_layer_color(data: &[u8]) -> Option<&'static str> {
         .copied()
 }
 
-pub(crate) fn layer_color_label(entries: &[LayerMetadata]) -> &'static str {
+pub(crate) fn layer_color_label(entries: &[LayerMetadata]) -> &str {
     entries
         .iter()
-        .find(|entry| entry.key == "lclr")
-        .and_then(|entry| parse_layer_color(&entry.data))
+        .find_map(|entry| match entry.key.as_str() {
+            "lclr" => parse_layer_color(&entry.data),
+            PEERBRUSH_LAYER_COLOR => private_layer_color(&entry.data),
+            _ => None,
+        })
         .unwrap_or("none")
 }
 
@@ -798,22 +811,30 @@ pub(crate) fn update_layer_color_label(
     let Some(value) = command.get("color_label") else {
         return Ok(());
     };
-    let (index, label) = LAYER_COLOR_LABELS
-        .iter()
-        .copied()
-        .enumerate()
-        .find(|(_, label)| value.as_str() == Some(*label))
-        .ok_or("Unknown Photoshop layer color label")?;
-    if layer_color_label(entries) == label {
+    let label = value.as_str().ok_or("Layer color requires a preset or #RRGGBB")?;
+    let index = LAYER_COLOR_LABELS.iter().position(|preset| *preset == label);
+    let custom = if index.is_none() {
+        let color = private_layer_color(label.as_bytes())
+            .ok_or("Layer color requires a preset or #RRGGBB")?;
+        Some(if color == "cyan" { color.to_owned() } else { color.to_ascii_uppercase() })
+    } else {
+        None
+    };
+    if layer_color_label(entries) == custom.as_deref().unwrap_or(label) {
         return Ok(());
     }
-    entries.retain(|entry| entry.key != "lclr");
-    if index != 0 {
+    entries.retain(|entry| !matches!(entry.key.as_str(), "lclr" | PEERBRUSH_LAYER_COLOR));
+    if let Some(index) = index.filter(|index| *index != 0) {
         let mut data = vec![0; 8];
         data[..2].copy_from_slice(&(index as u16).to_be_bytes());
         entries.push(LayerMetadata {
             key: "lclr".into(),
             data,
+        });
+    } else if let Some(color) = custom {
+        entries.push(LayerMetadata {
+            key: PEERBRUSH_LAYER_COLOR.into(),
+            data: color.into_bytes(),
         });
     }
     validate_metadata(entries)
@@ -913,6 +934,7 @@ fn validate_metadata_entry(entry: &LayerMetadata) -> Result<(), String> {
         }
         // Sheet colors are an enum followed by three reserved zero words.
         "lclr" if parse_layer_color(&entry.data).is_some() => Ok(()),
+        PEERBRUSH_LAYER_COLOR if private_layer_color(&entry.data).is_some() => Ok(()),
         "lnsr" | "lyid" if entry.data.len() == 4 => Ok(()),
         // A minimum Photoshop reader version is a compatibility marker, not
         // permission to ignore layer sources. Every other feature is validated
@@ -971,6 +993,7 @@ const CLOSING_METADATA_FORMAT: u32 = 137;
 const LEGACY_PRINT_SETUP_FORMAT: u32 = 138;
 const DOT_RANGE_FORMAT: u32 = 139;
 const DISABLED_VECTOR_MASK_FORMAT: u32 = 140;
+const PRIVATE_LAYER_COLOR_FORMAT: u32 = 141;
 const GLOBAL_ANGLE_FORMAT: u32 = 105;
 const GLOBAL_ALTITUDE_FORMAT: u32 = 106;
 const COLOR_OVERLAY_FORMAT: u32 = 107;
@@ -1047,6 +1070,12 @@ fn has_implicit_disabled_vector_mask(doc: &Document) -> bool {
     })
 }
 
+fn has_private_layer_color(doc: &Document) -> bool {
+    doc.layers.iter().any(|layer| {
+        layer.psd_metadata.iter().any(|entry| entry.key == PEERBRUSH_LAYER_COLOR)
+    })
+}
+
 pub fn validate_metadata(entries: &[LayerMetadata]) -> Result<(), String> {
     if entries.len() > MAX_LAYER_METADATA {
         return Err("Photoshop layer metadata exceeds its bounded tag count".into());
@@ -1057,6 +1086,9 @@ pub fn validate_metadata(entries: &[LayerMetadata]) -> Result<(), String> {
             return Err("Duplicate Photoshop layer metadata tag".into());
         }
         validate_metadata_entry(entry)?;
+    }
+    if keys.contains("lclr") && keys.contains(PEERBRUSH_LAYER_COLOR) {
+        return Err("Conflicting layer color labels".into());
     }
     if !keys.contains("vmsk")
         && entries.iter().any(|entry| entry.key == "vmgm" && entry.data[0] == 1)
@@ -1097,7 +1129,7 @@ fn standard_layer_metadata(
         let closing = entry.key.strip_suffix(":closing");
         if section == 3 {
             closing.map(|key| (key, entry.data.as_slice()))
-        } else if closing.is_none() && entry.key != CLOSED_FOLDER {
+        } else if closing.is_none() && !matches!(entry.key.as_str(), CLOSED_FOLDER | PEERBRUSH_LAYER_COLOR) {
             Some((entry.key.as_str(), entry.data.as_slice()))
         } else {
             None
@@ -2013,7 +2045,9 @@ fn encode_layout_scratch_to<S: Read + Write + Seek>(
     let file_info_format = doc.psd_file_info.as_deref().map(|bytes| file_info::source_format(bytes));
     let embedded = Embedded {
         // Older readers cannot interpret soft selections or smooth curve sources.
-        format: if has_implicit_disabled_vector_mask(doc) {
+        format: if has_private_layer_color(doc) {
+            PRIVATE_LAYER_COLOR_FORMAT
+        } else if has_implicit_disabled_vector_mask(doc) {
             DISABLED_VECTOR_MASK_FORMAT
         } else if let Some(format) = file_info_format.filter(|format| *format >= LEGACY_PRINT_SETUP_FORMAT) {
             format
@@ -4194,7 +4228,8 @@ fn decode_parts(
         observe_open_phase("source_decoded", 0);
         control.check()?;
         if let Ok(e) = result {
-            if ((1..=35).contains(&e.format) || (37..=DISABLED_VECTOR_MASK_FORMAT).contains(&e.format))
+            if ((1..=35).contains(&e.format) || (37..=PRIVATE_LAYER_COLOR_FORMAT).contains(&e.format))
+                && (e.format >= PRIVATE_LAYER_COLOR_FORMAT || !has_private_layer_color(&e.document))
                 && (e.format >= DISABLED_VECTOR_MASK_FORMAT || !has_implicit_disabled_vector_mask(&e.document))
                 && e.document.psd_file_info.as_deref().is_none_or(|bytes| e.format >= file_info::source_format(bytes))
                 && (e.format >= CLOSING_METADATA_FORMAT || !has_closing_metadata(&e.document))
@@ -7301,6 +7336,48 @@ mod storage_tests {
                 })]).unwrap();
                 assert!(cleared.layers[0].psd_metadata.is_empty());
             }
+        }
+    }
+
+    #[test]
+    fn private_color_labels_round_trip_without_standard_tags_or_pixel_changes() {
+        use crate::engine::Engine;
+        use serde_json::json;
+
+        for depth in [8, 16] {
+            let mut doc = Document::new_depth(2, 1, depth).unwrap();
+            doc.layers[0].pixels.set16(0, 0, [12347, 23459, 34571, 65535]);
+            let target = doc.layers[0].id.clone();
+            let pixels = doc.layers[0].pixels.clone();
+            let composite = doc.export_png().unwrap();
+            for (label, canonical) in [("red", "red"), ("cyan", "cyan"), ("#12AbC3", "#12ABC3")] {
+                doc = Engine::preview_edits(doc, &[json!({
+                    "op":"layer.update", "layer":target, "color_label":label,
+                })]).unwrap();
+                let metadata = &doc.layers[0].psd_metadata;
+                assert_eq!(layer_color_label(metadata), canonical);
+                assert_eq!(metadata_for_duplicate(metadata), *metadata);
+                if label == "red" {
+                    continue;
+                }
+                assert!(standard_layer_metadata(metadata, 0).next().is_none());
+                assert_eq!(doc.export_png().unwrap(), composite);
+                for layout in [Layout::Psd, Layout::Psb] {
+                    let encoded = encode_layout(&doc, layout).unwrap();
+                    let reopened = decode(&encoded).unwrap();
+                    assert!(!reopened.read_only, "{:?}", reopened.warnings);
+                    assert_eq!(layer_color_label(&reopened.layers[0].psd_metadata), canonical);
+                    assert_eq!(reopened.layers[0].pixels, pixels);
+                    assert_eq!(reopened.export_png().unwrap(), composite);
+                }
+            }
+            assert!(Engine::preview_edits(doc.clone(), &[json!({
+                "op":"layer.update", "layer":target, "color_label":"#123456FF",
+            })]).is_err());
+            let doc = Engine::preview_edits(doc, &[json!({
+                "op":"layer.update", "layer":target, "color_label":"none",
+            })]).unwrap();
+            assert!(doc.layers[0].psd_metadata.is_empty());
         }
     }
 
