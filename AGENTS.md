@@ -11,6 +11,7 @@
 - Use controls suited to the setting throughout PeerBrush. Use an interactive color picker for colors and recognizable icons for visual choices such as text alignment. Give icon controls accessible labels and tooltips. Keep precise entry available where the setting needs it.
 - Show the actual rendered result while the user works: strokes, transforms, blend choices, effect changes and layer reordering. Preview through the shared engine, without committing history until the gesture finishes. Outline-only feedback is insufficient.
 - Show AI work in blue. Animate meaningful AI changes in presentation only: numeric controls, canvas results and hierarchy movement. Commit the actual shared state immediately, keep animations out of history/PSD sources, isolate derived caches, and let human input interrupt them.
+- AI should reserve only the layers or document-coordinate regions it needs protected for the current edit. Release the task when work is done, leave newly created layers unlocked unless requested, and wait for the user's direction after takeover.
 - Editing logic belongs in the document engine. UI, MCP, and CLI must share commands and enforce the same reservations.
 - Never silently drop unsupported Photoshop features or claim full PSD compatibility. Keep unsupported documents read-only.
 - Every save must contain a current merged composite. PeerBrush-only source data must not replace standard PSD raster/mask data.

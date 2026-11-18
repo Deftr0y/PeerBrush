@@ -1323,6 +1323,14 @@ pub fn encode(doc: &Document) -> Result<Vec<u8>, String> {
 pub fn encode_psb(doc: &Document) -> Result<Vec<u8>, String> {
     encode_layout(doc, Layout::Psb)
 }
+pub(crate) fn encode_recovery(doc: &Document) -> Result<Vec<u8>, String> {
+    let mut output = Vec::new();
+    let mut spool = std::io::Cursor::new(Vec::new());
+    encode_layout_scratch_to(
+        doc, Layout::Psd, &mut output, &mut spool, None, true, &|| Ok(()), &|_, _, _| Ok(()),
+    )?;
+    Ok(output)
+}
 pub(crate) fn encode_to<S: Read + Write + Seek, C: Read + Write + Seek>(
     doc: &Document,
     output: &mut dyn Write,
@@ -1337,6 +1345,7 @@ pub(crate) fn encode_to<S: Read + Write + Seek, C: Read + Write + Seek>(
         output,
         spool,
         Some(scratch),
+        false,
         check,
         progress,
     )
@@ -1355,10 +1364,13 @@ pub(crate) fn encode_psb_to<S: Read + Write + Seek, C: Read + Write + Seek>(
         output,
         spool,
         Some(scratch),
+        false,
         check,
         progress,
     )
 }
+const RAW_CHANNEL_LIMIT: &str = "Uncompressed Photoshop channels alone exceed the 256 MiB file limit; use a smaller canvas or fewer full-frame layers";
+
 fn check_output_size(doc: &Document, plan: &StandardPlan, patterns: &patterns::StandardPatterns) -> Result<(), String> {
     // Validation bounds every frame and record count; u64 also covers their aggregate.
     let bytes = u64::from(doc.bit_depth / 8);
@@ -1396,9 +1408,44 @@ fn check_output_size(doc: &Document, plan: &StandardPlan, patterns: &patterns::S
         return Err("Too many PSD layer records".into());
     }
     if minimum > 256 * 1024 * 1024 {
-        return Err("Uncompressed Photoshop channels alone exceed the 256 MiB file limit; use a smaller canvas or fewer full-frame layers".into());
+        return Err(RAW_CHANNEL_LIMIT.into());
     }
     Ok(())
+}
+enum ChannelWriter<'a> {
+    Raw(&'a mut dyn Write),
+    Zip(ZlibEncoder<&'a mut dyn Write>),
+}
+impl<'a> ChannelWriter<'a> {
+    fn new(out: &'a mut dyn Write, compressed: bool) -> Result<Self, String> {
+        out.write_all(&if compressed { 2u16 } else { 0 }.to_be_bytes())
+            .map_err(|e| e.to_string())?;
+        Ok(if compressed {
+            Self::Zip(ZlibEncoder::new(out, Compression::fast()))
+        } else {
+            Self::Raw(out)
+        })
+    }
+    fn finish(self) -> Result<(), String> {
+        if let Self::Zip(zip) = self {
+            zip.finish().map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+}
+impl Write for ChannelWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Raw(out) => out.write(bytes),
+            Self::Zip(out) => out.write(bytes),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Raw(out) => out.flush(),
+            Self::Zip(out) => out.flush(),
+        }
+    }
 }
 // The caller has validated the layout and matching native depth. Keep absent
 // tiles and padded output outside the raster identical to Raster::get/get16.
@@ -1461,7 +1508,7 @@ fn encode_layout_progress_to<S: Read + Write + Seek>(
     check: &dyn Fn() -> Result<(), String>,
     progress: &dyn Fn(&str, usize, usize) -> Result<(), String>,
 ) -> Result<(), String> {
-    encode_layout_scratch_to(doc, layout, output, spool, None, check, progress)
+    encode_layout_scratch_to(doc, layout, output, spool, None, false, check, progress)
 }
 fn encode_layout_scratch_to<S: Read + Write + Seek>(
     doc: &Document,
@@ -1469,6 +1516,7 @@ fn encode_layout_scratch_to<S: Read + Write + Seek>(
     output: &mut dyn Write,
     spool: &mut S,
     scratch: Option<&mut dyn composite::Scratch>,
+    compress_oversize: bool,
     check: &dyn Fn() -> Result<(), String>,
     progress: &dyn Fn(&str, usize, usize) -> Result<(), String>,
 ) -> Result<(), String> {
@@ -1487,7 +1535,11 @@ fn encode_layout_scratch_to<S: Read + Write + Seek>(
     validate(doc)?;
     let plan = standard_plan(doc);
     let standard_patterns = resident_patterns(doc, &plan, patterns::Geometry::Rotation, PLACED_PATTERN_OVERLAY_FORMAT, check)?;
-    check_output_size(doc, &plan, &standard_patterns)?;
+    let compressed = match check_output_size(doc, &plan, &standard_patterns) {
+        Ok(()) => false,
+        Err(reason) if compress_oversize && reason == RAW_CHANNEL_LIMIT => true,
+        Err(reason) => return Err(reason),
+    };
     let high = doc.bit_depth == 16;
     // Effect/bake/profile paths retain their separately materialized behavior.
     let strip_composite = scratch.is_some()
@@ -1593,6 +1645,7 @@ fn encode_layout_scratch_to<S: Read + Write + Seek>(
     let mut pattern_format = 0;
     let mut style_format = 0;
     let mut channel_bytes = 0u64;
+    let mut channel_offsets = Vec::new();
     let mut layer_rows = 0usize;
     for (l, section) in &ordered {
         let standard_style = standard_styles(doc, l, *section, &plan, &standard_patterns);
@@ -1624,6 +1677,9 @@ fn encode_layout_scratch_to<S: Read + Write + Seek>(
                 .and_then(|n| n.checked_add(2))
                 .ok_or("Photoshop channel length overflow")?;
             u16b(&mut records, ch as u16);
+            if compressed {
+                channel_offsets.push(records.len());
+            }
             layout.write_length(&mut records, length)?;
             channel_bytes = channel_bytes
                 .checked_add(length)
@@ -1752,39 +1808,37 @@ fn encode_layout_scratch_to<S: Read + Write + Seek>(
         }
         block(&mut records, &extra);
     }
-    let info_raw = (records.len() as u64)
-        .checked_add(channel_bytes)
-        .and_then(|n| n.checked_add(2))
-        .ok_or("Photoshop section length overflow")?;
-    let info_length = info_raw
-        .checked_add(info_raw % 2)
-        .ok_or("Photoshop section length overflow")?;
-    let mut prefix = vec![];
-    if high {
-        layout.write_length(&mut prefix, 0)?; // Primary8-bit layer information is empty.
-        block(
-            &mut prefix,
-            doc.psd_global_mask
-                .as_ref()
-                .map_or(&[], |mask| mask.data.as_slice()),
-        );
-        // Photoshop needs the merged transparency marker before the 16-bit layer records.
-        prefix.extend(b"8BIMMt16");
-        layout.write_length(&mut prefix, 0)?;
-        prefix.extend(b"8BIMLr16");
-    }
-    layout.write_length(&mut prefix, info_length)?;
+    let record_bytes = records.len() as u64 + 2;
+    let section_size = |planes: u64| -> Result<(u64, u64), String> {
+        let raw = record_bytes.checked_add(planes).ok_or("Photoshop section length overflow")?;
+        Ok((raw, raw.checked_add(raw % 2).ok_or("Photoshop section length overflow")?))
+    };
+    let layer_prefix = |info_length| -> Result<Vec<u8>, String> {
+        let mut prefix = vec![];
+        if high {
+            layout.write_length(&mut prefix, 0)?; // Primary 8-bit layer information is empty.
+            block(
+                &mut prefix,
+                doc.psd_global_mask.as_ref().map_or(&[], |mask| mask.data.as_slice()),
+            );
+            // Photoshop needs the merged transparency marker before the 16-bit records.
+            prefix.extend(b"8BIMMt16");
+            layout.write_length(&mut prefix, 0)?;
+            prefix.extend(b"8BIMLr16");
+        }
+        layout.write_length(&mut prefix, info_length)?;
+        prefix.extend_from_slice(&(-(ordered.len() as i16)).to_be_bytes());
+        Ok(prefix)
+    };
+    let prefix = layer_prefix(section_size(if compressed { 0 } else { channel_bytes })?.1)?;
     let mut standard = StandardWriter::new(
         std::io::BufWriter::with_capacity(64 * 1024, &mut *spool),
         check,
     );
     standard.write_all(&prefix).map_err(|e| e.to_string())?;
-    // A negative count identifies the merged fourth channel as transparency.
-    standard
-        .write_all(&(-(ordered.len() as i16)).to_be_bytes())
-        .map_err(|e| e.to_string())?;
     standard.write_all(&records).map_err(|e| e.to_string())?;
-    drop(records);
+    let channel_start = standard.bytes;
+    let mut channel_offsets = channel_offsets.into_iter();
     let mut row = [0u8; crate::raster::MAX_EDGE as usize * 2];
     let mut completed_rows = 0;
     progress("Writing standard layer channels", 0, layer_rows)?;
@@ -1840,11 +1894,11 @@ fn encode_layout_scratch_to<S: Read + Write + Seek>(
             .chain(if has_mask { Some(-2) } else { None })
             .chain(dual.then_some(-3))
         {
-            standard
-                .write_all(&0u16.to_be_bytes())
-                .map_err(|e| e.to_string())?;
+            let start = standard.bytes;
             let is_mask = ch <= -2;
             let (cw, ch_height) = if is_mask { (mask_w, mask_h) } else { (w, h) };
+            // Empty channels need only their two-byte RAW header.
+            let mut channel = ChannelWriter::new(&mut standard, compressed && cw != 0 && ch_height != 0)?;
             let raw_native = !is_mask
                 && derived.is_none()
                 && derived16.is_none()
@@ -1931,7 +1985,7 @@ fn encode_layout_scratch_to<S: Read + Write + Seek>(
                         }
                     }
                 }
-                standard
+                channel
                     .write_all(&row[..cw as usize * usize::from(doc.bit_depth / 8)])
                     .map_err(|e| e.to_string())?;
                 completed_rows += 1;
@@ -1941,8 +1995,14 @@ fn encode_layout_scratch_to<S: Read + Write + Seek>(
                     layer_rows,
                 )?;
             }
+            channel.finish()?;
+            if let Some(offset) = channel_offsets.next() {
+                let width = if layout.large() { 8 } else { 4 };
+                layout.write_length(&mut &mut records[offset..offset + width], standard.bytes - start)?;
+            }
         }
     }
+    let (info_raw, info_length) = section_size(standard.bytes - channel_start)?;
     if info_raw % 2 != 0 {
         standard.write_all(&[0]).map_err(|e| e.to_string())?;
     }
@@ -1963,17 +2023,40 @@ fn encode_layout_scratch_to<S: Read + Write + Seek>(
     standard.write_all(&suffix).map_err(|e| e.to_string())?;
     standard_patterns.write(&mut standard)?;
     let layer_length = standard.bytes;
-    let layer_hash = standard.hash;
+    let layer_hash = if compressed {
+        standard.flush().map_err(|e| e.to_string())?;
+        drop(standard);
+        // Recovery owns an in-memory spool. Replace the tentative offsets
+        // before deriving the standard-section hash used by the editable source.
+        spool.rewind().map_err(|e| e.to_string())?;
+        spool.write_all(&layer_prefix(info_length)?).map_err(|e| e.to_string())?;
+        spool.write_all(&records).map_err(|e| e.to_string())?;
+        spool.rewind().map_err(|e| e.to_string())?;
+        let mut hash = 0xcbf29ce484222325;
+        let mut remaining = layer_length;
+        let mut buffer = [0u8; 64 * 1024];
+        while remaining != 0 {
+            check()?;
+            let part = remaining.min(buffer.len() as u64) as usize;
+            spool.read_exact(&mut buffer[..part]).map_err(|e| e.to_string())?;
+            hash_part(&mut hash, &buffer[..part]);
+            remaining -= part as u64;
+        }
+        standard = StandardWriter::new(std::io::BufWriter::with_capacity(64 * 1024, &mut *spool), check);
+        standard.bytes = layer_length;
+        hash
+    } else {
+        standard.hash
+    };
+    drop(records);
     standard.hash = 0xcbf29ce484222325;
     let (w, h) = (doc.width, doc.height);
     let composite_rows = h as usize * 4;
     let mut completed_composite_rows = 0;
     progress("Writing current composite", 0, composite_rows)?;
-    standard
-        .write_all(&0u16.to_be_bytes())
-        .map_err(|e| e.to_string())?;
+    let mut channel = ChannelWriter::new(&mut standard, compressed)?;
     if strip_composite {
-        composite::write(doc, scratch.unwrap(), &mut standard, check, progress)?;
+        composite::write(doc, scratch.unwrap(), &mut channel, check, progress)?;
     } else if let Some(image) = &composite16 {
         if image.width != w || image.height != h || image.words.len() != w as usize * h as usize * 4
         {
@@ -1991,7 +2074,7 @@ fn encode_layout_scratch_to<S: Read + Write + Seek>(
                     };
                     row[x * 2..x * 2 + 2].copy_from_slice(&value.to_be_bytes());
                 }
-                standard
+                channel
                     .write_all(&row[..w as usize * 2])
                     .map_err(|e| e.to_string())?;
                 completed_composite_rows += 1;
@@ -2018,7 +2101,7 @@ fn encode_layout_scratch_to<S: Read + Write + Seek>(
                         p[3]
                     };
                 }
-                standard
+                channel
                     .write_all(&row[..w as usize])
                     .map_err(|e| e.to_string())?;
                 completed_composite_rows += 1;
@@ -2030,6 +2113,7 @@ fn encode_layout_scratch_to<S: Read + Write + Seek>(
             }
         }
     }
+    channel.finish()?;
     let composite_length = standard.bytes - layer_length;
     let composite_hash = standard.hash;
     standard.flush().map_err(|e| e.to_string())?;

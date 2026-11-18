@@ -64,7 +64,7 @@ Optional selective reservation:
 {"action":"begin","actor":"my-agent","description":"Refining the character mask","scopes":[{"target":"LAYER_ID","rect":[20,20,240,240]}],"feedback":"batch"}
 ```
 
-Pass the returned task ID with subsequent edits. Update or end it explicitly. Reservations expire after five idle minutes. If the user takes back control, stop and inspect; never silently reacquire.
+Reserve the smallest layer or document-coordinate region that needs protection during a multi-step edit. A quick edit can use the observed revision without reserving anything. Reserve a whole project only for a genuinely document-wide operation that needs protection. Pass the task ID with its edits, update its scopes as the work changes, and end it when done. Leave created layers unlocked unless the user asks to lock them. Reservations expire after five idle minutes. If the user takes back control, stop and observe the current project before any new work. Resume on that target only with the user's direction.
 
 Feedback defaults to an image after each edit batch. Set `feedback` to `request` to avoid automatic images, or `batch`/`always` to receive them. `max_edge` controls image size. Observation also supports `rect`, `layer`, `mask`, `image:false`, and `since_revision` to skip unchanged images. PNGs are delivered as actual MCP image content, not screenshots of interface chrome.
 

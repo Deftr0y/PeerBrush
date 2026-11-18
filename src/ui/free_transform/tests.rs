@@ -107,6 +107,49 @@ fn open(app: &mut PeerBrush, ctx: &egui::Context) {
     workspace::key(app, ctx, SIZE, egui::Key::T, egui::Modifiers::COMMAND);
     assert!(app.free_transform.is_some(), "{}", app.message);
 }
+#[test]
+fn arrow_move_uses_document_pixels_and_free_transform_arrows_change_only_the_draft() {
+    let (mut app, ctx) = workspace::fixture(16);
+    app.recovery.open = false;
+    app.zoom = 2.5;
+    app.select_tool(Tool::Move);
+    frame(&mut app, &ctx, vec![]);
+    let (before, history) = {
+        let engine = app.shared.lock().unwrap();
+        let layer = &engine.resident_state().unwrap().document.layers[0];
+        ([layer.x, layer.y], engine.history_lengths())
+    };
+    workspace::key(&mut app, &ctx, SIZE, egui::Key::ArrowRight, Default::default());
+    {
+        let mut engine = app.shared.lock().unwrap();
+        let layer = &engine.resident_state().unwrap().document.layers[0];
+        assert_eq!([layer.x, layer.y], [before[0] + 1, before[1]]);
+        assert_eq!(engine.history_lengths()[0], history[0] + 1);
+        engine.undo("human").unwrap();
+        engine.edit("human", &[json!({"op":"selection","kind":"rectangle","rect":[4,4,8,8]})],
+            None, None, "Select pixels").unwrap();
+    }
+    frame(&mut app, &ctx, vec![]);
+    workspace::key(&mut app, &ctx, SIZE, egui::Key::ArrowRight, Default::default());
+    {
+        let mut engine = app.shared.lock().unwrap();
+        let doc = &engine.resident_state().unwrap().document;
+        assert_eq!(doc.selection, Some([5, 4, 9, 8]));
+        engine.undo("human").unwrap();
+    }
+    open(&mut app, &ctx);
+    settle(&mut app, &ctx);
+    let history = app.shared.lock().unwrap().history_lengths();
+    workspace::key(&mut app, &ctx, SIZE, egui::Key::ArrowUp, Default::default());
+    assert_eq!(app.free_transform.as_ref().unwrap().values.offset, [0., -1.]);
+    app.free_transform.as_mut().unwrap().set_mode(Tool::Rotate);
+    workspace::key(&mut app, &ctx, SIZE, egui::Key::ArrowRight, Default::default());
+    assert_eq!(app.free_transform.as_ref().unwrap().values.angle, 0.1);
+    app.free_transform.as_mut().unwrap().set_mode(Tool::Scale);
+    workspace::key(&mut app, &ctx, SIZE, egui::Key::ArrowRight, Default::default());
+    assert_eq!(app.free_transform.as_ref().unwrap().values.scale, [1.01; 2]);
+    assert_eq!(app.shared.lock().unwrap().history_lengths(), history);
+}
 fn settle(app: &mut PeerBrush, ctx: &egui::Context) -> egui::FullOutput {
     settle_size(app, ctx, SIZE)
 }

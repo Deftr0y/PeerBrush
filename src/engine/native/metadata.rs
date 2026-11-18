@@ -83,7 +83,7 @@ impl CapturedEdit {
             0
         };
         // The containing folder ID may not appear in the request parameters.
-        let parent_bytes = if grouping {
+        let parent_bytes = if grouping || parameters.get("relative_to").is_some() {
             base.layers
                 .iter()
                 .map(|layer| layer.id.len())
@@ -152,12 +152,12 @@ impl CapturedEdit {
                 if !matches!(kind, "paint" | "fill" | "group") {
                     return Err("Unsupported layer kind".into());
                 }
-                let parent = if let Some(group) = &group {
-                    group.parent.map(|index| base.layers[index].id.as_str())
+                let (insert, parent) = if let Some(group) = &group {
+                    (0, group.parent.map(|index| base.layers[index].id.clone()))
                 } else {
-                    parameters["parent"].as_str()
+                    crate::grouping::layer_insert_slot((&self.base).into(), parameters)?
                 };
-                if let Some(parent) = parent {
+                if let Some(parent) = parent.as_deref() {
                     if !metadata
                         .layers
                         .iter()
@@ -179,7 +179,7 @@ impl CapturedEdit {
                         "New layer"
                     }))?,
                     kind: owned(kind)?,
-                    parent: parent.map(owned).transpose()?,
+                    parent: parent.as_deref().map(owned).transpose()?,
                     clip_to: None,
                     visible: true,
                     locked: false,
@@ -216,7 +216,7 @@ impl CapturedEdit {
                         .layers
                         .try_reserve_exact(1)
                         .map_err(|_| "Native layer allocation refused")?;
-                    metadata.layers.insert(0, layer);
+                    metadata.layers.insert(insert, layer);
                 }
                 added = Some((ordinal, surface));
             } else {

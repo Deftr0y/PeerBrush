@@ -34,79 +34,94 @@ The [0.5 owner intake](https://github.com/Deftr0y/PeerBrush/blob/15da63fe42a821e
 
 ### PB-080
 
-**Recovery and close lifecycle · 0.5 · first batch · In progress**
+**Recovery and close lifecycle · 0.5 · first batch · Implemented / verification pending**
 
 - **01 Recovery.** Reproduce `Autosave failed: Uncompressed Photoshop channels alone exceed the 256 MiB file limit` on the affected build. Capture, discover and reopen a usable checkpoint for a representative large editable project. Compare native depth, hierarchy, masks and pixels and verify that the original and earlier good recovery survive. Verify the default native document path and the resident path that emits this error. [PB-105 investigation](docs/large-document-investigation.md) · [File safety](docs/file-safety.md) · [Legacy checkpoint](src/recovery.rs) · [Native checkpoint](src/recovery/native/autosave.rs)
+  - Reproduced on signed Windows Store package 1.30.1.0 (v0.30.1) with a synthetic 4096 × 2048, 16-bit, three-layer document. The worker reported `Autosave failed · Untitled.psd: Uncompressed Photoshop channels alone exceed the 256 MiB file limit; use a smaller canvas or fewer full-frame layers`. The new compressed standard channels and recovery/reopen regression are in source. Runtime acceptance for the fix is pending. [Published package evidence](https://github.com/Deftr0y/PeerBrush/releases/tag/v0.30.1)
 - **04 Close.** Reproduce the “finish the current operation” stall. While a file or edit operation is genuinely active, prevent destructive closure. After completion or cancel, reach the normal close review. Preserve unsaved work on Cancel or Save failure and keep other tabs intact. Exercise tab close and app exit. [Project behavior](docs/projects.md) · [Close review](src/ui/lifecycle.rs)
+  - The close request now waits for the relevant operation and resumes the ordinary unsaved-work review. The regression holds a job open, settles it successfully or with cancellation, and confirms that canceling close preserves both dirty projects. Exact baseline reproduction and native close acceptance remain pending.
 
 ### PB-138
 
-**Save safety · 0.5 · first batch · In progress**
+**Save safety · 0.5 · first batch · Implemented / verification pending**
 
 - **02 Full backup store.** Fill the previous-save store and save from the normal editor workflow. Reopen the current editable PSD and compare layers, masks, native samples and merged composite. Confirm original file and backup bytes remain intact. If the current destination cannot be safely replaced, provide a guarded way to save to a fresh PSD with the user's choice of path. Test Cancel, failed saves, existing targets and external changes. Keep the earlier stale-overwrite incident and its unknown original cause in the [file-safety audit](docs/file-safety.md). [File lease](src/file_safety.rs) · [Native publication](src/server/native_save.rs)
+  - Normal Save now offers a fresh-file picker when backup capacity is exhausted. Both save paths require an absent destination under the existing lease for this fallback. Regression source covers a full resident store, refusal to replace the original, and editable 16-bit reopen. Native execution remains pending.
+  - The signed Windows v0.30.1 baseline refused overwrite at the 1 GiB previous-save cap, retained the original SHA-256 and the backup length, and saved to a fresh PSD path. The new automatic prompt still needs candidate UI acceptance. The older two-instance report remains a later reproduction under this ticket. [Historical audit](docs/file-safety.md)
 
 ### PB-079
 
-**Independent project tabs and cross-tab editing · 0.5 · first batch · In progress**
+**Independent project tabs and cross-tab editing · 0.5 · first batch · Implemented / verification pending**
 
 - **03 Image drops.** With two existing tabs, drop a different image into each and switch while the first import is pending. Verify native drag-and-drop, on-tab and canvas routing, correct projects, unchanged original layers and independent undo. Exercise concurrent inspections and cancel a content choice in one project without touching the other. Keep empty-strip new-project drop under the existing PB-119 behavior. [Project behavior](docs/projects.md) · [File-drop entry point](src/ui/file_drop.rs)
+  - Source routes file drops to visible tab targets and owns import inspection, content choices and commits by project. Regression source exercises two tabs with independent 16-bit image data and undo. Native drag-and-drop execution remains pending.
 - Earlier cross-tab typed clipboard, copy/move preview, independent undo and AI isolation have development evidence. Recheck the affected flows alongside the import change. [Historical cross-tab record](FOLLOWUPS.MD#earlier-requested-work--implementation-records)
 
 ### PB-029
 
-**Folder preview and tree drag sorting · 0.5 · layer batch · Open**
+**Folder preview and tree drag sorting · 0.5 · layer batch · Implemented / verification pending**
 
 - **05 Folder icon.** Show the composited contents inside the icon. Use the shared renderer with masks, visibility, nesting and actual pixels. Verify refresh on a child edit and no stale preview after a tab switch.
 - **08 Drag.** Show before, after and into-folder insertion, including collapsed folders and multi-selection. The committed tree and rendered canvas must match the preview. Reject folders into their own descendants, honor locks/reservations and verify one-step undo. [Historical tree behavior](FOLLOWUPS.MD#implemented-work-and-historical-acceptance-records) · [Layer panel](src/ui.rs)
+- Folder icons request the existing rendered group preview. Outdenting over a nested row now uses the actual top-level anchor. Verify both against rendered native UI, especially a child edit, a collapsed folder and a different tab. [Layer panel](src/ui/layers.rs)
 
 ### PB-049
 
-**Contextual layer creation · 0.5 · layer batch · Open**
+**Contextual layer creation · 0.5 · layer batch · Implemented / verification pending**
 
 - **06 Creation.** With a folder selected, create the new layer inside it. With a layer selected, insert immediately above it in the same parent. Verify nested and root cases, Color/Mask target and one-step undo. Retain explicit placement for shared engine callers and existing folder collection behavior. [Historical layer creation](FOLLOWUPS.MD#implemented-work-and-historical-acceptance-records)
+- The paint-layer action now sends a relative layer ID through the shared engine, which resolves an insertion slot and validates the parent and reservations. [Shared placement](src/grouping.rs)
 
 ### PB-014
 
-**Hidden layer rows · 0.5 · layer batch · Open**
+**Hidden layer rows · 0.5 · layer batch · Implemented / verification pending**
 
 - **07 Visibility styling.** Shade hidden rows slightly darker gray. Verify readable selected, hovered, locked, reserved and AI states, including a hidden folder. Preserve existing visibility gestures and keyboard access. [Historical layer controls](FOLLOWUPS.MD#implemented-work-and-historical-acceptance-records)
+- The layer panel now shades hidden rows and uses a darker selected state while retaining the existing selection and AI markers. [Layer panel](src/ui/layers.rs)
 
 ### PB-046
 
-**Whole-layer Duplicate and Copy/Paste · 0.5 · layer batch · Open**
+**Whole-layer Duplicate and Copy/Paste · 0.5 · layer batch · In progress**
 
 - **09 Large selections.** Reproduce intermittent failures with many selected layers and folders. Check selected roots, sibling order, folder relationships, editable effects and masks, native depth and undo. Exercise both Duplicate and Copy/Paste, including an explicit error when a real clipboard or document limit prevents the full operation. PB-110 separately tracks selection-pixel copying. [Clipboard behavior](docs/projects.md) · [Earlier layer clipboard verification](FOLLOWUPS.MD#implemented-work-and-historical-acceptance-records)
+- The active clipboard target mode now follows its project tab. An immediate Paste can follow a pending layer Copy with the observed clipboard receipt. Source coverage exercises a 31-layer forest, an intervening replacement and one-step Duplicate and Paste undo. The original intermittent Duplicate report and native clipboard flows still need reproduction and acceptance. [Clipboard worker](src/clipboard.rs)
 
 ### PB-136
 
-**Native Stroke effect · 0.5 · layer batch · Open**
+**Native Stroke effect · 0.5 · layer batch · Implemented / verification pending**
 
 - **10 Rendering.** Reproduce Stroke doing nothing on an affected layer. Inspect the actual canvas at 8 and 16 bits when adding or editing Stroke. Compare inside/outside placement and a masked layer, verify bypass and undo, and preserve editable source and live preview. The broader Photoshop authored-style import criteria remain in [PB-122](#pb-122). [Native layer styles](docs/layer-styles.md) · [Original acceptance](FOLLOWUPS.MD#other-open-features-refinements-and-acceptance)
+- The Windows v0.30.1 baseline returned identical rendered PNGs before and after adding default Outside Stroke to a full-canvas opaque layer. Explicit Inside produced a different rendered PNG. New Stroke effects now default to Inside. Candidate canvas and existing saved settings still need verification. [Layer style implementation](src/effects/styles.rs)
 
 ### PB-069
 
-**AI reservation scope and task end · 0.5 · collaboration batch · Open**
+**AI reservation scope and task end · 0.5 · collaboration batch · Implemented / verification pending**
 
 - **11 Scope.** Update agent instructions and help to reserve only the layers or regions that need protection for the current edit. Verify unrelated user edits proceed. Verify user takeover interrupts the AI and that the agent cannot silently reclaim the target.
 - **12 Task end.** Have an AI task create a layer, finish or surrender it, and paint as the user. Test normal release, expiry and takeover. Respect an intentional document lock and any independent reservation. PB-069 was priority 7 in the older queue. [Collaboration](docs/collaboration.md) · [MCP](docs/mcp.md) · [PB-100 historical behavior](FOLLOWUPS.MD#earlier-refinements--implementation-records)
+- MCP initialization and contributor instructions now describe minimal reservations, task release and takeover. Regression source covers human painting outside a reservation, normal release, expiry, takeover and an intentional lock. [Collaboration engine](src/collaboration.rs)
+- **12 baseline shipped and verified.** Windows Store 1.30.1.0 (v0.30.1) let human work proceed outside the reservation and allowed painting on the AI-created layer after task end. An explicit layer lock still blocked paint. The resulting two-layer 16-bit PSD reopened editable. Candidate coverage includes expiry and takeover. [Published Windows build](https://github.com/Deftr0y/PeerBrush/releases/tag/v0.30.1)
 
 ### PB-002
 
-**Current AI task area animation · 0.5 · collaboration batch · Open**
+**Current AI task area animation · 0.5 · collaboration batch · Implemented / verification pending**
 
 - **13 Presentation.** Animate the current task area while AI work is active, including when the same text remains visible. Settle on stop and clear the animation on project switch. Verify readable blue presentation, human interruption and no effect on document history. [AI collaboration](docs/collaboration.md) · [Historical activity text](FOLLOWUPS.MD#implemented-work-and-historical-acceptance-records)
+- The top-bar area now pulses during active AI reservations, code runs and MCP work. Switching tabs refreshes the indication from the new project. Native desktop acceptance remains pending. [Top bar](src/ui.rs)
 
 ### PB-004
 
-**Transform arrow-key nudges · 0.5 · editing batch · Open**
+**Transform arrow-key nudges · 0.5 · editing batch · Implemented / verification pending**
 
 - **14 Nudging.** In W/E/R and Ctrl+T (Cmd+T on macOS), each position arrow press moves exactly one document pixel independent of zoom. Rotation and scale use fine mode-appropriate increments. Verify selected pixels, layers, linked/unlinked masks, text or number focus, cancellation and undo. Respect reservations and the current mode's appropriate preview/apply behavior. Check Free Transform and editable text against [PB-153](#pb-153). [Transform behavior](docs/retained-transforms.md)
+- Move uses one document pixel, Rotate uses 0.1°, and Scale uses 1% per press. Free Transform updates the draft for one guarded Apply. Regression source checks zoom-independent Move and draft Move/Rotate/Scale. [Free Transform](src/ui/free_transform.rs)
 
 ### PB-157
 
 **Full-resolution editing previews by default · 0.5 · editing batch · Implemented / verification pending**
 
 - **15 Default and opt-in.** Verify fresh and previously unset profiles use full resolution for live edits. Exercise the saved reduced-resolution setting, persistence, toggling, and final full-quality render. Audit normal edits, AI presentation and preview commands; source dimensions, native precision, saves and exports must stay exact. [Settings](docs/settings.md) · [Original requirements](FOLLOWUPS.MD#next-version-requests--2026-11-05)
+- Source inspection confirms an absent preference initializes full resolution and only an explicit saved opt-in enables reduced previews. Existing tests cover preference and rendering paths. Candidate results remain pending. [Preview settings source and tests](src/ui/preview_quality.rs)
 
 ## Later work and historical reconciliation
 
@@ -278,7 +293,7 @@ Free Transform and nine-point Warp shipped in v0.30.0. Finish native coverage of
 
 **Ctrl+E selects the Eraser · Later · priority existing queue · Implemented / verification pending**
 
-Earlier Windows development build passed Ctrl+E Eraser. Check remaining platforms, focus, layout changes and preservation of custom bindings. [Historical criteria and evidence](https://github.com/Deftr0y/PeerBrush/blob/15da63fe42a821eabd805f33bcc49fcaa9f54260/FOLLOWUPS.MD#L462)
+Verified but unreleased on the earlier Windows 0.4 development build for Ctrl+E Eraser. Check remaining platforms, focus, layout changes and preservation of custom bindings. [Historical criteria and evidence](https://github.com/Deftr0y/PeerBrush/blob/15da63fe42a821eabd805f33bcc49fcaa9f54260/FOLLOWUPS.MD#L462)
 
 ### PB-159
 

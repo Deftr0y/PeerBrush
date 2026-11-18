@@ -231,6 +231,12 @@ impl PeerBrush {
         self.project_views.retain(|id, _| live.contains(id));
         self.project_labels.retain(|id, _| live.contains(id));
         self.project_rects.clear();
+        self.project_file_drop_tab = None;
+        let file_pos = ctx.input(|i| {
+            (!i.raw.hovered_files.is_empty() || !i.raw.dropped_files.is_empty())
+                .then(|| i.pointer.hover_pos().or_else(|| i.pointer.interact_pos()))
+                .flatten()
+        });
         let changed = self.tab_active != active;
         self.tab_active = active;
         for (id, name, shared) in &entries {
@@ -296,6 +302,10 @@ impl PeerBrush {
                                         width,
                                     );
                                     self.project_rects.insert(id.clone(), response.rect);
+                                    let visible = response.rect.intersect(ui.clip_rect());
+                                    if ui.is_enabled() && file_pos.is_some_and(|pos| visible.contains(pos)) {
+                                        self.project_file_drop_tab = Some((id.clone(), visible));
+                                    }
                                     if response.body.drag_started() && self.layer_drag.is_none() {
                                         started = Some(id.clone());
                                     }

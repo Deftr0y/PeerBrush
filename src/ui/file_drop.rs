@@ -13,7 +13,7 @@ impl PeerBrush {
             self.message = "Drop one file onto the tabs area to open a new project".into();
             return;
         }
-        if self.busy || self.pending_image_open.is_some() || self.pending_import.is_some() {
+        if self.busy || self.pending_image_open.is_some() || self.load_control.is_some() {
             self.message =
                 "Finish the current file operation before opening a dropped project".into();
             return;
@@ -30,7 +30,14 @@ impl PeerBrush {
             egui::Order::Foreground,
             egui::Id::new("file-drop"),
         ));
-        if self.file_drop_on_tabs(ctx) {
+        if let Some((_, bounds)) = self.project_file_drop_tab.as_ref().filter(|_| {
+            ctx.input(|i| i.raw.hovered_files.iter().all(|file| {
+                file.path.as_ref().and_then(|path| path.extension()).and_then(|ext| ext.to_str())
+                    .is_none_or(|ext| !ext.eq_ignore_ascii_case("psd") && !ext.eq_ignore_ascii_case("psb"))
+            }))
+        }) {
+            painter.rect_stroke(*bounds, 6., Stroke::new(2., ACCENT), egui::StrokeKind::Inside);
+        } else if self.file_drop_on_tabs(ctx) {
             let bounds = self.project_drop_rect.unwrap();
             painter.rect_filled(bounds, 0., Color32::from_rgb(58, 36, 32));
             painter.line_segment(
@@ -75,6 +82,58 @@ mod tests {
             |ctx| app.draw(ctx),
         )
     }
+    #[test]
+    fn drops_into_two_existing_tabs_keep_independent_targets_and_undo() {
+        let (mut app, ctx) = super::super::tests::fixture();
+        app.recovery.open = false;
+        let first = app.shared.clone();
+        let first_id = app.project_id.clone();
+        let second = crate::workspace::new_project(&first, 64, 64, 16, None).unwrap();
+        let second_id = second.lock().unwrap().project_id.clone();
+        crate::workspace::select(&first, &first_id).unwrap();
+        let state = crate::engine::native::worker::tests::Fixture::new();
+        let image_a = state.path().join("first.png");
+        let image_b = state.path().join("second.png");
+        let words_a = [12345, 23457, 45679, 32123];
+        let words_b = [54321, 33333, 22223, 60001];
+        std::fs::write(&image_a, crate::raster::png16(1, 1, &words_a).unwrap()).unwrap();
+        std::fs::write(&image_b, crate::raster::png16(1, 1, &words_b).unwrap()).unwrap();
+        frame(&mut app, &ctx, Default::default());
+        for (id, path) in [(&first_id, image_a), (&second_id, image_b)] {
+            let pos = app.project_rects[id].center() - Vec2::new(20., 0.);
+            for pressed in [true, false] {
+                frame(&mut app, &ctx, egui::RawInput {
+                    events: vec![egui::Event::PointerMoved(pos), egui::Event::PointerButton {
+                        pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default(),
+                    }],
+                    ..Default::default()
+                });
+            }
+            assert_eq!(&app.project_id, id);
+            frame(&mut app, &ctx, egui::RawInput {
+                events: vec![egui::Event::PointerMoved(pos)],
+                dropped_files: vec![egui::DroppedFile { path: Some(path), ..Default::default() }],
+                ..Default::default()
+            });
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !app.jobs.is_empty() {
+            assert!(std::time::Instant::now() < deadline, "{}", app.message);
+            std::thread::sleep(Duration::from_millis(5));
+            frame(&mut app, &ctx, Default::default());
+        }
+        assert_eq!(crate::workspace::handles(&first).len(), 2);
+        for (project, expected) in [(first, words_a), (second, words_b)] {
+            let mut engine = project.lock().unwrap();
+            let state = engine.resident_state().unwrap();
+            assert_eq!(state.document.layers.len(), 2);
+            assert_eq!(state.document.layers[0].pixels.get16(0, 0), expected);
+            assert_eq!(state.undo.len(), 1);
+            engine.undo("human").unwrap();
+            assert_eq!(engine.resident_state().unwrap().document.layers.len(), 1);
+        }
+    }
+
     #[test]
     fn tab_drop_opens_native_image_and_canvas_drop_still_imports_without_losing_work() {
         for depth in [8, 16] {

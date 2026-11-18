@@ -689,6 +689,18 @@ pub fn save_accepted_source(
 fn save_guarded(shared: &Shared, path: &Path, request: &Value) -> Result<(), String> {
     save_prepared(shared, path, request, || {})
 }
+pub(crate) fn save_fresh_source(
+    shared: &Shared,
+    path: &Path,
+    document: &str,
+    revision: u64,
+    accepted: bool,
+) -> Result<(), String> {
+    save_guarded(shared, path, &json!({
+        "document_id": document, "expected_revision": revision,
+        "accept_editability_loss": accepted, "require_new_destination": true,
+    }))
+}
 // One registered control per project, retained for terminal observation. Its file
 // operation guard also covers asynchronous scheduling and failed worker creation.
 struct SaveOperation {
@@ -974,6 +986,9 @@ fn save_prepared_inner(
         return Err("Working documents must use .psd or .psb".into());
     }
     let lease = crate::file_safety::Lease::acquire(path)?;
+    if lease.expected.is_some() && request["require_new_destination"] == true {
+        return Err("Choose a new PSD/PSB filename. Existing files were retained.".into());
+    }
     let path = lease.path.as_path();
     if !path
         .extension()
@@ -2605,7 +2620,7 @@ fn initialization(params: &Value) -> Value {
     } else {
         MCP_HTTP_VERSIONS[1]
     };
-    json!({"protocolVersion":version,"capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"PeerBrush","version":env!("CARGO_PKG_VERSION")},"instructions":"Observe before edits. Use explicit IDs, expected_revision, optional selective task reservations, and PNG feedback. Never silently reacquire after user takeover. Work like an artist: inspect actual images after edits, undo weak attempts, refine and retry; use redo to compare. Publish concise human-language activity through task descriptions. Do not assume the first edit is final."})
+    json!({"protocolVersion":version,"capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"PeerBrush","version":env!("CARGO_PKG_VERSION")},"instructions":"Observe before edits. Use explicit IDs, expected_revision, and PNG feedback. Reserve only the layers or document-coordinate regions that need protection. Use project-wide reservations only for work that truly affects the whole project. End the task when done and leave created layers paintable unless the user requests a lock. If the user takes over, stop and observe. Resume on that target only with the user's direction. Inspect actual images after edits, undo weak attempts, refine and retry. Publish concise activity in task descriptions."})
 }
 
 pub fn mcp(shared: &Shared, request: &Value) -> Value {
@@ -2614,6 +2629,18 @@ pub fn mcp(shared: &Shared, request: &Value) -> Value {
 }
 fn mcp_owned(shared: &Shared, request: &Value) -> reply::OwnedReply {
     mcp_reply(shared, request, true).unwrap_or_else(|error| reply::OwnedReply::plain(json!({"jsonrpc":"2.0","id":request.get("id").unwrap_or(&Value::Null),"error":{"code":-32000,"message":error}})))
+}
+struct AgentActivity(Arc<std::sync::atomic::AtomicUsize>);
+impl AgentActivity {
+    fn begin(engine: &Engine) -> Self {
+        engine.agent_calls.fetch_add(1, Ordering::Relaxed);
+        Self(engine.agent_calls.clone())
+    }
+}
+impl Drop for AgentActivity {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 fn mcp_reply(shared: &Shared, request: &Value, owned: bool) -> Result<reply::OwnedReply, String> {
     let request_id = request.get("id").cloned().unwrap_or(Value::Null);
@@ -2666,28 +2693,36 @@ fn mcp_reply(shared: &Shared, request: &Value, owned: bool) -> Result<reply::Own
                     json!({"jsonrpc":"2.0","id":request_id,"result":{"content":[{"type":"text","text":"Unknown PeerBrush tool"}],"isError":true}}),
                 ));
             }
-            {
-                if let Ok(mut e) = shared.try_lock() {
-                    if e.activity.is_empty() || e.leases.is_empty() {
-                        e.activity = match method {
-                            "observe" => "Looking at the canvas",
-                            "edit" => "Updating the shared canvas",
-                            "proposal" => "Reviewing proposed canvas changes",
-                            "place_image" => "Placing image pixels",
-                            "segment" => "Selecting the subject",
-                            "document" => "Working with your document",
-                            "history" => "Reviewing recent changes",
-                            _ => "Getting ready to work together",
-                        }
-                        .into();
-                    }
+            let empty_arguments = json!({});
+            let arguments = p.get("arguments").unwrap_or(&empty_arguments);
+            let activity_project = arguments["project_id"].as_str()
+                .and_then(|id| crate::workspace::get_in(&crate::workspace::attach(shared), id).ok())
+                .unwrap_or_else(|| shared.clone());
+            let _activity = activity_project.try_lock().ok().and_then(|mut e| {
+                if arguments["actor"] == "human" {
+                    return None;
                 }
-            }
+                if e.activity.is_empty() || e.leases.is_empty() {
+                    e.activity = match method {
+                        "observe" => "Looking at the canvas",
+                        "edit" => "Updating the shared canvas",
+                        "proposal" => "Reviewing proposed canvas changes",
+                        "place_image" => "Placing image pixels",
+                        "segment" => "Selecting the subject",
+                        "document" => "Working with your document",
+                        "history" => "Reviewing recent changes",
+                        _ => "Getting ready to work together",
+                    }
+                    .into();
+                }
+                matches!(method, "observe" | "edit" | "code" | "proposal" | "place_image" | "segment" | "document" | "history")
+                    .then(|| AgentActivity::begin(&e))
+            });
             let mut admission = reply::ReplyAdmission::new(owned);
             match dispatch_reply(
                 shared,
                 method,
-                p.get("arguments").unwrap_or(&json!({})),
+                arguments,
                 &mut admission,
             ) {
                 Ok(result) => admission.finish(result)?.tool_result(),

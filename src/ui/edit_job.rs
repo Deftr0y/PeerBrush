@@ -23,6 +23,7 @@ impl Commands {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Origin {
     Action,
+    Nudge,
     Stroke(eframe::egui::Id),
     SampledStroke(super::sample_input::Id),
     Magnetic(eframe::egui::Id),

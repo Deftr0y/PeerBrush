@@ -54,7 +54,7 @@ AI can reserve specific layers or rectangular regions while you edit elsewhere. 
 
 ## Maya-style transforms
 
-Use the small **Q / W / E / R** controls at the bottom right for Deselect, Move, Rotate and Scale. The active mode has an Ember underline; recent AI transform activity appears in blue. The same keyboard shortcuts work after clicking controls, and text fields retain normal typing. Transform modes no longer occupy the left painting toolbar.
+Use the small **Q / W / E / R** controls at the bottom right for Deselect, Move, Rotate and Scale. The active mode has an Ember underline; recent AI transform activity appears in blue. In Move, each arrow press nudges one document pixel. In Rotate and Scale, Right or Up increases by 0.1° or 1%, and Left or Down decreases by the corresponding increment. Free Transform previews these changes until you apply them. Text and number fields keep their normal arrow-key behavior.
 
 **Q** clears the area selection, deselects the active tool and cancels unfinished gestures; **W** shows move; **E** shows rotation; **R** shows scale. Select a layer, then drag the colored X/Y handles or the center handle. Move/scale axis handles constrain that axis. Shift snaps rotation to 15° or makes scaling uniform. Escape cancels a drag. **D** selects the eraser.
 

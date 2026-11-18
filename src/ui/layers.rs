@@ -13,6 +13,18 @@ fn layer_type_icon(layer: LayerView<'_>) -> Option<(Icon, &'static str)> {
     }
 }
 
+fn paint_layer_type(painter: &egui::Painter, rect: Rect, icon: Icon, thumbnail: Option<&TextureHandle>) {
+    if matches!(icon, Icon::Folder) {
+        if let Some(texture) = thumbnail {
+            let size = texture.size_vec2();
+            let scale = (rect.width() * 0.49 / size.x).min(rect.height() * 0.31 / size.y);
+            let image = Rect::from_center_size(rect.center() + Vec2::new(0.0, 1.5), size * scale);
+            painter.image(texture.id(), image, Rect::from_min_max(Pos2::ZERO, Pos2::new(1., 1.)), Color32::WHITE);
+        }
+    }
+    icons::paint(painter, rect, icon, true);
+}
+
 fn sweep_hits_eye(from: Pos2, to: Pos2, eye: Rect) -> bool {
     if !eye.is_positive() {
         return false;
@@ -864,7 +876,7 @@ impl PeerBrush {
             }
             if let Some((icon, title)) = layer_type_icon(l) {
                 let (r, response) = ui.allocate_exact_size(Vec2::splat(30.0), egui::Sense::click());
-                icons::paint(ui.painter(), r, icon, true);
+                paint_layer_type(ui.painter(), r, icon, thumb);
                 response.widget_info(|| {
                     egui::WidgetInfo::labeled(egui::WidgetType::Button, response.enabled(), title)
                 });
@@ -1191,13 +1203,21 @@ impl PeerBrush {
                 let target=original.get(slot).map(|&(i,depth)|(view.layer(i).unwrap(),depth));
                 let (parent,before)=if let Some((target,depth))=target {
                     let y=pointer.y-(base.y+slot as f32*46.0);
-                    if target.kind()=="group" && (10.0..32.0).contains(&y) && !drag.ids.iter().any(|id|id==target.id()) {
+                    if target.kind()=="group" && pointer.x >= base.x+45.0 && (10.0..32.0).contains(&y) && !drag.ids.iter().any(|id|id==target.id()) {
                         drop_folder=Some(target.id().to_owned());open.to_mut().remove(target.id());
                         (Some(target.id()),view.layers().find(|l|l.parent()==Some(target.id())&&!drag.ids.iter().any(|id|id==l.id())).map(|l|l.id()))
                     } else {
-                        let parent=if depth>0 && pointer.x<base.x+45.0 {None}else{target.parent()};
-                        let before=if y<21.0 && !drag.ids.iter().any(|id|id==target.id()) {Some(target.id())}else{
-                            original.iter().skip(slot+1).map(|&(i,_)|view.layer(i).unwrap()).find(|l|l.parent()==parent&&!drag.ids.iter().any(|id|id==l.id())).map(|l|l.id())
+                        let mut anchor = target;
+                        let mut start = slot;
+                        if depth > 0 && pointer.x < base.x + 45.0 {
+                            while let Some(parent) = anchor.parent().and_then(|id| view.find_layer(id)) {
+                                anchor = parent;
+                            }
+                            start = original.iter().position(|&(index, _)| view.layer(index).is_some_and(|l| l.id() == anchor.id())).unwrap_or(slot);
+                        }
+                        let parent=anchor.parent();
+                        let before=if y<21.0 && !drag.ids.iter().any(|id|id==anchor.id()) {Some(anchor.id())}else{
+                            original.iter().skip(start+1).map(|&(i,_)|view.layer(i).unwrap()).find(|l|l.parent()==parent&&!drag.ids.iter().any(|id|id==l.id())).map(|l|l.id())
                         };
                         (parent,before)
                     }
@@ -1249,7 +1269,7 @@ impl PeerBrush {
                     egui::WidgetType::Button, response.enabled(), self.selection_layers.contains(l.id()), l.name(),
                 ));
                 let floating_row = held && self.layer_drag.as_ref().is_some_and(|drag| drag.id == l.id());
-                let thumb = if layer_type_icon(l).is_none() && ((!held && visible) || floating_row) {
+                let thumb = if l.kind() != "adjustment" && ((!held && visible) || floating_row) {
                     self.thumbnail(ui, doc, l, false)
                 } else {
                     None
@@ -1266,8 +1286,16 @@ impl PeerBrush {
                 } else {
                     if visible {
                         let selected=self.selection_layers.contains(l.id());
+                        let hidden = !tree.visible(l);
                         let hover=ui.ctx().animate_bool_with_time(response.id.with("hover"),response.hovered(),0.08);
-                        if selected {ui.painter().rect_filled(rect,5,Color32::from_rgb(74,48,71).gamma_multiply(solo_opacity));
+                        if hidden && !selected {
+                            ui.painter().rect_filled(rect,5,Color32::BLACK.gamma_multiply(0.16*solo_opacity));
+                        }
+                        if selected {ui.painter().rect_filled(rect,5,if hidden {
+                            Color32::from_rgb(61,43,60)
+                        } else {
+                            Color32::from_rgb(74,48,71)
+                        }.gamma_multiply(solo_opacity));
                             ui.painter().rect_filled(Rect::from_min_size(rect.min+Vec2::new(0.0,5.0),Vec2::new(2.0,32.0)),1,ACCENT.gamma_multiply(solo_opacity));}
                         else if hover>0.0 {ui.painter().rect_filled(rect,5,Color32::WHITE.gamma_multiply(0.035*hover*solo_opacity));}
                         if ai {
@@ -1309,7 +1337,7 @@ impl PeerBrush {
                 painter.line_segment([rect.left_top(),rect.left_bottom()],Stroke::new(2.0_f32,ACCENT));
                 let x=rect.left()+75.0+depth as f32*TREE_INDENT;
                 let image_rect=Rect::from_min_size(egui::pos2(x,rect.top()+6.0),Vec2::splat(30.0));
-                if let Some((icon,_))=layer_type_icon(layer){icons::paint(&painter,image_rect,icon,true);}
+                if let Some((icon,_))=layer_type_icon(layer){paint_layer_type(&painter,image_rect,icon,thumb.as_ref());}
                 else if let Some(t)=thumb {painter.image(t.id(),image_rect,Rect::from_min_max(Pos2::ZERO,Pos2::new(1.0,1.0)),Color32::WHITE);}
                 let label=if drag.ids.len()>1 {format!("{}  +{}",layer.name(),drag.ids.len()-1)}else{layer.name().to_owned()};
                 painter.text(egui::pos2(x+38.0,rect.center().y),egui::Align2::LEFT_CENTER,label,egui::FontId::proportional(12.0),Color32::WHITE);

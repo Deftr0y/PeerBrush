@@ -649,7 +649,7 @@ pub fn checkpoint(workspace: &workspace::Registry, dir: &Path, previous: &mut Ve
                 continue;
             }
         };
-        let result = psd::encode(&doc).and_then(|bytes| {
+        let result = psd::encode_recovery(&doc).and_then(|bytes| {
             if resident_checkpoint_guard(&shared, &doc)?.is_none() {
                 return Ok(None);
             }
@@ -918,6 +918,57 @@ pub fn legacy(dir: &Path) -> Vec<(String, PathBuf)> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn resident_autosave_recovers_layered_native16_at_raw_channel_limit() {
+        let fixture = crate::engine::native::worker::tests::Fixture::new();
+        let dir = fixture.path();
+        let original = dir.join("original.psd");
+        let mut engine = engine::Engine::new();
+        let project = engine.project_id.clone();
+        let small = engine::Document::new_depth(4, 4, 16).unwrap();
+        let original_bytes = psd::encode(&small).unwrap();
+        fs::write(&original, &original_bytes).unwrap();
+        let old = persist(dir, &project, &small, None, &original_bytes, |_| Ok(())).unwrap();
+        let (w, h) = (4096, 2048);
+        let mut doc = engine::Document::new_depth(w, h, 16).unwrap();
+        doc.id = small.id;
+        doc.revision += 1;
+        for name in ["Upper", "Middle"] {
+            let mut layer = engine::Layer::new(name, "paint", w, h);
+            layer.pixels = crate::raster::Raster::new_depth(w, h, 16);
+            doc.layers.insert(0, layer);
+        }
+        doc.layers[0].pixels.set16(31, 49, [12347, 23459, 34571, 60001]);
+        let mut mask = crate::raster::Raster::new_depth(w, h, 16);
+        mask.set16(31, 49, [45673, 45673, 45673, 65535]);
+        doc.layers[0].mask = Some(engine::Mask {
+            enabled: false, linked: true, cache_key: engine::id(),
+            steps: vec![engine::MaskStep {
+                id: engine::id(), kind: "paint".into(), enabled: true, weight: 1., value: 0.,
+                pixels: mask, settings: Value::Null,
+            }],
+        });
+        assert!(psd::encode(&doc).unwrap_err()
+            .starts_with("Uncompressed Photoshop channels alone exceed the 256 MiB file limit"));
+        engine.path = Some(original.clone());
+        engine.file_version = crate::file_safety::snapshot(&original).unwrap();
+        engine.resident_state_mut().unwrap().document = doc.clone();
+        let shared = Arc::new(Mutex::new(engine));
+        let workspace = workspace::attach(&shared);
+        checkpoint(&workspace, dir, &mut Versions::new());
+        assert!(workspace.lock().unwrap().recovery_error.is_none());
+        let new = catalog(dir).into_iter().find(|entry| entry.document_id == doc.id && entry.revision == doc.revision).unwrap();
+        assert!(verify_checkpoint_data(dir, &old).unwrap());
+        let reopened = restore(&workspace, dir, &new.snapshot, &Default::default(), None).unwrap();
+        let reopened = reopened.lock().unwrap();
+        let recovered = &reopened.resident_state().unwrap().document;
+        assert!(!recovered.read_only);
+        assert_eq!((recovered.width, recovered.height, recovered.bit_depth), (w, h, 16));
+        assert_eq!(serde_json::to_value(&recovered.layers).unwrap(), serde_json::to_value(doc.layers).unwrap());
+        assert!(reopened.path.is_none());
+        assert_eq!(fs::read(original).unwrap(), original_bytes);
+    }
 
     #[test]
     fn saving_during_resident_checkpoint_staging_leaves_the_earlier_recovery() {

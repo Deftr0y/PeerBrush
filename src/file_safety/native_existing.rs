@@ -32,14 +32,7 @@ impl<'inventory, 'lease, 'session> NativeExistingDestination<'inventory, 'lease,
         if plan.expected_version().is_none() || plan.backup_name().is_none() {
             return Err("Existing native staging requires an observed original".into());
         }
-        let expected = plan.expected_version().unwrap();
-        inventory.admit_created_backups(
-            expected
-                .bytes
-                .checked_mul(2)
-                .ok_or("Native original/backup coexistence overflow")?,
-            2,
-        )?;
+        inventory.check_replacement_backup_capacity()?;
         let original = open_original(plan.target())?;
         check_target(&plan, Some(&original))?;
         let metadata = metadata::Snapshot::capture(&original, &session.resident(), check)?;

@@ -180,6 +180,7 @@ impl PeerBrush {
             let pending = self.pending_image_open.take().unwrap();
             let workspace = self.workspace.clone();
             self.load_control = Some(pending.control.clone());
+            self.load_project = Some(self.project_id.clone());
             self.job(move || finish(pending, &workspace));
         }
     }

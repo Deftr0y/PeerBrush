@@ -1169,6 +1169,27 @@ fn stroke(
 #[cfg(test)]
 mod window_tests {
     use super::*;
+    #[test]
+    fn new_stroke_renders_the_inside_edge_of_opaque_canvas_at_native_depth() {
+        for depth in [8, 16] {
+            let mut doc = crate::engine::Document::new_depth(12, 12, depth).unwrap();
+            let layer = doc.layers[0].id.clone();
+            for y in 0..12 {
+                for x in 0..12 {
+                    doc.layers[0].pixels.set16(x, y, [65535; 4]);
+                }
+            }
+            let before = doc.preview(None, 12, None, false).unwrap().2;
+            let mut engine = crate::engine::Engine::from_document(doc);
+            engine.edit("human", &[json!({"op":"effect.add","layer":layer,"kind":"stroke"})],
+                None, None, "Add Stroke").unwrap();
+            let rendered = engine.resident_state().unwrap().document.preview(None, 12, None, false).unwrap().2;
+            assert_eq!(&rendered[..4], &[0, 0, 0, 255]);
+            assert_eq!(&rendered[(6*12+6)*4..(6*12+6)*4+4], &[255; 4]);
+            engine.undo("human").unwrap();
+            assert_eq!(engine.resident_state().unwrap().document.preview(None, 12, None, false).unwrap().2, before);
+        }
+    }
     use base64::{engine::general_purpose::STANDARD, Engine as _};
 
     #[test]
