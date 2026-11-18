@@ -10,7 +10,7 @@ unreleased. Production source is `main`. `dev` and existing feature/fix branches
 retain historical and explicitly unqualified WIP checkpoints. Do not delete,
 rewrite or automatically integrate those checkpoints.
 
-See the [0.4.0 draft release notes](release-0.4.md) for the source changes and remaining release work.
+See the [0.5.0 draft release notes](release-0.5.0.md) for the current source changes. Production preparation selects `docs/release-<Cargo version>.md` from the reviewed source and checks its independently supplied SHA-256.
 
 The development path is **version branch → main**. Do not create routine feature
 PRs or run push/feature-to-version CI. A version-to-`main` promotion is a release

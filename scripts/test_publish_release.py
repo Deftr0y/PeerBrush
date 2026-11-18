@@ -293,6 +293,16 @@ class Transactions(unittest.TestCase):
         self.assertEqual(connection.request.call_count, 1)
         connection.close.assert_called_once()
 
+    def test_source_release_notes_select_the_exact_stable_version(self):
+        manifest = self.directory / 'Cargo.toml'
+        manifest.write_text('[package]\nversion = "0.5.0"\n', encoding='utf-8')
+        self.assertEqual(publishing.source_release_notes(self.directory),
+                         ('0.5.0', self.directory / 'docs/release-0.5.0.md'))
+        for version in ('0.5', '0.5.0-rc.1', '../release-0.4'):
+            with self.subTest(version=version), self.assertRaises(ValueError):
+                manifest.write_text('[package]\nversion = ' + json.dumps(version), encoding='utf-8')
+                publishing.source_release_notes(self.directory)
+
     def test_preparation_workflow_has_no_publication_authority_or_ready_report_override(self):
         root = Path(__file__).resolve().parent.parent
         text = (root / '.github/workflows/production.yml').read_text(encoding='utf-8')
@@ -309,7 +319,7 @@ class Transactions(unittest.TestCase):
         preflight = text.split('      - name: Revalidate actual final inputs through the publication preflight\n', 1)[1].split('\n      - ', 1)[0]
         self.assertIn('scripts/publish_release.py --source-root', preflight)
         self.assertIn('--final-input-index-sha256 "$FINAL_INPUTS_INDEX_SHA256"', preflight)
-        self.assertIn('--notes "$GITHUB_WORKSPACE/docs/release-0.4.md" --notes-sha256 "$RELEASE_NOTES_SHA256"', preflight)
+        self.assertIn('--source-notes --notes-sha256 "$RELEASE_NOTES_SHA256"', preflight)
         self.assertNotIn('--execute', preflight)
         self.assertNotIn('GH_TOKEN:', preflight)
 
@@ -340,7 +350,7 @@ class Transactions(unittest.TestCase):
         self.assertIn('scripts/acquire_final_inputs.py --source-root', publish)
         self.assertLess(publish.index('scripts/acquire_final_inputs.py'), publish.index('scripts/publish_release.py'))
         for argument in ['--final-input-index-sha256 "$FINAL_INPUTS_INDEX_SHA256"',
-                         '--selection-sha256 "$SELECTION_SHA256"', '--notes-sha256 "$RELEASE_NOTES_SHA256"', '--execute']:
+                         '--selection-sha256 "$SELECTION_SHA256"', '--source-notes --notes-sha256 "$RELEASE_NOTES_SHA256"', '--execute']:
             self.assertIn(argument, publish)
         self.assertLess(publish.index('scripts/publish_release.py'), publish.index('Retain final manifest only after exact public release readback'))
         self.assertIn('peerbrush-final-candidate/final-release-inventory.json', publish)

@@ -522,6 +522,8 @@ The consolidated source is reviewable in [PR #49](https://github.com/Deftr0y/Pee
 
 PeerBrush 0.5.0 is in development. Its scope is every open item in this backlog, including the November requests above, the installation and publishing foundations, and unfinished acceptance recorded with earlier implementations. When an earlier checkpoint closes an item, retain its evidence and carry forward any separate reopened report or outstanding acceptance check. Standing UI, engine, precision and save-safety requirements apply.
 
+PB-154 production preparation now selects the reviewed notes for the exact Cargo version. The candidate version and independently supplied notes digest must match before any public operation. The 0.5 notes are a development draft.
+
 ### Ordered reliability work
 
 PB-108 is the first reliability priority for PeerBrush 0.5, followed by PB-122 and PB-110.
