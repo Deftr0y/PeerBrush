@@ -1219,3 +1219,31 @@ CI558 passed unfiltered Rust/Clippy on all three platforms, then macOS failed st
 The next reviewed source cohort remains pending one combined replay. PB-108 changes the repeated Windows Save identity open to request metadata access, preserving held/named identity, reparse refusal, bounded transfers, source/cancellation/quota and complete integrity checks. This deliberately avoids requesting file-data access for identity inspection; it does not preserve the incidental repeated data-read permission request. A real-handle regression and a separately ignored, twelve-row 2 MiB I/O diagnostic are prepared, not executed; no speed improvement is established.
 
 CI558 is now terminal: its complete Windows job passed; macOS and Ubuntu failed later acceptance, and the aggregate was skipped. The owned-PNG-root fixture correction and bounded Linux GUI bootstrap/phase diagnostics need fresh replay. The underlying Ubuntu child failure is still unknown. Windows source adds explicit authenticated CURRENT recovery-copy capture and keeps it held through NEW transfer/staging; stable newer-version discovery and immutable historical-package routing remain unfinished. No installation or recovery authority follows. [Pending cohort and unchanged release holds](docs/development-0.3.md#pending-save-and-native-acceptance-cohort-unreleased-2026-10-24-utc). Previous qualified local and mixed normal-Save results remain historical evidence for their exact sources. Remote control and add-ons remain excluded; completed history is preserved.
+
+## PeerBrush 0.5 owner-requested intake
+
+Recorded 2026-11-18 from the November 16 reports. These are 15 acceptance checks for 0.5, not claims that defects have been reproduced or fixes have shipped. Where a check maps to an existing PB item, carry its exact criteria into that item during backlog reconciliation rather than opening duplicate work.
+
+### Save safety and project lifecycle
+
+1. **Autosave at the 256 MiB channel limit.** Reproduce `Autosave failed: Uncompressed Photoshop channels alone exceed the 256 MiB file limit` on the affected build. Verify that a representative large editable project gets a usable recovery checkpoint and reopens; preserve depth, layers and masks. See [PB-105 investigation](docs/large-document-investigation.md) as background, not a verified diagnosis.
+2. **Normal PSD save with a full previous-version backup store.** A full backup store must not strand the current editable document. Verify both a normal save workflow and safe handling of existing destination and backup bytes. Do not bypass overwrite protection or silently discard backups. Track separately from the autosave size failure.
+3. **Image drop onto a second existing tab.** Drop an image into project A, switch to already-open project B, and drop another. Both should import into the intended project. Exercise native drag-and-drop.
+4. **Close blocked after a project operation.** Reproduce the stuck “finish the current operation” flow. Completion or cancellation must unblock close without losing unsaved work; a genuinely active operation must still be guarded.
+
+### Layer stack and AI collaboration
+
+5. **Folder thumbnails.** Show a composite preview of the folder contents inside its icon in the layer panel.
+6. **Contextual layer creation.** With a folder selected, create the new layer inside it. With a layer selected, create just above it in the same parent.
+7. **Hidden row styling.** Make hidden layer rows slightly darker gray while retaining readable selection and lock states.
+8. **Predictable layer and folder drag sorting.** Show the actual target and whether the drop inserts before, after, or into a folder. Confirm the result matches the preview.
+9. **Multi-layer Duplicate and Copy/Paste.** Reproduce the intermittent failures with many selected layers. Check that all intended layers and folder relationships survive and that undo is safe.
+10. **Stroke effect.** Adding Stroke to a layer must visibly work on the canvas. Reproduce the reported no-op and verify the rendered result.
+11. **AI reserves only what it needs.** Improve AI instructions so it reserves the relevant layers or regions while working, not the whole project, and preserves user takeover.
+12. **AI-created layer remains paintable.** After AI finishes working, the user can paint on the created layer. Clear stale AI ownership without overriding an intentional lock.
+13. **Active AI task animation.** Animate the current-task area in the top bar while AI is working; settle when it stops.
+
+### Editing
+
+14. **Transform arrow keys.** While W, E, R or Ctrl+T is active, use arrow presses for one-document-pixel directional adjustments where applicable and fine, mode-appropriate rotation/scale increments. Respect selection, text focus and undo.
+15. **Reduced-resolution editing previews off by default.** Keep the option available as an explicit opt-in. This is the existing PB-157 requirement; verify the default and the toggle rather than creating a duplicate feature.
