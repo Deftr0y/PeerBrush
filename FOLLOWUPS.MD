@@ -530,6 +530,8 @@ Adjustment rows in the layer stack now draw their type icon during normal displa
 
 Layer-stack and mask-step thumbnail requests now reuse the row's borrowed layer metadata. Cached and pending thumbnails avoid a layer-list search on each draw. The source generation guard rejects a row from a replaced document even when its layer ID and revision match. Native timing remains open.
 
+Layer thumbnails reuse the display-profile digest across revisions that share the same immutable ICC profile. A replacement profile is hashed before cache reuse is considered.
+
 PB-122 Photoshop import now validates and retains supported global metadata in one pass. When a known metadata record requires protection, the shared warning names the affected setting. The codec still uses the saved composite for unsupported content. Runtime and Photoshop acceptance remain open.
 
 PB-110 Copy and Paste delivered in the same frame now share one clipboard job. Paste uses the newly copied pixels or layers only after the copy succeeds and the clipboard still contains that copy. Focused regression source covers a wand release followed by both shortcuts at native 8/16-bit depth, failed clipboard writes and clipboard takeover. Runtime verification remains open.

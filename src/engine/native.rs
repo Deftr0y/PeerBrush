@@ -473,6 +473,13 @@ impl<'a> Metadata<'a> {
     pub fn profile(&self) -> Option<&'a [u8]> {
         self.0.icc_profile.as_deref().map(Vec::as_slice)
     }
+    pub(crate) fn share_profile(&self) -> Result<Option<super::scene::MetadataPayload<Vec<u8>>>> {
+        self.0
+            .icc_profile
+            .as_ref()
+            .map(super::scene::MetadataPayload::shared)
+            .transpose()
+    }
     pub fn srgb_tagged(&self) -> bool {
         self.0.srgb_tagged
     }

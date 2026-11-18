@@ -1,5 +1,6 @@
 use super::*;
 use crate::engine::native::{LayerMetadata, NativeDocument};
+use crate::engine::scene::MetadataPayload;
 use crate::render::native_preview::{layer_thumbnail_key, LayerThumbnailKey};
 use crate::workspace::native_dispatch::retryable_source_read;
 use std::time::Instant;
@@ -185,6 +186,7 @@ struct State {
     source: crate::engine::native::DocumentKey,
     layer: Option<String>,
     profile: Option<Option<[u8; 32]>>,
+    profile_source: Option<MetadataPayload<Vec<u8>>>,
     limit: usize,
     textures: HashMap<Key, (TextureHandle, Option<ThumbnailKey>)>,
     pending: Option<(Key, color_sample::Ticket, Option<ThumbnailKey>)>,
@@ -193,6 +195,14 @@ struct State {
     _charge: Arc<crate::psd::memory36::MetadataCharge>,
 }
 impl State {
+    fn same_profile(&self, source: Option<&MetadataPayload<Vec<u8>>>) -> bool {
+        match (self.profile_source.as_ref(), source) {
+            (Some(a), Some(b)) => a.same_allocation(b),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
     fn record_failure(&mut self, target: Key, error: String) {
         if retryable_source_read(&error) {
             self.retry_after = Some(Instant::now() + INVENTORY_RETRY_DELAY);
@@ -320,12 +330,17 @@ impl Thumbnails {
             }
             let charge =
                 crate::psd::memory36::MetadataCharge::reserve(doc.budget(), bytes, &|| Ok(()))?;
-            // The layer panel shares one profile digest across all color targets.
-            let profile = if scope.is_none() {
-                crate::color_profile::prepared::profile_binding(metadata.profile(), &mut || Ok(()))
-                    .ok()
+            // Reuse the digest when edits carried the same admitted profile forward.
+            let (profile_source, profile) = if scope.is_none() {
+                let source = metadata.share_profile()?;
+                let profile = previous.as_ref().filter(|state| state.same_profile(source.as_ref()))
+                    .map_or_else(
+                        || crate::color_profile::prepared::profile_binding(metadata.profile(), &mut || Ok(())).ok(),
+                        |state| state.profile,
+                    );
+                (source, profile)
             } else {
-                None
+                (None, None)
             };
             let textures = previous.as_mut().map_or_else(HashMap::new, |state| {
                 state.textures.retain(|(id, mask, step), (_, old)| {
@@ -346,6 +361,7 @@ impl Thumbnails {
                 source: doc.key(),
                 layer: scope.map(str::to_owned),
                 profile,
+                profile_source,
                 limit: count,
                 textures,
                 pending: None,
