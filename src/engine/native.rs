@@ -603,6 +603,9 @@ impl<'a> Metadata<'a> {
 #[derive(Clone, Copy)]
 pub struct LayerMetadata<'a>(&'a Layer36, DocumentKey);
 impl<'a> LayerMetadata<'a> {
+    pub(crate) fn binding(&self) -> DocumentKey {
+        self.1
+    }
     pub fn id(&self) -> &'a str {
         &self.0.id
     }

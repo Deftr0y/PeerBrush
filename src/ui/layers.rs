@@ -1116,12 +1116,12 @@ impl PeerBrush {
                 ));
                 let floating_row = held && self.layer_drag.as_ref().is_some_and(|drag| drag.id == l.id());
                 let thumb = if layer_type_icon(l).is_none() && ((!held && visible) || floating_row) {
-                    self.thumbnail(ui, doc, l.id(), false)
+                    self.thumbnail(ui, doc, l, false)
                 } else {
                     None
                 };
                 let mask_thumb = if visible && !held && l.mask().is_some() {
-                    self.thumbnail(ui, doc, l.id(), true)
+                    self.thumbnail(ui, doc, l, true)
                 } else {
                     None
                 };

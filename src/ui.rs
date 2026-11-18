@@ -3718,16 +3718,16 @@ impl PeerBrush {
         &mut self,
         ui: &egui::Ui,
         doc: impl Into<DocumentView<'a>>,
-        id: &str,
+        layer: LayerView<'a>,
         mask: bool,
     ) -> Option<TextureHandle> {
         let doc = doc.into();
-        if let Some(native) = doc.native() {
+        if let (Some(native), LayerView::Native(layer)) = (doc.native(), layer) {
             match self.layer_thumbnails.get_layer(
                 &self.shared,
                 &self.project_id,
                 native,
-                id,
+                layer,
                 mask,
                 ui.ctx(),
             ) {
@@ -3738,7 +3738,7 @@ impl PeerBrush {
                 }
             }
         } else {
-            self.thumbnail_for(ui.ctx(), doc.resident().unwrap(), id, mask, None)
+            self.thumbnail_for(ui.ctx(), doc.resident()?, layer.id(), mask, None)
         }
     }
     fn thumbnail_for(

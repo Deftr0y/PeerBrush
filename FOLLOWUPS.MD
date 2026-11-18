@@ -528,6 +528,8 @@ PB-108 is the first reliability priority for PeerBrush 0.5, followed by PB-122 a
 
 Adjustment rows in the layer stack now draw their type icon during normal display and drag, without scheduling an unused color thumbnail. Mask thumbnails still follow the shared renderer. The kickoff package-version checks passed for Windows, macOS and Debian. The build, editor, engine, codec and protocol checks remain pending after Windows Application Control blocked a dependency build script. End-to-end responsiveness remains open.
 
+Layer-stack and mask-step thumbnail requests now reuse the row's borrowed layer metadata. Cached and pending thumbnails avoid a layer-list search on each draw. The source generation guard rejects a row from a replaced document even when its layer ID and revision match. Native timing remains open.
+
 The layer panel now uses an indexed parent lookup for reservation indicators and checks multi-layer selections in one pass through the layer list. Folder descendants and ancestors use the shared reservation rules. Native timing remains unmeasured.
 
 Desktop rendering captures the active proposal with the document frame and reads loading progress from the same frame. The proposal window serializes only the open review. Preview requests and acceptance still validate the live proposal. Native timing remains unmeasured.
