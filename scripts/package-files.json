@@ -153,6 +153,7 @@
     "scripts/assemble_final_inputs.py",
     "scripts/attach_apt_signatures.py",
     "scripts/build_release.py",
+    "scripts/check_notary_credentials.py",
     "scripts/check_site_release.py",
     "scripts/build_windows_setup.py",
     "scripts/check_branch_policy.py",
