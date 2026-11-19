@@ -3959,9 +3959,24 @@ impl PeerBrush {
             ui.close_menu();
         }
         ui.separator();
+        if ui.button("Rename").clicked() {
+            self.begin_rename(doc, l.id());
+            ui.close_menu();
+        }
+        if ui
+            .add_enabled(
+                !self.busy && !self.edit_worker.pending() && !doc.read_only(),
+                egui::Button::new("Duplicate"),
+            )
+            .clicked()
+        {
+            if !self.selection_layers.contains(l.id()) {
+                self.select_content(l.id());
+            }
+            self.duplicate_layers(doc);
+            ui.close_menu();
+        }
         for (title, op, extra) in [
-            ("Rename", "rename", json!({})),
-            ("Duplicate", "layer.duplicate", json!({})),
             (
                 if l.locked() { "Unlock" } else { "Lock" },
                 "layer.update",
@@ -3971,23 +3986,18 @@ impl PeerBrush {
         ] {
             if ui
                 .add_enabled(
-                    !(op == "layer.duplicate" && l.kind() == "group")
-                        && !(op == "mask.add" && l.mask().is_some()),
+                    !(op == "mask.add" && l.mask().is_some()),
                     egui::Button::new(title),
                 )
                 .clicked()
             {
                 self.selected = l.id().to_owned();
-                if op == "rename" {
-                    self.begin_rename(doc, l.id());
+                let extra = if op == "mask.add" {
+                    json!({"value":255,"document_id":doc.id(),"source_revision":doc.revision()})
                 } else {
-                    let extra = if op == "mask.add" {
-                        json!({"value":255,"document_id":doc.id(),"source_revision":doc.revision()})
-                    } else {
-                        extra
-                    };
-                    self.layer_cmd(op, extra, title);
-                }
+                    extra
+                };
+                self.layer_cmd(op, extra, title);
                 ui.close_menu();
             }
         }
@@ -11117,6 +11127,33 @@ mod tests {
                     drop(engine);
                     app.select_content(&other);
                     app.selection_layers.insert(folder.clone());
+                } else if target == &folder && position == group.left_center() + Vec2::new(85., 0.) {
+                    let duplicate = output.shapes.iter().find_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) if text.galley.job.text == "Duplicate" => {
+                            Some(text.visual_bounding_rect().center())
+                        }
+                        _ => None,
+                    }).unwrap();
+                    click(&mut app, &ctx, duplicate);
+                    assert!(app.layer_context.is_none());
+                    assert_eq!(app.selection_layers.len(), 2);
+                    assert!(app.selection_layers.is_disjoint(&selected));
+                    {
+                        let engine = app.shared.lock().unwrap();
+                        let state = engine.resident_state().unwrap();
+                        assert_eq!(state.undo.len(), 1);
+                        assert_eq!(state.document.layers.len(), 6);
+                        let copied_child = state.document.layers.iter().find(|layer| {
+                            layer.id != child && layer.parent.as_ref()
+                                .is_some_and(|parent| app.selection_layers.contains(parent))
+                        }).unwrap();
+                        assert!(copied_child.mask.is_some());
+                        assert_eq!(copied_child.pixels.get16(2, 2),
+                            state.document.layers.iter().find(|layer| layer.id == child)
+                                .unwrap().pixels.get16(2, 2));
+                    }
+                    app.history_action(false);
+                    assert_eq!(app.selection_layers, selected);
                 } else {
                     key(&mut app, &ctx, egui::Key::Escape);
                     assert!(app.layer_context.is_none());
