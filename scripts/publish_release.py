@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import tempfile
 import time
+import tomllib
 from urllib.parse import quote, urlsplit
 
 from final_release import Candidate, LIMIT, MANIFEST, STORE_FORMAT, checksum_bytes, encode, public_records, read, validate_manifest
@@ -591,12 +592,22 @@ def publish(candidate, client, notes, *, execute=False, environment=None):
         return _transfer(client, candidate.directory, candidate.manifest, notes, after_publish=handoff)
 
 
+def source_release_notes(root):
+    version = tomllib.loads((root / 'Cargo.toml').read_text(encoding='utf-8'))['package']['version']
+    if not isinstance(version, str) or not re.fullmatch(r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', version):
+        raise ValueError('Release notes require an exact stable application version.')
+    return version, root / 'docs' / f'release-{version}.md'
+
+
 def main(argv=None):
     import argparse
     from final_release import from_selection
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ['source-root', 'directory', 'output', 'notes']:
+    for name in ['source-root', 'directory', 'output']:
         parser.add_argument('--' + name, required=True, type=Path)
+    notes_input = parser.add_mutually_exclusive_group(required=True)
+    notes_input.add_argument('--notes', type=Path)
+    notes_input.add_argument('--source-notes', action='store_true')
     for name in ['selection-sha256', 'notes-sha256']:
         parser.add_argument('--' + name, required=True)
     selected = parser.add_mutually_exclusive_group(required=True)
@@ -613,13 +624,17 @@ def main(argv=None):
     elif args.final_input_index_sha256 is not None or args.work is not None:
         parser.error('Final-input digest and work options require --final-input-index.')
     try:
-        notes = read(args.notes, 128 * 1024, args.notes_sha256).decode('utf-8')
+        notes_version, notes_path = (source_release_notes(args.source_root)
+                                     if args.source_notes else (None, args.notes))
+        notes = read(notes_path, 128 * 1024, args.notes_sha256).decode('utf-8')
         if args.final_input_index is not None:
             from prepare_final_inputs import MAX_INDEX, consume, json_input
             index = json_input(args.final_input_index, MAX_INDEX, args.final_input_index_sha256)
             candidate = consume(args.source_root, args.directory, args.output, args.work, index, args.selection_sha256)
         else:
             candidate = from_selection(args.source_root, args.directory, args.output, args.selection, args.selection_sha256)
+        if notes_version is not None and notes_version != candidate.manifest['version']:
+            raise ValueError('Reviewed source notes must match the candidate version.')
         # Missing native producers must stop before even requesting a write token.
         allowed = not store_submission_blockers(candidate) if args.submit_store else (
             not candidate.blockers and candidate.assessment.get('production_ready') is True)

@@ -257,9 +257,10 @@ class Msix(unittest.TestCase):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 msix.package_version(invalid, development=True)
 
-    def test_04_series_advances_the_installed_package_version(self):
+    def test_single_digit_series_advance_the_installed_package_version(self):
         self.assertEqual(msix.package_version('0.4.0', previous='1.30.1.0'), '2.4.0.0')
         self.assertEqual(msix.package_version('0.4.1', previous='2.4.0.0'), '2.4.1.0')
+        self.assertEqual(msix.package_version('0.5.0', previous='2.4.1.0'), '2.5.0.0')
         with self.assertRaises(ValueError):
             msix.package_version('0.30.1', previous='2.4.0.0')
 

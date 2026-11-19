@@ -116,7 +116,9 @@ pub(super) fn prepare(
             placement.ok_or("Adjustment placement missing")?
         };
         let mut adjustment = layer(
-            c["name"].as_str().unwrap_or(kind),
+            c["name"]
+                .as_str()
+                .unwrap_or(crate::adjustment::DEFAULT_NAME),
             "adjustment",
             reference(ordinal),
         );

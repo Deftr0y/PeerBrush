@@ -173,5 +173,16 @@ mod tests {
         );
         let mismatched_build = transition.replace("<s:version>1.4.0", "<s:version>1.4.1");
         assert!(read(sign(&mismatched_build).as_bytes(), &key, "0.30.1").is_err());
+        let v05 = transition
+            .replace("<s:version>1.4.0", "<s:version>1.5.0")
+            .replace("<s:shortVersionString>0.4.0", "<s:shortVersionString>0.5.0");
+        assert_eq!(
+            read(sign(&v05).as_bytes(), &key, "0.4.0").unwrap(),
+            Some(("0.5.0".into(), "Brush & pen".into()))
+        );
+        assert_eq!(
+            read(sign(&transition).as_bytes(), &key, "0.5.0").unwrap(),
+            None
+        );
     }
 }

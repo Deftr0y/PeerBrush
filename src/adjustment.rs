@@ -5,6 +5,8 @@ use crate::{
 };
 use serde_json::{json, Value};
 
+pub(crate) const DEFAULT_NAME: &str = "Adjustment layer";
+
 pub(crate) fn definition(c: &Value) -> Result<(&str, Value), String> {
     let kind = c["kind"].as_str().unwrap_or("color_balance");
     if ![
@@ -107,7 +109,7 @@ pub fn add(doc: &mut Document, c: &Value) -> Result<String, String> {
         return Err("Initial version supports up to 100 layers".into());
     }
     let mut adjustment = Layer::new(
-        c["name"].as_str().unwrap_or(kind),
+        c["name"].as_str().unwrap_or(DEFAULT_NAME),
         "adjustment",
         doc.width,
         doc.height,

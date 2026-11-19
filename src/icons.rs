@@ -62,6 +62,7 @@ pub enum Icon {
     Undo,
     Redo,
     Adjust,
+    AdjustmentLayer,
     Frame,
     CanvasBounds,
     TrimAlpha,
@@ -589,6 +590,17 @@ pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, enabled: bool) {
                 painter.circle_filled(point(x, y), 3. * f, Color32::from_rgb(41, 39, 43));
                 painter.circle_stroke(point(x, y), 3. * f, stroke);
             }
+        }
+        Icon::AdjustmentLayer => {
+            let radius = 9.;
+            let half = (0..=12)
+                .map(|step| {
+                    let angle = (step as f32 / 12. - 0.5) * std::f32::consts::PI;
+                    point(radius * angle.cos(), radius * angle.sin())
+                })
+                .collect();
+            painter.add(egui::Shape::convex_polygon(half, color, Stroke::NONE));
+            painter.circle_stroke(point(0., 0.), radius * f, stroke);
         }
         Icon::Levels => {
             line(&[(-11., 10.), (11., 10.)]);

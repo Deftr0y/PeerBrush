@@ -502,6 +502,11 @@ class Packages(unittest.TestCase):
                         packaging.release_version_order('0.4.0'))
         self.assertLess(packaging.release_version_order('0.4.0'),
                         packaging.release_version_order('0.4.1'))
+        self.assertLess(packaging.release_version_order('0.4.1'),
+                        packaging.release_version_order('0.5.0'))
+        updated = packaging.macos_info('0.5.0')
+        self.assertEqual(updated['CFBundleShortVersionString'], '0.5.0')
+        self.assertEqual(updated['CFBundleVersion'], '1.5.0')
         for version in ['0.30.0-beta.1', '0.30.0-dev.01', '0.30.0+build', '00.30.0-dev.1']:
             with self.subTest(version=version), self.assertRaises(ValueError):
                 packaging.macos_info(version)

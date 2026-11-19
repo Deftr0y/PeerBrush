@@ -23,6 +23,7 @@ impl Commands {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Origin {
     Action,
+    Nudge,
     Stroke(eframe::egui::Id),
     SampledStroke(super::sample_input::Id),
     Magnetic(eframe::egui::Id),
@@ -32,6 +33,7 @@ pub(super) enum Origin {
     Group,
     Masks,
     Parameter(eframe::egui::Id),
+    LayerColor(Option<crate::engine::native::DocumentKey>),
     Source(u64),
     CanvasGesture(crate::engine::native::DocumentKey),
     FreeTransform(eframe::egui::Id, Option<crate::engine::native::DocumentKey>),

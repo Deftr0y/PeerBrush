@@ -193,11 +193,16 @@ pub(super) fn timestamp(ms: u64) -> String {
 }
 impl PeerBrush {
     fn recover_version(&mut self, snapshot: String) {
+        if self.busy || self.load_control.is_some() {
+            self.message = "Finish or cancel the current file operation first".into();
+            return;
+        }
         let workspace = self.workspace.clone();
         let dir = self.connection.state_dir.clone();
         let initiating = self.project_id.clone();
         let control = crate::loading::Control::default();
         self.load_control = Some(control.clone());
+        self.load_project = Some(initiating.clone());
         self.job(move || {
             crate::recovery::restore(&workspace, &dir, &snapshot, &control, Some(&initiating))?;
             Ok("Recovered into a new unsaved tab · choose Save As · recovery retained".into())

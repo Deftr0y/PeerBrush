@@ -53,9 +53,9 @@ def dependencies(depends, require_runtime=False):
 def deb_version(version):
     if not isinstance(version, str) or not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?', version):
         raise ValueError('Expected a bounded application SemVer without build metadata')
-    # A Debian epoch lets the 0.4 series upgrade the published 0.30 series.
+    # Retain the epoch introduced in 0.4 to upgrade the published 0.30 series.
     # Tilde keeps prerelease versions before their release.
-    epoch = '1:' if version.startswith('0.4.') else ''
+    epoch = '1:' if version.startswith(('0.4.', '0.5.')) else ''
     return epoch + version.replace('-', '~', 1) + '-1'
 
 

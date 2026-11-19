@@ -317,6 +317,9 @@ class DebianPackage(unittest.TestCase):
         self.assertEqual(deb.deb_version('0.4.0'), '1:0.4.0-1')
         self.assertEqual(deb.deb_version('0.4.0-rc.1'), '1:0.4.0~rc.1-1')
         self.assertEqual(deb.deb_filename('0.4.0'), 'peerbrush_0.4.0-1_amd64.deb')
+        self.assertEqual(deb.deb_version('0.5.0'), '1:0.5.0-1')
+        self.assertEqual(deb.deb_version('0.5.0-rc.1'), '1:0.5.0~rc.1-1')
+        self.assertEqual(deb.deb_filename('0.5.0'), 'peerbrush_0.5.0-1_amd64.deb')
         self.assertIn(
             'Version: 1:0.4.0-1\n',
             deb.control('0.4.0', 'libc6 (>= 2.34)', 123, 'Synthetic Maintainer <builds@example.invalid>'),

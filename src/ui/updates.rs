@@ -623,7 +623,7 @@ impl PeerBrush {
             || self.load_control.is_some()
             || self.lifecycle.is_some()
             || self.save_loss_review.is_some()
-            || self.pending_import.is_some()
+            || !self.pending_import.is_empty()
             || self.pending_image_open.is_some()
             || self.show_new
             || self.parameter_gesture.is_some()

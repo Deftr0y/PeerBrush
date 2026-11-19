@@ -40,7 +40,7 @@ on:
         type: string
         required: true
       release_notes_sha256:
-        description: Independent SHA-256 of reviewed docs/release-0.4.md public notes
+        description: Independent SHA-256 of the reviewed public notes for the exact Cargo version
         type: string
         required: true
       selection_sha256:
@@ -132,7 +132,7 @@ jobs:
             --directory "$RUNNER_TEMP/peerbrush-final-inputs/data" --selection-sha256 "$SELECTION_SHA256" \
             --final-input-index "$RUNNER_TEMP/peerbrush-final-inputs/final-inputs.json" \
             --final-input-index-sha256 "$FINAL_INPUTS_INDEX_SHA256" \
-            --notes "$GITHUB_WORKSPACE/docs/release-0.4.md" --notes-sha256 "$RELEASE_NOTES_SHA256" \
+            --source-notes --notes-sha256 "$RELEASE_NOTES_SHA256" \
             --work "$RUNNER_TEMP/peerbrush-final-verification" --output "$RUNNER_TEMP/peerbrush-final-candidate"
           result=$?
           set -e
@@ -211,7 +211,7 @@ jobs:
             --directory "$RUNNER_TEMP/peerbrush-final-inputs/data" --selection-sha256 "$SELECTION_SHA256" \
             --final-input-index "$RUNNER_TEMP/peerbrush-final-inputs/final-inputs.json" \
             --final-input-index-sha256 "$FINAL_INPUTS_INDEX_SHA256" \
-            --notes "$GITHUB_WORKSPACE/docs/release-0.4.md" --notes-sha256 "$RELEASE_NOTES_SHA256" \
+            --source-notes --notes-sha256 "$RELEASE_NOTES_SHA256" \
             --work "$RUNNER_TEMP/peerbrush-final-verification" --output "$RUNNER_TEMP/peerbrush-final-candidate" --submit-store --execute
       - name: Retain final manifest only after exact public release readback
         if: ${{ false }} # Certification submission does not publish a GitHub release.

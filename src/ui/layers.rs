@@ -5,6 +5,26 @@ use crate::engine::{
 };
 const TREE_INDENT: f32 = 22.0;
 
+fn layer_type_icon(layer: LayerView<'_>) -> Option<(Icon, &'static str)> {
+    match layer.kind() {
+        "group" => Some((Icon::Folder, "Folder")),
+        "adjustment" => Some((Icon::AdjustmentLayer, crate::adjustment::DEFAULT_NAME)),
+        _ => None,
+    }
+}
+
+fn paint_layer_type(painter: &egui::Painter, rect: Rect, icon: Icon, thumbnail: Option<&TextureHandle>) {
+    if matches!(icon, Icon::Folder) {
+        if let Some(texture) = thumbnail {
+            let size = texture.size_vec2();
+            let scale = (rect.width() * 0.49 / size.x).min(rect.height() * 0.31 / size.y);
+            let image = Rect::from_center_size(rect.center() + Vec2::new(0.0, 1.5), size * scale);
+            painter.image(texture.id(), image, Rect::from_min_max(Pos2::ZERO, Pos2::new(1., 1.)), Color32::WHITE);
+        }
+    }
+    icons::paint(painter, rect, icon, true);
+}
+
 fn sweep_hits_eye(from: Pos2, to: Pos2, eye: Rect) -> bool {
     if !eye.is_positive() {
         return false;
@@ -30,12 +50,18 @@ fn sweep_hits_eye(from: Pos2, to: Pos2, eye: Rect) -> bool {
     enter <= exit
 }
 
+pub(super) const COLOR_LABEL_OPTIONS: [&str; 13] = [
+    "none", "red", "orange", "yellow", "green", "cyan", "blue", "violet", "gray", "seafoam",
+    "indigo", "magenta", "fuchsia",
+];
+
 pub(super) fn label_color(label: &str) -> Option<Color32> {
     let [r, g, b] = match label {
         "red" => [232, 104, 105],
         "orange" => [237, 143, 85],
         "yellow" => [238, 196, 99],
         "green" => [136, 192, 101],
+        "cyan" => [84, 194, 206],
         "blue" => [107, 165, 222],
         "violet" => [174, 136, 218],
         "gray" => [164, 161, 172],
@@ -43,9 +69,128 @@ pub(super) fn label_color(label: &str) -> Option<Color32> {
         "indigo" => [129, 139, 227],
         "magenta" => [221, 116, 192],
         "fuchsia" => [238, 123, 159],
+        _ if label.starts_with('#') => {
+            let [r, g, b, _] = color::parse_hex(label)?;
+            [r, g, b]
+        }
         _ => return None,
     };
     Some(Color32::from_rgb(r, g, b))
+}
+
+pub(super) struct ColorEdit {
+    document: String,
+    revision: u64,
+    native: Option<crate::engine::native::DocumentKey>,
+    layer: String,
+    hsv: egui::ecolor::Hsva,
+    hex: String,
+    field: Option<(u16, TextureHandle)>,
+}
+impl ColorEdit {
+    pub(super) fn new(doc: DocumentView<'_>, layer: LayerView<'_>) -> Self {
+        let rgb = label_color(layer.color_label()).unwrap_or(ACCENT).to_array();
+        Self {
+            document: doc.id().to_owned(),
+            revision: doc.revision(),
+            native: doc.native().map(|doc| doc.key()),
+            layer: layer.id().to_owned(),
+            hsv: egui::ecolor::Hsva::from_srgba_unmultiplied(rgb),
+            hex: color::format_hex(rgb),
+            field: None,
+        }
+    }
+
+    fn matches(&self, doc: DocumentView<'_>) -> bool {
+        self.document == doc.id()
+            && self.revision == doc.revision()
+            && self.native == doc.native().map(|doc| doc.key())
+    }
+
+    fn pixel(&self) -> Option<Pixel> {
+        let value = self.hex.trim();
+        let digits = value.strip_prefix('#').unwrap_or(value);
+        if !matches!(digits.len(), 3 | 6) {
+            return None;
+        }
+        color::parse_hex(digits)
+    }
+}
+
+impl PeerBrush {
+    pub(super) fn set_layer_color(&mut self, doc: DocumentView<'_>, layer: &str, label: &str) {
+        if doc.find_layer(layer).is_none_or(|layer| layer.color_label() == label) {
+            return;
+        }
+        self.finish_parameter(true);
+        self.cancel_free_transform();
+        self.close_proposal();
+        self.apply_action(
+            vec![json!({"op":"layer.update", "layer":layer, "color_label":label})],
+            "Layer color label",
+            Some((doc.id(), doc.revision())),
+            edit_job::Origin::LayerColor(doc.native().map(|doc| doc.key())),
+        );
+    }
+
+    pub(super) fn layer_color_window(
+        &mut self,
+        ctx: &egui::Context,
+        doc: DocumentView<'_>,
+        reserved: &HashSet<&str>,
+    ) {
+        let Some(mut draft) = self.layer_color_edit.take() else { return };
+        if !draft.matches(doc) || doc.read_only()
+            || doc.find_layer(&draft.layer).is_none_or(|layer| layer.locked())
+            || reserved.contains(draft.layer.as_str())
+        {
+            return;
+        }
+        let mut open = true;
+        let mut cancelled = false;
+        let mut apply = None;
+        egui::Window::new("Custom layer color")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                if color::picker(ui, &mut draft.hsv, &mut draft.field, 144., |hsv| {
+                    hsv.to_srgba_unmultiplied()
+                }).is_some() {
+                    draft.hex = color::format_hex(draft.hsv.to_srgba_unmultiplied());
+                    ctx.request_repaint();
+                }
+                ui.horizontal(|ui| {
+                    let label = ui.label("HEX");
+                    let entry = ui.add(egui::TextEdit::singleline(&mut draft.hex)
+                        .char_limit(7).desired_width(72.))
+                        .labelled_by(label.id);
+                    if entry.changed() {
+                        if let Some(pixel) = draft.pixel() {
+                            draft.hsv = egui::ecolor::Hsva::from_srgba_unmultiplied(pixel);
+                            ctx.request_repaint();
+                        }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    let pixel = draft.pixel();
+                    if ui.add_enabled(
+                        pixel.is_some() && !self.busy && !self.edit_worker.pending(),
+                        dialogs::primary("Apply"),
+                    ).clicked() {
+                        apply = pixel.map(color::format_hex);
+                    }
+                    cancelled = ui.button("Cancel").clicked();
+                });
+            });
+        if let Some(hex) = apply {
+            self.set_layer_color(doc, &draft.layer, &format!("#{hex}"));
+        } else if open && !cancelled && !ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+            self.layer_color_edit = Some(draft);
+        } else {
+            ctx.request_repaint();
+        }
+    }
 }
 
 pub(super) const BLEND_ENDPOINTS: [&str; 4] = ["Black low", "Black high", "White low", "White high"];
@@ -635,9 +780,18 @@ impl PeerBrush {
             let (grip, grip_response) = ui.allocate_exact_size(Vec2::new(6.0, 28.0), egui::Sense::hover());
             if show_details {
                 let label = l.color_label();
-                if let Some(color) = label_color(label) {
+                let draft = self.layer_color_edit.as_ref()
+                    .filter(|draft| !reserved && !l.locked() && draft.layer == l.id() && draft.matches(doc))
+                    .and_then(ColorEdit::pixel);
+                let color = draft.map(|[r, g, b, _]| Color32::from_rgb(r, g, b))
+                    .or_else(|| label_color(label));
+                if let Some(color) = color {
                     ui.painter().circle_filled(grip.center() - Vec2::new(0., 10.), 2.5, color);
-                    grip_response.on_hover_text(format!("Layer color label · {label}"));
+                    grip_response.on_hover_text(if draft.is_some() {
+                        "Layer color preview".to_owned()
+                    } else {
+                        format!("Layer color label · {label}")
+                    });
                 }
                 for x in 0..2 {
                     for y in 0..3 {
@@ -720,18 +874,16 @@ impl PeerBrush {
             if !show_details {
                 return disclosure;
             }
-            if l.kind() == "group" {
+            if let Some((icon, title)) = layer_type_icon(l) {
                 let (r, response) = ui.allocate_exact_size(Vec2::splat(30.0), egui::Sense::click());
-                icons::paint(ui.painter(), r, Icon::Folder, true);
+                paint_layer_type(ui.painter(), r, icon, thumb);
+                response.widget_info(|| {
+                    egui::WidgetInfo::labeled(egui::WidgetType::Button, response.enabled(), title)
+                });
                 if response.clicked() {
                     self.select_row(ui, doc, tree.order, l.id());
                 }
-            } else if l.kind() == "adjustment" {
-                let (r, response) = ui.allocate_exact_size(Vec2::splat(30.), egui::Sense::click());
-                icons::paint(ui.painter(), r, Icon::Adjust, true);
-                if response.clicked() {
-                    self.select_row(ui, doc, &tree.order, l.id());
-                }
+                response.on_hover_text(title);
             } else if self
                 .thumb_button(
                     ui,
@@ -1051,13 +1203,21 @@ impl PeerBrush {
                 let target=original.get(slot).map(|&(i,depth)|(view.layer(i).unwrap(),depth));
                 let (parent,before)=if let Some((target,depth))=target {
                     let y=pointer.y-(base.y+slot as f32*46.0);
-                    if target.kind()=="group" && (10.0..32.0).contains(&y) && !drag.ids.iter().any(|id|id==target.id()) {
+                    if target.kind()=="group" && pointer.x >= base.x+45.0 && (10.0..32.0).contains(&y) && !drag.ids.iter().any(|id|id==target.id()) {
                         drop_folder=Some(target.id().to_owned());open.to_mut().remove(target.id());
                         (Some(target.id()),view.layers().find(|l|l.parent()==Some(target.id())&&!drag.ids.iter().any(|id|id==l.id())).map(|l|l.id()))
                     } else {
-                        let parent=if depth>0 && pointer.x<base.x+45.0 {None}else{target.parent()};
-                        let before=if y<21.0 && !drag.ids.iter().any(|id|id==target.id()) {Some(target.id())}else{
-                            original.iter().skip(slot+1).map(|&(i,_)|view.layer(i).unwrap()).find(|l|l.parent()==parent&&!drag.ids.iter().any(|id|id==l.id())).map(|l|l.id())
+                        let mut anchor = target;
+                        let mut start = slot;
+                        if depth > 0 && pointer.x < base.x + 45.0 {
+                            while let Some(parent) = anchor.parent().and_then(|id| view.find_layer(id)) {
+                                anchor = parent;
+                            }
+                            start = original.iter().position(|&(index, _)| view.layer(index).is_some_and(|l| l.id() == anchor.id())).unwrap_or(slot);
+                        }
+                        let parent=anchor.parent();
+                        let before=if y<21.0 && !drag.ids.iter().any(|id|id==anchor.id()) {Some(anchor.id())}else{
+                            original.iter().skip(start+1).map(|&(i,_)|view.layer(i).unwrap()).find(|l|l.parent()==parent&&!drag.ids.iter().any(|id|id==l.id())).map(|l|l.id())
                         };
                         (parent,before)
                     }
@@ -1109,13 +1269,13 @@ impl PeerBrush {
                     egui::WidgetType::Button, response.enabled(), self.selection_layers.contains(l.id()), l.name(),
                 ));
                 let floating_row = held && self.layer_drag.as_ref().is_some_and(|drag| drag.id == l.id());
-                let thumb = if l.kind() != "group" && (visible || floating_row) {
-                    self.thumbnail(ui, doc, l.id(), false)
+                let thumb = if l.kind() != "adjustment" && ((!held && visible) || floating_row) {
+                    self.thumbnail(ui, doc, l, false)
                 } else {
                     None
                 };
                 let mask_thumb = if visible && !held && l.mask().is_some() {
-                    self.thumbnail(ui, doc, l.id(), true)
+                    self.thumbnail(ui, doc, l, true)
                 } else {
                     None
                 };
@@ -1126,8 +1286,16 @@ impl PeerBrush {
                 } else {
                     if visible {
                         let selected=self.selection_layers.contains(l.id());
+                        let hidden = !tree.visible(l);
                         let hover=ui.ctx().animate_bool_with_time(response.id.with("hover"),response.hovered(),0.08);
-                        if selected {ui.painter().rect_filled(rect,5,Color32::from_rgb(74,48,71).gamma_multiply(solo_opacity));
+                        if hidden && !selected {
+                            ui.painter().rect_filled(rect,5,Color32::BLACK.gamma_multiply(0.16*solo_opacity));
+                        }
+                        if selected {ui.painter().rect_filled(rect,5,if hidden {
+                            Color32::from_rgb(61,43,60)
+                        } else {
+                            Color32::from_rgb(74,48,71)
+                        }.gamma_multiply(solo_opacity));
                             ui.painter().rect_filled(Rect::from_min_size(rect.min+Vec2::new(0.0,5.0),Vec2::new(2.0,32.0)),1,ACCENT.gamma_multiply(solo_opacity));}
                         else if hover>0.0 {ui.painter().rect_filled(rect,5,Color32::WHITE.gamma_multiply(0.035*hover*solo_opacity));}
                         if ai {
@@ -1169,7 +1337,7 @@ impl PeerBrush {
                 painter.line_segment([rect.left_top(),rect.left_bottom()],Stroke::new(2.0_f32,ACCENT));
                 let x=rect.left()+75.0+depth as f32*TREE_INDENT;
                 let image_rect=Rect::from_min_size(egui::pos2(x,rect.top()+6.0),Vec2::splat(30.0));
-                if layer.kind()=="group"{icons::paint(&painter,image_rect,Icon::Folder,true);}
+                if let Some((icon,_))=layer_type_icon(layer){paint_layer_type(&painter,image_rect,icon,thumb.as_ref());}
                 else if let Some(t)=thumb {painter.image(t.id(),image_rect,Rect::from_min_max(Pos2::ZERO,Pos2::new(1.0,1.0)),Color32::WHITE);}
                 let label=if drag.ids.len()>1 {format!("{}  +{}",layer.name(),drag.ids.len()-1)}else{layer.name().to_owned()};
                 painter.text(egui::pos2(x+38.0,rect.center().y),egui::Align2::LEFT_CENTER,label,egui::FontId::proportional(12.0),Color32::WHITE);

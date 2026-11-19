@@ -7,6 +7,7 @@ use super::{
 };
 use crate::engine::scene::SceneSnapshot;
 use std::sync::{MutexGuard, TryLockError};
+use std::time::{Duration, Instant};
 
 const PROJECT_BUSY: &str = "Project is busy; source capture deferred";
 const WORKSPACE_BUSY: &str = "Workspace is busy; source capture deferred";
@@ -14,6 +15,19 @@ const WORKSPACE_BUSY: &str = "Workspace is busy; source capture deferred";
 pub(crate) fn retryable_source_read(error: &str) -> bool {
     matches!(error, PROJECT_BUSY | WORKSPACE_BUSY | source_runtime::INVENTORY_CHECK_BUSY)
         || error == crate::large_document::Error::Busy.to_string()
+}
+
+/// For off-UI source admission and read-only checks. Retrying publication is unsafe.
+pub(crate) fn retry_source_read<T>(mut read: impl FnMut() -> Result<T, String>) -> Result<T, String> {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        match read() {
+            Err(error) if retryable_source_read(&error) && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            result => return result,
+        }
+    }
 }
 
 pub(crate) fn try_source_engine(shared: &Shared) -> Result<MutexGuard<'_, Engine>, String> {
@@ -163,5 +177,39 @@ mod tests {
         registry.lock().unwrap().exiting = false;
         registry.lock().unwrap().entries[0].handle = Handle::Owned(shared());
         assert!(runtime_for(&engine).is_err());
+    }
+
+    #[test]
+    fn import_source_admission_retries_for_the_original_tab_after_switching() {
+        let fixture = crate::engine::native::worker::tests::Fixture::new();
+        let (runtime, _connection) = fixture.runtime();
+        let first = shared();
+        let registry = attach(&first);
+        let second = new_project(&first, 8, 8, 16, None).unwrap();
+        let second_id = second.lock().unwrap().project_id.clone();
+        select(&first, &second_id).unwrap();
+
+        let mut held = registry.lock().unwrap();
+        held.source_runtime = Some(runtime.clone());
+        let (blocked, waiting) = std::sync::mpsc::channel();
+        let observed = std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                let mut blocked = Some(blocked);
+                retry_source_read(|| {
+                    let result = runtime_for(&first);
+                    if matches!(&result, Err(error) if error == WORKSPACE_BUSY) {
+                        if let Some(blocked) = blocked.take() {
+                            blocked.send(()).unwrap();
+                        }
+                    }
+                    result
+                })
+            });
+            let received = waiting.recv_timeout(Duration::from_secs(5));
+            drop(held);
+            received.unwrap();
+            worker.join().unwrap().unwrap()
+        });
+        assert!(Arc::ptr_eq(&observed, &runtime));
     }
 }

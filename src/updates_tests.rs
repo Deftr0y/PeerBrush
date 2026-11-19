@@ -75,10 +75,11 @@ fn parse(
 }
 
 #[test]
-fn official_release_selection_handles_the_04_transition_without_offering_a_downgrade() {
+fn official_release_selection_orders_04_and_05_without_offering_a_downgrade() {
     let previous = release("0.30.1", "PeerBrush-0.30.1-Windows-x64.zip");
     let next = release("0.4.0", "PeerBrush-0.4.0-Windows-x64.zip");
     let patch = release("0.4.1", "PeerBrush-0.4.1-Windows-x64.zip");
+    let v05 = release("0.5.0", "PeerBrush-0.5.0-Windows-x64.zip");
     let report = parse(
         json!([previous, next, patch]),
         "0.30.1",
@@ -96,6 +97,18 @@ fn official_release_selection_handles_the_04_transition_without_offering_a_downg
     .unwrap()
     .release_version
     .is_none());
+    let releases = json!([v05, patch, next, previous]);
+    assert_eq!(
+        parse(releases.clone(), "0.4.1", Channel::Stable, Target::WindowsX64)
+            .unwrap()
+            .release_version
+            .as_deref(),
+        Some("0.5.0")
+    );
+    assert!(parse(releases, "0.5.0", Channel::Stable, Target::WindowsX64)
+        .unwrap()
+        .release_version
+        .is_none());
 }
 
 #[test]

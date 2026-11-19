@@ -553,6 +553,7 @@ pub struct Engine {
     pub capture_panel: Option<String>,
     pub mcp_clients: BTreeMap<String, u64>,
     pub activity: String,
+    pub(crate) agent_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     pub ai_change: Option<runtime_value::RuntimeValue<AiChange>>,
     ai_serial: u64,
     pub focus_requested: bool,
@@ -882,6 +883,7 @@ impl Engine {
             capture_panel: None,
             mcp_clients: BTreeMap::new(),
             activity: String::new(),
+            agent_calls: Default::default(),
             ai_change: None,
             ai_serial: 0,
             focus_requested: false,
@@ -1156,15 +1158,12 @@ impl Engine {
                 });
         }
         if ["layer.add", "image.import", "source.add", "path.create"].contains(&op) {
-            return c["parent"]
-                .as_str()
-                .map(|p| {
-                    vec![Scope {
-                        target: Some(p.into()),
-                        rect: None,
-                    }]
-                })
-                .unwrap_or_default();
+            let parent = if op == "layer.add" {
+                crate::grouping::layer_insert_slot(doc.into(), c).ok().and_then(|(_, parent)| parent)
+            } else {
+                c["parent"].as_str().map(str::to_owned)
+            };
+            return parent.into_iter().map(|p| Scope::layer(&p)).collect();
         }
         if [
             "layer.reorder",
@@ -2213,18 +2212,11 @@ impl Engine {
             if c.get("color").is_some() {
                 layer.color = color(c);
             }
-            if let Some(parent) = c.get("parent").and_then(Value::as_str) {
-                if !self
-                    .authority.resident_state()?.document
-                    .layers
-                    .iter()
-                    .any(|l| l.id == parent && l.kind == "group")
-                {
-                    return Err("Parent must be an existing group".into());
-                }
-                layer.parent = Some(parent.into());
-            }
-            self.authority.resident_state_mut()?.document.layers.insert(0, layer);
+            let (index, parent) = crate::grouping::layer_insert_slot(
+                (&self.authority.resident_state()?.document).into(), c,
+            )?;
+            layer.parent = parent;
+            self.authority.resident_state_mut()?.document.layers.insert(index, layer);
             return Ok(());
         }
         let i = self
@@ -2548,7 +2540,7 @@ impl Engine {
                     let settings = c
                         .get("settings")
                         .cloned()
-                        .unwrap_or_else(|| crate::effects::defaults(kind));
+                        .unwrap_or_else(|| crate::effects::new_layer_effect_defaults(kind));
                     let mut settings = crate::effects::normalized(kind, &settings)?;
                     let global = global_light_request(kind, c)?;
                     apply_global_light_request(&mut settings, &mut doc.psd_global_angle, global);
