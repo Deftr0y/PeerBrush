@@ -65,7 +65,7 @@ mod tests {
     }
     #[test]
     fn deferred_close_reviews_unsaved_tabs_after_file_completion_or_cancellation() {
-        for cancel_file in [false, true] {
+        for (cancel_file, choose_content) in [(false, false), (true, false), (false, true)] {
             let (mut app, ctx, root, second) = fixture(16);
             app.recovery.open = false;
             let project = second.lock().unwrap().project_id.clone();
@@ -82,8 +82,33 @@ mod tests {
             frame(&mut app, &ctx, vec![]);
             assert_eq!(app.deferred_file_close, Some(Intent::Close(project.clone())));
             assert!(app.lifecycle.is_none());
+            if choose_content {
+                let engine = second.lock().unwrap();
+                let doc = crate::engine::view::current(&engine);
+                app.pending_import.insert(project.clone(), PendingImport {
+                    project: project.clone(),
+                    document: doc.id().into(),
+                    revision: doc.revision(),
+                    native: None,
+                    files: Vec::new(),
+                });
+            }
             release.send(()).unwrap();
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            if choose_content {
+                while app.jobs.contains(&project) {
+                    assert!(std::time::Instant::now() < deadline, "{}", app.message);
+                    std::thread::sleep(Duration::from_millis(5));
+                    frame(&mut app, &ctx, vec![]);
+                }
+                assert!(app.lifecycle.is_none());
+                assert_eq!(app.deferred_file_close, Some(Intent::Close(project.clone())));
+                frame(&mut app, &ctx, vec![egui::Event::Key {
+                    key: egui::Key::Escape, physical_key: None, pressed: true, repeat: false,
+                    modifiers: Default::default(),
+                }]);
+                assert!(!app.pending_import.contains_key(&project));
+            }
             while app.lifecycle.is_none() {
                 assert!(std::time::Instant::now() < deadline, "{}", app.message);
                 std::thread::sleep(Duration::from_millis(5));
@@ -866,6 +891,14 @@ impl Review {
 }
 
 impl PeerBrush {
+    fn pending_file_choice(&self, intent: &Intent) -> bool {
+        let includes = |project: &str| {
+            intent == &Intent::Exit || matches!(intent, Intent::Close(id) if id.as_str() == project)
+        };
+        self.pending_import.keys().any(|project| includes(project))
+            || self.pending_image_open.as_ref().is_some_and(|choice| includes(&choice.initiating))
+    }
+
     fn close_file_work_pending(&self, intent: &Intent) -> bool {
         let affects_active =
             intent == &Intent::Exit || matches!(intent, Intent::Close(id) if id == &self.project_id);
@@ -896,11 +929,7 @@ impl PeerBrush {
             self.message = "Waiting for the current operation before close review · Esc cancels closing".into();
             return;
         }
-        let import_pending = match &intent {
-            Intent::Close(project) => self.pending_import.contains_key(project),
-            Intent::Exit => !self.pending_import.is_empty(),
-        };
-        if import_pending {
+        if self.pending_file_choice(&intent) {
             self.message = "Finish or cancel the image-content choice in its project tab before closing.".into();
             return;
         }
@@ -913,7 +942,6 @@ impl PeerBrush {
                 || self.source_editor.is_some()
                 || self.filter_editor.is_some()
                 || self.refinement.is_some()
-                || self.pending_image_open.is_some()
                 || self.rename_edit.is_some()
                 || self.color_editor.is_some()
                 || self.proposal_review.is_some()
@@ -1074,10 +1102,12 @@ impl PeerBrush {
 
     pub(super) fn lifecycle_dialog(&mut self, ctx: &egui::Context) {
         if let Some(intent) = self.deferred_file_close.clone() {
-            if ctx.input_mut(|i| i.consume_key(i.modifiers, egui::Key::Escape)) {
+            let visible_choice = self.pending_image_open.is_some()
+                || self.pending_import.contains_key(&self.project_id);
+            if !visible_choice && ctx.input_mut(|i| i.consume_key(i.modifiers, egui::Key::Escape)) {
                 self.deferred_file_close = None;
                 self.message = "Close canceled · project remains open".into();
-            } else if !self.close_file_work_pending(&intent) {
+            } else if !self.close_file_work_pending(&intent) && !self.pending_file_choice(&intent) {
                 self.deferred_file_close = None;
                 self.request_close(intent);
             }

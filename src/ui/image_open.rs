@@ -131,7 +131,7 @@ pub(super) fn finish(
 }
 
 impl PeerBrush {
-    pub(super) fn image_open_dialog(&mut self, ctx: &egui::Context) {
+    pub(super) fn poll_image_open_choice(&mut self) {
         while let Ok(pending) = self.image_open_rx.try_recv() {
             self.pending_image_open = Some(pending);
         }
@@ -142,9 +142,13 @@ impl PeerBrush {
             self.pending_image_open = None;
             self.message = "Open canceled · current projects preserved".into();
         }
+    }
+
+    pub(super) fn image_open_dialog(&mut self, ctx: &egui::Context) {
         let Some(pending) = &mut self.pending_image_open else {
             return;
         };
+        let can_open = !self.jobs.contains(&pending.initiating) && self.load_control.is_none();
         let (choice, count) = pending.source.choice();
         let choice = choice.unwrap_or("content");
         let mut open = true;
@@ -168,7 +172,7 @@ impl PeerBrush {
                 content_choice(ui, choice, count, sizes, &mut pending.index);
                 ui.horizontal(|ui| {
                     apply = ui
-                        .add_enabled(!self.busy, dialogs::primary("Open"))
+                        .add_enabled(can_open, dialogs::primary("Open"))
                         .clicked();
                     cancel = ui.button("Cancel").clicked();
                 });
@@ -176,12 +180,14 @@ impl PeerBrush {
         if cancel || !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.pending_image_open = None;
             self.message = "Open canceled · current projects preserved".into();
+            ctx.request_repaint();
         } else if apply {
             let pending = self.pending_image_open.take().unwrap();
             let workspace = self.workspace.clone();
+            let initiating = pending.initiating.clone();
             self.load_control = Some(pending.control.clone());
-            self.load_project = Some(self.project_id.clone());
-            self.job(move || finish(pending, &workspace));
+            self.load_project = Some(initiating.clone());
+            self.project_job(initiating, move || finish(pending, &workspace));
         }
     }
 }
@@ -272,7 +278,11 @@ mod tests {
         assert!(finish(changed, &app.workspace).is_err());
         assert_eq!(crate::workspace::handles(&root).len(), 1);
         std::fs::write(&path, &bytes).unwrap();
+        let initiating = app.project_id.clone();
         app.pending_image_open = Some(pending(&app, &path));
+        let other = crate::workspace::new_project(&root, 64, 64, 8, None).unwrap();
+        let other_id = other.lock().unwrap().project_id.clone();
+        crate::workspace::select(&root, &other_id).unwrap();
         let mut output = frame(&mut app, &ctx, vec![]);
         for _ in 0..3 {
             output = frame(&mut app, &ctx, vec![]);
@@ -302,15 +312,22 @@ mod tests {
                 ],
             );
         }
+        assert_eq!(app.project_id, other_id);
+        assert!(app.jobs.contains(&initiating));
+        assert!(!app.jobs.contains(&other_id));
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while crate::workspace::handles(&root).len() < 2 && std::time::Instant::now() < deadline {
+        while (app.jobs.contains(&initiating) || crate::workspace::handles(&root).len() < 3)
+            && std::time::Instant::now() < deadline
+        {
             std::thread::sleep(Duration::from_millis(10));
             frame(&mut app, &ctx, vec![]);
         }
-        assert_eq!(crate::workspace::handles(&root).len(), 2);
+        assert!(!app.jobs.contains(&initiating));
+        assert_eq!(app.project_id, other_id);
+        assert_eq!(crate::workspace::handles(&root).len(), 3);
         let opened = crate::workspace::handles(&root)
             .into_iter()
-            .find(|s| !Arc::ptr_eq(s, &root))
+            .find(|s| !Arc::ptr_eq(s, &root) && !Arc::ptr_eq(s, &other))
             .unwrap();
         let e = opened.lock().unwrap();
         assert_eq!(

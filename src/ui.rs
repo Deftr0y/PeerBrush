@@ -2962,8 +2962,6 @@ impl PeerBrush {
         });
     }
     fn import_dialog(&mut self, ctx: &egui::Context) {
-        self.pending_import
-            .retain(|project, _| crate::workspace::get_in(&self.workspace, project).is_ok());
         let Some(pending) = self.pending_import.get_mut(&self.project_id) else {
             return;
         };
@@ -3000,6 +2998,7 @@ impl PeerBrush {
         if cancel || !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.pending_import.remove(&self.project_id);
             self.message = "Import canceled".into();
+            ctx.request_repaint();
         } else if apply {
             self.commit_import();
         }
@@ -7096,6 +7095,9 @@ impl PeerBrush {
             self.message = result.unwrap_or_else(|e| e).into();
             self.last_preview = None;
         }
+        self.poll_image_open_choice();
+        self.pending_import
+            .retain(|project, _| crate::workspace::get_in(&self.workspace, project).is_ok());
         if self.save_loss_review.is_some() {
             self.save_loss_dialog(ctx);
         } else {
@@ -7189,8 +7191,11 @@ impl PeerBrush {
         self.cancel_interrupted_text_drag(ctx, doc);
         self.sync_free_transform(ctx, doc);
         if self.lifecycle.is_none() && !self.lifecycle_frame {
-            self.import_dialog(ctx);
-            self.image_open_dialog(ctx);
+            if self.pending_image_open.is_some() {
+                self.image_open_dialog(ctx);
+            } else {
+                self.import_dialog(ctx);
+            }
             self.open_activated_file(ctx);
         }
         if self.rename_edit.as_ref().is_some_and(|edit| {
