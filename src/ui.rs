@@ -2847,8 +2847,10 @@ impl PeerBrush {
                 if paths.len() > 16 {
                     return Err("Import at most 16 images at once".into());
                 }
+                use crate::workspace::native_dispatch::{retry_source_read, runtime_for};
                 let runtime = (native.is_some() && !paths.is_empty())
-                    .then(|| crate::workspace::native_dispatch::runtime_for(&shared)).transpose()?;
+                    .then(|| retry_source_read(|| runtime_for(&shared)))
+                    .transpose()?;
                 let session = runtime
                     .as_ref()
                     .map(|runtime| runtime.begin_foreground())
@@ -2863,7 +2865,7 @@ impl PeerBrush {
                                 .ok_or("Missing image extension")?;
                             let format = crate::image_import::native::OpenFormat::from_path(&path)
                                 .ok_or("Unsupported image format")?;
-                            let check = || session.check();
+                            let check = || retry_source_read(|| session.check());
                             let (choice, digest, icon_sizes) = match format {
                                 crate::image_import::native::OpenFormat::Png => {
                                     let inspection = crate::image_import::prepared_png::apng::inspect_layer(

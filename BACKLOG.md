@@ -54,7 +54,7 @@ The [0.5 owner intake](https://github.com/Deftr0y/PeerBrush/blob/15da63fe42a821e
 **Independent project tabs and cross-tab editing · 0.5 · first batch · Implemented / verification pending**
 
 - **03 Image drops.** With two existing tabs, drop a different image into each and switch while the first import is pending. Verify native drag-and-drop, on-tab and canvas routing, correct projects, unchanged original layers and independent undo. Exercise concurrent inspections and cancel a content choice in one project without touching the other. Keep empty-strip new-project drop under the existing PB-119 behavior. [Project behavior](docs/projects.md) · [File-drop entry point](src/ui/file_drop.rs)
-  - Source routes file drops to visible tab targets and owns import inspection, content choices and commits by project. Regression source exercises two tabs with independent 16-bit image data and undo. Native drag-and-drop execution remains pending.
+  - Source routes file drops to visible tab targets and owns import inspection, content choices and commits by project. Native inspection retries transient source contention for the same destination. Regression source covers independent 16-bit image data and undo in two tabs, and native admission during transient contention. Native drag-and-drop execution remains pending.
 - Earlier cross-tab typed clipboard, copy/move preview, independent undo and AI isolation have development evidence. Recheck the affected flows alongside the import change. [Historical cross-tab record](FOLLOWUPS.MD#earlier-requested-work--implementation-records)
 
 ### PB-029
