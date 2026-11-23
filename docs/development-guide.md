@@ -6,9 +6,12 @@ PeerBrush is a GPL v3 native image editor built with Rust, egui/eframe and wgpu.
 
 Develop directly on the appropriate version branch. The active branch is
 `version/0.5`, with 0.5.0 as the working version. Development builds remain
-unreleased. Production source is `main`. `dev` and existing feature/fix branches
-retain historical and explicitly unqualified WIP checkpoints. Do not delete,
-rewrite or automatically integrate those checkpoints.
+unreleased. Production source is `main`. Unmerged feature/fix branches retain
+historical and explicitly unqualified WIP checkpoints. Do not delete, rewrite or
+automatically integrate those checkpoints. Delete branches whose changes are
+already in `main`: the tip is an ancestor of `main`, or merging it into `main`
+leaves the tree unchanged. Protected branches need their ruleset changed first,
+which requires separate authorization.
 
 See the [0.5.0 draft release notes](release-0.5.0.md) for the current source changes. Production preparation selects `docs/release-<Cargo version>.md` from the reviewed source and checks its independently supplied SHA-256.
 
@@ -58,8 +61,8 @@ discovery during routine work.
 Repository administrators must reconcile branch rules with this policy: permit
 authorized direct development on `version/*`; retain protected production `main`
 with its release gate, attribution and package inspection. Changing protection,
-required-check or credential settings requires separate authorization. Existing
-branches and PRs must not be deleted or forcibly closed to enforce this workflow.
+required-check or credential settings requires separate authorization. Unmerged
+branches and their PRs must not be deleted or forcibly closed to enforce this workflow.
 
 ## Architecture and contribution rules
 
