@@ -104,6 +104,17 @@ allowlists, suffix refusal and all build/acceptance checks remain unchanged.
 This source review is not native build qualification; new exact-head CI must
 establish compilation and codec/application acceptance. No tool is downloaded.
 
+The 0.5 release gate's Windows job selected VS2026 image `20261116.315.1`,
+which contains CMake `4.5.0`, and stopped before compilation. Its
+[fixed image inventory](https://github.com/actions/runner-images/blob/win25-vs2026/20261116.315/images/windows/Windows2025-VS2026-Readme.md)
+lists CMake `4.5.0`, LLVM `20.1.8` and Ninja `1.13.2`.
+[Kitware's 4.5 notes](https://cmake.org/cmake/help/v4.5/release/4.5.html)
+remove only the Visual Studio 2015 generator and list no change to
+`cmake_minimum_required` compatibility, clang-cl/MSVC handling or compile flags;
+this build uses Ninja. Windows now also accepts exactly `4.5.0`. As before,
+this source review is not native build qualification; exact-head CI must
+establish compilation and codec/application acceptance.
+
 The macOS 15 Apple Silicon upgrade test uses Apple Clang 17.0.0, CMake 4.4.4
 and Ninja 1.13.2 from its [hosted image](https://github.com/actions/runner-images/blob/macos-15-arm64/20261028.0489/images/macos/macos-15-arm64-Readme.md).
 The macOS 26 release producer still requires Clang 21.0.0.
