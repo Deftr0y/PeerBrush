@@ -3,8 +3,9 @@ on:
   pull_request:
     branches: [main]
     types: [opened, synchronize]
+  workflow_dispatch:
 concurrency:
-  group: release-gate-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+  group: release-gate-${{ github.event.pull_request.number || github.ref }}-${{ github.event.pull_request.head.sha || github.sha }}
   cancel-in-progress: false
 permissions:
   contents: read
