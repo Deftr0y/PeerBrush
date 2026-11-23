@@ -127,6 +127,23 @@ class AppleSigningProducer(unittest.TestCase):
         self.assertNotIn('environment:', upgrade)
         self.assertIn('python3 -B scripts/check_sparkle_upgrade.py', upgrade)
 
+    def test_notary_diagnostic_is_separate_and_needs_only_notary_credentials(self):
+        job = self.workflow.split('\n  check-notary:\n', 1)[1].split('\n  build:\n', 1)[0]
+        self.assertIn('environment: apple-signing', job)
+        self.assertEqual(set(re.findall(r'secrets\.([A-Z0-9_]+)', job)),
+                         {'APPLE_ID', 'APPLE_TEAM_ID', 'APPLE_NOTARY_PASSWORD'})
+        self.assertIn('&& !inputs.notary_check_only', self.build)
+        program = inline(job, 'Require the exact reviewed main or 0.4 version branch', "python3 -I - <<'PY'\n")
+        ref = 'refs/heads/version/0.4'
+        with mock.patch.dict(os.environ, self.environment | {
+            'GITHUB_REF': ref,
+            'GITHUB_WORKFLOW_REF': self.environment['GITHUB_WORKFLOW_REF'].split('@')[0] + '@' + ref,
+        }, clear=True):
+            exec(program, {})
+            with mock.patch.dict(os.environ, {'GITHUB_WORKFLOW_SHA': '2' * 40}):
+                with self.assertRaises(SystemExit):
+                    exec(program, {})
+
     def test_native_activation_and_quit_must_pass_in_guarded_unprivileged_build_before_signing(self):
         build = step(self.build, 'Test and build without Apple credentials')
         activation = 'cargo run --locked --example macos_activation'
