@@ -1,16 +1,19 @@
 # PeerBrush development guide
 
-PeerBrush is a GPL v3 native image editor built with Rust, egui/eframe and wgpu. Document editing, codecs and transports share one engine. Read [AGENTS.md](../AGENTS.md), the [backlog](../FOLLOWUPS.MD) and the [development queue](development-0.3.md) before changing behavior. The latest published version is [0.30.1](https://github.com/Deftr0y/PeerBrush/releases/tag/v0.30.1). The next version carries forward the remaining backlog, with PB-108 first.
+PeerBrush is a GPL v3 native image editor built with Rust, egui/eframe and wgpu. Document editing, codecs and transports share one engine. Read [AGENTS.md](../AGENTS.md) and the [canonical backlog](../BACKLOG.md) before changing behavior. Record requests, status, verification and release evidence in that file in the same PR or version-branch change as the work. The 0.5 checklist and older follow-up milestones are listed there. See the [latest stable release](https://github.com/Deftr0y/PeerBrush/releases/latest) for current downloads and release notes.
 
 ## Direct version development and release promotion
 
 Develop directly on the appropriate version branch. The active branch is
-`version/0.4`, with 0.4.0 as the working version. Development builds remain
-unreleased. Production source is `main`. `dev` and existing feature/fix branches
-retain historical and explicitly unqualified WIP checkpoints. Do not delete,
-rewrite or automatically integrate those checkpoints.
+`version/0.5`, with 0.5.0 as the working version. Development builds remain
+unreleased. Production source is `main`. Unmerged feature/fix branches retain
+historical and explicitly unqualified WIP checkpoints. Do not delete, rewrite or
+automatically integrate those checkpoints. Delete branches whose changes are
+already in `main`: the tip is an ancestor of `main`, or merging it into `main`
+leaves the tree unchanged. Protected branches need their ruleset changed first,
+which requires separate authorization.
 
-See the [0.4.0 draft release notes](release-0.4.md) for the source changes and remaining release work.
+See the [0.5.0 draft release notes](release-0.5.0.md) for the current source changes. Production preparation selects `docs/release-<Cargo version>.md` from the reviewed source and checks its independently supplied SHA-256.
 
 The development path is **version branch → main**. Do not create routine feature
 PRs or run push/feature-to-version CI. A version-to-`main` promotion is a release
@@ -18,12 +21,12 @@ candidate, not authorization to publish. Never force-push shared history. Websit
 maintenance remains separate: `maintenance/site-*` → `site-content`.
 
 ```sh
-git switch version/0.4
+git switch version/0.5
 ```
 
 Once the branch has an upstream, synchronize it with `git pull --ff-only` before editing. Commit the requested change directly on the version branch.
 
-The 0.4 series follows the published 0.30 series in PeerBrush release ordering. The app and release assets use 0.4.0. The 0.4.0 MSIX identity version is 2.4.0.0, the Debian package version is `1:0.4.0-1`, and the macOS bundle build version is 1.4.0. Each native package version sorts above its 0.30.1 predecessor. Once 0.4.0 is published, users of older portable builds can use the official download for a one-time manual upgrade. Those builds compare release tags numerically. Native package acceptance remains required.
+PeerBrush release order is 0.30, then 0.4, then 0.5. For 0.5.0 the MSIX identity version is 2.5.0.0, the Debian package version is `1:0.5.0-1`, and the macOS bundle build version is 1.5.0. This continues the installed upgrade numbering introduced in 0.4. Native package acceptance remains required.
 
 ## Essential release verification
 
@@ -48,8 +51,7 @@ validates the selection without executing application tests.
 Actual artifact identity, signatures, Store/notarization requirements, package
 installation, native feature acceptance and publication protections still apply.
 Release/signing producers build and validate their exact artifacts without
-repeating the broad code suite. The 16000 × 16000 editor (PB-068) is in scope
-for the next version and requires acceptance at those limits before release.
+repeating the broad code suite. Any candidate claiming 16000 × 16000 editing (PB-068) requires native acceptance at those limits.
 
 Use Rust 1.92.0 and the [native JPEG XL prerequisites](jpeg-xl-build.md). For an
 explicit build use `python scripts/jxl_build.py -- build --locked --bin peerbrush`.
@@ -59,8 +61,8 @@ discovery during routine work.
 Repository administrators must reconcile branch rules with this policy: permit
 authorized direct development on `version/*`; retain protected production `main`
 with its release gate, attribution and package inspection. Changing protection,
-required-check or credential settings requires separate authorization. Existing
-branches and PRs must not be deleted or forcibly closed to enforce this workflow.
+required-check or credential settings requires separate authorization. Unmerged
+branches and their PRs must not be deleted or forcibly closed to enforce this workflow.
 
 ## Architecture and contribution rules
 

@@ -755,8 +755,7 @@ fn standard_flag(key: &[u8], bytes: &[u8]) -> Result<(), &'static str> {
     }
 }
 
-/// Non-rendering Photoshop layer information that remains standard PSD data.
-/// Only a small, validated allowlist can be emitted by this codec.
+/// Validated layer metadata. PeerBrush-only entries stay in editable sources.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LayerMetadata {
     pub key: String,
@@ -774,6 +773,17 @@ pub(crate) const LAYER_COLOR_LABELS: &[&str] = &[
     "indigo", "magenta", "fuchsia",
 ];
 
+const PEERBRUSH_LAYER_COLOR: &str = "peerbrush:layer_color";
+
+fn private_layer_color(data: &[u8]) -> Option<&str> {
+    let label = std::str::from_utf8(data).ok()?;
+    (label == "cyan"
+        || label.strip_prefix('#').is_some_and(|digits| {
+            digits.len() == 6 && digits.bytes().all(|byte| byte.is_ascii_hexdigit())
+        }))
+        .then_some(label)
+}
+
 fn parse_layer_color(data: &[u8]) -> Option<&'static str> {
     let [high, low, 0, 0, 0, 0, 0, 0] = *data else {
         return None;
@@ -783,11 +793,14 @@ fn parse_layer_color(data: &[u8]) -> Option<&'static str> {
         .copied()
 }
 
-pub(crate) fn layer_color_label(entries: &[LayerMetadata]) -> &'static str {
+pub(crate) fn layer_color_label(entries: &[LayerMetadata]) -> &str {
     entries
         .iter()
-        .find(|entry| entry.key == "lclr")
-        .and_then(|entry| parse_layer_color(&entry.data))
+        .find_map(|entry| match entry.key.as_str() {
+            "lclr" => parse_layer_color(&entry.data),
+            PEERBRUSH_LAYER_COLOR => private_layer_color(&entry.data),
+            _ => None,
+        })
         .unwrap_or("none")
 }
 
@@ -798,22 +811,30 @@ pub(crate) fn update_layer_color_label(
     let Some(value) = command.get("color_label") else {
         return Ok(());
     };
-    let (index, label) = LAYER_COLOR_LABELS
-        .iter()
-        .copied()
-        .enumerate()
-        .find(|(_, label)| value.as_str() == Some(*label))
-        .ok_or("Unknown Photoshop layer color label")?;
-    if layer_color_label(entries) == label {
+    let label = value.as_str().ok_or("Layer color requires a preset or #RRGGBB")?;
+    let index = LAYER_COLOR_LABELS.iter().position(|preset| *preset == label);
+    let custom = if index.is_none() {
+        let color = private_layer_color(label.as_bytes())
+            .ok_or("Layer color requires a preset or #RRGGBB")?;
+        Some(if color == "cyan" { color.to_owned() } else { color.to_ascii_uppercase() })
+    } else {
+        None
+    };
+    if layer_color_label(entries) == custom.as_deref().unwrap_or(label) {
         return Ok(());
     }
-    entries.retain(|entry| entry.key != "lclr");
-    if index != 0 {
+    entries.retain(|entry| !matches!(entry.key.as_str(), "lclr" | PEERBRUSH_LAYER_COLOR));
+    if let Some(index) = index.filter(|index| *index != 0) {
         let mut data = vec![0; 8];
         data[..2].copy_from_slice(&(index as u16).to_be_bytes());
         entries.push(LayerMetadata {
             key: "lclr".into(),
             data,
+        });
+    } else if let Some(color) = custom {
+        entries.push(LayerMetadata {
+            key: PEERBRUSH_LAYER_COLOR.into(),
+            data: color.into_bytes(),
         });
     }
     validate_metadata(entries)
@@ -913,6 +934,7 @@ fn validate_metadata_entry(entry: &LayerMetadata) -> Result<(), String> {
         }
         // Sheet colors are an enum followed by three reserved zero words.
         "lclr" if parse_layer_color(&entry.data).is_some() => Ok(()),
+        PEERBRUSH_LAYER_COLOR if private_layer_color(&entry.data).is_some() => Ok(()),
         "lnsr" | "lyid" if entry.data.len() == 4 => Ok(()),
         // A minimum Photoshop reader version is a compatibility marker, not
         // permission to ignore layer sources. Every other feature is validated
@@ -971,6 +993,7 @@ const CLOSING_METADATA_FORMAT: u32 = 137;
 const LEGACY_PRINT_SETUP_FORMAT: u32 = 138;
 const DOT_RANGE_FORMAT: u32 = 139;
 const DISABLED_VECTOR_MASK_FORMAT: u32 = 140;
+const PRIVATE_LAYER_COLOR_FORMAT: u32 = 141;
 const GLOBAL_ANGLE_FORMAT: u32 = 105;
 const GLOBAL_ALTITUDE_FORMAT: u32 = 106;
 const COLOR_OVERLAY_FORMAT: u32 = 107;
@@ -1047,6 +1070,12 @@ fn has_implicit_disabled_vector_mask(doc: &Document) -> bool {
     })
 }
 
+fn has_private_layer_color(doc: &Document) -> bool {
+    doc.layers.iter().any(|layer| {
+        layer.psd_metadata.iter().any(|entry| entry.key == PEERBRUSH_LAYER_COLOR)
+    })
+}
+
 pub fn validate_metadata(entries: &[LayerMetadata]) -> Result<(), String> {
     if entries.len() > MAX_LAYER_METADATA {
         return Err("Photoshop layer metadata exceeds its bounded tag count".into());
@@ -1057,6 +1086,9 @@ pub fn validate_metadata(entries: &[LayerMetadata]) -> Result<(), String> {
             return Err("Duplicate Photoshop layer metadata tag".into());
         }
         validate_metadata_entry(entry)?;
+    }
+    if keys.contains("lclr") && keys.contains(PEERBRUSH_LAYER_COLOR) {
+        return Err("Conflicting layer color labels".into());
     }
     if !keys.contains("vmsk")
         && entries.iter().any(|entry| entry.key == "vmgm" && entry.data[0] == 1)
@@ -1097,7 +1129,7 @@ fn standard_layer_metadata(
         let closing = entry.key.strip_suffix(":closing");
         if section == 3 {
             closing.map(|key| (key, entry.data.as_slice()))
-        } else if closing.is_none() && entry.key != CLOSED_FOLDER {
+        } else if closing.is_none() && !matches!(entry.key.as_str(), CLOSED_FOLDER | PEERBRUSH_LAYER_COLOR) {
             Some((entry.key.as_str(), entry.data.as_slice()))
         } else {
             None
@@ -1291,6 +1323,14 @@ pub fn encode(doc: &Document) -> Result<Vec<u8>, String> {
 pub fn encode_psb(doc: &Document) -> Result<Vec<u8>, String> {
     encode_layout(doc, Layout::Psb)
 }
+pub(crate) fn encode_recovery(doc: &Document) -> Result<Vec<u8>, String> {
+    let mut output = Vec::new();
+    let mut spool = std::io::Cursor::new(Vec::new());
+    encode_layout_scratch_to(
+        doc, Layout::Psd, &mut output, &mut spool, None, true, &|| Ok(()), &|_, _, _| Ok(()),
+    )?;
+    Ok(output)
+}
 pub(crate) fn encode_to<S: Read + Write + Seek, C: Read + Write + Seek>(
     doc: &Document,
     output: &mut dyn Write,
@@ -1305,6 +1345,7 @@ pub(crate) fn encode_to<S: Read + Write + Seek, C: Read + Write + Seek>(
         output,
         spool,
         Some(scratch),
+        false,
         check,
         progress,
     )
@@ -1323,10 +1364,13 @@ pub(crate) fn encode_psb_to<S: Read + Write + Seek, C: Read + Write + Seek>(
         output,
         spool,
         Some(scratch),
+        false,
         check,
         progress,
     )
 }
+const RAW_CHANNEL_LIMIT: &str = "Uncompressed Photoshop channels alone exceed the 256 MiB file limit; use a smaller canvas or fewer full-frame layers";
+
 fn check_output_size(doc: &Document, plan: &StandardPlan, patterns: &patterns::StandardPatterns) -> Result<(), String> {
     // Validation bounds every frame and record count; u64 also covers their aggregate.
     let bytes = u64::from(doc.bit_depth / 8);
@@ -1364,9 +1408,44 @@ fn check_output_size(doc: &Document, plan: &StandardPlan, patterns: &patterns::S
         return Err("Too many PSD layer records".into());
     }
     if minimum > 256 * 1024 * 1024 {
-        return Err("Uncompressed Photoshop channels alone exceed the 256 MiB file limit; use a smaller canvas or fewer full-frame layers".into());
+        return Err(RAW_CHANNEL_LIMIT.into());
     }
     Ok(())
+}
+enum ChannelWriter<'a> {
+    Raw(&'a mut dyn Write),
+    Zip(ZlibEncoder<&'a mut dyn Write>),
+}
+impl<'a> ChannelWriter<'a> {
+    fn new(out: &'a mut dyn Write, compressed: bool) -> Result<Self, String> {
+        out.write_all(&if compressed { 2u16 } else { 0 }.to_be_bytes())
+            .map_err(|e| e.to_string())?;
+        Ok(if compressed {
+            Self::Zip(ZlibEncoder::new(out, Compression::fast()))
+        } else {
+            Self::Raw(out)
+        })
+    }
+    fn finish(self) -> Result<(), String> {
+        if let Self::Zip(zip) = self {
+            zip.finish().map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+}
+impl Write for ChannelWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Raw(out) => out.write(bytes),
+            Self::Zip(out) => out.write(bytes),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Raw(out) => out.flush(),
+            Self::Zip(out) => out.flush(),
+        }
+    }
 }
 // The caller has validated the layout and matching native depth. Keep absent
 // tiles and padded output outside the raster identical to Raster::get/get16.
@@ -1429,7 +1508,7 @@ fn encode_layout_progress_to<S: Read + Write + Seek>(
     check: &dyn Fn() -> Result<(), String>,
     progress: &dyn Fn(&str, usize, usize) -> Result<(), String>,
 ) -> Result<(), String> {
-    encode_layout_scratch_to(doc, layout, output, spool, None, check, progress)
+    encode_layout_scratch_to(doc, layout, output, spool, None, false, check, progress)
 }
 fn encode_layout_scratch_to<S: Read + Write + Seek>(
     doc: &Document,
@@ -1437,6 +1516,7 @@ fn encode_layout_scratch_to<S: Read + Write + Seek>(
     output: &mut dyn Write,
     spool: &mut S,
     scratch: Option<&mut dyn composite::Scratch>,
+    compress_oversize: bool,
     check: &dyn Fn() -> Result<(), String>,
     progress: &dyn Fn(&str, usize, usize) -> Result<(), String>,
 ) -> Result<(), String> {
@@ -1455,7 +1535,11 @@ fn encode_layout_scratch_to<S: Read + Write + Seek>(
     validate(doc)?;
     let plan = standard_plan(doc);
     let standard_patterns = resident_patterns(doc, &plan, patterns::Geometry::Rotation, PLACED_PATTERN_OVERLAY_FORMAT, check)?;
-    check_output_size(doc, &plan, &standard_patterns)?;
+    let compressed = match check_output_size(doc, &plan, &standard_patterns) {
+        Ok(()) => false,
+        Err(reason) if compress_oversize && reason == RAW_CHANNEL_LIMIT => true,
+        Err(reason) => return Err(reason),
+    };
     let high = doc.bit_depth == 16;
     // Effect/bake/profile paths retain their separately materialized behavior.
     let strip_composite = scratch.is_some()
@@ -1561,6 +1645,7 @@ fn encode_layout_scratch_to<S: Read + Write + Seek>(
     let mut pattern_format = 0;
     let mut style_format = 0;
     let mut channel_bytes = 0u64;
+    let mut channel_offsets = Vec::new();
     let mut layer_rows = 0usize;
     for (l, section) in &ordered {
         let standard_style = standard_styles(doc, l, *section, &plan, &standard_patterns);
@@ -1592,6 +1677,9 @@ fn encode_layout_scratch_to<S: Read + Write + Seek>(
                 .and_then(|n| n.checked_add(2))
                 .ok_or("Photoshop channel length overflow")?;
             u16b(&mut records, ch as u16);
+            if compressed {
+                channel_offsets.push(records.len());
+            }
             layout.write_length(&mut records, length)?;
             channel_bytes = channel_bytes
                 .checked_add(length)
@@ -1720,39 +1808,37 @@ fn encode_layout_scratch_to<S: Read + Write + Seek>(
         }
         block(&mut records, &extra);
     }
-    let info_raw = (records.len() as u64)
-        .checked_add(channel_bytes)
-        .and_then(|n| n.checked_add(2))
-        .ok_or("Photoshop section length overflow")?;
-    let info_length = info_raw
-        .checked_add(info_raw % 2)
-        .ok_or("Photoshop section length overflow")?;
-    let mut prefix = vec![];
-    if high {
-        layout.write_length(&mut prefix, 0)?; // Primary8-bit layer information is empty.
-        block(
-            &mut prefix,
-            doc.psd_global_mask
-                .as_ref()
-                .map_or(&[], |mask| mask.data.as_slice()),
-        );
-        // Photoshop needs the merged transparency marker before the 16-bit layer records.
-        prefix.extend(b"8BIMMt16");
-        layout.write_length(&mut prefix, 0)?;
-        prefix.extend(b"8BIMLr16");
-    }
-    layout.write_length(&mut prefix, info_length)?;
+    let record_bytes = records.len() as u64 + 2;
+    let section_size = |planes: u64| -> Result<(u64, u64), String> {
+        let raw = record_bytes.checked_add(planes).ok_or("Photoshop section length overflow")?;
+        Ok((raw, raw.checked_add(raw % 2).ok_or("Photoshop section length overflow")?))
+    };
+    let layer_prefix = |info_length| -> Result<Vec<u8>, String> {
+        let mut prefix = vec![];
+        if high {
+            layout.write_length(&mut prefix, 0)?; // Primary 8-bit layer information is empty.
+            block(
+                &mut prefix,
+                doc.psd_global_mask.as_ref().map_or(&[], |mask| mask.data.as_slice()),
+            );
+            // Photoshop needs the merged transparency marker before the 16-bit records.
+            prefix.extend(b"8BIMMt16");
+            layout.write_length(&mut prefix, 0)?;
+            prefix.extend(b"8BIMLr16");
+        }
+        layout.write_length(&mut prefix, info_length)?;
+        prefix.extend_from_slice(&(-(ordered.len() as i16)).to_be_bytes());
+        Ok(prefix)
+    };
+    let prefix = layer_prefix(section_size(if compressed { 0 } else { channel_bytes })?.1)?;
     let mut standard = StandardWriter::new(
         std::io::BufWriter::with_capacity(64 * 1024, &mut *spool),
         check,
     );
     standard.write_all(&prefix).map_err(|e| e.to_string())?;
-    // A negative count identifies the merged fourth channel as transparency.
-    standard
-        .write_all(&(-(ordered.len() as i16)).to_be_bytes())
-        .map_err(|e| e.to_string())?;
     standard.write_all(&records).map_err(|e| e.to_string())?;
-    drop(records);
+    let channel_start = standard.bytes;
+    let mut channel_offsets = channel_offsets.into_iter();
     let mut row = [0u8; crate::raster::MAX_EDGE as usize * 2];
     let mut completed_rows = 0;
     progress("Writing standard layer channels", 0, layer_rows)?;
@@ -1808,11 +1894,11 @@ fn encode_layout_scratch_to<S: Read + Write + Seek>(
             .chain(if has_mask { Some(-2) } else { None })
             .chain(dual.then_some(-3))
         {
-            standard
-                .write_all(&0u16.to_be_bytes())
-                .map_err(|e| e.to_string())?;
+            let start = standard.bytes;
             let is_mask = ch <= -2;
             let (cw, ch_height) = if is_mask { (mask_w, mask_h) } else { (w, h) };
+            // Empty channels need only their two-byte RAW header.
+            let mut channel = ChannelWriter::new(&mut standard, compressed && cw != 0 && ch_height != 0)?;
             let raw_native = !is_mask
                 && derived.is_none()
                 && derived16.is_none()
@@ -1899,7 +1985,7 @@ fn encode_layout_scratch_to<S: Read + Write + Seek>(
                         }
                     }
                 }
-                standard
+                channel
                     .write_all(&row[..cw as usize * usize::from(doc.bit_depth / 8)])
                     .map_err(|e| e.to_string())?;
                 completed_rows += 1;
@@ -1909,8 +1995,14 @@ fn encode_layout_scratch_to<S: Read + Write + Seek>(
                     layer_rows,
                 )?;
             }
+            channel.finish()?;
+            if let Some(offset) = channel_offsets.next() {
+                let width = if layout.large() { 8 } else { 4 };
+                layout.write_length(&mut &mut records[offset..offset + width], standard.bytes - start)?;
+            }
         }
     }
+    let (info_raw, info_length) = section_size(standard.bytes - channel_start)?;
     if info_raw % 2 != 0 {
         standard.write_all(&[0]).map_err(|e| e.to_string())?;
     }
@@ -1931,17 +2023,40 @@ fn encode_layout_scratch_to<S: Read + Write + Seek>(
     standard.write_all(&suffix).map_err(|e| e.to_string())?;
     standard_patterns.write(&mut standard)?;
     let layer_length = standard.bytes;
-    let layer_hash = standard.hash;
+    let layer_hash = if compressed {
+        standard.flush().map_err(|e| e.to_string())?;
+        drop(standard);
+        // Recovery owns an in-memory spool. Replace the tentative offsets
+        // before deriving the standard-section hash used by the editable source.
+        spool.rewind().map_err(|e| e.to_string())?;
+        spool.write_all(&layer_prefix(info_length)?).map_err(|e| e.to_string())?;
+        spool.write_all(&records).map_err(|e| e.to_string())?;
+        spool.rewind().map_err(|e| e.to_string())?;
+        let mut hash = 0xcbf29ce484222325;
+        let mut remaining = layer_length;
+        let mut buffer = [0u8; 64 * 1024];
+        while remaining != 0 {
+            check()?;
+            let part = remaining.min(buffer.len() as u64) as usize;
+            spool.read_exact(&mut buffer[..part]).map_err(|e| e.to_string())?;
+            hash_part(&mut hash, &buffer[..part]);
+            remaining -= part as u64;
+        }
+        standard = StandardWriter::new(std::io::BufWriter::with_capacity(64 * 1024, &mut *spool), check);
+        standard.bytes = layer_length;
+        hash
+    } else {
+        standard.hash
+    };
+    drop(records);
     standard.hash = 0xcbf29ce484222325;
     let (w, h) = (doc.width, doc.height);
     let composite_rows = h as usize * 4;
     let mut completed_composite_rows = 0;
     progress("Writing current composite", 0, composite_rows)?;
-    standard
-        .write_all(&0u16.to_be_bytes())
-        .map_err(|e| e.to_string())?;
+    let mut channel = ChannelWriter::new(&mut standard, compressed)?;
     if strip_composite {
-        composite::write(doc, scratch.unwrap(), &mut standard, check, progress)?;
+        composite::write(doc, scratch.unwrap(), &mut channel, check, progress)?;
     } else if let Some(image) = &composite16 {
         if image.width != w || image.height != h || image.words.len() != w as usize * h as usize * 4
         {
@@ -1959,7 +2074,7 @@ fn encode_layout_scratch_to<S: Read + Write + Seek>(
                     };
                     row[x * 2..x * 2 + 2].copy_from_slice(&value.to_be_bytes());
                 }
-                standard
+                channel
                     .write_all(&row[..w as usize * 2])
                     .map_err(|e| e.to_string())?;
                 completed_composite_rows += 1;
@@ -1986,7 +2101,7 @@ fn encode_layout_scratch_to<S: Read + Write + Seek>(
                         p[3]
                     };
                 }
-                standard
+                channel
                     .write_all(&row[..w as usize])
                     .map_err(|e| e.to_string())?;
                 completed_composite_rows += 1;
@@ -1998,6 +2113,7 @@ fn encode_layout_scratch_to<S: Read + Write + Seek>(
             }
         }
     }
+    channel.finish()?;
     let composite_length = standard.bytes - layer_length;
     let composite_hash = standard.hash;
     standard.flush().map_err(|e| e.to_string())?;
@@ -2013,7 +2129,9 @@ fn encode_layout_scratch_to<S: Read + Write + Seek>(
     let file_info_format = doc.psd_file_info.as_deref().map(|bytes| file_info::source_format(bytes));
     let embedded = Embedded {
         // Older readers cannot interpret soft selections or smooth curve sources.
-        format: if has_implicit_disabled_vector_mask(doc) {
+        format: if has_private_layer_color(doc) {
+            PRIVATE_LAYER_COLOR_FORMAT
+        } else if has_implicit_disabled_vector_mask(doc) {
             DISABLED_VECTOR_MASK_FORMAT
         } else if let Some(format) = file_info_format.filter(|format| *format >= LEGACY_PRINT_SETUP_FORMAT) {
             format
@@ -3927,29 +4045,8 @@ fn decode_parts(
     };
     let mut rr = Cursor::new(resources);
     let mut embedded = None;
-    let mut warnings = global_warnings(layer_section, depth, layout)?;
-    let (_, global_mask, global_tags) = global_blocks(layer_section, layout)?;
-    let mut global_metadata = Vec::<GlobalMetadata>::new();
-    for (key, data) in global_tags {
-        control.check()?;
-        if let Ok(key) = std::str::from_utf8(key) {
-            // Duplicates already force protection. Retain at most one bounded
-            // value per known key while inspecting the protected source.
-            if !global_metadata.iter().any(|old| old.key == key)
-                && global_metadata::validate_entry(key, data).is_ok()
-            {
-                global_metadata.push(GlobalMetadata {
-                    key: key.into(),
-                    data: data.to_vec(),
-                });
-            }
-        }
-    }
-    let global_mask_settings = (!global_mask.is_empty()
-        && validate_global_mask_settings(global_mask).is_ok())
-    .then(|| GlobalMaskSettings {
-        data: global_mask.to_vec(),
-    });
+    let (global_mask_settings, global_metadata, mut warnings) =
+        inspect_global_layers(layer_section, depth, layout, control)?;
     let mut saved_composite = None;
     let mut icc_profile = None;
     let mut seen_profile = false;
@@ -4194,7 +4291,8 @@ fn decode_parts(
         observe_open_phase("source_decoded", 0);
         control.check()?;
         if let Ok(e) = result {
-            if ((1..=35).contains(&e.format) || (37..=DISABLED_VECTOR_MASK_FORMAT).contains(&e.format))
+            if ((1..=35).contains(&e.format) || (37..=PRIVATE_LAYER_COLOR_FORMAT).contains(&e.format))
+                && (e.format >= PRIVATE_LAYER_COLOR_FORMAT || !has_private_layer_color(&e.document))
                 && (e.format >= DISABLED_VECTOR_MASK_FORMAT || !has_implicit_disabled_vector_mask(&e.document))
                 && e.document.psd_file_info.as_deref().is_none_or(|bytes| e.format >= file_info::source_format(bytes))
                 && (e.format >= CLOSING_METADATA_FORMAT || !has_closing_metadata(&e.document))
@@ -5579,32 +5677,62 @@ fn global_blocks(section: &[u8], layout: Layout) -> Result<GlobalBlocks<'_>, Str
     }
     Ok((primary, mask, tags))
 }
-fn global_warnings(section: &[u8], depth: u16, layout: Layout) -> Result<Vec<String>, String> {
+fn inspect_global_layers(
+    section: &[u8],
+    depth: u16,
+    layout: Layout,
+    control: &crate::loading::Control,
+) -> Result<(Option<GlobalMaskSettings>, Vec<GlobalMetadata>, Vec<String>), String> {
     let (primary, mask, tags) = global_blocks(section, layout)?;
-    let mut warnings = vec![];
-    if !mask.is_empty() && validate_global_mask_settings(mask).is_err() {
-        warnings
-            .push("Photoshop global layer masks are protected; using the saved composite".into());
-    }
+    let mut warnings = Vec::new();
+    let mut metadata = Vec::<GlobalMetadata>::new();
+    let mask = if mask.is_empty() {
+        None
+    } else if validate_global_mask_settings(mask).is_err() {
+        warnings.push("Photoshop global layer masks are protected; using the saved composite".into());
+        None
+    } else {
+        Some(GlobalMaskSettings { data: mask.to_vec() })
+    };
     let mut seen = std::collections::HashSet::new();
     for (key, data) in tags {
+        control.check()?;
         if !seen.insert(key) {
             warnings.push(format!(
                 "Duplicate global Photoshop layer tag: {}",
                 String::from_utf8_lossy(key)
             ));
         }
-        let supported = (depth == 8 && key == b"Layr")
+        let structural = (depth == 8 && key == b"Layr")
             || (depth == 16 && key == b"Lr16")
             || (data.is_empty()
-                && ((depth == 8 && key == b"Mtrn") || (depth == 16 && key == b"Mt16")))
-            || std::str::from_utf8(key)
-                .is_ok_and(|key| global_metadata::validate_entry(key, data).is_ok());
-        if !supported {
-            warnings.push(format!(
-                "Unsupported global Photoshop feature: {}",
-                String::from_utf8_lossy(key)
-            ));
+                && ((depth == 8 && key == b"Mtrn") || (depth == 16 && key == b"Mt16")));
+        if !structural {
+            let name = String::from_utf8_lossy(key);
+            if global_metadata::validate_entry(&name, data).is_ok() {
+                if !metadata.iter().any(|old| old.key.as_str() == name.as_ref()) {
+                    metadata.push(GlobalMetadata {
+                        key: name.into_owned(),
+                        data: data.to_vec(),
+                    });
+                }
+            } else {
+                // Pattern handling may discharge its own warning after all assets bind.
+                let detail = match key {
+                    b"CAI " => Some("Content Credentials settings"),
+                    b"OCIO" => Some("OpenColorIO display or color-management settings"),
+                    b"GenI" => Some("generative metadata settings"),
+                    b"FMsk" => Some("filter-mask display settings"),
+                    b"cinf" => Some("compositor information"),
+                    _ => None,
+                };
+                let mut warning = format!("Unsupported global Photoshop feature: {name}");
+                if let Some(detail) = detail {
+                    warning.push_str(" · ");
+                    warning.push_str(detail);
+                }
+                warnings.push(warning);
+            }
         }
         if (depth == 8 && key == b"Layr" && !primary.is_empty())
             || (depth == 16
@@ -5614,7 +5742,7 @@ fn global_warnings(section: &[u8], depth: u16, layout: Layout) -> Result<Vec<Str
             warnings.push("Conflicting primary and global Photoshop layer records".into());
         }
     }
-    Ok(warnings)
+    Ok((mask, metadata, warnings))
 }
 fn layer_info(section: &[u8], depth: u16, layout: Layout) -> Result<&[u8], String> {
     let (mut info, _, tags) = global_blocks(section, layout)?;
@@ -7301,6 +7429,48 @@ mod storage_tests {
                 })]).unwrap();
                 assert!(cleared.layers[0].psd_metadata.is_empty());
             }
+        }
+    }
+
+    #[test]
+    fn private_color_labels_round_trip_without_standard_tags_or_pixel_changes() {
+        use crate::engine::Engine;
+        use serde_json::json;
+
+        for depth in [8, 16] {
+            let mut doc = Document::new_depth(2, 1, depth).unwrap();
+            doc.layers[0].pixels.set16(0, 0, [12347, 23459, 34571, 65535]);
+            let target = doc.layers[0].id.clone();
+            let pixels = doc.layers[0].pixels.clone();
+            let composite = doc.export_png().unwrap();
+            for (label, canonical) in [("red", "red"), ("cyan", "cyan"), ("#12AbC3", "#12ABC3")] {
+                doc = Engine::preview_edits(doc, &[json!({
+                    "op":"layer.update", "layer":target, "color_label":label,
+                })]).unwrap();
+                let metadata = &doc.layers[0].psd_metadata;
+                assert_eq!(layer_color_label(metadata), canonical);
+                assert_eq!(metadata_for_duplicate(metadata), *metadata);
+                if label == "red" {
+                    continue;
+                }
+                assert!(standard_layer_metadata(metadata, 0).next().is_none());
+                assert_eq!(doc.export_png().unwrap(), composite);
+                for layout in [Layout::Psd, Layout::Psb] {
+                    let encoded = encode_layout(&doc, layout).unwrap();
+                    let reopened = decode(&encoded).unwrap();
+                    assert!(!reopened.read_only, "{:?}", reopened.warnings);
+                    assert_eq!(layer_color_label(&reopened.layers[0].psd_metadata), canonical);
+                    assert_eq!(reopened.layers[0].pixels, pixels);
+                    assert_eq!(reopened.export_png().unwrap(), composite);
+                }
+            }
+            assert!(Engine::preview_edits(doc.clone(), &[json!({
+                "op":"layer.update", "layer":target, "color_label":"#123456FF",
+            })]).is_err());
+            let doc = Engine::preview_edits(doc, &[json!({
+                "op":"layer.update", "layer":target, "color_label":"none",
+            })]).unwrap();
+            assert!(doc.layers[0].psd_metadata.is_empty());
         }
     }
 

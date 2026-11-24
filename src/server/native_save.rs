@@ -87,6 +87,9 @@ pub(super) fn save(
     active()?;
     control.progress("Checking native destination", 0, 0)?;
     let lease = NativeLease::acquire_admitted(session.admit_destination(path, &active)?, active)?;
+    if lease.expected().is_some() && request["require_new_destination"] == true {
+        return Err("Choose a new PSD/PSB filename. Existing files were retained.".into());
+    }
     let extension = lease.path().extension().and_then(|e| e.to_str());
     if !matches!((format, extension), (Format::Psd, Some(e)) if e.eq_ignore_ascii_case("psd"))
         && !matches!((format, extension), (Format::Psb, Some(e)) if e.eq_ignore_ascii_case("psb"))
@@ -140,6 +143,7 @@ pub(super) fn save(
         file_charge.clone(),
     )?;
     let mut inventory = lease.freeze_inventory(pool, &active)?;
+    inventory.check_replacement_backup_capacity()?;
     control.progress("Preparing native Photoshop layers", 0, 0)?;
     let candidate = native_rows36::with_styles(
         &captured.scene,

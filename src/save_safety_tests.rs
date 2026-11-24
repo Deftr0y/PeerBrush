@@ -63,6 +63,47 @@ fn native_save_fixture(depth: u16, name: &str) -> Shared {
 }
 
 #[test]
+fn full_previous_save_store_allows_fresh_editable_psd_without_overwriting() {
+    let fixture = crate::engine::native::worker::tests::Fixture::new();
+    let root = fixture.path();
+    let original = root.join("original.psd");
+    let fresh = root.join("new-save.psd");
+    let shared = native_save_fixture(16, "original.psd");
+    save(&shared, &original).unwrap();
+    let original_bytes = fs::read(&original).unwrap();
+    let backup_path = root.join(".peerbrush-versions").join("full-backup.psd");
+    let mut backup = fs::File::create(&backup_path).unwrap();
+    backup.write_all(&original_bytes).unwrap();
+    backup.set_len(1024 * 1024 * 1024).unwrap();
+    drop(backup);
+    let (document, revision, layers) = {
+        let mut engine = shared.lock().unwrap();
+        let layer = engine.resident_state().unwrap().document.layers[0].id.clone();
+        engine.edit("human", &[json!({"op":"layer.update","layer":layer,"name":"Retain my edit"})],
+            None, None, "Rename").unwrap();
+        let doc = &engine.resident_state().unwrap().document;
+        (doc.id.clone(), doc.revision, doc.layers.clone())
+    };
+    assert_eq!(
+        save_confirmed_source(&shared, &original, &document, revision, false).unwrap_err(),
+        crate::file_safety::PREVIOUS_SAVE_STORE_FULL
+    );
+    assert!(save_fresh_source(&shared, &original, &document, revision, false).is_err());
+    assert_ne!(shared.lock().unwrap().saved_revision, revision);
+    save_fresh_source(&shared, &fresh, &document, revision, false).unwrap();
+    let reopened = psd::decode(&fs::read(fresh).unwrap()).unwrap();
+    assert!(!reopened.read_only);
+    assert_eq!(reopened.bit_depth, 16);
+    assert_eq!(serde_json::to_value(&reopened.layers).unwrap(), serde_json::to_value(layers).unwrap());
+    assert_eq!(fs::read(original).unwrap(), original_bytes);
+    let mut retained = fs::File::open(backup_path).unwrap();
+    assert_eq!(retained.metadata().unwrap().len(), 1024 * 1024 * 1024);
+    let mut prefix = vec![0; original_bytes.len()];
+    retained.read_exact(&mut prefix).unwrap();
+    assert_eq!(prefix, original_bytes);
+}
+
+#[test]
 fn multistrip_working_save_preserves_destination_history_and_foreign_scratch() {
     for depth in [8, 16] {
         for extension in ["psd", "psb"] {

@@ -63,6 +63,73 @@ mod tests {
         )
         .unwrap();
     }
+    #[test]
+    fn deferred_close_reviews_unsaved_tabs_after_file_completion_or_cancellation() {
+        for (cancel_file, choose_content) in [(false, false), (true, false), (false, true)] {
+            let (mut app, ctx, root, second) = fixture(16);
+            app.recovery.open = false;
+            let project = second.lock().unwrap().project_id.clone();
+            crate::workspace::select(&root, &project).unwrap();
+            frame(&mut app, &ctx, vec![]);
+            dirty(&second, "Unsaved work in second tab");
+            dirty(&root, "Unsaved work in first tab");
+            let (release, active) = mpsc::channel();
+            app.job(move || {
+                active.recv().unwrap();
+                if cancel_file { Err("Operation canceled".into()) } else { Ok("Finished".into()) }
+            });
+            app.request_close(Intent::Close(project.clone()));
+            frame(&mut app, &ctx, vec![]);
+            assert_eq!(app.deferred_file_close, Some(Intent::Close(project.clone())));
+            assert!(app.lifecycle.is_none());
+            if choose_content {
+                let engine = second.lock().unwrap();
+                let doc = crate::engine::view::current(&engine);
+                app.pending_import.insert(project.clone(), PendingImport {
+                    project: project.clone(),
+                    document: doc.id().into(),
+                    revision: doc.revision(),
+                    native: None,
+                    files: Vec::new(),
+                });
+            }
+            release.send(()).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            if choose_content {
+                while app.jobs.contains(&project) {
+                    assert!(std::time::Instant::now() < deadline, "{}", app.message);
+                    std::thread::sleep(Duration::from_millis(5));
+                    frame(&mut app, &ctx, vec![]);
+                }
+                assert!(app.lifecycle.is_none());
+                assert_eq!(app.deferred_file_close, Some(Intent::Close(project.clone())));
+                frame(&mut app, &ctx, vec![egui::Event::Key {
+                    key: egui::Key::Escape, physical_key: None, pressed: true, repeat: false,
+                    modifiers: Default::default(),
+                }]);
+                assert!(!app.pending_import.contains_key(&project));
+            }
+            while app.lifecycle.is_none() {
+                assert!(std::time::Instant::now() < deadline, "{}", app.message);
+                std::thread::sleep(Duration::from_millis(5));
+                frame(&mut app, &ctx, vec![]);
+            }
+            let row = app.lifecycle.as_ref().unwrap().current().unwrap();
+            assert_eq!(row.source.project, project);
+            assert!(row.dirty);
+            assert!(app.deferred_file_close.is_none());
+            frame(&mut app, &ctx, vec![egui::Event::Key {
+                key: egui::Key::Escape, physical_key: None, pressed: true, repeat: false,
+                modifiers: Default::default(),
+            }]);
+            assert!(app.lifecycle.is_none());
+            for handle in [&root, &second] {
+                let engine = handle.lock().unwrap();
+                assert!(!engine.closed);
+                assert_ne!(engine.resident_state().unwrap().document.revision, engine.saved_revision);
+            }
+        }
+    }
     fn click(app: &mut PeerBrush, ctx: &egui::Context, index: usize) {
         // A new centered modal measures its contents before settling its position.
         for _ in 0..3 {
@@ -824,11 +891,26 @@ impl Review {
 }
 
 impl PeerBrush {
-    pub(super) fn request_close(&mut self, intent: Intent) {
-        if self.edit_worker.pending() {
-            self.message = "Wait for the edit result before closing the project".into();
-            return;
+    fn pending_file_choice(&self, intent: &Intent) -> bool {
+        let includes = |project: &str| {
+            intent == &Intent::Exit || matches!(intent, Intent::Close(id) if id.as_str() == project)
+        };
+        self.pending_import.keys().any(|project| includes(project))
+            || self.pending_image_open.as_ref().is_some_and(|choice| includes(&choice.initiating))
+    }
+
+    fn close_file_work_pending(&self, intent: &Intent) -> bool {
+        let affects_active =
+            intent == &Intent::Exit || matches!(intent, Intent::Close(id) if id == &self.project_id);
+        if affects_active && (self.edit_worker.pending() || self.sampled_input_pending()) {
+            return true;
         }
+        match intent {
+            Intent::Close(project) => self.jobs.contains(project),
+            Intent::Exit => !self.jobs.is_empty() || self.tab_transfer_committing,
+        }
+    }
+    pub(super) fn request_close(&mut self, intent: Intent) {
         #[cfg(target_os = "macos")]
         if intent == Intent::Exit && self.native_update_quit() {
             return;
@@ -840,14 +922,18 @@ impl PeerBrush {
         if intent == Intent::Exit {
             self.updates.defer_windows_for_close();
         }
-        let working = match &intent {
-            Intent::Close(project) => self.jobs.contains(project),
-            Intent::Exit => !self.jobs.is_empty() || self.tab_transfer_committing,
-        };
-        if working {
-            self.message = "Finish or cancel the current file operation before closing.".into();
+        if self.close_file_work_pending(&intent) {
+            if self.deferred_file_close != Some(Intent::Exit) {
+                self.deferred_file_close = Some(intent);
+            }
+            self.message = "Waiting for the current operation before close review · Esc cancels closing".into();
             return;
         }
+        if self.pending_file_choice(&intent) {
+            self.message = "Finish or cancel the image-content choice in its project tab before closing.".into();
+            return;
+        }
+        self.deferred_file_close = None;
         let affects_active =
             intent == Intent::Exit || matches!(&intent,Intent::Close(id) if id == &self.project_id);
         if affects_active
@@ -856,8 +942,6 @@ impl PeerBrush {
                 || self.source_editor.is_some()
                 || self.filter_editor.is_some()
                 || self.refinement.is_some()
-                || self.pending_import.is_some()
-                || self.pending_image_open.is_some()
                 || self.rename_edit.is_some()
                 || self.color_editor.is_some()
                 || self.proposal_review.is_some()
@@ -1017,6 +1101,17 @@ impl PeerBrush {
     }
 
     pub(super) fn lifecycle_dialog(&mut self, ctx: &egui::Context) {
+        if let Some(intent) = self.deferred_file_close.clone() {
+            let visible_choice = self.pending_image_open.is_some()
+                || self.pending_import.contains_key(&self.project_id);
+            if !visible_choice && ctx.input_mut(|i| i.consume_key(i.modifiers, egui::Key::Escape)) {
+                self.deferred_file_close = None;
+                self.message = "Close canceled · project remains open".into();
+            } else if !self.close_file_work_pending(&intent) && !self.pending_file_choice(&intent) {
+                self.deferred_file_close = None;
+                self.request_close(intent);
+            }
+        }
         if self.lifecycle.is_none() && !self.exit_approved {
             for (project, _, shared) in crate::workspace::entries_in(&self.workspace) {
                 if self.jobs.contains(&project) {

@@ -269,20 +269,12 @@ fn command_source_session(
     scene: &crate::engine::scene::SceneSnapshot,
     check: impl Fn() -> Result<(), String>,
 ) -> Result<crate::workspace::source_runtime::SourceSession, String> {
-    use crate::workspace::native_dispatch::{begin_edit_scene, retryable_source_read};
-    use std::time::{Duration, Instant};
-
-    let deadline = Instant::now() + Duration::from_secs(1);
-    loop {
+    use crate::workspace::native_dispatch::{begin_edit_scene, retry_source_read};
+    // Wait before preparing a candidate. Each attempt checks the same source.
+    retry_source_read(|| {
         check()?;
-        match begin_edit_scene(shared, scene) {
-            // Wait before preparing a candidate. Each attempt checks the same source.
-            Err(error) if retryable_source_read(&error) && Instant::now() < deadline => {
-                thread::sleep(Duration::from_millis(10));
-            }
-            result => return result,
-        }
-    }
+        begin_edit_scene(shared, scene)
+    })
 }
 
 #[cfg(test)]
@@ -303,7 +295,7 @@ fn command_source_admission_retries_the_same_project_after_contention() {
     engine.authority = DocumentAuthority::from_native(document, 4).unwrap();
     let scene = engine.capture_scene(None).unwrap().into_native().unwrap();
     let (attempted, retry) = mpsc::channel();
-    let result = thread::scope(|scope| {
+    let result = std::thread::scope(|scope| {
         let worker = scope.spawn(|| {
             let calls = Cell::new(0);
             command_source_session(&shared, &scene, || {

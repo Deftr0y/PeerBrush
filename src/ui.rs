@@ -520,6 +520,23 @@ struct DeferredSelectionShortcuts {
     step: Option<String>,
     _charge: Arc<crate::psd::memory36::MetadataCharge>,
 }
+impl DeferredSelectionShortcuts {
+    fn follow_copy_with_paste(&mut self, incoming: &[egui::Event]) -> bool {
+        let is_paste = |event: &egui::Event| matches!(clipboard_shortcut(event), Some(ClipboardShortcut::Paste));
+        if incoming.is_empty()
+            || !incoming.iter().all(is_paste)
+            || !self.events.iter().any(|event| matches!(clipboard_shortcut(event), Some(ClipboardShortcut::Copy(_))))
+            || self.events.iter().any(|event| !matches!(clipboard_shortcut(event), Some(ClipboardShortcut::Copy(_) | ClipboardShortcut::Paste)))
+            || self.events.len() >= 8
+        {
+            return false;
+        }
+        if !self.events.iter().any(is_paste) {
+            self.events.push(egui::Event::Paste(String::new()));
+        }
+        true
+    }
+}
 enum TabPreviewOutput {
     Resident(crate::workspace::TransferImage),
     Native(crate::workspace::TransferSummary, native_texture::Prepared),
@@ -550,6 +567,7 @@ struct ProjectView {
     selected: String,
     selection_layers: HashSet<String>,
     selection_anchor: String,
+    layer_clipboard: bool,
     mask: bool,
     mask_step: Option<String>,
     effect_selected: Option<(String, bool, String)>,
@@ -573,6 +591,13 @@ struct LayerDrag {
     ids: Vec<String>,
     commands: Vec<Value>,
     drop_plan: Option<Arc<layers::LayerDropPlan>>,
+}
+struct QueuedNudge {
+    delta: [i32; 2],
+    tool: Tool,
+    roots: Vec<String>,
+    mask: bool,
+    step: Option<String>,
 }
 struct EyeSweep {
     gesture: String,
@@ -664,6 +689,7 @@ pub struct PeerBrush {
     project_views: HashMap<String, ProjectView>,
     project_rects: HashMap<String, Rect>,
     project_drop_rect: Option<Rect>,
+    project_file_drop_tab: Option<(String, Rect)>,
     project_labels: HashMap<String, tabs::Label>,
     tab_active: String,
     tab_drag: Option<tabs::TabDrag>,
@@ -675,6 +701,7 @@ pub struct PeerBrush {
     updates: updates::Panel,
     about: about::About,
     lifecycle: Option<lifecycle::Review>,
+    deferred_file_close: Option<lifecycle::Intent>,
     recovery: recovery::Browser,
     saved_versions: Option<saved_versions::Browser>,
     open_file_warning: Option<String>,
@@ -781,6 +808,7 @@ pub struct PeerBrush {
     layer_rects: HashMap<String, Rect>,
     eye_rects: HashMap<String, Rect>,
     layer_context: Option<(String, egui::menu::MenuRootManager)>,
+    layer_color_edit: Option<layers::ColorEdit>,
     effect_add_rect: Option<Rect>,
     clipboard: crate::clipboard::Worker,
     zoom: f32,
@@ -835,7 +863,7 @@ pub struct PeerBrush {
     last_status: RuntimeValue<String>,
     import_tx: mpsc::Sender<ImportReply>,
     import_rx: mpsc::Receiver<ImportReply>,
-    pending_import: Option<PendingImport>,
+    pending_import: HashMap<String, PendingImport>,
     image_open_tx: mpsc::Sender<image_open::Pending>,
     image_open_rx: mpsc::Receiver<image_open::Pending>,
     pending_image_open: Option<image_open::Pending>,
@@ -843,6 +871,7 @@ pub struct PeerBrush {
     job_tx: mpsc::Sender<JobReply>,
     busy: bool,
     load_control: Option<crate::loading::Control>,
+    load_project: Option<String>,
     load_preview: Option<TextureHandle>,
     show_new: bool,
     new_size: new_canvas::Suggestion,
@@ -876,6 +905,7 @@ pub struct PeerBrush {
     rename_edit: Option<RenameEdit>,
     name_click: Option<(String, Pos2, f64)>,
     layer_clipboard: bool,
+    clipboard_copy: Option<Arc<std::sync::atomic::AtomicBool>>,
     opacity_rect: Option<Rect>,
     blend_rect: Option<Rect>,
     color_tab_rect: Option<Rect>,
@@ -888,8 +918,10 @@ pub struct PeerBrush {
     effect_selected: Option<(String, bool, String)>,
     effect_expanded: HashSet<(String, bool, String)>,
     activity_text: String,
+    activity_running: bool,
     activity_changed: std::time::Instant,
     gizmo_handle: u8,
+    queued_nudge: Option<QueuedNudge>,
     gizmo_source: Option<TransformGestureSource>,
     drag_revision: Option<u64>,
     gizmo_bounds: Option<(String, u64, [i32; 4])>,
@@ -1069,6 +1101,7 @@ impl PeerBrush {
             project_views: HashMap::new(),
             project_rects: HashMap::new(),
             project_drop_rect: None,
+            project_file_drop_tab: None,
             project_labels: HashMap::new(),
             tab_active: String::new(),
             tab_drag: None,
@@ -1078,6 +1111,7 @@ impl PeerBrush {
             canvas_input_region: None,
             jobs: HashSet::new(),
             lifecycle: None,
+            deferred_file_close: None,
             lifecycle_frame: false,
             exit_approved: false,
             connected: false,
@@ -1184,6 +1218,7 @@ impl PeerBrush {
             layer_rects: HashMap::new(),
             eye_rects: HashMap::new(),
             layer_context: None,
+            layer_color_edit: None,
             effect_add_rect: None,
             #[cfg(not(test))]
             clipboard: crate::clipboard::Worker::new(ctx.clone()),
@@ -1244,11 +1279,12 @@ impl PeerBrush {
             image_open_tx,
             image_open_rx,
             pending_image_open: None,
-            pending_import: None,
+            pending_import: HashMap::new(),
             job_rx,
             job_tx,
             busy: false,
             load_control: None,
+            load_project: None,
             load_preview: None,
             show_new: false,
             new_size: Default::default(),
@@ -1288,6 +1324,7 @@ impl PeerBrush {
             rename_edit: None,
             name_click: None,
             layer_clipboard: false,
+            clipboard_copy: None,
             opacity_rect: None,
             blend_rect: None,
             color_tab_rect: None,
@@ -1300,8 +1337,10 @@ impl PeerBrush {
             effect_selected: None,
             effect_expanded: HashSet::new(),
             activity_text: String::new(),
+            activity_running: false,
             activity_changed: std::time::Instant::now(),
             gizmo_handle: 0,
+            queued_nudge: None,
             gizmo_source: None,
             drag_revision: None,
             gizmo_bounds: None,
@@ -1360,7 +1399,8 @@ impl PeerBrush {
             let (native, source) = match origin {
                 edit_job::Origin::FreeTransform(_, key)
                 | edit_job::Origin::Geometry(_, key)
-                | edit_job::Origin::Filter(_, key) => {
+                | edit_job::Origin::Filter(_, key)
+                | edit_job::Origin::LayerColor(key) => {
                     let source = key.is_none().then(|| {
                         if self.doc_snapshot.view().same_observation(view) {
                             self.doc_snapshot.clone()
@@ -1496,6 +1536,7 @@ impl PeerBrush {
             | edit_job::Origin::Pen(_, Some(key))
             | edit_job::Origin::NativeDuplicateRepeat(key)
             | edit_job::Origin::Geometry(_, Some(key))
+            | edit_job::Origin::LayerColor(Some(key))
             | edit_job::Origin::Filter(_, Some(key)) = request.origin {
             Some(self.doc_snapshot.view().native()
                 .filter(|doc| doc.key() == key)
@@ -1598,6 +1639,26 @@ impl PeerBrush {
         }
         if current {
             self.show_edit_result(request, &completed.result, completed.commands());
+            if request.origin == edit_job::Origin::Nudge {
+                if let Some(next) = self.queued_nudge.take() {
+                    let latest = completed.result.as_ref().ok()
+                        .and_then(|reply| reply.data()["revision"].as_u64());
+                    let ctx = self.edit_context.clone();
+                    if next.tool == self.tool && next.mask == self.mask && next.step == self.mask_step
+                        && !self.document_shortcut_typing(&ctx)
+                        && ctx.input(|input| input.focused && !input.pointer.any_pressed()
+                            && !input.key_pressed(egui::Key::Escape))
+                    {
+                        let snapshot = self.shared.lock().unwrap().doc_snapshot();
+                        let doc = snapshot.view();
+                        if Some(doc.revision()) == latest && doc.id() == request.document
+                            && crate::tree::roots_view(doc, &self.selection_layers) == next.roots
+                        {
+                            self.nudge_transform(doc, next.delta);
+                        }
+                    }
+                }
+            }
         } else if let Some(view) = self.project_views.get_mut(&request.project) {
             view.message = completed
                 .result
@@ -1931,7 +1992,7 @@ impl PeerBrush {
     fn create_panel_layer<'a>(
         &mut self,
         doc: impl Into<DocumentView<'a>>,
-        adjustment: Option<(&str, &str)>,
+        adjustment: Option<&str>,
     ) {
         let doc = doc.into();
         if self.busy || self.edit_worker.pending() || self.parameter_gesture.is_some() {
@@ -1963,14 +2024,20 @@ impl PeerBrush {
             }
         };
         let (command, label) = match adjustment {
-            Some((kind, name)) => (
-                json!({"op":"adjustment.add","layers":self.selected_layer_ids(doc),"kind":kind,"name":name}),
-                "New adjustment",
+            Some(kind) => (
+                json!({"op":"adjustment.add","layers":self.selected_layer_ids(doc),"kind":kind}),
+                "New adjustment layer",
             ),
-            None => (
-                json!({"op":"layer.add","kind":"paint","name":format!("Paint {}",doc.layer_count()+1)}),
-                "New paint layer",
-            ),
+            None => {
+                let mut command = json!({"op":"layer.add","kind":"paint","name":format!("Paint {}",doc.layer_count()+1)});
+                if let Some(layer) = doc.find_layer(&self.selected) {
+                    command["relative_to"] = json!(layer.id());
+                    if layer.kind() == "group" {
+                        self.collapsed.remove(layer.id());
+                    }
+                }
+                (command, "New paint layer")
+            }
         };
         self.apply_action(
             vec![command],
@@ -2365,20 +2432,38 @@ impl PeerBrush {
         self.last_preview = None;
     }
     fn job<F: FnOnce() -> Result<String, String> + Send + 'static>(&mut self, f: F) {
-        if self.busy {
+        self.project_job(self.project_id.clone(), f);
+    }
+    fn finish_file_job(&mut self, project: &str) {
+        self.jobs.remove(project);
+        self.busy = self.jobs.contains(&self.project_id);
+        if self.load_project.as_deref() == Some(project) {
+            self.load_project = None;
+            self.load_control = None;
+            self.load_preview = None;
+        }
+    }
+    fn project_job<F: FnOnce() -> Result<String, String> + Send + 'static>(
+        &mut self,
+        project: String,
+        f: F,
+    ) {
+        if !self.jobs.insert(project.clone()) {
             return;
         }
-        self.busy = true;
-        let project = self.project_id.clone();
-        self.jobs.insert(project.clone());
+        self.busy = self.jobs.contains(&self.project_id);
         let tx = self.job_tx.clone();
-        std::thread::spawn(move || {
+        let owner = project.clone();
+        if let Err(error) = std::thread::Builder::new().name("peerbrush-file".into()).spawn(move || {
             let result =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|_| {
                     Err("File operation could not complete; current work preserved".into())
                 });
             let _ = tx.send(JobReply { project, result });
-        });
+        }) {
+            self.finish_file_job(&owner);
+            self.message = format!("Could not start the file operation: {error}").into();
+        }
     }
     fn connect_ai(&mut self, ctx: &egui::Context) {
         if self.connecting {
@@ -2499,13 +2584,14 @@ impl PeerBrush {
         self.open_named_job(path, recover, None);
     }
     fn open_named_job(&mut self, path: Option<PathBuf>, recover: bool, name: Option<String>) {
-        if self.busy || self.pending_image_open.is_some() {
+        if self.busy || self.pending_image_open.is_some() || self.load_control.is_some() {
             return;
         }
         let workspace = self.workspace.clone();
         let initiating = self.project_id.clone();
         let control = crate::loading::Control::default();
         self.load_control = Some(control.clone());
+        self.load_project = Some(initiating.clone());
         self.load_preview = None;
         let image_open_tx = self.image_open_tx.clone();
         self.job(move || {
@@ -2642,7 +2728,7 @@ impl PeerBrush {
             s.lock().unwrap().path.clone()
         };
         self.job(move || {
-            let overwrite = current.is_none();
+            let overwriting_current = current.is_some();
             let path = current.or_else(|| {
                 rfd::FileDialog::new()
                     .add_filter("PSD document", &["psd"])
@@ -2653,10 +2739,28 @@ impl PeerBrush {
             let Some(path) = path else {
                 return Ok("Save canceled · project remains open".into());
             };
-            if accepted {
-                server::save_accepted_source(&s, &path, &document, revision, overwrite)?;
+            let result = if accepted {
+                server::save_accepted_source(&s, &path, &document, revision, !overwriting_current)
             } else {
-                server::save_confirmed_source(&s, &path, &document, revision, overwrite)?;
+                server::save_confirmed_source(&s, &path, &document, revision, !overwriting_current)
+            };
+            if overwriting_current
+                && result.as_ref().is_err_and(|error| error.as_str() == crate::file_safety::PREVIOUS_SAVE_STORE_FULL)
+            {
+                let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("psd");
+                let name = path.file_stem().unwrap_or_default().to_string_lossy();
+                let fresh = rfd::FileDialog::new()
+                    .set_title("Previous-save storage is full · Choose a new file in another folder")
+                    .add_filter("PSD document", &["psd"])
+                    .add_filter("PSB document", &["psb"])
+                    .set_file_name(format!("{name} (new save).{extension}"))
+                    .save_file();
+                let Some(fresh) = fresh else {
+                    return Ok("Save canceled · edits and previous saves retained".into());
+                };
+                server::save_fresh_source(&s, &fresh, &document, revision, accepted)?;
+            } else {
+                result?;
             }
             Ok("Photoshop document saved".into())
         });
@@ -2706,23 +2810,31 @@ impl PeerBrush {
         self.begin_import(None);
     }
     fn begin_import(&mut self, paths: Option<Vec<PathBuf>>) {
-        if self.busy || self.pending_import.is_some() {
+        self.begin_project_import(self.project_id.clone(), paths);
+    }
+    fn begin_project_import(&mut self, project: String, paths: Option<Vec<PathBuf>>) {
+        if self.jobs.contains(&project) || self.pending_import.contains_key(&project) {
             self.message = "Finish or cancel the current import first".into();
             return;
         }
-        self.close_proposal();
-        self.finish_parameter(true);
-        let project = self.project_id.clone();
+        let Ok(shared) = crate::workspace::get_in(&self.workspace, &project) else {
+            self.message = "Import destination project was closed".into();
+            return;
+        };
+        if project == self.project_id {
+            self.close_proposal();
+            self.finish_parameter(true);
+        }
         let (document, revision, native) = {
-            let e = self.shared.lock().unwrap();
+            let e = shared.lock().unwrap();
             let view = crate::engine::view::current(&e);
             (view.id().to_owned(), view.revision(), e.native_document().cloned())
         };
-        self.busy = true;
         self.jobs.insert(project.clone());
+        self.busy = self.jobs.contains(&self.project_id);
         let tx = self.import_tx.clone();
-        let shared = self.shared.clone();
-        std::thread::spawn(move || {
+        let owner = project.clone();
+        if let Err(error) = std::thread::Builder::new().name("peerbrush-import".into()).spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let paths = paths.or_else(|| {
                     rfd::FileDialog::new()
@@ -2735,8 +2847,10 @@ impl PeerBrush {
                 if paths.len() > 16 {
                     return Err("Import at most 16 images at once".into());
                 }
+                use crate::workspace::native_dispatch::{retry_source_read, runtime_for};
                 let runtime = (native.is_some() && !paths.is_empty())
-                    .then(|| crate::workspace::native_dispatch::runtime_for(&shared)).transpose()?;
+                    .then(|| retry_source_read(|| runtime_for(&shared)))
+                    .transpose()?;
                 let session = runtime
                     .as_ref()
                     .map(|runtime| runtime.begin_foreground())
@@ -2751,7 +2865,7 @@ impl PeerBrush {
                                 .ok_or("Missing image extension")?;
                             let format = crate::image_import::native::OpenFormat::from_path(&path)
                                 .ok_or("Unsupported image format")?;
-                            let check = || session.check();
+                            let check = || retry_source_read(|| session.check());
                             let (choice, digest, icon_sizes) = match format {
                                 crate::image_import::native::OpenFormat::Png => {
                                     let inspection = crate::image_import::prepared_png::apng::inspect_layer(
@@ -2797,21 +2911,26 @@ impl PeerBrush {
                 native,
                 result,
             });
-        });
+        }) {
+            self.jobs.remove(&owner);
+            self.busy = self.jobs.contains(&self.project_id);
+            self.message = format!("Could not start the image import: {error}").into();
+        }
     }
     fn commit_import(&mut self) {
         if self.busy {
             return;
         }
-        let Some(pending) = self.pending_import.take() else {
+        if let Some(pending) = self.pending_import.remove(&self.project_id) {
+            self.commit_project_import(pending);
+        }
+    }
+    fn commit_project_import(&mut self, pending: PendingImport) {
+        let Ok(shared) = crate::workspace::get_in(&self.workspace, &pending.project) else {
+            self.message = "Import source project was closed; current work preserved".into();
             return;
         };
-        if pending.project != self.project_id {
-            self.pending_import = Some(pending);
-            return;
-        }
-        let shared = self.shared.clone();
-        self.job(move || {
+        self.project_job(pending.project.clone(), move || {
             crate::workspace::guard(&shared.lock().unwrap(),&pending.document,pending.revision)?;
             if let Some(document) = pending.native {
                 let mut commands = Vec::with_capacity(pending.files.len());
@@ -2845,20 +2964,9 @@ impl PeerBrush {
         });
     }
     fn import_dialog(&mut self, ctx: &egui::Context) {
-        if self
-            .pending_import
-            .as_ref()
-            .is_some_and(|p| crate::workspace::get_in(&self.workspace, &p.project).is_err())
-        {
-            self.pending_import = None;
-            self.message = "Import source project was closed; current work preserved".into();
-        }
-        let Some(pending) = &mut self.pending_import else {
+        let Some(pending) = self.pending_import.get_mut(&self.project_id) else {
             return;
         };
-        if pending.project != self.project_id {
-            return;
-        }
         let mut open = true;
         let mut apply = false;
         let mut cancel = false;
@@ -2890,8 +2998,9 @@ impl PeerBrush {
                 });
             });
         if cancel || !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.pending_import = None;
+            self.pending_import.remove(&self.project_id);
             self.message = "Import canceled".into();
+            ctx.request_repaint();
         } else if apply {
             self.commit_import();
         }
@@ -3718,16 +3827,16 @@ impl PeerBrush {
         &mut self,
         ui: &egui::Ui,
         doc: impl Into<DocumentView<'a>>,
-        id: &str,
+        layer: LayerView<'a>,
         mask: bool,
     ) -> Option<TextureHandle> {
         let doc = doc.into();
-        if let Some(native) = doc.native() {
+        if let (Some(native), LayerView::Native(layer)) = (doc.native(), layer) {
             match self.layer_thumbnails.get_layer(
                 &self.shared,
                 &self.project_id,
                 native,
-                id,
+                layer,
                 mask,
                 ui.ctx(),
             ) {
@@ -3738,7 +3847,7 @@ impl PeerBrush {
                 }
             }
         } else {
-            self.thumbnail_for(ui.ctx(), doc.resident().unwrap(), id, mask, None)
+            self.thumbnail_for(ui.ctx(), doc.resident()?, layer.id(), mask, None)
         }
     }
     fn thumbnail_for(
@@ -3850,9 +3959,24 @@ impl PeerBrush {
             ui.close_menu();
         }
         ui.separator();
+        if ui.button("Rename").clicked() {
+            self.begin_rename(doc, l.id());
+            ui.close_menu();
+        }
+        if ui
+            .add_enabled(
+                !self.busy && !self.edit_worker.pending() && !doc.read_only(),
+                egui::Button::new("Duplicate"),
+            )
+            .clicked()
+        {
+            if !self.selection_layers.contains(l.id()) {
+                self.select_content(l.id());
+            }
+            self.duplicate_layers(doc);
+            ui.close_menu();
+        }
         for (title, op, extra) in [
-            ("Rename", "rename", json!({})),
-            ("Duplicate", "layer.duplicate", json!({})),
             (
                 if l.locked() { "Unlock" } else { "Lock" },
                 "layer.update",
@@ -3862,23 +3986,18 @@ impl PeerBrush {
         ] {
             if ui
                 .add_enabled(
-                    !(op == "layer.duplicate" && l.kind() == "group")
-                        && !(op == "mask.add" && l.mask().is_some()),
+                    !(op == "mask.add" && l.mask().is_some()),
                     egui::Button::new(title),
                 )
                 .clicked()
             {
                 self.selected = l.id().to_owned();
-                if op == "rename" {
-                    self.begin_rename(doc, l.id());
+                let extra = if op == "mask.add" {
+                    json!({"value":255,"document_id":doc.id(),"source_revision":doc.revision()})
                 } else {
-                    let extra = if op == "mask.add" {
-                        json!({"value":255,"document_id":doc.id(),"source_revision":doc.revision()})
-                    } else {
-                        extra
-                    };
-                    self.layer_cmd(op, extra, title);
-                }
+                    extra
+                };
+                self.layer_cmd(op, extra, title);
                 ui.close_menu();
             }
         }
@@ -3897,8 +4016,8 @@ impl PeerBrush {
         ui.add_enabled_ui(
             !doc.read_only() && !self.busy && !l.locked() && !reserved,
             |ui| {
-                ui.menu_button("Color label", |ui| {
-                    for &label in crate::psd::LAYER_COLOR_LABELS {
+                ui.menu_button("Color", |ui| {
+                    for label in layers::COLOR_LABEL_OPTIONS {
                         let title = format!("{}{}", label[..1].to_ascii_uppercase(), &label[1..]);
                         let option = match layers::label_color(label) {
                             Some(color) => RichText::new(format!("●  {title}")).color(color),
@@ -3908,10 +4027,13 @@ impl PeerBrush {
                         let response = ui.selectable_label(selected, option);
                         response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, ui.is_enabled(), selected, &title));
                         if response.clicked() {
-                            self.edit(vec![json!({"op":"layer.update", "layer":l.id(), "color_label":label,
-                                "document_id":doc.id(), "source_revision":doc.revision()})], "Layer color label");
+                            self.set_layer_color(doc, l.id(), label);
                             ui.close_menu();
                         }
+                    }
+                    if ui.button("Custom…").clicked() {
+                        self.layer_color_edit = Some(layers::ColorEdit::new(doc, l));
+                        ui.close_menu();
                     }
                 });
             },
@@ -4345,18 +4467,18 @@ impl PeerBrush {
                             (crate::effects::legacy_brightness::KIND, "Legacy Brightness/Contrast"),
                         ] {
                             if effects::menu_effect(ui, kind, label, None).clicked() {
-                                self.create_panel_layer(doc, Some((kind, label)));
+                                self.create_panel_layer(doc, Some(kind));
                                 ui.close_menu();
                             }
                         }
                     },
                 )
                 .response
-                .on_hover_text("Add clipped adjustment · multiple layers become a shared color group");
+                .on_hover_text("Add adjustment layer · multiple layers become a shared color group");
                 adjustment.widget_info(|| {
                     egui::WidgetInfo::labeled(egui::WidgetType::Button, adjustment.enabled(), "Add adjustment layer")
                 });
-                icons::paint(ui.painter(), adjustment.rect.shrink(4.), Icon::Adjust, adjustment.enabled());
+                icons::paint(ui.painter(), adjustment.rect.shrink(4.), Icon::AdjustmentLayer, adjustment.enabled());
                 icons::paint_focus(ui, &adjustment);
                 if icons::button(ui, Icon::AddLayer, "New paint layer").clicked() {
                     self.create_panel_layer(doc, None);
@@ -5483,6 +5605,7 @@ impl PeerBrush {
                 selected: self.selected.clone(),
                 selection_layers: self.selection_layers.clone(),
                 selection_anchor: self.selection_anchor.clone(),
+                layer_clipboard: self.layer_clipboard,
                 mask: self.mask,
                 mask_step: self.mask_step.clone(),
                 effect_selected: self.effect_selected.clone(),
@@ -5506,6 +5629,7 @@ impl PeerBrush {
             self.tab_transfer = None;
         }
         self.layer_context = None;
+        self.layer_color_edit = None;
         self.geometry = None;
         self.source_editor = None;
         self.filter_editor = None;
@@ -5531,6 +5655,7 @@ impl PeerBrush {
             self.selected = view.selected;
             self.selection_layers = view.selection_layers;
             self.selection_anchor = view.selection_anchor;
+            self.layer_clipboard = view.layer_clipboard;
             self.mask = view.mask;
             self.mask_step = view.mask_step;
             self.effect_selected = view.effect_selected;
@@ -5546,6 +5671,7 @@ impl PeerBrush {
             self.selected = String::new();
             self.selection_layers.clear();
             self.selection_anchor = String::new();
+            self.layer_clipboard = false;
             self.mask = false;
             self.mask_step = None;
             self.effect_selected = None;
@@ -5578,6 +5704,9 @@ impl PeerBrush {
         self.thumb_document.clear();
         self.thumb_native = false;
         self.last_status = "".into();
+        self.activity_running = false;
+        self.activity_text.clear();
+        self.queued_nudge = None;
     }
     fn draw_header(&mut self, ctx: &egui::Context) {
         let (connected, activity) = {
@@ -5587,12 +5716,18 @@ impl PeerBrush {
                     .values()
                     .any(|expiry| *expiry > crate::engine::now());
             }
-            let activity = self
-                .shared
-                .try_lock()
-                .ok()
-                .map(|e| e.activity.clone())
-                .unwrap_or_else(|| self.activity_text.clone());
+            let activity = match self.shared.try_lock() {
+                Ok(engine) => {
+                    let now = crate::engine::now();
+                    let task = engine.leases.iter().rev().find(|lease| lease.owner != "human" && lease.expires > now);
+                    self.activity_running = task.is_some() || engine.has_running_code()
+                        || engine.agent_calls.load(std::sync::atomic::Ordering::Relaxed) != 0;
+                    task.map(|lease| lease.description.clone()).unwrap_or_else(|| {
+                        if self.activity_running { engine.activity.clone() } else { String::new() }
+                    })
+                }
+                Err(_) => self.activity_text.clone(),
+            };
             (self.connected, activity)
         };
         let available = self.connection.is_available();
@@ -5680,25 +5815,28 @@ impl PeerBrush {
                 });
                 let width = (bounds.width() - 610.0).clamp(200.0, 540.0);
                 let center = Rect::from_center_size(bounds.center(), Vec2::new(width, 32.0));
+                let pulse = (ui.input(|i| i.time) as f32 * 4.0).sin();
                 ui.painter()
                     .rect_filled(center, 9.0, Color32::from_rgb(36, 34, 38));
+                if self.activity_running {
+                    ui.painter().rect_filled(center, 9.0, AI_BLUE.gamma_multiply(0.075 + pulse * 0.027));
+                }
                 let progress = (self.activity_changed.elapsed().as_secs_f32() / 0.3).min(1.0);
                 let alpha = 0.75 + progress * 0.25;
-                let pulse = ui.input(|i| i.time) as f32;
                 ui.painter().circle_filled(
                     center.left_center() + Vec2::new(13.0, 0.0),
-                    if connected {
-                        3.0 + 0.7 * (pulse * 3.0).sin()
+                    if self.activity_running {
+                        3.0 + 0.7 * pulse
                     } else {
                         2.5
                     },
-                    if connected {
+                    if connected || self.activity_running {
                         AI_BLUE
                     } else {
                         MUTED.gamma_multiply(0.5)
                     },
                 );
-                if connected {
+                if self.activity_running {
                     ctx.request_repaint_after(Duration::from_millis(50));
                 }
                 if progress < 1.0 {
@@ -5717,7 +5855,7 @@ impl PeerBrush {
                             egui::Label::new(
                                 RichText::new(&self.activity_text)
                                     .size(12.0)
-                                    .color(if self.animation.active(ui.input(|i| i.time)) { AI_BLUE.gamma_multiply(alpha) } else { MUTED.gamma_multiply(alpha) }),
+                                    .color(if self.activity_running || self.animation.active(ui.input(|i| i.time)) { AI_BLUE.gamma_multiply(alpha) } else { MUTED.gamma_multiply(alpha) }),
                             )
                             .truncate(),
                         )
@@ -6120,11 +6258,19 @@ impl PeerBrush {
     }
 
     fn queue_selection_shortcuts(&mut self, doc: DocumentView<'_>, events: Vec<egui::Event>, modifiers: egui::Modifiers) {
-        if events.is_empty() || self.deferred_selection_shortcuts.is_some() { return; }
+        if events.is_empty() { return; }
         let Some(document) = doc.native() else { return; };
         let Some(request) = self.edit_worker.request_owner().filter(|request| {
             request.selection_edit && request.project == self.project_id && request.document == doc.id()
         }) else { return; };
+        if let Some(queued) = self.deferred_selection_shortcuts.as_mut() {
+            if Arc::ptr_eq(&queued.request, &request) && queued.layer == self.selected
+                && queued.tool == self.tool && queued.mask == self.mask && queued.step == self.mask_step
+            {
+                queued.follow_copy_with_paste(&events);
+            }
+            return;
+        }
         let bytes = 2048 + self.selected.len() + self.mask_step.as_ref().map_or(0, String::len);
         let charge = match crate::psd::memory36::MetadataCharge::reserve(document.budget(), bytes, &|| Ok(())) {
             Ok(charge) => charge,
@@ -6138,13 +6284,20 @@ impl PeerBrush {
 
     fn replay_selection_shortcuts(&mut self, ctx: &egui::Context, doc: DocumentView<'_>) {
         if self.edit_worker.pending() { return; }
-        let Some(queued) = self.deferred_selection_shortcuts.take() else { return; };
+        let Some(mut queued) = self.deferred_selection_shortcuts.take() else { return; };
         let Some((revision, source)) = queued.committed else { return; };
         if queued.request.project != self.project_id || queued.request.document != doc.id()
             || queued.tool != self.tool || queued.layer != self.selected
             || queued.mask != self.mask || queued.step != self.mask_step
             || self.document_shortcut_typing(ctx) || self.free_transform.is_some() || self.free_transform_frame
         { return; }
+        let incoming = ctx.input(|input| self.selection_shortcut_events(&input.events));
+        let following_paste = queued.follow_copy_with_paste(&incoming);
+        if following_paste {
+            ctx.input_mut(|input| input.events.retain(|event| {
+                !matches!(clipboard_shortcut(event), Some(ClipboardShortcut::Paste))
+            }));
+        }
         let current = self.shared.try_lock().ok().map(|engine| {
             let live = crate::engine::view::current(&engine);
             live.id() == doc.id() && live.revision() == revision
@@ -6157,9 +6310,7 @@ impl PeerBrush {
             return;
         }
         if doc.revision() != revision || doc.native().is_none_or(|document| document.key() != source)
-            || ctx.input(|input| input.events.iter().any(|event| {
-                !matches!(event, egui::Event::Key { repeat: true, .. }) && self.shortcuts.selection_dependent_event(event)
-            }))
+            || (!following_paste && !incoming.is_empty())
         { return; }
         if doc.selection().is_none() {
             self.message = "Selection is empty; shortcut skipped".into();
@@ -6175,6 +6326,7 @@ impl PeerBrush {
     fn document_shortcut_typing(&self, ctx: &egui::Context) -> bool {
         self.lifecycle.is_some()
             || self.source_editor.is_some()
+            || self.layer_color_edit.is_some()
             || (self.tool == Tool::Text
                 && ctx.input(|input| input.pointer.primary_down() || input.pointer.primary_pressed()))
             || self.shortcuts.open || self.filter_editor.is_some() || self.rename_edit.is_some()
@@ -6295,7 +6447,88 @@ impl PeerBrush {
         }))
     }
 
+    fn nudge_transform(&mut self, doc: DocumentView<'_>, [x, y]: [i32; 2]) {
+        if [x, y] == [0, 0] || self.busy || self.gizmo_handle != 0
+            || !matches!(self.tool, Tool::Move | Tool::Rotate | Tool::Scale)
+        {
+            return;
+        }
+        let roots = crate::tree::roots_view(doc, &self.selection_layers);
+        if roots.is_empty() {
+            return;
+        }
+        if let Some(request) = self.edit_worker.request() {
+            if request.origin == edit_job::Origin::Nudge && request.project == self.project_id
+                && request.document == doc.id()
+            {
+                let queued = self.queued_nudge.get_or_insert_with(|| QueuedNudge {
+                    delta: [0, 0], tool: self.tool, roots: roots.clone(), mask: self.mask, step: self.mask_step.clone(),
+                });
+                if queued.tool == self.tool && queued.roots == roots
+                    && queued.mask == self.mask && queued.step == self.mask_step
+                {
+                    for (amount, delta) in queued.delta.iter_mut().zip([x, y]) {
+                        *amount = amount.saturating_add(delta).clamp(-256, 256);
+                    }
+                }
+            }
+            return;
+        }
+        let selection = doc.selection().filter(|_| !self.transform_entire_pixel_copy(doc));
+        let bounds = selection
+            .or_else(|| doc.resident().and_then(|doc| crate::transform::tree_bounds(doc, &roots)))
+            .unwrap_or_else(|| {
+                let tree = crate::transform::tree_ids_view(doc, &roots);
+                doc.layers().filter(|layer| tree.iter().any(|id| id == layer.id()))
+                    .filter(|layer| layer.kind() != "group")
+                    .map(|layer| {
+                        let [left, top] = layer.origin();
+                        let shape = layer.pixels();
+                        let (width, height) = (shape.width, shape.height);
+                        [left, top, left.saturating_add(width as i32), top.saturating_add(height as i32)]
+                    })
+                    .reduce(|a, b| [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])])
+                    .unwrap_or([0, 0, doc.width() as i32, doc.height() as i32])
+            });
+        let pivot = [
+            (f64::from(bounds[0]) + f64::from(bounds[2])) * 0.5,
+            (f64::from(bounds[1]) + f64::from(bounds[3])) * 0.5,
+        ];
+        let step = (roots.len() == 1).then_some(self.mask_step.as_deref()).flatten();
+        let commands: Vec<_> = roots.iter().map(|layer| {
+            let mut command = json!({
+                "op": "transform", "layer": layer, "pivot": pivot, "mask": self.mask,
+                "step": step, "selection_only": selection.is_some()
+            });
+            match self.tool {
+                Tool::Move => {
+                    command["op"] = json!("move");
+                    command["dx"] = json!(x);
+                    command["dy"] = json!(y);
+                }
+                Tool::Rotate => command["angle"] = json!(f64::from(x - y) * 0.1),
+                Tool::Scale => {
+                    let amount = 1.01_f64.powi(x - y).clamp(0.05, 20.);
+                    command["scale_x"] = json!(amount);
+                    command["scale_y"] = json!(amount);
+                }
+                _ => unreachable!(),
+            }
+            command
+        }).collect();
+        if self.tool == Tool::Move || x != y {
+            self.apply_action(commands, "Nudge transform", Some((doc.id(), doc.revision())), edit_job::Origin::Nudge);
+        }
+    }
+
     fn dispatch_document_shortcuts(&mut self, ctx: &egui::Context, doc: DocumentView<'_>) {
+        if self.edit_worker.request().is_some_and(|request| request.origin == edit_job::Origin::Nudge) {
+            let delta = ctx.input(free_transform::arrow_delta);
+            if delta != [0, 0] {
+                self.nudge_transform(doc, delta);
+                return;
+            }
+        }
         if self.edit_worker.request().is_some_and(|request| request.selection_edit) {
             if ctx.input(|input| input.pointer.primary_pressed()) { return; }
             let (events, modifiers) = ctx.input(|input| (self.selection_shortcut_events(&input.events), input.modifiers));
@@ -6351,13 +6584,36 @@ impl PeerBrush {
                 (copy, cut, paste)
             });
             let merged = copy.unwrap_or(false);
+            let copy_and_paste = copy.is_some() && paste && !cut;
             if copy.is_some() || cut {
+                self.clipboard_copy = None;
                 if let Some(request) = self.copy_request(&self.doc_snapshot, cut, merged) {
-                    self.message = self
-                        .clipboard
-                        .request_snapshot(request)
+                    let tracked = !copy_and_paste
+                        && matches!(&request, crate::clipboard::EditRequest::Layers { cut: None, .. });
+                    let receipt = tracked.then(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
+                    let request = if let Some(receipt) = &receipt {
+                        crate::clipboard::EditRequest::TrackedCopy {
+                            copy: Box::new(request), receipt: receipt.clone(),
+                        }
+                    } else if copy_and_paste {
+                        crate::clipboard::EditRequest::CopyAndPaste {
+                            copy: Box::new(request),
+                            shared: self.shared.clone(),
+                            doc: self.doc_snapshot.clone(),
+                            target: self.selected.clone(),
+                        }
+                    } else {
+                        request
+                    };
+                    let queued = self.clipboard.request_snapshot(request);
+                    if queued.is_ok() {
+                        self.clipboard_copy = receipt;
+                    }
+                    self.message = queued
                         .map(|_| {
-                            if cut {
+                            if copy_and_paste {
+                                "Copying and pasting…".into()
+                            } else if cut {
                                 if doc.selection().is_some() {
                                     "Cutting selected pixels…".into()
                                 } else {
@@ -6373,14 +6629,23 @@ impl PeerBrush {
                         .into();
                 }
             }
-            if paste {
-                self.message = self
-                    .clipboard
-                    .request_snapshot(crate::clipboard::EditRequest::Paste {
-                        shared: self.shared.clone(),
-                        doc: self.doc_snapshot.clone(),
-                        target: self.selected.clone(),
-                    })
+            if paste && !copy_and_paste {
+                use crate::clipboard::EditRequest;
+                let shared = self.shared.clone();
+                let doc = self.doc_snapshot.clone();
+                let target = self.selected.clone();
+                let receipt = self.clipboard_copy.take();
+                let request = match receipt.as_ref() {
+                    Some(receipt) if !receipt.load(std::sync::atomic::Ordering::Acquire) => {
+                        EditRequest::PasteAfterCopy { shared, doc, target, receipt: receipt.clone() }
+                    }
+                    _ => EditRequest::Paste { shared, doc, target },
+                };
+                let queued = self.clipboard.request_snapshot(request);
+                if queued.is_err() {
+                    self.clipboard_copy = receipt;
+                }
+                self.message = queued
                     .map(|_| "Pasting image…".into())
                     .unwrap_or_else(|e| e)
                     .into();
@@ -6443,6 +6708,7 @@ impl PeerBrush {
                 }
                 if command_key(i,egui::Key::J) && self.layer_clipboard {self.duplicate_layers(doc);}
                 self.configured_shortcuts(i,doc);
+                self.nudge_transform(doc, free_transform::arrow_delta(i));
                 if i.key_pressed(egui::Key::Escape) {
                     let cancelled=self.straight.line || !self.points.is_empty();
                     self.straight.cancel();self.straight.cancelled=cancelled;self.drag_revision=None;
@@ -6782,20 +7048,20 @@ impl PeerBrush {
             match reply.result {
                 Ok(files) if !files.is_empty() => {
                     let needs_choice = files.iter().any(|f| f.choice().is_some());
-                    self.pending_import = Some(PendingImport {
+                    let pending = PendingImport {
                         project: reply.project,
                         document: reply.document,
                         revision: reply.revision,
                         native: reply.native,
                         files,
-                    });
-                    if !needs_choice
-                        && self
-                            .pending_import
-                            .as_ref()
-                            .is_some_and(|p| p.project == self.project_id)
-                    {
-                        self.commit_import();
+                    };
+                    if needs_choice {
+                        if let Some(view) = self.project_views.get_mut(&pending.project) {
+                            view.message = "Choose image content to finish importing".into();
+                        }
+                        self.pending_import.insert(pending.project.clone(), pending);
+                    } else {
+                        self.commit_project_import(pending);
                     }
                 }
                 Ok(_) => {}
@@ -6809,10 +7075,7 @@ impl PeerBrush {
             }
         }
         while let Ok(reply) = self.job_rx.try_recv() {
-            self.jobs.remove(&reply.project);
-            self.busy = self.jobs.contains(&self.project_id);
-            self.load_control = None;
-            self.load_preview = None;
+            self.finish_file_job(&reply.project);
             let result = reply.result;
             if self.recovery.record_job.as_deref() == Some(reply.project.as_str()) {
                 self.recovery.finish_record_job(
@@ -6844,6 +7107,9 @@ impl PeerBrush {
             self.message = result.unwrap_or_else(|e| e).into();
             self.last_preview = None;
         }
+        self.poll_image_open_choice();
+        self.pending_import
+            .retain(|project, _| crate::workspace::get_in(&self.workspace, project).is_ok());
         if self.save_loss_review.is_some() {
             self.save_loss_dialog(ctx);
         } else {
@@ -6937,8 +7203,11 @@ impl PeerBrush {
         self.cancel_interrupted_text_drag(ctx, doc);
         self.sync_free_transform(ctx, doc);
         if self.lifecycle.is_none() && !self.lifecycle_frame {
-            self.import_dialog(ctx);
-            self.image_open_dialog(ctx);
+            if self.pending_image_open.is_some() {
+                self.image_open_dialog(ctx);
+            } else {
+                self.import_dialog(ctx);
+            }
             self.open_activated_file(ctx);
         }
         if self.rename_edit.as_ref().is_some_and(|edit| {
@@ -7052,7 +7321,15 @@ impl PeerBrush {
                 .collect::<Vec<_>>()
         });
         if !dropped.is_empty() && self.lifecycle.is_none() && !self.lifecycle_frame {
-            if self.file_drop_on_tabs(ctx) {
+            if let Some((project, _)) = self.project_file_drop_tab.clone().filter(|_| {
+                !dropped.iter().any(|path| {
+                    path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| {
+                        ext.eq_ignore_ascii_case("psd") || ext.eq_ignore_ascii_case("psb")
+                    })
+                })
+            }) {
+                self.begin_project_import(project, Some(dropped));
+            } else if self.file_drop_on_tabs(ctx) {
                 self.drop_project_file(dropped);
             } else {
                 self.drop_files(dropped);
@@ -7683,6 +7960,7 @@ impl PeerBrush {
             self.brush_settings(ctx);
         }
         self.color_window(ctx);
+        self.layer_color_window(ctx, doc, &reserved);
         self.task_history_review(ctx, doc);
         self.proposal_window(ctx, doc, frame.proposal.as_ref());
         self.refinement_window(ctx, doc);
@@ -7785,7 +8063,7 @@ impl PeerBrush {
         }
         // Preview workers wake the UI when results arrive. Background project
         // activity still needs the workspace's periodic refresh.
-        if self.busy || !self.points.is_empty() {
+        if !self.jobs.is_empty() || !self.points.is_empty() {
             ctx.request_repaint_after(Duration::from_millis(16));
         } else {
             ctx.request_repaint_after(Duration::from_millis(200));
@@ -10490,7 +10768,7 @@ mod tests {
                 break;
             }
         }
-        assert!(app.pending_import.is_some());
+        assert!(app.pending_import.contains_key(&app.project_id));
         path
     }
     fn wait_import(app: &mut PeerBrush, ctx: &egui::Context) {
@@ -10520,11 +10798,11 @@ mod tests {
             }],
             Default::default(),
         );
-        assert!(app.pending_import.is_none());
+        assert!(app.pending_import.is_empty());
         assert!(app.shared.lock().unwrap().resident_state().expect("resident fixture").undo.is_empty());
         std::fs::remove_file(path).unwrap();
         let path = import_choice_fixture(&mut app, &ctx);
-        app.pending_import.as_mut().unwrap().files[0].index = 1;
+        app.pending_import.get_mut(&app.project_id).unwrap().files[0].index = 1;
         std::fs::write(&path, b"Changed after inspection").unwrap();
         app.commit_import();
         wait_import(&mut app, &ctx);
@@ -10572,7 +10850,7 @@ mod tests {
         crate::workspace::select(&app.workspace_root, &other_id).unwrap();
         frame(&mut app, &ctx, vec![], Default::default());
         app.commit_import();
-        assert!(app.pending_import.is_some());
+        assert!(app.pending_import.contains_key(&project));
         assert!(other.lock().unwrap().resident_state().expect("resident fixture").undo.is_empty());
         assert_eq!(source.lock().unwrap().resident_state().expect("resident fixture").undo.len(), 1);
         crate::workspace::close(
@@ -10585,7 +10863,7 @@ mod tests {
         )
         .unwrap();
         frame(&mut app, &ctx, vec![], Default::default());
-        assert!(app.pending_import.is_none());
+        assert!(app.pending_import.is_empty());
         assert!(other.lock().unwrap().resident_state().expect("resident fixture").undo.is_empty());
         std::fs::remove_file(path).unwrap();
     }
@@ -10607,7 +10885,7 @@ mod tests {
                 std::env::temp_dir().join(format!("peerbrush-ui-svg-{}.svg", uuid::Uuid::new_v4()));
             std::fs::write(&path, markup).unwrap();
             let encoded = crate::image_import::Encoded::file(&path).unwrap();
-            app.pending_import = Some(PendingImport {
+            app.pending_import.insert(app.project_id.clone(), PendingImport {
                 project: app.project_id.clone(),
                 document: before.id.clone(),
                 revision: before.revision,
@@ -10849,6 +11127,33 @@ mod tests {
                     drop(engine);
                     app.select_content(&other);
                     app.selection_layers.insert(folder.clone());
+                } else if target == &folder && position == group.left_center() + Vec2::new(85., 0.) {
+                    let duplicate = output.shapes.iter().find_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) if text.galley.job.text == "Duplicate" => {
+                            Some(text.visual_bounding_rect().center())
+                        }
+                        _ => None,
+                    }).unwrap();
+                    click(&mut app, &ctx, duplicate);
+                    assert!(app.layer_context.is_none());
+                    assert_eq!(app.selection_layers.len(), 2);
+                    assert!(app.selection_layers.is_disjoint(&selected));
+                    {
+                        let engine = app.shared.lock().unwrap();
+                        let state = engine.resident_state().unwrap();
+                        assert_eq!(state.undo.len(), 1);
+                        assert_eq!(state.document.layers.len(), 6);
+                        let copied_child = state.document.layers.iter().find(|layer| {
+                            layer.id != child && layer.parent.as_ref()
+                                .is_some_and(|parent| app.selection_layers.contains(parent))
+                        }).unwrap();
+                        assert!(copied_child.mask.is_some());
+                        assert_eq!(copied_child.pixels.get16(2, 2),
+                            state.document.layers.iter().find(|layer| layer.id == child)
+                                .unwrap().pixels.get16(2, 2));
+                    }
+                    app.history_action(false);
+                    assert_eq!(app.selection_layers, selected);
                 } else {
                     key(&mut app, &ctx, egui::Key::Escape);
                     assert!(app.layer_context.is_none());
@@ -14409,7 +14714,7 @@ mod tests {
                                     assert_eq!(step.as_deref(), Some("observed-mask-step"));
                                     captured
                                 }
-                                EditRequest::Resident(_) | EditRequest::Paste { .. } => panic!("Copy must retain its frame snapshot"),
+                                _ => panic!("Copy must retain its frame snapshot"),
                             };
                             match (&snapshot, captured) {
                                 (DocumentSnapshot::Resident(a), DocumentSnapshot::Resident(b)) => assert!(Arc::ptr_eq(a, b)),
@@ -14713,11 +15018,12 @@ mod tests {
     fn native_wand_replays_release_frame_clipboard_and_transform_shortcuts() {
         use crate::engine::{native::{worker::tests::Fixture, NativeDocument}, scene::{CapturedScene, LegacyTileCache}};
         for depth in [8, 16] {
-            for (event, tool) in [
-                (egui::Event::Copy, Tool::MagicWand),
-                (shortcut_press(egui::Key::W), Tool::Move),
-                (shortcut_press(egui::Key::E), Tool::Rotate),
-                (shortcut_press(egui::Key::R), Tool::Scale),
+            for (event, tool, following_paste) in [
+                (egui::Event::Copy, Tool::MagicWand, false),
+                (egui::Event::Copy, Tool::MagicWand, true),
+                (shortcut_press(egui::Key::W), Tool::Move, false),
+                (shortcut_press(egui::Key::E), Tool::Rotate, false),
+                (shortcut_press(egui::Key::R), Tool::Scale, false),
             ] {
                 let fixture = Fixture::new();
                 let (runtime, _connection) = fixture.runtime();
@@ -14758,6 +15064,17 @@ mod tests {
                 frame(&mut app, &ctx, vec![primary_release(point), event], Default::default());
                 assert!(app.deferred_selection_shortcuts.is_some());
                 let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                if following_paste {
+                    // Finish the worker without drawing, so Paste reaches the same
+                    // frame that will replay the queued Copy against the selection.
+                    while app.edit_worker.pending() {
+                        assert!(std::time::Instant::now() < deadline);
+                        app.poll_edit_job();
+                        std::thread::yield_now();
+                    }
+                    assert!(app.deferred_selection_shortcuts.as_ref().unwrap().committed.is_some());
+                    frame(&mut app, &ctx, vec![egui::Event::Paste(String::new())], Default::default());
+                }
                 while app.deferred_selection_shortcuts.is_some() || app.edit_worker.pending() {
                     assert!(std::time::Instant::now() < deadline);
                     frame(&mut app, &ctx, vec![], Default::default());
@@ -14766,19 +15083,24 @@ mod tests {
                 assert!(app.tool == tool);
                 let snapshot = {
                     let engine = shared.lock().unwrap();
-                    assert_eq!(engine.history_lengths(), [1, 0]);
+                    if !following_paste {
+                        assert_eq!(engine.history_lengths(), [1, 0]);
+                    }
                     assert_eq!(engine.native_document().unwrap().metadata().selection(), Some([4, 5, 12, 13]));
                     engine.doc_snapshot()
                 };
                 if tool == Tool::MagicWand {
-                    let copy = app.clipboard.replies.recv_timeout(Duration::from_secs(5)).unwrap();
-                    assert!(copy.result.is_ok(), "{:?}", copy.result);
-                    app.clipboard.request_snapshot(crate::clipboard::EditRequest::Paste {
-                        shared: shared.clone(), doc: snapshot, target: layer,
-                    }).unwrap();
+                    if !following_paste {
+                        let copy = app.clipboard.replies.recv_timeout(Duration::from_secs(5)).unwrap();
+                        assert!(copy.result.is_ok(), "{:?}", copy.result);
+                        app.clipboard.request_snapshot(crate::clipboard::EditRequest::Paste {
+                            shared: shared.clone(), doc: snapshot, target: layer,
+                        }).unwrap();
+                    }
                     let paste = app.clipboard.replies.recv_timeout(Duration::from_secs(5)).unwrap();
                     assert!(paste.result.is_ok(), "{:?}", paste.result);
                     let engine = shared.lock().unwrap();
+                    assert_eq!(engine.history_lengths(), [2, 0]);
                     let document = engine.native_document().unwrap();
                     let pasted = document.metadata().layers().find(|layer| Some(layer.id()) == paste.selected.as_deref()).unwrap();
                     let raster = pasted.pixels();
@@ -14994,6 +15316,34 @@ mod tests {
             assert!(matches!(app.clipboard.replies.recv_timeout(Duration::from_millis(50)), Err(mpsc::RecvTimeoutError::Timeout)));
         }
     }
+    #[test]
+    fn copy_and_paste_in_the_wand_release_frame_uses_only_the_new_selection() {
+        for depth in [8, 16] {
+            let (mut app, ctx, point, before) = pressed_wand_fixture(depth);
+            frame(
+                &mut app,
+                &ctx,
+                vec![
+                    primary_release(point),
+                    egui::Event::Copy,
+                    egui::Event::Paste(String::new()),
+                ],
+                Default::default(),
+            );
+            let reply = app.clipboard.replies.recv_timeout(Duration::from_secs(3)).unwrap();
+            assert!(reply.result.is_ok(), "{:?}", reply.result);
+            let engine = app.shared.lock().unwrap();
+            let state = engine.resident_state().unwrap();
+            let paste = state.document.layers.iter()
+                .find(|layer| Some(&layer.id) == reply.selected.as_ref()).unwrap();
+            assert_eq!([paste.x, paste.y], [4, 5]);
+            assert_eq!([paste.pixels.width, paste.pixels.height], [8, 8]);
+            assert_eq!(paste.pixels.depth, depth);
+            assert_eq!(paste.pixels.get16(0, 0), before.layers[0].pixels.get16(4, 5));
+            assert_eq!(state.undo.len(), 2);
+        }
+    }
+
     #[test]
     fn wand_release_before_copy_cut_or_delete_uses_current_selected_pixels() {
         for depth in [8, 16] {

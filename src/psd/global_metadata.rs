@@ -445,6 +445,24 @@ pub(crate) mod tests {
                         );
                     }
                 }
+                let mut unsupported = ordinary.clone();
+                let ocio = unsupported.windows(8).position(|w| w == b"8BIMOCIO").unwrap();
+                let neutral = [0, b'n', 0, b'o', 0, b'n', 0, b'e'];
+                let kind = ocio + unsupported[ocio..].windows(8).position(|w| w == neutral).unwrap();
+                unsupported[kind + 1] = b'd';
+                for loaded in [
+                    psd::decode(&unsupported).unwrap(),
+                    psd::decode_reader(&mut std::io::Cursor::new(&unsupported), &Default::default())
+                        .unwrap(),
+                ] {
+                    assert!(loaded.read_only);
+                    assert!(loaded.warnings.iter().any(|reason| reason ==
+                        "Unsupported global Photoshop feature: OCIO · OpenColorIO display or color-management settings"));
+                    assert_eq!(
+                        loaded.export_png().unwrap(),
+                        engine.resident_state().expect("resident fixture").document.export_png().unwrap()
+                    );
+                }
                 // Private definitions must not override standard metadata, even
                 // if an external tool changes only a valid display setting.
                 let mut changed = saved.clone();

@@ -76,7 +76,7 @@ pub(super) fn prepare(
     });
     let defaults;
     let settings = if adding {
-        defaults = crate::effects::defaults(kind);
+        defaults = crate::effects::new_layer_effect_defaults(kind);
         Some(c.get("settings").unwrap_or(&defaults))
     } else {
         c.get("settings").or_else(|| global.and(old).map(|i| layer.effects[i].settings.value()))

@@ -13,7 +13,7 @@ use crate::{
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde_json::{json, Value};
-use std::{path::PathBuf, sync::mpsc};
+use std::{path::PathBuf, sync::{mpsc, Arc}};
 const MAX_PASTE_FILES: usize = 16;
 #[cfg(windows)]
 mod windows;
@@ -454,6 +454,22 @@ pub(crate) enum EditRequest {
         doc: DocumentSnapshot,
         target: String,
     },
+    CopyAndPaste {
+        copy: Box<EditRequest>,
+        shared: Shared,
+        doc: DocumentSnapshot,
+        target: String,
+    },
+    TrackedCopy {
+        copy: Box<EditRequest>,
+        receipt: Arc<std::sync::atomic::AtomicBool>,
+    },
+    PasteAfterCopy {
+        shared: Shared,
+        doc: DocumentSnapshot,
+        target: String,
+        receipt: Arc<std::sync::atomic::AtomicBool>,
+    },
     Layers {
         doc: DocumentSnapshot,
         ids: Vec<String>,
@@ -473,7 +489,9 @@ impl EditRequest {
     fn document(&self) -> &str {
         match self {
             Self::Resident(request) => request.document(),
-            Self::Layers { doc, .. } | Self::Pixels { doc, .. } | Self::Paste { doc, .. } => {
+            Self::TrackedCopy { copy, .. } => copy.document(),
+            Self::Layers { doc, .. } | Self::Pixels { doc, .. } | Self::Paste { doc, .. }
+                | Self::CopyAndPaste { doc, .. } | Self::PasteAfterCopy { doc, .. } => {
                 doc.view().id()
             }
         }
@@ -498,7 +516,7 @@ impl Worker {
         ctx: eframe::egui::Context,
         images: Vec<Result<Image, String>>,
     ) -> Self {
-        let (tx, rx) = mpsc::sync_channel::<Work>(1);
+        let (tx, rx) = mpsc::sync_channel::<Work>(2);
         let (reply_tx, replies) = mpsc::channel();
         std::thread::spawn(move || {
             let mut clipboard = tests::Fake::with_images(images);
@@ -526,7 +544,7 @@ impl Worker {
         Self { tx, replies }
     }
     pub fn new(ctx: eframe::egui::Context) -> Self {
-        let (tx, rx) = mpsc::sync_channel::<Work>(1);
+        let (tx, rx) = mpsc::sync_channel::<Work>(2);
         let (reply_tx, replies) = mpsc::channel();
         std::thread::spawn(move || {
             // Open on first use and retain ownership for Linux clipboard providers.
@@ -858,6 +876,7 @@ struct Session {
     image: Option<native::CapturedImage>,
     image_identity: Option<ImageIdentity>,
     layers: Option<LayerBuffer>,
+    tracked_copy: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 impl Session {
     fn check_cut_clipboard(&self, clipboard: &mut dyn Provider) -> Result<(), String> {
@@ -877,6 +896,9 @@ impl Session {
     }
 
     fn process_edit(&mut self, clipboard: &mut dyn Provider, request: EditRequest) -> Reply {
+        if !matches!(&request, EditRequest::Paste { .. } | EditRequest::PasteAfterCopy { .. }) {
+            self.tracked_copy = None;
+        }
         match request {
             EditRequest::Resident(request) => self.process(clipboard, request),
             EditRequest::Paste {
@@ -892,7 +914,46 @@ impl Session {
                     target,
                 },
                 Some(doc.view()),
+                false,
             ),
+            EditRequest::CopyAndPaste { copy, shared, doc, target } => {
+                let copied = self.process_edit(clipboard, *copy);
+                if copied.result.is_err() {
+                    return copied;
+                }
+                self.process_observed(
+                    clipboard,
+                    Request::Paste {
+                        shared,
+                        document: doc.view().id().to_owned(),
+                        revision: doc.view().revision(),
+                        target,
+                    },
+                    Some(doc.view()),
+                    true,
+                )
+            }
+            EditRequest::TrackedCopy { copy, receipt } => {
+                let reply = self.process_edit(clipboard, *copy);
+                receipt.store(reply.result.is_ok(), std::sync::atomic::Ordering::Release);
+                if reply.result.is_ok() {
+                    self.tracked_copy = Some(receipt);
+                }
+                reply
+            }
+            EditRequest::PasteAfterCopy { shared, doc, target, receipt } => {
+                let document = doc.view().id().to_owned();
+                if !self.tracked_copy.as_ref().is_some_and(|copy| Arc::ptr_eq(copy, &receipt)) {
+                    return Reply {
+                        document, result: Err("Paste canceled because the preceding copy did not complete or was replaced".into()),
+                        selected: None, selected_layers: vec![],
+                    };
+                }
+                self.process_observed(
+                    clipboard, Request::Paste { shared, document, revision: doc.view().revision(), target },
+                    Some(doc.view()), true,
+                )
+            }
             EditRequest::Layers { doc, ids, cut } => Reply {
                 document: doc.view().id().to_owned(),
                 result: self.copy_layers(clipboard, doc.view(), ids, cut),
@@ -1107,13 +1168,14 @@ impl Session {
         }
     }
     fn process(&mut self, clipboard: &mut dyn Provider, request: Request) -> Reply {
-        self.process_observed(clipboard, request, None)
+        self.process_observed(clipboard, request, None, false)
     }
     fn process_observed(
         &mut self,
         clipboard: &mut dyn Provider,
         request: Request,
         source: Option<DocumentView<'_>>,
+        require_copy: bool,
     ) -> Reply {
         let document = request.document().to_owned();
         let mut selected = None;
@@ -1194,6 +1256,10 @@ impl Session {
                     selected = selected_layers.first().cloned();
                     return Ok(edit_status(&reply, "Pasted editable layers".into()));
                 }
+                let replaced = "Clipboard no longer contains the new copy; paste skipped";
+                if require_copy && (!files.is_empty() || self.layers.is_some()) {
+                    return Err(replaced.into());
+                }
                 let mut images = vec![];
                 let mut commands = vec![];
                 let mut received = None;
@@ -1210,6 +1276,9 @@ impl Session {
                         }
                         (_, expected) => identity.is_some() && expected == identity,
                     });
+                    if require_copy && retained.is_none() {
+                        return Err(replaced.into());
+                    }
                     match image {
                         // Exact bytes came from our validated encoder. Keep the
                         // admitted native pixels and skip a second PNG decode.
@@ -1235,6 +1304,8 @@ impl Session {
                                 } else {
                                     Some(&*received.insert(image.into()))
                                 }
+                            } else if require_copy {
+                                return Err(replaced.into());
                             } else {
                                 Some(&*received.insert(image.into()))
                             }
@@ -1529,6 +1600,88 @@ mod tests {
         assert_eq!(engine.resident_state().unwrap().document.layers[0].id, target);
         assert_eq!(engine.history_lengths(), [0, 0]);
     }
+    #[test]
+    fn paired_copy_and_paste_refuses_an_older_clipboard_after_copy_failure_or_takeover() {
+        let (shared, doc, target) = fixture();
+        let snapshot: DocumentSnapshot = doc.into();
+        let old = Image::from_raster(Raster::from_rgba(1, 1, &[21, 43, 65, 255]).unwrap());
+        for fail_write in [true, false] {
+            let mut clipboard = Fake {
+                image_reads: [Ok(ClipboardImage::Bitmap(old.clone()))].into(),
+                sequence: Some(17),
+                fail_write,
+                replace_after_write: !fail_write,
+                ..Default::default()
+            };
+            let request = EditRequest::CopyAndPaste {
+                copy: Box::new(EditRequest::Pixels {
+                    shared: shared.clone(),
+                    doc: snapshot.clone(),
+                    target: target.clone(),
+                    mask: false,
+                    merged: false,
+                    cut: false,
+                    step: None,
+                }),
+                shared: shared.clone(),
+                doc: snapshot.clone(),
+                target: target.clone(),
+            };
+            let reply = Session::default().process_edit(&mut clipboard, request);
+            let expected = if fail_write { "clipboard write failed" } else {
+                "Clipboard no longer contains the new copy; paste skipped"
+            };
+            assert_eq!(reply.result.unwrap_err(), expected);
+            let engine = shared.lock().unwrap();
+            assert_eq!(engine.history_lengths(), [0, 0]);
+            assert_eq!(crate::engine::view::current(&engine).layer_count(), 1);
+        }
+    }
+
+    #[test]
+    fn tracked_copy_pastes_large_layer_forests_and_refuses_a_replaced_copy() {
+        let (shared, _, target) = fixture();
+        let (snapshot, ids) = {
+            let mut engine = shared.lock().unwrap();
+            engine.edit("human", &[json!({"op":"layer.add","kind":"group","name":"Folder"})],
+                None, None, "Create folder").unwrap();
+            let folder = engine.resident_state().unwrap().document.layers[0].id.clone();
+            let commands: Vec<_> = (0..30).map(|n|
+                json!({"op":"layer.add","kind":"paint","parent":folder,"name":format!("Child {n}")})
+            ).collect();
+            engine.edit("human", &commands, None, None, "Populate folder").unwrap();
+            (engine.doc_snapshot(), vec![folder])
+        };
+        let mut clipboard = Fake::default();
+        let mut session = Session::default();
+        let copy = |receipt| EditRequest::TrackedCopy {
+            copy: Box::new(EditRequest::Layers { doc: snapshot.clone(), ids: ids.clone(), cut: None }),
+            receipt,
+        };
+        let paste = |receipt| EditRequest::PasteAfterCopy {
+            shared: shared.clone(), doc: snapshot.clone(), target: target.clone(), receipt,
+        };
+        let first = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        session.process_edit(&mut clipboard, copy(first.clone())).result.unwrap();
+        let current = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        session.process_edit(&mut clipboard, copy(current.clone())).result.unwrap();
+        assert!(session.process_edit(&mut clipboard, paste(first)).result.is_err());
+        let reply = session.process_edit(&mut clipboard, paste(current));
+        assert!(reply.result.is_ok(), "{:?}", reply.result);
+        let mut engine = shared.lock().unwrap();
+        let doc = &engine.resident_state().unwrap().document;
+        assert_eq!(doc.layers.len(), 63);
+        let pasted = &reply.selected_layers[0];
+        assert_eq!(doc.layers.iter().filter(|layer| layer.parent.as_ref() == Some(pasted)).count(), 30);
+        engine.undo("human").unwrap();
+        assert_eq!(engine.resident_state().unwrap().document.layers.len(), 32);
+        engine.edit("human", &[json!({"op":"layer.duplicate","layers":ids})],
+            None, None, "Duplicate folder").unwrap();
+        assert_eq!(engine.resident_state().unwrap().document.layers.len(), 63);
+        engine.undo("human").unwrap();
+        assert_eq!(engine.resident_state().unwrap().document.layers.len(), 32);
+    }
+
     #[test]
     fn resident_oversized_selection_refuses_before_render_or_clipboard_write() {
         let (shared, _, _) = fixture();

@@ -420,6 +420,32 @@ mod tests {
     use crate::engine::{Mask, MaskStep};
     use std::sync::Mutex;
     #[test]
+    fn an_agent_created_layer_is_paintable_after_release_but_explicit_locks_remain() {
+        for status in ["ended", "expired", "taken_over"] {
+            let mut engine = Engine::from_document(Document::new_depth(16, 12, 16).unwrap());
+            let original = engine.resident_state().unwrap().document.layers[0].id.clone();
+            let task = engine.reserve("agent", "Add paint", vec![]).unwrap();
+            engine.edit("agent", &[json!({"op":"layer.add","name":"Created by AI"})],
+                Some(0), Some(&task.id), "Create paint").unwrap();
+            let layer = engine.resident_state().unwrap().document.layers[0].id.clone();
+            engine.leases[0].scopes = vec![Scope::layer(&layer)];
+            let paint = |id: &str| json!({"op":"paint","layer":id,"points":[[4.,4.]],"radius":2.,"color16":[12345,23457,34567,65535]});
+            assert!(engine.edit("human", &[paint(&layer)], None, None, "Blocked paint").is_err());
+            engine.edit("human", &[paint(&original)], None, None, "Unrelated human paint").unwrap();
+            match status {
+                "expired" => { engine.leases[0].expires = 0; engine.expire(); }
+                "taken_over" => engine.take_over_tasks(),
+                _ => engine.finish_task(&task.id, status),
+            }
+            engine.edit("human", &[paint(&layer)], None, None, "Human paint").unwrap();
+            assert_ne!(engine.resident_state().unwrap().document.layers[0].pixels.get16(4, 4)[3], 0);
+            engine.edit("human", &[json!({"op":"layer.update","layer":layer,"locked":true})],
+                None, None, "Intentional lock").unwrap();
+            assert!(engine.edit("human", &[paint(&layer)], None, None, "Locked paint").is_err());
+            assert!(engine.resident_state().unwrap().document.layers[0].locked);
+        }
+    }
+    #[test]
     fn proposal_wire_bound_counts_escaped_bytes_without_materializing_another_payload() {
         assert!(validate_commands(&[], &|| Ok(())).is_err());
         assert!(validate_commands(&vec![json!({}); 101], &|| Ok(())).is_err());

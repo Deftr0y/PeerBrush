@@ -221,6 +221,14 @@ pub fn defaults(kind: &str) -> Value {
         _ => json!({}),
     }
 }
+pub(crate) fn new_layer_effect_defaults(kind: &str) -> Value {
+    let mut settings = defaults(kind);
+    if kind == "stroke" {
+        // Outside strokes on full-canvas opaque artwork are clipped by the canvas.
+        settings["position"] = json!("inside");
+    }
+    settings
+}
 pub fn number(v: &Value, key: &str, default: f32) -> f32 {
     v[key]
         .as_f64()

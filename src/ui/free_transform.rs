@@ -1,6 +1,24 @@
 //! One source-bound transform preview; the shared engine owns every pixel and guard.
 use super::*;
 
+pub(super) fn arrow_delta(input: &egui::InputState) -> [i32; 2] {
+    let mut delta = [0, 0];
+    for event in &input.events {
+        if let egui::Event::Key { key, pressed: true, repeat: false, modifiers, .. } = event {
+            if !modifiers.any() {
+                match key {
+                    egui::Key::ArrowLeft => delta[0] -= 1,
+                    egui::Key::ArrowRight => delta[0] += 1,
+                    egui::Key::ArrowUp => delta[1] -= 1,
+                    egui::Key::ArrowDown => delta[1] += 1,
+                    _ => {}
+                }
+            }
+        }
+    }
+    delta
+}
+
 fn mode_choice(ui: &mut egui::Ui, menu: bool, icon: Icon, label: &str, selected: bool) -> bool {
     let min_width = if menu { ui.available_width() } else { 0. };
     let clicked = icons::labeled_choice(ui, icon, label, Some(selected), min_width).clicked();
@@ -1541,7 +1559,7 @@ impl PeerBrush {
             || self.shortcuts.open
             || !self.jobs.is_empty()
             || self.load_control.is_some()
-            || self.pending_import.is_some()
+            || !self.pending_import.is_empty()
             || self.pending_image_open.is_some();
         let cancelled_contact = self.free_transform.as_ref().is_some_and(|editor| editor.drag.is_some())
             && Self::pointer_contact_cancelled(ctx);
@@ -1656,6 +1674,41 @@ impl PeerBrush {
                 if ctx.input(|input| self.shortcuts.pressed_once(action, input)) {
                     editor.set_mode(tool);
                 }
+            }
+            let [x, y] = ctx.input(arrow_delta);
+            if [x, y] != [0, 0] && editor.drag.is_none() {
+                let mode = editor.mode();
+                if x == y && matches!(mode, Some(Tool::Rotate | Tool::Scale)) {
+                    return;
+                }
+                if editor.snap {
+                    let Ok(current) = crate::transform::resolve_command(&editor.raw("", true)) else {
+                        return;
+                    };
+                    let value = |name, fallback| current[name].as_f64().unwrap_or(fallback);
+                    editor.values.offset = [value("dx", 0.), value("dy", 0.)];
+                    editor.values.angle = value("angle", 0.);
+                    editor.values.scale = [value("scale_x", 1.), value("scale_y", 1.)];
+                    editor.snap = false;
+                }
+                match mode {
+                    Some(Tool::Rotate) => {
+                        editor.values.angle = (editor.values.angle + f64::from(x - y) * 0.1).clamp(-100000., 100000.);
+                    }
+                    Some(Tool::Scale) => {
+                        for scale in &mut editor.values.scale {
+                            *scale = (*scale * 1.01_f64.powi(x - y)).clamp(0.05, 20.);
+                        }
+                    }
+                    _ => {
+                        for (offset, pixels) in editor.values.offset.iter_mut().zip([x, y]) {
+                            *offset = (*offset + f64::from(pixels)).clamp(-100000., 100000.);
+                        }
+                    }
+                }
+                editor.changed();
+                self.last_preview = None;
+                ctx.request_repaint();
             }
         }
     }

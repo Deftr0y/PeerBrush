@@ -13,6 +13,8 @@ pub(crate) use permissions::wide_absolute_file_path;
 
 pub(crate) const RESIDENT_FILE_BYTES: u64 = 256 * 1024 * 1024;
 pub(crate) const NATIVE_FILE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+pub(crate) const PREVIOUS_SAVE_STORE_FULL: &str =
+    "Previous-save storage is full. The current file and backups were retained. Save As to a new file.";
 
 #[derive(Clone, Copy)]
 enum FilePolicy {
@@ -576,10 +578,7 @@ impl Lease {
                     .ok_or("Previous-save byte accounting overflow")
             })?;
         if total.saturating_add(expected.bytes) > self.policy.backup_bytes() {
-            return Err(match self.policy {
-                FilePolicy::Legacy => "Previous-save storage is full (1 GiB per directory). Preserve or remove old versions before overwriting; Save As to a new directory is available.",
-                FilePolicy::Source36 => "Source36 previous-save storage is full (64 GiB per directory). Current file retained; preserve old versions or choose a new Save As directory.",
-            }.into());
+            return Err(PREVIOUS_SAVE_STORE_FULL.into());
         }
         let key = destination_key(&self.path);
         let name = format!(

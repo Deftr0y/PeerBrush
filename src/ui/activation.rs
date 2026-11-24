@@ -8,7 +8,7 @@ impl PeerBrush {
             || !self.jobs.is_empty()
             || self.load_control.is_some()
             || self.pending_image_open.is_some()
-            || self.pending_import.is_some()
+            || !self.pending_import.is_empty()
             || self.layer_drag.is_some()
             || self.eye_sweep.is_some()
             || self.tab_transfer.is_some()

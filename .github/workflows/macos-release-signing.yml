@@ -1,11 +1,15 @@
 name: PeerBrush reviewed current-source Apple signing
-run-name: Prepare signed Mac ZIP and DMG for the reviewed main source
+run-name: ${{ inputs.notary_check_only && 'Check Apple notarization credentials' || 'Prepare signed Mac ZIP and DMG for the reviewed main source' }}
 
 # Dormant preparation. Activation, protected-environment settings and dispatch
 # require approval. The historical 0.26 signing workflow is intentionally separate.
 on:
   workflow_dispatch:
     inputs:
+      notary_check_only:
+        description: Verify the protected Apple notarization login without building, signing, or submitting
+        type: boolean
+        default: false
       private_upgrade_test:
         description: Also sign and exercise the private fixed 0.29.99 starting app
         type: boolean
@@ -46,9 +50,44 @@ env:
   MACOSX_DEPLOYMENT_TARGET: '11.0'
 
 jobs:
+  check-notary:
+    if: inputs.notary_check_only && vars.PEERBRUSH_APPLE_RELEASE_SIGNING_ENABLED == 'true' && github.repository == 'Deftr0y/PeerBrush' && github.event_name == 'workflow_dispatch'
+    runs-on: macos-26
+    environment: apple-signing
+    timeout-minutes: 5
+    steps:
+      - name: Require the exact reviewed main or 0.4 version branch
+        run: |
+          python3 -I - <<'PY'
+          import os, re
+          source = os.environ['SELECTED_COMMIT']
+          ref = os.environ['GITHUB_REF']
+          if (not re.fullmatch('[0-9a-f]{40}', source)
+                  or ref not in {'refs/heads/main', 'refs/heads/version/0.4'}
+                  or os.environ['GITHUB_SHA'] != source
+                  or os.environ['GITHUB_WORKFLOW_SHA'] != source
+                  or os.environ['GITHUB_WORKFLOW_REF'] !=
+                      'Deftr0y/PeerBrush/.github/workflows/macos-release-signing.yml@' + ref
+                  or os.environ['GITHUB_RUN_ATTEMPT'] != '1'
+                  or os.environ['RUNNER_ENVIRONMENT'] != 'github-hosted'
+                  or os.environ['RUNNER_OS'] != 'macOS'
+                  or os.environ['RUNNER_ARCH'] != 'ARM64'):
+              raise SystemExit('The credential check requires its exact reviewed workflow source.')
+          PY
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Check the configured Notary Service login
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_NOTARY_PASSWORD: ${{ secrets.APPLE_NOTARY_PASSWORD }}
+        run: python3 -I scripts/check_notary_credentials.py
+
   build:
     name: build
-    if: vars.PEERBRUSH_APPLE_RELEASE_SIGNING_ENABLED == 'true' && github.repository == 'Deftr0y/PeerBrush' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch'
+    if: vars.PEERBRUSH_APPLE_RELEASE_SIGNING_ENABLED == 'true' && github.repository == 'Deftr0y/PeerBrush' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && !inputs.notary_check_only
     runs-on: macos-26
     timeout-minutes: 120
     outputs:

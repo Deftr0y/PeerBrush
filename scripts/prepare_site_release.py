@@ -73,9 +73,10 @@ def public_url(url, *, api=False, redirected=False, website=False):
                 return False
             pairs = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True, strict_parsing=True, max_num_fields=2)
             values = dict(pairs)
-            if pairs and (len(values) != len(pairs) or not set(values) <= {'release', 'layout'}
+            if pairs and (len(values) != len(pairs) or not set(values) <= {'release', 'layout', 'downloads'}
                           or not re.fullmatch('v' + STABLE, values.get('release', ''))
-                          or ('layout' in values and not re.fullmatch(NUMERIC, values['layout']))):
+                          or any(not re.fullmatch(NUMERIC, value)
+                                 for key, value in values.items() if key != 'release')):
                 return False
             return url == WEBSITE[:-1] + parsed.path + ('?' + urllib.parse.urlencode(pairs) if pairs else '')
         if redirected:

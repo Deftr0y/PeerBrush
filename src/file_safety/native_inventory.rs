@@ -100,7 +100,7 @@ impl NativeLease {
             inventory.entries.push(entry);
         }
         if inventory.backup_bytes > FilePolicy::Source36.backup_bytes() {
-            return Err("Source36 previous-save storage exceeds its directory admission".into());
+            return Err(super::PREVIOUS_SAVE_STORE_FULL.into());
         }
         inventory.validate(check)?;
         Ok(inventory)
@@ -288,7 +288,10 @@ impl NativeInventory<'_> {
         for item in fs::read_dir(&self.directory).map_err(|e| e.to_string())? {
             check()?;
             let name = item.map_err(|e| e.to_string())?.file_name();
-            if names.len() == MAX_ENTRIES || name.as_encoded_bytes().len() > 1024 {
+            if names.len() == MAX_ENTRIES {
+                return Err(super::PREVIOUS_SAVE_STORE_FULL.into());
+            }
+            if name.as_encoded_bytes().len() > 1024 {
                 return Err(
                     "Native previous-save inventory exceeds bounded entry admission".into(),
                 );
@@ -328,6 +331,14 @@ impl NativeInventory<'_> {
     pub(in crate::file_safety) fn admit_created_backup(&self, bytes: u64) -> Result<u64, String> {
         self.admit_created_backups(bytes, 1)
     }
+    pub(crate) fn check_replacement_backup_capacity(&self) -> Result<(), String> {
+        if let Some(original) = self.lease.expected() {
+            let bytes = original.bytes.checked_mul(2)
+                .ok_or("Native original/backup coexistence overflow")?;
+            self.admit_created_backups(bytes, 2)?;
+        }
+        Ok(())
+    }
     pub(in crate::file_safety) fn admit_created_backups(
         &self,
         bytes: u64,
@@ -339,12 +350,12 @@ impl NativeInventory<'_> {
             .checked_add(count)
             .is_none_or(|n| n > self.entries.capacity() || n > MAX_ENTRIES)
         {
-            return Err("Native backup exceeds its frozen entry admission".into());
+            return Err(super::PREVIOUS_SAVE_STORE_FULL.into());
         }
         self.backup_bytes
             .checked_add(bytes)
             .filter(|n| *n <= FilePolicy::Source36.backup_bytes())
-            .ok_or_else(|| "Native backup exceeds its directory admission".into())
+            .ok_or_else(|| super::PREVIOUS_SAVE_STORE_FULL.into())
     }
     pub(in crate::file_safety) fn validate_created_backup(
         &self,

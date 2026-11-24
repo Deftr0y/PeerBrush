@@ -187,15 +187,14 @@ fn command_scopes(metadata: &Document36, c: &Value) -> Vec<Scope> {
             });
     }
     if ["layer.add", "image.import", "source.add", "path.create"].contains(&op) {
-        return c["parent"]
-            .as_str()
-            .map(|p| {
-                vec![Scope {
-                    target: Some(p.into()),
-                    rect: None,
-                }]
-            })
-            .unwrap_or_default();
+        let parent = if op == "layer.add" && c.get("relative_to").is_some() {
+            c["relative_to"].as_str()
+                .and_then(|id| metadata.layers.iter().find(|layer| layer.id == id))
+                .and_then(|layer| if layer.kind == "group" { Some(layer.id.as_str()) } else { layer.parent.as_deref() })
+        } else {
+            c["parent"].as_str()
+        };
+        return parent.into_iter().map(Scope::layer).collect();
     }
     if [
         "layer.reorder",

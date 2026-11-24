@@ -64,7 +64,7 @@ Optional selective reservation:
 {"action":"begin","actor":"my-agent","description":"Refining the character mask","scopes":[{"target":"LAYER_ID","rect":[20,20,240,240]}],"feedback":"batch"}
 ```
 
-Pass the returned task ID with subsequent edits. Update or end it explicitly. Reservations expire after five idle minutes. If the user takes back control, stop and inspect; never silently reacquire.
+Reserve the smallest layer or document-coordinate region that needs protection during a multi-step edit. A quick edit can use the observed revision without reserving anything. Reserve a whole project only for a genuinely document-wide operation that needs protection. Pass the task ID with its edits, update its scopes as the work changes, and end it when done. Leave created layers unlocked unless the user asks to lock them. Reservations expire after five idle minutes. If the user takes back control, stop and observe the current project before any new work. Resume on that target only with the user's direction.
 
 Feedback defaults to an image after each edit batch. Set `feedback` to `request` to avoid automatic images, or `batch`/`always` to receive them. `max_edge` controls image size. Observation also supports `rect`, `layer`, `mask`, `image:false`, and `since_revision` to skip unchanged images. PNGs are delivered as actual MCP image content, not screenshots of interface chrome.
 
@@ -200,7 +200,9 @@ Unreleased: destructive `adjust` accepts `layer`, optional document-coordinate `
 
 `peerbrush_capabilities` returns brush tip/settings, all blend modes and runnable commands. Use `paint` with `tip:dry|chalk|grain|bristle`, density/grain, pressure toggles and taper distances. Pressure points accept `[x,y,p]` with `p` in0–1; plain points remain compatible. `smudge` adds wetness/load/pickup and uses the same selection, layer and mask coordinates.
 
-`adjustment.add` accepts `layers`, `kind` and editable `settings`. A paint target gets a clipped adjustment; a folder target gets a scoped child; multiple roots become a shared folder. An existing pixel selection becomes its mask. `layer.clip` sets `base` to the next unclipped sibling below; `base:null` releases clipping. Preserve whole clipping units when copying or reorganizing.
+`adjustment.add` accepts `layers`, `kind`, editable `settings` and an optional `name`. The default name is “Adjustment layer”. A paint target gets a clipped adjustment. A folder target gets a scoped child, and multiple roots become a shared folder. An existing pixel selection becomes its mask. `layer.clip` sets `base` to the next unclipped sibling below. Use `base:null` to release clipping. Preserve whole clipping units when copying or reorganizing.
+
+`layer.update` accepts a `color_label` preset or an RGB string such as `"#3DB9C4"`. Use `"none"` to clear it. Cyan and custom RGB are stored in PeerBrush editable PSD/PSB sources. The other presets use standard Photoshop layer metadata. Right-click a layer or folder and choose **Color → Custom…** to preview the accent and then apply it as one undoable edit. Labels leave the artwork pixels unchanged.
 
 Color effects add `color_balance`, `hsl`, `bloom` and `liquify`. Balance uses shadows/midtones/highlights RGB complementary-axis arrays in −1–1, with preserve_luminosity. HSL uses hue degrees −180–180 and saturation/lightness −1–1. Bloom uses threshold 0–1, spread 0–64 document pixels and strength 0–3.
 

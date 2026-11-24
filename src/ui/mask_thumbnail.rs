@@ -1,4 +1,6 @@
 use super::*;
+use crate::engine::native::{LayerMetadata, NativeDocument};
+use crate::engine::scene::MetadataPayload;
 use crate::render::native_preview::{layer_thumbnail_key, LayerThumbnailKey};
 use crate::workspace::native_dispatch::retryable_source_read;
 use std::time::Instant;
@@ -31,7 +33,7 @@ mod tests {
                     &shared,
                     &app.project_id,
                     &native,
-                    &doc.layers[0].id,
+                    native.metadata().layer(0).unwrap(),
                     false,
                     &ctx
                 )
@@ -50,7 +52,7 @@ mod tests {
                     &shared,
                     &app.project_id,
                     &native,
-                    &doc.layers[1].id,
+                    native.metadata().layer(1).unwrap(),
                     false,
                     &ctx
                 )
@@ -60,12 +62,25 @@ mod tests {
             assert!(state.layer.is_none());
             assert_eq!(state.pending.as_ref().unwrap().0 .0, doc.layers[0].id);
             assert_eq!(state.pending.as_ref().unwrap().1, ticket);
+            let stale = thumbnails.get_layer(
+                &shared,
+                &app.project_id,
+                &replacement,
+                native.metadata().layer(1).unwrap(),
+                false,
+                &ctx,
+            );
+            assert_eq!(stale.err().as_deref(), Some("Thumbnail layer source changed"));
+            assert_eq!(
+                thumbnails.state.as_ref().unwrap().pending.as_ref().unwrap().1,
+                ticket
+            );
             assert!(thumbnails
                 .get_layer(
                     &shared,
                     &app.project_id,
                     &replacement,
-                    &doc.layers[1].id,
+                    replacement.metadata().layer(1).unwrap(),
                     false,
                     &ctx
                 )
@@ -97,13 +112,19 @@ mod tests {
         layer.pixels = crate::raster::Raster::new_depth(doc.width, doc.height, 16);
         layer.effects.clear();
         layer.mask = None;
-        let id = layer.id.clone();
         let pool = crate::large_document::ResidentBudget::new(16 * 1024 * 1024).unwrap();
         let native = crate::tree::presentation_tests::native(&doc, &pool);
         let mut thumbnails = Thumbnails::default();
         let guard = app.shared.lock().unwrap();
         let get = |thumbnails: &mut Thumbnails| {
-            thumbnails.get_layer(&app.shared, &app.project_id, &native, &id, false, &ctx)
+            thumbnails.get_layer(
+                &app.shared,
+                &app.project_id,
+                &native,
+                native.metadata().layer(0).unwrap(),
+                false,
+                &ctx,
+            )
         };
         assert!(get(&mut thumbnails).unwrap().is_none());
         thumbnails.sampler.cancel();
@@ -165,6 +186,7 @@ struct State {
     source: crate::engine::native::DocumentKey,
     layer: Option<String>,
     profile: Option<Option<[u8; 32]>>,
+    profile_source: Option<MetadataPayload<Vec<u8>>>,
     limit: usize,
     textures: HashMap<Key, (TextureHandle, Option<ThumbnailKey>)>,
     pending: Option<(Key, color_sample::Ticket, Option<ThumbnailKey>)>,
@@ -173,6 +195,14 @@ struct State {
     _charge: Arc<crate::psd::memory36::MetadataCharge>,
 }
 impl State {
+    fn same_profile(&self, source: Option<&MetadataPayload<Vec<u8>>>) -> bool {
+        match (self.profile_source.as_ref(), source) {
+            (Some(a), Some(b)) => a.same_allocation(b),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
     fn record_failure(&mut self, target: Key, error: String) {
         if retryable_source_read(&error) {
             self.retry_after = Some(Instant::now() + INVENTORY_RETRY_DELAY);
@@ -195,24 +225,27 @@ impl Thumbnails {
         &mut self,
         shared: &Shared,
         project: &str,
-        doc: &crate::engine::native::NativeDocument,
+        doc: &NativeDocument,
         layer: LayerView<'_>,
         index: usize,
         ctx: &egui::Context,
     ) -> Result<Option<TextureHandle>, String> {
+        let LayerView::Native(layer) = layer else {
+            return Err("Thumbnail layer source changed".into());
+        };
         let step = layer
             .mask()
-            .and_then(|mask| mask.step(index))
+            .and_then(|mask| mask.steps().nth(index))
             .ok_or("Thumbnail mask step disappeared")?
             .id();
-        self.get_target(shared, project, doc, layer.id(), true, Some(step), ctx)
+        self.get_target(shared, project, doc, layer, true, Some(step), ctx)
     }
     pub(super) fn get_layer(
         &mut self,
         shared: &Shared,
         project: &str,
-        doc: &crate::engine::native::NativeDocument,
-        layer: &str,
+        doc: &NativeDocument,
+        layer: LayerMetadata<'_>,
         mask: bool,
         ctx: &egui::Context,
     ) -> Result<Option<TextureHandle>, String> {
@@ -222,26 +255,22 @@ impl Thumbnails {
         &mut self,
         shared: &Shared,
         project: &str,
-        doc: &crate::engine::native::NativeDocument,
-        layer_id: &str,
+        doc: &NativeDocument,
+        layer: LayerMetadata<'_>,
         mask: bool,
         step: Option<&str>,
         ctx: &egui::Context,
     ) -> Result<Option<TextureHandle>, String> {
+        if layer.binding() != doc.key() {
+            return Err("Thumbnail layer source changed".into());
+        }
         let metadata = doc.metadata();
-        let layer = metadata.layers().find(|layer| layer.id() == layer_id)
-            .ok_or("Thumbnail layer disappeared")?;
+        let layer_id = layer.id();
         if self.retirement.as_ref().is_some_and(|owner| !owner.uses_budget(doc.budget())) {
             self.retirement = None;
         }
         if mask && layer.mask().is_none() {
             return Err("Thumbnail mask disappeared".into());
-        }
-        if let Some(id) = step {
-            let channel = layer.mask().ok_or("Thumbnail mask disappeared")?;
-            if !channel.steps().any(|step| step.id() == id) {
-                return Err("Thumbnail mask step disappeared".into());
-            }
         }
         let scope = step.map(|_| layer_id);
         let same_document = |state: &State| {
@@ -301,12 +330,17 @@ impl Thumbnails {
             }
             let charge =
                 crate::psd::memory36::MetadataCharge::reserve(doc.budget(), bytes, &|| Ok(()))?;
-            // The layer panel shares one profile digest across all color targets.
-            let profile = if scope.is_none() {
-                crate::color_profile::prepared::profile_binding(metadata.profile(), &mut || Ok(()))
-                    .ok()
+            // Reuse the digest when edits carried the same admitted profile forward.
+            let (profile_source, profile) = if scope.is_none() {
+                let source = metadata.share_profile()?;
+                let profile = previous.as_ref().filter(|state| state.same_profile(source.as_ref()))
+                    .map_or_else(
+                        || crate::color_profile::prepared::profile_binding(metadata.profile(), &mut || Ok(())).ok(),
+                        |state| state.profile,
+                    );
+                (source, profile)
             } else {
-                None
+                (None, None)
             };
             let textures = previous.as_mut().map_or_else(HashMap::new, |state| {
                 state.textures.retain(|(id, mask, step), (_, old)| {
@@ -327,6 +361,7 @@ impl Thumbnails {
                 source: doc.key(),
                 layer: scope.map(str::to_owned),
                 profile,
+                profile_source,
                 limit: count,
                 textures,
                 pending: None,

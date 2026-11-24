@@ -382,9 +382,10 @@ fn canonical_url(actual: &str, expected: &str) -> bool {
     url::Url::parse(actual).is_ok_and(|u| u.as_str() == expected && actual == expected)
 }
 pub(crate) fn release_version_cmp(left: &Version, right: &Version) -> std::cmp::Ordering {
-    // PeerBrush 0.4 follows the published 0.30 release line.
+    // PeerBrush returned to single-digit minor versions after 0.30.
     let series = |version: &Version| match (version.major, version.minor) {
         (0, 4) => (0, 30, 1),
+        (0, 5) => (0, 30, 2),
         (major, minor) => (major, minor, 0),
     };
     series(left)

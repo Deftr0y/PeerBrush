@@ -230,6 +230,7 @@ mod tests {
                     &mut output,
                     &mut Cursor::new(Vec::new()),
                     Some(&mut scratch),
+                    false,
                     &|| Ok(()),
                     &|_, _, _| Ok(()),
                 )
@@ -270,6 +271,7 @@ mod tests {
                     &mut output,
                     &mut Cursor::new(Vec::new()),
                     Some(&mut scratch),
+                    false,
                     &|| Ok(()),
                     &|stage, completed, _| {
                         if fault == "cancel"

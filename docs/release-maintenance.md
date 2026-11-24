@@ -42,6 +42,8 @@ Perform only steps covered by the current authorization. When blocked, prepare p
 
 The existing [CI workflow](../.github/workflows/ci.yml) builds and uploads Actions artifacts; do not assume it publishes GitHub releases or updates any external channel. Changes to automation, deployment settings or credentials require the applicable separate permissions.
 
+The [release site workflow](../.github/workflows/release-site-sync.yml) dispatches the protected Pages workflow after a stable GitHub release and reconciles daily. Prepare and review the release metadata and platform downloads on `site-content` through the normal website review. Pages requires the reviewed feed and its latest history entry to match the published release, tag commit, timestamp and uploaded asset checksums. A stale feed fails the run until the reviewed update is available. The daily reconciliation also covers publication with GitHub's workflow token and skips deployment when the release pages and scripts already match the live site. Manual dispatch still accepts the exact reviewed site commit. After deployment, readback compares the live pages, scripts and cache URLs with the reviewed files. Package qualification and Microsoft Store availability still use their platform workflows.
+
 ## Idempotency, receipts and recovery
 
 Use a stable publication key: repository + exact release tag (or development commit) + update kind + destination. Before posting, inspect the existing destination and an approved private publication record for that key. Prefer correcting an existing post within the authorized scope over creating another. Do not retry an ambiguous send until its outcome has been reconciled. Do not repost an unchanged release just because a job reruns.
