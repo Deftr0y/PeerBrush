@@ -13,7 +13,7 @@ use crate::{
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde_json::{json, Value};
-use std::{path::PathBuf, sync::mpsc};
+use std::{path::PathBuf, sync::{mpsc, Arc}};
 const MAX_PASTE_FILES: usize = 16;
 #[cfg(windows)]
 mod windows;

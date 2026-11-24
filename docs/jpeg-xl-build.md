@@ -29,6 +29,9 @@ paths before starting DevShell and pass all three with --selected-clang-cl,
 --selected-cmake and --selected-ninja. The explicit Application command filter
 can enumerate multiple PATH matches; -TotalCount 1 keeps the first executable
 in execution-precedence order, so an array cannot become extra native arguments.
+Hosted workflows then replace the clang-cl selection with the absolute
+`VC\Tools\Llvm\x64\bin\clang-cl.exe` from the same Visual Studio installation,
+because MSVC 14.52's STL rejects Clang older than 22 (STL1000).
 Qualification uses those exact files after
 the SDK changes PATH. Partial or relative selections are rejected. CC/CXX and
 CMAKE retain the selected executables; the process-local CMAKE_MAKE_PROGRAM is
@@ -114,6 +117,20 @@ remove only the Visual Studio 2015 generator and list no change to
 this build uses Ninja. Windows now also accepts exactly `4.5.0`. As before,
 this source review is not native build qualification; exact-head CI must
 establish compilation and codec/application acceptance.
+
+That run failed for a different reason. Image `20261116.315.1` also moved
+Visual Studio from 18.11 to 18.12, whose MSVC 14.52 STL requires Clang 22
+([STL1000 check](https://github.com/microsoft/STL/blob/main/stl/inc/yvals_core.h)).
+The standalone LLVM `20.1.8` therefore failed the first C++ configure probe
+(libjxl `FindAtomics`, "Neither lock free instructions nor -latomic found").
+The Windows workflows now select Visual Studio's bundled clang-cl and Windows
+accepts Clang `22.1.3`, the version the STL changelog lists for this toolset.
+The image inventory lists the component but not its compiler version, so the
+qualification step must confirm it. macOS image `20261117.0516` likewise ships
+CMake `4.5.0` with Clang `21.0.0` and Ninja `1.13.2`
+([inventory](https://github.com/actions/runner-images/blob/macos-26-arm64/20261117.0516/images/macos/macos-26-arm64-Readme.md));
+macOS now also accepts exactly `4.5.0`. Exact-head CI must still establish
+compilation and codec/application acceptance.
 
 The macOS 15 Apple Silicon upgrade test uses Apple Clang 17.0.0, CMake 4.4.4
 and Ninja 1.13.2 from its [hosted image](https://github.com/actions/runner-images/blob/macos-15-arm64/20261028.0489/images/macos/macos-15-arm64-Readme.md).

@@ -32,6 +32,8 @@ The [0.5 owner intake](https://github.com/Deftr0y/PeerBrush/blob/15da63fe42a821e
 | 14 | Arrow-key nudges in W/E/R and Ctrl+T | [PB-004](#pb-004), includes Free Transform ([PB-153](#pb-153)) |
 | 15 | Reduced-resolution previews opt-in | [PB-157](#pb-157) |
 
+**Release-candidate gate.** The 0.5.0 candidate ([Deftr0y/PeerBrush#66](https://github.com/Deftr0y/PeerBrush/pull/66)) has not passed. [Run 45225398868](https://github.com/Deftr0y/PeerBrush/actions/runs/45225398868) at `505357cf` failed on all three platforms before the essential cases ran. Linux failed to compile because `src/clipboard.rs` used `Arc` without importing it. macOS image `20261117.0516` ships CMake 4.5.0, which was not yet allowlisted. Windows image `20261116.315.1` moved to Visual Studio 18.12, whose MSVC 14.52 STL requires Clang 22, so the image's standalone LLVM 20.1.8 failed libjxl's atomics probe. Source now imports `Arc`, allows CMake 4.5.0 on macOS, and selects Visual Studio's bundled clang-cl (allowlisted at 22.1.3) on Windows. [Details](docs/jpeg-xl-build.md). These fixes are not compiled locally; a new gate run must confirm them.
+
 ### PB-080
 
 **Recovery and close lifecycle · 0.5 · first batch · Implemented / verification pending**
