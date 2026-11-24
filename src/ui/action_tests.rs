@@ -6,13 +6,13 @@ fn layer_panel_creation_selects_receipt_ids_and_rejects_stale_or_pending_sources
         let (mut app, ctx) = workspace_tests::fixture(depth);
         let base = app.selected.clone();
         let initial = app.shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
-        app.create_panel_layer(&initial, Some(("hsl", "Hue / saturation")));
+        app.create_panel_layer(&initial, Some("hsl"));
         let first = app.selected.clone();
         assert_ne!(first, base);
         app.select_content(&base);
         let before = app.shared.lock().unwrap().resident_state().expect("resident fixture").document.clone();
         let history = app.shared.lock().unwrap().history_lengths();
-        app.create_panel_layer(&before, Some(("hsl", "Hue / saturation")));
+        app.create_panel_layer(&before, Some("hsl"));
         assert_ne!(app.selected, first);
         assert_ne!(app.selected, base);
         {
@@ -24,7 +24,7 @@ fn layer_panel_creation_selects_receipt_ids_and_rejects_stale_or_pending_sources
                 .find(|layer| layer.id == app.selected)
                 .unwrap();
             assert_eq!(selected.kind, "adjustment");
-            assert_eq!(selected.name, "Hue / saturation");
+            assert_eq!(selected.name, crate::adjustment::DEFAULT_NAME);
             assert_eq!(engine.history_lengths(), [history[0] + 1, 0]);
             assert_eq!(
                 engine
@@ -85,7 +85,7 @@ fn layer_panel_creation_selects_receipt_ids_and_rejects_stale_or_pending_sources
         .unwrap();
         app.proposal_review = Some("preserved-proposal".into());
         app.create_panel_layer(&current, None);
-        app.create_panel_layer(&current, Some(("hsl", "Hue / saturation")));
+        app.create_panel_layer(&current, Some("hsl"));
         assert_eq!(app.selected, selected);
         assert_eq!(app.proposal_review.as_deref(), Some("preserved-proposal"));
         assert_eq!(serde_json::to_value(&guard.resident_state().expect("resident fixture").document).unwrap(), saved);
